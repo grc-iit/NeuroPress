@@ -9,6 +9,115 @@ This document provides a comprehensive implementation plan to create/enhance a s
 
 ---
 
+## File Structure Diagrams
+
+### Project Directory Structure
+
+```
+benchmarkDatatypes/
+│
+├── Source Files
+│   ├── GPU_Compress.cu              ← Main implementation (NEW/Enhanced)
+│   ├── GPU_LZ4.cu                   ← Original LZ4-only version (backup)
+│   ├── benchmark.cc                 ← Data generator
+│   └── gpu_handler                  ← Compiled GPU handler
+│
+├── Header Files (if separated)
+│   ├── compression_factory.hpp      ← Algorithm factory (optional)
+│   └── compression_types.hpp        ← Enums and types (optional)
+│
+├── Test Data
+│   ├── noisy_pattern.bin            ← Test input
+│   ├── smooth_pattern.bin           ← Test input
+│   ├── turbulent_pattern.bin        ← Test input
+│   └── periodic_pattern.bin         ← Test input
+│
+├── Compressed Output
+│   ├── noisy_pattern.bin.lz4        ← Compressed with LZ4
+│   ├── noisy_pattern.bin.snappy     ← Compressed with Snappy
+│   ├── noisy_pattern.bin.zst        ← Compressed with Zstd
+│   └── noisy_pattern.bin.cascaded   ← Compressed with Cascaded
+│
+├── Analysis Scripts
+│   ├── analyze_patternsANDentropy.py
+│   ├── visualize_entropy.py
+│   └── visualize_patterns.py
+│
+├── Build Files
+│   ├── Makefile                     ← Build system
+│   ├── CMakeLists.txt              ← Alternative build (optional)
+│   └── benchmark                    ← Compiled benchmark tool
+│
+└── Documentation
+    ├── IMPLEMENTATION_PLAN.md       ← This document
+    └── README.md                    ← Usage guide (to be created)
+```
+
+### GPU_Compress.cu Code Structure
+
+```
+GPU_Compress.cu (Single File Architecture)
+│
+├── [SECTION 1: Headers & Includes]
+│   ├── CUDA Runtime
+│   ├── cuFile (GDS)
+│   ├── NVTX (Profiling)
+│   └── nvCOMP (All algorithms)
+│       ├── lz4.hpp
+│       ├── snappy.hpp
+│       ├── deflate.hpp
+│       ├── gdeflate.hpp
+│       ├── zstd.hpp
+│       ├── ans.hpp
+│       ├── cascaded.hpp
+│       └── bitcomp.hpp
+│
+├── [SECTION 2: Macros & Constants]
+│   ├── CUDA_CHECK()
+│   ├── DEFAULT_CHUNK_SIZE
+│   └── GDS_ALIGNMENT (4KB)
+│
+├── [SECTION 3: Type Definitions]
+│   └── enum class CompressionAlgorithm
+│       ├── LZ4
+│       ├── SNAPPY
+│       ├── DEFLATE
+│       ├── GZIP
+│       ├── ZSTD
+│       ├── ANS
+│       ├── CASCADED
+│       ├── BITCOMP
+│       └── AUTO
+│
+├── [SECTION 4: Helper Functions]
+│   ├── getAlgorithmName()
+│   ├── toLowerCase()
+│   ├── parseCompressionAlgorithm()
+│   └── usage()
+│
+├── [SECTION 5: Core Factory Function]
+│   └── createCompressionManager()    ← KEY COMPONENT
+│       ├── Switch on algorithm type
+│       ├── Create appropriate Manager
+│       └── Return unique_ptr<nvcompManagerBase>
+│
+├── [SECTION 6: Optional Advanced Features]
+│   ├── analyzeData()                 (for AUTO mode)
+│   ├── chooseOptimalCompressor()     (for AUTO mode)
+│   └── benchmarkAllAlgorithms()      (for benchmark mode)
+│
+└── [SECTION 7: Main Function]
+    ├── Parse command-line arguments
+    ├── Open input file
+    ├── Initialize GPU & GDS
+    ├── Allocate GPU memory
+    ├── GDS Read (file → GPU)
+    ├── Create compression manager (factory)
+    ├── Compress data on GPU
+    ├── GDS Write (GPU → file)
+    └── Cleanup & report stats
+```
+
 ### Data Flow Diagram
 
 ```
@@ -330,6 +439,29 @@ Key Benefits:
 
 ---
 
+## Current State Analysis
+
+### What You Already Have ✓
+
+Your existing `GPU_LZ4.cu` file (317 lines) already implements:
+- ✓ GDS initialization and file handle registration
+- ✓ Direct file-to-GPU memory transfer (bypassing CPU)
+- ✓ LZ4 compression on GPU using nvCOMP
+- ✓ GDS write back to storage
+- ✓ Proper memory alignment (4KB) for GDS optimal performance
+- ✓ Error handling and resource cleanup
+- ✓ NVTX profiling annotations
+
+### What Needs Enhancement
+
+The current implementation is **hardcoded to use LZ4** compression only. The enhancement will add:
+- ⚠ Dynamic compression algorithm selection (runtime choice)
+- ⚠ Support for multiple nvCOMP compression algorithms
+- ⚠ Command-line interface to choose compression type
+- ⚠ Automatic algorithm selection based on data characteristics (optional advanced feature)
+
+---
+
 ## nvCOMP Compression Algorithms Overview
 
 Based on the NVIDIA CUDALibrarySamples nvCOMP examples, the following compression algorithms are available:
@@ -393,7 +525,21 @@ createCompressionManager(
 
 ### Phase 2: Code Structure Enhancement
 
-#### 2.1 Required Header Inclusions
+#### 2.1 New File Organization
+
+**Option A: Enhance existing `GPU_LZ4.cu`**
+- Rename to `GPU_Compress.cu` (more generic name)
+- Add dynamic algorithm selection
+- Maintain backward compatibility
+
+**Option B: Create new file `GPU_DynamicCompress.cu`**
+- Keep `GPU_LZ4.cu` as reference implementation
+- Build new file with all algorithms
+- Cleaner approach for testing
+
+**Recommendation**: Option A with backup of original file
+
+#### 2.2 Required Header Inclusions
 
 ```cpp
 // Existing headers
@@ -683,6 +829,14 @@ Stream 3:                                     [Read Chunk 3]      [Compress Chun
 
 ### File: GPU_LZ4.cu → GPU_Compress.cu
 
+#### Lines to Modify:
+
+1. **Line 22-24**: Add all compression headers
+2. **Line 37-45**: Update usage() to show algorithm options
+3. **Line 47-50**: Add algorithm parameter parsing
+4. **Line 168-177**: Replace hardcoded LZ4Manager with factory
+5. **Line 199-210**: Update compression call to use base class
+
 #### New Functions to Add:
 
 ```cpp
@@ -847,6 +1001,31 @@ clean:
 
 ---
 
+## Expected Results
+
+### Performance Targets
+
+Based on typical nvCOMP + GDS performance:
+
+| Algorithm | Compression Ratio | Throughput | Use Case |
+|-----------|-------------------|------------|----------|
+| Snappy    | 1.5-2.0x         | 10-15 GB/s | Speed-critical |
+| LZ4       | 2.0-2.5x         | 8-12 GB/s  | Balanced |
+| Zstd      | 2.5-3.5x         | 2-5 GB/s   | Better compression |
+| Cascaded  | 3.0-5.0x         | 1-3 GB/s   | Scientific data |
+| Bitcomp   | 2.5-4.0x         | 3-6 GB/s   | Scientific data |
+
+### Success Criteria
+
+- ✓ All algorithms compile and run without errors
+- ✓ GDS read/write working (verify with nsight systems)
+- ✓ Compression ratio > 1.5x for test data
+- ✓ No CPU memory copies in critical path
+- ✓ Throughput > 5 GB/s for LZ4
+- ✓ Clean error handling and resource cleanup
+
+---
+
 ## Troubleshooting Guide
 
 ### Common Issues
@@ -915,4 +1094,44 @@ stat -c "%s" input.bin  # Should be multiple of 4096
 - Add AUTO mode
 - Add benchmarking capability
 - Add compression metadata
+
+---
+
+## References
+
+### NVIDIA Documentation
+- [nvCOMP Documentation](https://developer.nvidia.com/nvcomp)
+- [GPUDirect Storage Guide](https://docs.nvidia.com/gpudirect-storage/)
+- [CUDA Programming Guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide/)
+
+### Code Examples
+- [NVIDIA CUDALibrarySamples nvCOMP Examples](https://github.com/NVIDIA/CUDALibrarySamples/tree/main/nvCOMP/examples)
+- Existing GPU_LZ4.cu implementation (your current file)
+
+### Related Tools
+- `benchmark.cc` - Your data generator
+- `analyze_patternsANDentropy.py` - Data analysis
+- `visualize_entropy.py` - Visualization
+
+---
+
+## Conclusion
+
+This implementation plan provides a comprehensive roadmap for enhancing your existing GDS + nvCOMP implementation with dynamic compression algorithm selection. The modular approach allows you to start with a minimal implementation and progressively add advanced features based on your needs.
+
+**Key Advantages:**
+- ✓ Builds on existing working code
+- ✓ Maintains GDS performance benefits
+- ✓ Provides flexibility in algorithm choice
+- ✓ Enables data-specific optimization
+- ✓ Scalable architecture for future enhancements
+
+Please review this plan and answer the questions in the "Questions to Address" section so we can proceed with the implementation tailored to your specific requirements.
+
+---
+
+**Document Version**: 1.0  
+**Date**: January 5, 2026  
+**Author**: Implementation Plan for Enhanced GPU Compression  
+**Status**: Ready for Review & Implementation
 

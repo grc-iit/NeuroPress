@@ -1,0 +1,3 @@
+GPU_LZ4.cu
+*.bin
+*.o
