@@ -26,12 +26,12 @@ link_directories(
 
 # Source files
 set(FACTORY_SOURCES
-    CompressionFactory.cpp
-    CompressionFactory.hpp
+    src/CompressionFactory.cpp
+    src/CompressionFactory.hpp
 )
 
 set(MAIN_SOURCES
-    GPU_Compress.cpp
+    src/GPU_Compress.cpp
 )
 
 # Create executable
@@ -42,8 +42,8 @@ add_executable(gpu_compress
 
 # Set language property for .cpp files that use CUDA
 set_source_files_properties(
-    CompressionFactory.cpp
-    GPU_Compress.cpp
+    src/CompressionFactory.cpp
+    src/GPU_Compress.cpp
     PROPERTIES LANGUAGE CUDA
 )
 
