@@ -25,15 +25,8 @@
 // nvCOMP base
 #include "nvcomp.hpp"
 
-// Individual compression algorithm headers
-#include "nvcomp/lz4.hpp"
-#include "nvcomp/snappy.hpp"
-#include "nvcomp/deflate.hpp"
-#include "nvcomp/gdeflate.hpp"
-#include "nvcomp/zstd.hpp"
-#include "nvcomp/ans.hpp"
-#include "nvcomp/cascaded.hpp"
-#include "nvcomp/bitcomp.hpp"
+// Compression factory for algorithm selection
+#include "CompressionFactory.hpp"
 
 using namespace nvcomp;
 
@@ -47,58 +40,6 @@ using namespace nvcomp;
       throw;                                                                   \
     }                                                                          \
   } while (0)
-
-// Compression algorithm enumeration
-enum class CompressionAlgorithm {
-    LZ4,
-    SNAPPY,
-    DEFLATE,
-    GZIP,
-    ZSTD,
-    ANS,
-    CASCADED,
-    BITCOMP
-};
-
-// Helper: Convert string to lowercase
-std::string toLowerCase(const std::string& str) {
-    std::string result = str;
-    std::transform(result.begin(), result.end(), result.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
-    return result;
-}
-
-// Helper: Get algorithm name as string
-std::string getAlgorithmName(CompressionAlgorithm algo) {
-    switch (algo) {
-        case CompressionAlgorithm::LZ4:      return "LZ4";
-        case CompressionAlgorithm::SNAPPY:   return "Snappy";
-        case CompressionAlgorithm::DEFLATE:  return "Deflate";
-        case CompressionAlgorithm::GZIP:     return "Gzip";
-        case CompressionAlgorithm::ZSTD:     return "Zstd";
-        case CompressionAlgorithm::ANS:      return "ANS";
-        case CompressionAlgorithm::CASCADED: return "Cascaded";
-        case CompressionAlgorithm::BITCOMP:  return "Bitcomp";
-        default: return "Unknown";
-    }
-}
-
-// Parse algorithm from command-line string
-CompressionAlgorithm parseCompressionAlgorithm(const std::string& algo_str) {
-    std::string lower = toLowerCase(algo_str);
-    switch (lower) {
-        case "lz4"       :  return CompressionAlgorithm::LZ4;
-        case "snappy"    :  return CompressionAlgorithm::SNAPPY;
-        case "deflate"   :  return CompressionAlgorithm::DEFLATE;
-        case "gzip"      :  return CompressionAlgorithm::GZIP;
-        case "zstd"      :  return CompressionAlgorithm::ZSTD;
-        case "ans"       :  return CompressionAlgorithm::ANS;
-        case "cascaded"  :  return CompressionAlgorithm::CASCADED;
-        case "bitcomp"   :  return CompressionAlgorithm::BITCOMP;
-        default:   
-            throw std::runtime_error("Unknown compression algorithm: " + algo_str);
-    }
-}
 
 // Usage information
 void usage(const char* prog) {
@@ -119,82 +60,6 @@ void usage(const char* prog) {
     printf("  %s noisy_pattern.bin output.bin.lz4 lz4\n", prog);
     printf("  %s noisy_pattern.bin output.bin.zst zstd\n", prog);
     exit(1);
-}
-
-// Factory function to create compression manager
-std::unique_ptr<nvcomp::nvcompManagerBase> createCompressionManager(
-    CompressionAlgorithm algo,
-    size_t chunk_size,
-    cudaStream_t stream,
-    const void* sample_input = nullptr
-) {
-    (void)sample_input; // Unused for now, reserved for future AUTO mode
-    
-    switch (algo) {
-        case CompressionAlgorithm::LZ4: {
-            nvcompBatchedLZ4CompressOpts_t opts = nvcompBatchedLZ4CompressDefaultOpts;
-            opts.data_type = NVCOMP_TYPE_CHAR;
-            return std::make_unique<nvcomp::LZ4Manager>(
-                chunk_size, opts, nvcompBatchedLZ4DecompressDefaultOpts, stream);
-        }
-        
-        case CompressionAlgorithm::SNAPPY: {
-            return std::make_unique<nvcomp::SnappyManager>(
-                chunk_size, 
-                nvcompBatchedSnappyCompressDefaultOpts,
-                nvcompBatchedSnappyDecompressDefaultOpts,
-                stream);
-        }
-        
-        case CompressionAlgorithm::DEFLATE: {
-            nvcompBatchedDeflateCompressOpts_t opts = nvcompBatchedDeflateCompressDefaultOpts;
-            opts.algorithm = 0; // High throughput mode
-            return std::make_unique<nvcomp::DeflateManager>(
-                chunk_size, opts, nvcompBatchedDeflateDecompressDefaultOpts, stream);
-        }
-        
-        case CompressionAlgorithm::GZIP: {
-            return std::make_unique<nvcomp::GdeflateManager>(
-                chunk_size,
-                nvcompBatchedGdeflateCompressDefaultOpts,
-                nvcompBatchedGdeflateDecompressDefaultOpts,
-                stream);
-        }
-        
-        case CompressionAlgorithm::ZSTD: {
-            return std::make_unique<nvcomp::ZstdManager>(
-                chunk_size,
-                nvcompBatchedZstdCompressDefaultOpts,
-                nvcompBatchedZstdDecompressDefaultOpts,
-                stream);
-        }
-        
-        case CompressionAlgorithm::ANS: {
-            return std::make_unique<nvcomp::ANSManager>(
-                chunk_size,
-                nvcompBatchedANSCompressDefaultOpts,
-                nvcompBatchedANSDecompressDefaultOpts,
-                stream);
-        }
-        
-        case CompressionAlgorithm::CASCADED: {
-            nvcompBatchedCascadedCompressOpts_t opts = nvcompBatchedCascadedCompressDefaultOpts;
-            opts.type = NVCOMP_TYPE_LONGLONG; // Good for floating-point/scientific data
-            return std::make_unique<nvcomp::CascadedManager>(
-                chunk_size, opts, nvcompBatchedCascadedDecompressDefaultOpts, stream);
-        }
-        
-        case CompressionAlgorithm::BITCOMP: {
-            nvcompBatchedBitcompCompressOpts_t opts = nvcompBatchedBitcompCompressDefaultOpts;
-            opts.data_type = NVCOMP_TYPE_LONGLONG; // Good for scientific data
-            opts.algorithm = 0; // Default algorithm
-            return std::make_unique<nvcomp::BitcompManager>(
-                chunk_size, opts, nvcompBatchedBitcompDecompressDefaultOpts, stream);
-        }
-        
-        default:
-            throw std::runtime_error("Unsupported compression algorithm");
-    }
 }
 
 int main(int argc, char* argv[]) {
