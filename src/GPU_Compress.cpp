@@ -20,7 +20,7 @@
 
 #include <cuda_runtime.h>
 #include <cufile.h>
-#include <nvtx3/nvToolsExt.h>
+// #include <nvtx3/nvToolsExt.h>  // Commented out - profiling disabled
 
 // nvCOMP base
 #include "nvcomp.hpp"
@@ -82,7 +82,7 @@ int main(int argc, char* argv[]) {
     printf("Algorithm: %s\n\n", getAlgorithmName(algo).c_str());
 
     // ========== Step 1: Open input file for reading ==========
-    nvtxRangePushA("Open Input File");
+    // nvtxRangePushA("Open Input File");
     
     int fd_input = open(input_file, O_RDONLY | O_DIRECT);
     if (fd_input == -1) {
@@ -103,10 +103,10 @@ int main(int argc, char* argv[]) {
     printf("Input file: %s\n", input_file);
     printf("File size: %lu bytes (%.2f MB)\n", file_size, file_size / (1024.0 * 1024.0));
     
-    nvtxRangePop();
+    // nvtxRangePop();
 
     // ========== Step 2: Initialize GPU ==========
-    nvtxRangePushA("GPU Initialization");
+    // nvtxRangePushA("GPU Initialization");
     
     cudaDeviceProp deviceProp;
     CUDA_CHECK(cudaGetDeviceProperties(&deviceProp, 0));
@@ -116,10 +116,10 @@ int main(int argc, char* argv[]) {
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
     
-    nvtxRangePop();
+    // nvtxRangePop();
 
     // ========== Step 3: Allocate GPU memory for input data ==========
-    nvtxRangePushA("Allocate GPU Memory");
+    // nvtxRangePushA("Allocate GPU Memory");
     
     // Align to 4KB for GDS optimal performance
     size_t aligned_input_size = ((file_size + 4095) / 4096) * 4096;
@@ -129,10 +129,10 @@ int main(int argc, char* argv[]) {
     printf("\nAllocated %lu bytes (%.2f MB) on GPU for input\n", 
            aligned_input_size, aligned_input_size / (1024.0 * 1024.0));
     
-    nvtxRangePop();
+    // nvtxRangePop();
 
     // ========== Step 4: Initialize GDS (cuFile) ==========
-    nvtxRangePushA("GDS Setup");
+    // nvtxRangePushA("GDS Setup");
     
     CUfileError_t status = cuFileDriverOpen();
     if (status.err != CU_FILE_SUCCESS) {
@@ -170,10 +170,10 @@ int main(int argc, char* argv[]) {
         printf("✓ Input buffer registered\n");
     }
     
-    nvtxRangePop();
+    // nvtxRangePop();
 
     // ========== Step 5: Read data from file to GPU using GDS ==========
-    nvtxRangePushA("GDS Read");
+    // nvtxRangePushA("GDS Read");
     
     printf("\n--- Reading data from file to GPU via GDS ---\n");
     ssize_t bytes_read = cuFileRead(cf_handle_in, d_input, aligned_input_size, 0, 0);
@@ -188,10 +188,10 @@ int main(int argc, char* argv[]) {
     }
     printf("✓ Read %ld bytes directly to GPU (bypassed CPU!)\n", bytes_read);
     
-    nvtxRangePop();
+    // nvtxRangePop();
 
     // ========== Step 6: Setup compression ==========
-    nvtxRangePushA("Compression Setup");
+    // nvtxRangePushA("Compression Setup");
     
     printf("\n--- Setting up %s compression ---\n", getAlgorithmName(algo).c_str());
     
@@ -214,10 +214,10 @@ int main(int argc, char* argv[]) {
     printf("Aligned compressed size: %lu bytes (%.2f MB)\n",
            aligned_compressed_size, aligned_compressed_size / (1024.0 * 1024.0));
     
-    nvtxRangePop();
+    // nvtxRangePop();
 
     // ========== Step 7: Compress data on GPU ==========
-    nvtxRangePushA("GPU Compression");
+    // nvtxRangePushA("GPU Compression");
     
     printf("\n--- Compressing data on GPU ---\n");
     compressor->compress(d_input, d_compressed, comp_config);
@@ -230,10 +230,10 @@ int main(int argc, char* argv[]) {
     printf("  Compression ratio: %.2fx\n", (double)file_size / compressed_size);
     printf("  Aligned for GDS write: %lu bytes\n", final_aligned_size);
     
-    nvtxRangePop();
+    // nvtxRangePop();
 
     // ========== Step 8: Open output file and write compressed data ==========
-    nvtxRangePushA("GDS Write");
+    // nvtxRangePushA("GDS Write");
     
     printf("\n--- Writing compressed data via GDS ---\n");
     
@@ -300,10 +300,10 @@ int main(int argc, char* argv[]) {
     // Truncate file to actual compressed size (remove padding)
     ftruncate(fd_out, compressed_size);
     
-    nvtxRangePop();
+    // nvtxRangePop();
 
     // ========== Step 9: Cleanup ==========
-    nvtxRangePushA("Cleanup");
+    // nvtxRangePushA("Cleanup");
     
     if (output_buf_registered) cuFileBufDeregister(d_compressed);
     if (input_buf_registered) cuFileBufDeregister(d_input);
@@ -311,6 +311,9 @@ int main(int argc, char* argv[]) {
     cuFileHandleDeregister(cf_handle_out);
     cuFileHandleDeregister(cf_handle_in);
     cuFileDriverClose();
+    
+    // IMPORTANT: Destroy compressor BEFORE destroying the stream it uses
+    compressor.reset();  // Manually destroy the nvcomp manager
     
     CUDA_CHECK(cudaStreamDestroy(stream));
     CUDA_CHECK(cudaFree(d_compressed));
@@ -321,7 +324,7 @@ int main(int argc, char* argv[]) {
     
     printf("✓ Cleanup complete\n");
     
-    nvtxRangePop();
+    // nvtxRangePop();
 
     // ========== Summary ==========
     printf("\n========================================\n");
