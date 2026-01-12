@@ -23,6 +23,7 @@
 
 // nvCOMP base
 #include "nvcomp.hpp"
+#include "nvcomp/nvcompManagerFactory.hpp"
 
 // Compression factory for algorithm selection
 #include "CompressionFactory.hpp"
@@ -40,6 +41,21 @@ using namespace nvcomp;
     }                                                                          \
   } while (0)
 
+// Kernel to compare two buffers for data integrity verification
+// Sets *invalid = 1 if any mismatch is found
+__global__ void compare_buffers(const uint8_t* ref, const uint8_t* val, int* invalid, size_t n)
+{
+  size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  size_t stride = (size_t)gridDim.x * blockDim.x;
+  
+  for (size_t i = idx; i < n; i += stride) {
+    if (ref[i] != val[i]) {
+      *invalid = 1;
+      return;  // Exit early on first mismatch
+    }
+  }
+}
+
 // Usage information
 void usage(const char* prog) {
     printf("Usage: %s <input_file> <output_file> [algorithm]\n", prog);
@@ -50,14 +66,14 @@ void usage(const char* prog) {
     printf("  lz4       - Fast compression, general purpose (default)\n");
     printf("  snappy    - Fastest compression, lower ratio\n");
     printf("  deflate   - Better ratio, slower\n");
-    printf("  gzip      - Standard compression, compatible\n");
+    printf("  gdeflate  - Standard compression, compatible\n");
     printf("  zstd      - Best ratio, configurable\n");
     printf("  ans       - Entropy coding, numerical data\n");
     printf("  cascaded  - High compression for floating-point\n");
     printf("  bitcomp   - Lossless for scientific data\n");
     printf("\nExample:\n");
-    printf("  %s noisy_pattern.bin output.bin.lz4 lz4\n", prog);
-    printf("  %s noisy_pattern.bin output.bin.zst zstd\n", prog);
+    printf("  %s noisy_pattern.bin output.bin lz4\n", prog);
+    printf("  %s noisy_pattern.bin output.bin zstd\n", prog);
     exit(1);
 }
 
@@ -200,12 +216,70 @@ int main(int argc, char* argv[]) {
     
     // Get actual compressed size
     const size_t compressed_size = compressor->get_compressed_output_size(d_compressed);
-    size_t final_aligned_size = ((compressed_size + 4095) / 4096) * 4096;
     
     printf("✓ Compressed %lu bytes -> %lu bytes\n", file_size, compressed_size);
     printf("  Compression ratio: %.2fx\n", (double)file_size / compressed_size);
-    printf("  Aligned for GDS write: %lu bytes\n", final_aligned_size);
     
+    size_t final_aligned_size = ((compressed_size + 4095) / 4096) * 4096;
+    printf("  Aligned for GDS write: %lu bytes\n", final_aligned_size);
+        
+    // ========== Step 7.5: Verify compression with decompression ==========
+    
+    printf("\n--- Verifying data integrity ---\n");
+    
+    // Configure decompression using the same compressor manager
+    DecompressionConfig decomp_config = compressor->configure_decompression(d_compressed);
+    
+    printf("Decompressed size: %lu bytes\n", decomp_config.decomp_data_size);
+    
+    // Allocate buffer for decompressed data
+    uint8_t* d_decompressed;
+    CUDA_CHECK(cudaMalloc(&d_decompressed, decomp_config.decomp_data_size));
+
+    // Decompress the data
+    compressor->decompress(d_decompressed, d_compressed, decomp_config);
+    
+    // Verify that decompressed data matches original input
+    int* d_invalid;
+    CUDA_CHECK(cudaMallocHost(&d_invalid, sizeof(int)));
+    *d_invalid = 0;
+    
+    // Get device properties for optimal grid size
+    cudaDeviceProp deviceProp;
+    CUDA_CHECK(cudaGetDeviceProperties(&deviceProp, 0));
+    int sm_count = deviceProp.multiProcessorCount;
+    
+    // Launch comparison kernel
+    compare_buffers<<<2 * sm_count, 1024, 0, stream>>>(
+        d_input, d_decompressed, d_invalid, file_size);
+    
+    // Synchronize and check result
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    
+    if (*d_invalid) {
+        printf("✗ FAILED: Decompressed data does NOT match original input!\n");
+        printf("  Data integrity check failed - compression/decompression error!\n");
+        
+        // Cleanup and exit
+        CUDA_CHECK(cudaFreeHost(d_invalid));
+        CUDA_CHECK(cudaFree(d_decompressed));
+        if (input_buf_registered) cuFileBufDeregister(d_input);
+        cuFileHandleDeregister(cf_handle_in);
+        cuFileDriverClose();
+        CUDA_CHECK(cudaFree(d_compressed));
+        CUDA_CHECK(cudaFree(d_input));
+        CUDA_CHECK(cudaStreamDestroy(stream));
+        close(fd_input);
+        return -1;
+    } else {
+        printf("✓ PASSED: Decompressed data matches original input perfectly!\n");
+        printf("  Data integrity verified: %lu bytes verified byte-by-byte\n", file_size);
+    }
+    
+    // Clean up verification resources
+    CUDA_CHECK(cudaFreeHost(d_invalid));
+    CUDA_CHECK(cudaFree(d_decompressed));
+
     // ========== Step 8: Open output file and write compressed data ==========
     
     printf("\n--- Writing compressed data via GDS ---\n");
