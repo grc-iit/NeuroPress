@@ -172,7 +172,7 @@ int main(int argc, char* argv[]) {
     
     // ========== Step 5: Read data from file to GPU using GDS ==========
     
-    printf("\n--- Reading data from file to GPU via GDS ---\n");
+    printf("\n###### Reading data from file to GPU via GDS ######\n");
     ssize_t bytes_read = cuFileRead(cf_handle_in, d_input, aligned_input_size, 0, 0);
     if (bytes_read < 0) {
         printf("Error: cuFileRead failed with return value %ld\n", bytes_read);
@@ -187,7 +187,7 @@ int main(int argc, char* argv[]) {
     
     // ========== Step 6: Setup compression ==========
     
-    printf("\n--- Setting up %s compression ---\n", getAlgorithmName(algo).c_str());
+    printf("\n###### Setting up %s compression ######\n", getAlgorithmName(algo).c_str());
     
     // Create compression manager using factory
     const size_t CHUNK_SIZE = 1 << 16; // 64KB chunks
@@ -211,7 +211,7 @@ int main(int argc, char* argv[]) {
 
     // ========== Step 7: Compress data on GPU ==========
     
-    printf("\n--- Compressing data on GPU ---\n");
+    printf("\n###### Compressing data on GPU ######\n");
     compressor->compress(d_input, d_compressed, comp_config);
     
     // Get actual compressed size
@@ -225,7 +225,7 @@ int main(int argc, char* argv[]) {
         
     // ========== Step 7.5: Verify compression with decompression ==========
     
-    printf("\n--- Verifying data integrity ---\n");
+    printf("\n###### Verifying data integrity ######\n");
     
     // Configure decompression using the same compressor manager
     DecompressionConfig decomp_config = compressor->configure_decompression(d_compressed);
@@ -282,7 +282,7 @@ int main(int argc, char* argv[]) {
 
     // ========== Step 8: Open output file and write compressed data ==========
     
-    printf("\n--- Writing compressed data via GDS ---\n");
+    printf("\n###### Writing compressed data via GDS ######\n");
     
     // Open output file with O_DIRECT for GDS
     int fd_out = open(output_file, O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT, 0666);

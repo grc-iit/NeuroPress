@@ -13,6 +13,7 @@
 
 // nvCOMP includes
 #include "nvcomp.hpp"
+#include "nvcomp/nvcompManagerFactory.hpp"
 #include "nvcomp/lz4.hpp"
 #include "nvcomp/snappy.hpp"
 #include "nvcomp/deflate.hpp"
@@ -138,5 +139,17 @@ std::unique_ptr<nvcomp::nvcompManagerBase> createCompressionManager(
         default:
             throw std::runtime_error("Unsupported compression algorithm");
     }
+}
+
+
+// Factory function to create decompression manager from compressed data
+// The algorithm is automatically detected from the compressed data header
+std::shared_ptr<nvcomp::nvcompManagerBase> createDecompressionManager(
+    const void* d_compressed,
+    cudaStream_t stream
+) {
+    // create_manager automatically detects the compression algorithm
+    // from the metadata stored in the compressed data header
+    return create_manager(static_cast<const uint8_t*>(d_compressed), stream);
 }
 

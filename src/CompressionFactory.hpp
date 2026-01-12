@@ -41,5 +41,14 @@ std::unique_ptr<nvcomp::nvcompManagerBase> createCompressionManager(
     const void* sample_input = nullptr
 );
 
+// Factory function to create decompression manager from compressed data
+// Algorithm is auto-detected from the compressed data header
+// Note: Accepts const void* for convenience, internally casts to uint8_t*
+// Returns shared_ptr (as returned by nvcomp's create_manager)
+std::shared_ptr<nvcomp::nvcompManagerBase> createDecompressionManager(
+    const void* d_compressed,
+    cudaStream_t stream
+);
+
 #endif // COMPRESSION_FACTORY_HPP
 

@@ -35,24 +35,20 @@ set(FACTORY_SOURCES
     src/CompressionFactory.hpp
 )
 
-set(MAIN_SOURCES
-    src/GPU_Compress.cpp
-)
-
-# Create executable with GDS support
-add_executable(gpu_compress 
-    ${MAIN_SOURCES}
-    ${FACTORY_SOURCES}
-)
-
 # Set language property for .cpp files that use CUDA
 set_source_files_properties(
     src/CompressionFactory.cpp
     src/GPU_Compress.cpp
+    src/GPU_Decompress.cpp
     PROPERTIES LANGUAGE CUDA
 )
 
-# Link libraries for GDS version
+# ========== Executable 1: GPU Compress (with verification) ==========
+add_executable(gpu_compress 
+    src/GPU_Compress.cpp
+    ${FACTORY_SOURCES}
+)
+
 target_link_libraries(gpu_compress
     PRIVATE
     nvcomp
@@ -60,16 +56,36 @@ target_link_libraries(gpu_compress
     CUDA::cudart
 )
 
-# Set CUDA architectures - use native detection
 set_target_properties(gpu_compress PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
 )
 
+# ========== Executable 2: GPU Decompress ==========
+add_executable(gpu_decompress 
+    src/GPU_Decompress.cpp
+    ${FACTORY_SOURCES}
+)
+
+target_link_libraries(gpu_decompress
+    PRIVATE
+    nvcomp
+    cufile
+    CUDA::cudart
+)
+
+set_target_properties(gpu_decompress PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+)
+
 # Display build configuration
-message(STATUS "Building GPU Compression with modular factory pattern")
+message(STATUS "Building GPU Compression/Decompression with modular factory pattern")
+message(STATUS "Executables:")
+message(STATUS "  - gpu_compress: Compression with data verification")
+message(STATUS "  - gpu_decompress: Decompression (auto-detects algorithm)")
+message(STATUS "Features:")
 message(STATUS "  - CompressionFactory.cpp/hpp (Factory pattern)")
-message(STATUS "  - GPU_Compress.cpp (GDS version)")
-message(STATUS "  - nvcomp library support")
-message(STATUS "  - GPUDirect Storage (cuFile) support for GDS version")
-message(STATUS "Note: Using .cpp extension with CUDA compilation (no custom kernels)")
+message(STATUS "  - nvcomp library support (LZ4, Snappy, Deflate, Gdeflate, Zstd, ANS, Cascaded, Bitcomp)")
+message(STATUS "  - GPUDirect Storage (cuFile) support for direct GPU<->NVMe transfers")
+message(STATUS "  - 4KB alignment for optimal GDS performance")
+message(STATUS "Note: Using .cpp extension with CUDA compilation")
 
