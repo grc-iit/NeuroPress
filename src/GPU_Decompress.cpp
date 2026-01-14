@@ -27,6 +27,10 @@
 // Compression factory for algorithm selection
 #include "CompressionFactory.hpp"
 
+// Compression header and byte shuffle
+#include "compression_header.h"
+#include "byte_shuffle.cuh"
+
 using namespace nvcomp;
 
 // CUDA error checking macro
@@ -157,17 +161,50 @@ int main(int argc, char* argv[]) {
     }
     printf("✓ Read %ld bytes of compressed data directly to GPU (bypassed CPU!)\n", bytes_read);
     
+    // ========== Step 5.5: Read and validate compression header ==========
+    
+    printf("\n###### Reading compression header ######\n");
+    
+    CompressionHeader header;
+    readHeaderFromDevice(d_compressed, header, stream);
+    
+    if (!header.isValid()) {
+        printf("✗ Error: Invalid compression header or unsupported format!\n");
+        printf("  Magic: 0x%08X (expected 0x%08X)\n", header.magic, COMPRESSION_MAGIC);
+        printf("  This file may not be compressed with shuffle metadata.\n");
+        
+        if (input_buf_registered) cuFileBufDeregister(d_compressed);
+        cuFileHandleDeregister(cf_handle_in);
+        cuFileDriverClose();
+        CUDA_CHECK(cudaFree(d_compressed));
+        close(fd_input);
+        return -1;
+    }
+    
+    printf("✓ Valid compression header detected\n");
+    header.print();
+    printf("\n");
+    
+    // Get pointer to actual compressed data (after header)
+    uint8_t* d_compressed_data = getCompressedDataPtr(d_compressed);
+    
     // ========== Step 6: Setup decompression ==========
     
-    printf("\n--- Setting up decompression (auto-detecting algorithm) ---\n");
+    printf("--- Setting up decompression (auto-detecting algorithm) ---\n");
     
     // Create decompression manager - algorithm is auto-detected from compressed data
-    auto decompressor = createDecompressionManager(d_compressed, stream);
+    auto decompressor = createDecompressionManager(d_compressed_data, stream);
 
     // Configure decompression and get output size
-    const DecompressionConfig decomp_config = decompressor->configure_decompression(d_compressed);
+    const DecompressionConfig decomp_config = decompressor->configure_decompression(d_compressed_data);
 
     size_t decompressed_size = decomp_config.decomp_data_size;
+    
+    // Verify decompressed size matches header
+    if (header.hasShuffleApplied() && decompressed_size != header.original_size) {
+        printf("Warning: Decompressed size (%lu) doesn't match header original size (%lu)\n",
+               decompressed_size, header.original_size);
+    }
     
     printf("Decompressed size: %lu bytes (%.2f MB)\n",
         decompressed_size, decompressed_size / (1024.0 * 1024.0));
@@ -185,10 +222,55 @@ int main(int argc, char* argv[]) {
     // ========== Step 7: Decompress data on GPU ==========
     
     printf("\n--- Decompressing data on GPU ---\n");
-    decompressor->decompress(d_decompressed, d_compressed, decomp_config);
+    decompressor->decompress(d_decompressed, d_compressed_data, decomp_config);
     
-    printf("✓ Decompressed %lu bytes -> %lu bytes\n", file_size, decompressed_size);
-    printf("  Decompression ratio: %.2fx\n", (double)decompressed_size / file_size);
+    printf("✓ Decompressed %lu bytes -> %lu bytes\n", header.compressed_size, decompressed_size);
+    printf("  Decompression ratio: %.2fx\n", (double)decompressed_size / header.compressed_size);
+    
+    // ========== Step 7.5: Apply unshuffle if shuffle was used ==========
+    
+    uint8_t* d_final_output = d_decompressed;  // Default: output decompressed data as-is
+    uint8_t* d_unshuffled = nullptr;
+    size_t final_output_allocated_size = aligned_decompressed_size;  // Track actual allocated size
+    
+    if (header.hasShuffleApplied()) {
+        printf("\n###### Applying byte unshuffle (shuffle was applied during compression) ######\n");
+        printf("Element size: %u bytes\n", header.shuffle_element_size);
+        
+        // Apply unshuffle to restore original data format
+        const size_t SHUFFLE_CHUNK_SIZE = 256 * 1024;  // 256KB chunks
+        d_unshuffled = byte_unshuffle_simple(
+            d_decompressed,
+            decompressed_size,
+            header.shuffle_element_size,
+            SHUFFLE_CHUNK_SIZE,
+            ShuffleKernelType::AUTO,
+            stream
+        );
+        
+        if (d_unshuffled == nullptr) {
+            printf("✗ Error: Byte unshuffle failed!\n");
+            if (input_buf_registered) cuFileBufDeregister(d_compressed);
+            cuFileHandleDeregister(cf_handle_in);
+            cuFileDriverClose();
+            CUDA_CHECK(cudaFree(d_decompressed));
+            CUDA_CHECK(cudaFree(d_compressed));
+            CUDA_CHECK(cudaStreamDestroy(stream));
+            close(fd_input);
+            return -1;
+        }
+        
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        printf("✓ Byte unshuffle complete - original data format restored\n");
+        
+        // Free the still-shuffled decompressed buffer
+        CUDA_CHECK(cudaFree(d_decompressed));
+        d_final_output = d_unshuffled;  // Output the unshuffled data
+        
+        // IMPORTANT: byte_unshuffle_simple allocates exact size, not aligned
+        // We need to reallocate with proper alignment for GDS or adjust our write size
+        final_output_allocated_size = decompressed_size;  // Actual allocated size
+    }
     
     size_t final_aligned_size = ((decompressed_size + 4095) / 4096) * 4096;
     printf("  Aligned for GDS write: %lu bytes\n", final_aligned_size);
@@ -231,31 +313,36 @@ int main(int argc, char* argv[]) {
         return -1;
     }
 
-    // Register output buffer (decompressed data)
+    // Register output buffer (final output data - either decompressed or unshuffled)
+    // Use actual allocated size to avoid buffer overrun
     bool output_buf_registered = true;
-    status = cuFileBufRegister(d_decompressed, aligned_decompressed_size, 0);
+    status = cuFileBufRegister(d_final_output, final_output_allocated_size, 0);
     if (status.err != CU_FILE_SUCCESS) {
         printf("Warning: Output buffer registration failed\n");
         output_buf_registered = false;
     }
 
-    // Write decompressed data from GPU to file using GDS
-    ssize_t bytes_written = cuFileWrite(cf_handle_out, d_decompressed, final_aligned_size, 0, 0);
-    if (bytes_written != (ssize_t)final_aligned_size) {
-        printf("Error: cuFileWrite returned %ld instead of %lu\n", bytes_written, final_aligned_size);
-        if (output_buf_registered) cuFileBufDeregister(d_decompressed);
+    // Write final output data from GPU to file using GDS
+    // Write only the actual data size, not aligned size (GDS can handle unaligned writes for last chunk)
+    ssize_t bytes_written = cuFileWrite(cf_handle_out, d_final_output, decompressed_size, 0, 0);
+    if (bytes_written != (ssize_t)decompressed_size) {
+        printf("Error: cuFileWrite returned %ld instead of %lu\n", bytes_written, decompressed_size);
+        if (output_buf_registered) cuFileBufDeregister(d_final_output);
         cuFileHandleDeregister(cf_handle_out);
         close(fd_out);
         if (input_buf_registered) cuFileBufDeregister(d_compressed);
         cuFileHandleDeregister(cf_handle_in);
         cuFileDriverClose();
-        CUDA_CHECK(cudaFree(d_decompressed));
+        CUDA_CHECK(cudaFree(d_final_output));
         CUDA_CHECK(cudaFree(d_compressed));
         close(fd_input);
         return -1;
     }
     
-    printf("✓ Wrote %ld bytes of decompressed data to %s via GDS\n", bytes_written, output_file);
+    printf("✓ Wrote %ld bytes of %s data to %s via GDS\n", 
+           bytes_written, 
+           header.hasShuffleApplied() ? "unshuffled" : "decompressed",
+           output_file);
     
     // Truncate file to actual decompressed size (remove padding)
     ftruncate(fd_out, decompressed_size);
@@ -264,7 +351,7 @@ int main(int argc, char* argv[]) {
 
     // ========== Step 9: Cleanup ==========
     
-    if (output_buf_registered) cuFileBufDeregister(d_decompressed);
+    if (output_buf_registered) cuFileBufDeregister(d_final_output);
     if (input_buf_registered) cuFileBufDeregister(d_compressed);
     
     cuFileHandleDeregister(cf_handle_out);
@@ -275,7 +362,7 @@ int main(int argc, char* argv[]) {
     decompressor.reset();  // Manually destroy the nvcomp manager
     
     CUDA_CHECK(cudaStreamDestroy(stream));
-    CUDA_CHECK(cudaFree(d_decompressed));
+    CUDA_CHECK(cudaFree(d_final_output));
     CUDA_CHECK(cudaFree(d_compressed));
     
     close(fd_out);
@@ -288,11 +375,15 @@ int main(int argc, char* argv[]) {
     printf("           SUCCESS!\n");
     printf("========================================\n");
     printf("Algorithm: Auto-detected\n");
-    printf("Input (compressed):  %s (%.2f MB)\n", input_file, file_size / (1024.0 * 1024.0));
-    printf("Output (decompressed): %s (%.2f MB)\n", output_file, decompressed_size / (1024.0 * 1024.0));
-    printf("Decompression ratio: %.2fx\n", (double)decompressed_size / file_size);
+    printf("Shuffle: %s\n", header.hasShuffleApplied() ? 
+           (std::to_string(header.shuffle_element_size) + "-byte (unshuffled)").c_str() : "None");
+    printf("Input (compressed):  %s (%.2f MB, includes metadata)\n", 
+           input_file, file_size / (1024.0 * 1024.0));
+    printf("Output (original): %s (%.2f MB)\n", 
+           output_file, decompressed_size / (1024.0 * 1024.0));
+    printf("Decompression ratio: %.2fx\n", (double)decompressed_size / header.compressed_size);
     printf("Data expanded: %.2f MB\n", 
-           (decompressed_size - file_size) / (1024.0 * 1024.0));
+           (decompressed_size - header.compressed_size) / (1024.0 * 1024.0));
     printf("\n");
 
     return 0;

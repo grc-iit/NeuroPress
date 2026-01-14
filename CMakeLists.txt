@@ -22,6 +22,7 @@ include_directories(
     $ENV{HOME}/.local/lib/python3.12/site-packages/nvidia/libnvcomp/include
     /usr/local/cuda/include
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
 # Link directories
@@ -46,6 +47,7 @@ set_source_files_properties(
 # ========== Executable 1: GPU Compress (with verification) ==========
 add_executable(gpu_compress 
     src/GPU_Compress.cpp
+    src/byte_shuffle_kernels.cu
     ${FACTORY_SOURCES}
 )
 
@@ -63,6 +65,7 @@ set_target_properties(gpu_compress PROPERTIES
 # ========== Executable 2: GPU Decompress ==========
 add_executable(gpu_decompress 
     src/GPU_Decompress.cpp
+    src/byte_shuffle_kernels.cu
     ${FACTORY_SOURCES}
 )
 

@@ -28,6 +28,13 @@
 // Compression factory for algorithm selection
 #include "CompressionFactory.hpp"
 
+// Byte shuffle for preprocessing
+#include "byte_shuffle.cuh"
+#include "util.h"
+
+// Compression header for metadata
+#include "compression_header.h"
+
 using namespace nvcomp;
 
 // CUDA error checking macro
@@ -58,8 +65,9 @@ __global__ void compare_buffers(const uint8_t* ref, const uint8_t* val, int* inv
 
 // Usage information
 void usage(const char* prog) {
-    printf("Usage: %s <input_file> <output_file> [algorithm]\n", prog);
+    printf("Usage: %s <input_file> <output_file> [algorithm] [element_size_for_shuffle]\n", prog);
     printf("\nReads uncompressed data from input_file using GDS,\n");
+    printf("optionally applies byte shuffle preprocessing,\n");
     printf("compresses it on GPU with nvcomp, and writes\n");
     printf("compressed data to output_file using GDS.\n");
     printf("\nAvailable algorithms:\n");
@@ -71,14 +79,19 @@ void usage(const char* prog) {
     printf("  ans       - Entropy coding, numerical data\n");
     printf("  cascaded  - High compression for floating-point\n");
     printf("  bitcomp   - Lossless for scientific data\n");
-    printf("\nExample:\n");
-    printf("  %s noisy_pattern.bin output.bin lz4\n", prog);
-    printf("  %s noisy_pattern.bin output.bin zstd\n", prog);
+    printf("\nOptional shuffle parameter:\n");
+    printf("  element_size - If specified, applies byte shuffle with this element size\n");
+    printf("                 Common values: 2, 4, 8 (bytes)\n");
+    printf("                 0 or omitted = no shuffle (default)\n");
+    printf("\nExamples:\n");
+    printf("  %s noisy_pattern.bin output.bin lz4          # No shuffle\n", prog);
+    printf("  %s noisy_pattern.bin output.bin lz4 4        # With 4-byte shuffle\n", prog);
+    printf("  %s noisy_pattern.bin output.bin zstd 8       # With 8-byte shuffle\n", prog);
     exit(1);
 }
 
 int main(int argc, char* argv[]) {
-    if (argc < 3 || argc > 4) {
+    if (argc < 3 || argc > 5) {
         usage(argv[0]);
     }
 
@@ -87,14 +100,30 @@ int main(int argc, char* argv[]) {
     
     // Default to LZ4 if no algorithm specified
     CompressionAlgorithm algo = CompressionAlgorithm::LZ4;
-    if (argc == 4) {
+    if (argc >= 4) {
         algo = parseCompressionAlgorithm(argv[3]);
     }
-
-    printf("========================================\n");
-    printf("   GPU Direct Storage Compression\n");
-    printf("========================================\n");
-    printf("Algorithm: %s\n\n", getAlgorithmName(algo).c_str());
+    
+    // Parse optional shuffle element size
+    unsigned shuffle_element_size = 0;  // 0 = no shuffle
+    if (argc == 5) {
+        shuffle_element_size = atoi(argv[4]);
+        if (shuffle_element_size > 0) {
+            printf("========================================\n");
+            printf("   GPU Direct Storage Compression\n");
+            printf("   WITH BYTE SHUFFLE PREPROCESSING\n");
+            printf("========================================\n");
+            printf("Algorithm: %s\n", getAlgorithmName(algo).c_str());
+            printf("Shuffle element size: %u bytes\n\n", shuffle_element_size);
+        }
+    }
+    
+    if (shuffle_element_size == 0) {
+        printf("========================================\n");
+        printf("   GPU Direct Storage Compression\n");
+        printf("========================================\n");
+        printf("Algorithm: %s\n\n", getAlgorithmName(algo).c_str());
+    }
 
     // ========== Step 1: Open input file for reading ==========
     
@@ -185,34 +214,82 @@ int main(int argc, char* argv[]) {
     }
     printf("✓ Read %ld bytes directly to GPU (bypassed CPU!)\n", bytes_read);
     
+    // ========== Step 5.5: Apply byte shuffle if requested ==========
+    
+    uint8_t* d_compress_input = d_input;  // Default: compress original input
+    uint8_t* d_shuffled = nullptr;
+    
+    if (shuffle_element_size > 0) {
+        printf("\n###### Applying byte shuffle preprocessing ######\n");
+        printf("Element size: %u bytes\n", shuffle_element_size);
+        
+        // Apply shuffle using the simple API
+        const size_t SHUFFLE_CHUNK_SIZE = 256 * 1024;  // 256KB chunks
+        d_shuffled = byte_shuffle_simple(
+            d_input,
+            file_size,
+            shuffle_element_size,
+            SHUFFLE_CHUNK_SIZE,
+            ShuffleKernelType::AUTO,
+            stream
+        );
+        
+        if (d_shuffled == nullptr) {
+            printf("Error: Byte shuffle failed!\n");
+            if (input_buf_registered) cuFileBufDeregister(d_input);
+            cuFileHandleDeregister(cf_handle_in);
+            cuFileDriverClose();
+            CUDA_CHECK(cudaFree(d_input));
+            CUDA_CHECK(cudaStreamDestroy(stream));
+            close(fd_input);
+            return -1;
+        }
+        
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        printf("✓ Byte shuffle complete - data reorganized for better compression\n");
+        
+        // Compress the shuffled data instead
+        d_compress_input = d_shuffled;
+    }
+    
     // ========== Step 6: Setup compression ==========
     
     printf("\n###### Setting up %s compression ######\n", getAlgorithmName(algo).c_str());
     
     // Create compression manager using factory
     const size_t CHUNK_SIZE = 1 << 16; // 64KB chunks
-    auto compressor = createCompressionManager(algo, CHUNK_SIZE, stream, d_input);
+    auto compressor = createCompressionManager(algo, CHUNK_SIZE, stream, d_compress_input);
     
     // Configure compression and get max output size
     const CompressionConfig comp_config = compressor->configure_compression(file_size);
     size_t max_compressed_size = comp_config.max_compressed_buffer_size;
     
-    // Align compressed output to 4KB for GDS
-    size_t aligned_compressed_size = ((max_compressed_size + 4095) / 4096) * 4096;
+    // Add space for compression header (32 bytes)
+    size_t header_size = sizeof(CompressionHeader);
+    size_t max_total_size = header_size + max_compressed_size;
     
-    uint8_t* d_compressed;
-    CUDA_CHECK(cudaMalloc(&d_compressed, aligned_compressed_size));
+    // Align total size to 4KB for GDS
+    size_t aligned_total_size = ((max_total_size + 4095) / 4096) * 4096;
+    
+    uint8_t* d_output_buffer;
+    CUDA_CHECK(cudaMalloc(&d_output_buffer, aligned_total_size));
+    
+    // Pointer to compressed data section (after header)
+    uint8_t* d_compressed = d_output_buffer + header_size;
     
     printf("Max compressed size: %lu bytes (%.2f MB)\n", 
            max_compressed_size, max_compressed_size / (1024.0 * 1024.0));
-    printf("Aligned compressed size: %lu bytes (%.2f MB)\n",
-           aligned_compressed_size, aligned_compressed_size / (1024.0 * 1024.0));
+    printf("Header size: %lu bytes\n", header_size);
+    printf("Max total size (header + compressed): %lu bytes (%.2f MB)\n",
+           max_total_size, max_total_size / (1024.0 * 1024.0));
+    printf("Aligned total size for GDS: %lu bytes (%.2f MB)\n",
+           aligned_total_size, aligned_total_size / (1024.0 * 1024.0));
     
 
     // ========== Step 7: Compress data on GPU ==========
     
     printf("\n###### Compressing data on GPU ######\n");
-    compressor->compress(d_input, d_compressed, comp_config);
+    compressor->compress(d_compress_input, d_compressed, comp_config);
     
     // Get actual compressed size
     const size_t compressed_size = compressor->get_compressed_output_size(d_compressed);
@@ -220,8 +297,31 @@ int main(int argc, char* argv[]) {
     printf("✓ Compressed %lu bytes -> %lu bytes\n", file_size, compressed_size);
     printf("  Compression ratio: %.2fx\n", (double)file_size / compressed_size);
     
-    size_t final_aligned_size = ((compressed_size + 4095) / 4096) * 4096;
-    printf("  Aligned for GDS write: %lu bytes\n", final_aligned_size);
+    // ========== Step 7.3: Write compression header with metadata ==========
+    
+    printf("\n###### Writing compression header with metadata ######\n");
+    
+    CompressionHeader header;
+    header.magic = COMPRESSION_MAGIC;
+    header.version = COMPRESSION_HEADER_VERSION;
+    header.shuffle_element_size = shuffle_element_size;
+    header.reserved = 0;
+    header.original_size = file_size;
+    header.compressed_size = compressed_size;
+    
+    // Write header to device memory (at beginning of output buffer)
+    writeHeaderToDevice(d_output_buffer, header, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    
+    printf("Header written:\n");
+    header.print();
+    
+    // Calculate total size to write (header + compressed data)
+    size_t total_output_size = header_size + compressed_size;
+    size_t final_aligned_size = ((total_output_size + 4095) / 4096) * 4096;
+    printf("\nTotal output size: %lu bytes (%.2f MB)\n", 
+           total_output_size, total_output_size / (1024.0 * 1024.0));
+    printf("Aligned for GDS write: %lu bytes\n", final_aligned_size);
         
     // ========== Step 7.5: Verify compression with decompression ==========
     
@@ -239,7 +339,48 @@ int main(int argc, char* argv[]) {
     // Decompress the data
     compressor->decompress(d_decompressed, d_compressed, decomp_config);
     
-    // Verify that decompressed data matches original input
+    // ========== Step 7.6: Apply unshuffle if shuffle was used ==========
+    
+    uint8_t* d_verify_input = d_input;      // Default: compare to original input
+    uint8_t* d_unshuffled = nullptr;
+    
+    if (shuffle_element_size > 0) {
+        printf("Applying byte unshuffle to restore original data format...\n");
+        
+        // Unshuffle the decompressed data to restore original format
+        const size_t SHUFFLE_CHUNK_SIZE = 256 * 1024;  // Same as shuffle
+        d_unshuffled = byte_unshuffle_simple(
+            d_decompressed,
+            file_size,
+            shuffle_element_size,
+            SHUFFLE_CHUNK_SIZE,
+            ShuffleKernelType::AUTO,
+            stream
+        );
+        
+        if (d_unshuffled == nullptr) {
+            printf("Error: Byte unshuffle failed!\n");
+            CUDA_CHECK(cudaFree(d_decompressed));
+            if (input_buf_registered) cuFileBufDeregister(d_input);
+            cuFileHandleDeregister(cf_handle_in);
+            cuFileDriverClose();
+            CUDA_CHECK(cudaFree(d_output_buffer));
+            if (d_shuffled) CUDA_CHECK(cudaFree(d_shuffled));
+            CUDA_CHECK(cudaFree(d_input));
+            CUDA_CHECK(cudaStreamDestroy(stream));
+            close(fd_input);
+            return -1;
+        }
+        
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        printf("✓ Byte unshuffle complete - data restored to original format\n");
+        
+        // Free the still-shuffled decompressed buffer, verify against unshuffled
+        CUDA_CHECK(cudaFree(d_decompressed));
+        d_decompressed = d_unshuffled;  // Point to unshuffled data for verification
+    }
+    
+    // Verify that decompressed (and unshuffled if applicable) data matches original input
     int* d_invalid;
     CUDA_CHECK(cudaMallocHost(&d_invalid, sizeof(int)));
     *d_invalid = 0;
@@ -249,16 +390,21 @@ int main(int argc, char* argv[]) {
     CUDA_CHECK(cudaGetDeviceProperties(&deviceProp, 0));
     int sm_count = deviceProp.multiProcessorCount;
     
-    // Launch comparison kernel
+    // Launch comparison kernel - compare unshuffled decompressed data to original input
     compare_buffers<<<2 * sm_count, 1024, 0, stream>>>(
-        d_input, d_decompressed, d_invalid, file_size);
+        d_verify_input, d_decompressed, d_invalid, file_size);
     
     // Synchronize and check result
     CUDA_CHECK(cudaStreamSynchronize(stream));
     
     if (*d_invalid) {
-        printf("✗ FAILED: Decompressed data does NOT match original input!\n");
-        printf("  Data integrity check failed - compression/decompression error!\n");
+        if (shuffle_element_size > 0) {
+            printf("✗ FAILED: Shuffle → Compress → Decompress → Unshuffle did NOT restore original data!\n");
+            printf("  Data integrity check failed - full round-trip verification error!\n");
+        } else {
+            printf("✗ FAILED: Decompressed data does NOT match original input!\n");
+            printf("  Data integrity check failed - compression/decompression error!\n");
+        }
         
         // Cleanup and exit
         CUDA_CHECK(cudaFreeHost(d_invalid));
@@ -266,14 +412,21 @@ int main(int argc, char* argv[]) {
         if (input_buf_registered) cuFileBufDeregister(d_input);
         cuFileHandleDeregister(cf_handle_in);
         cuFileDriverClose();
-        CUDA_CHECK(cudaFree(d_compressed));
+        CUDA_CHECK(cudaFree(d_output_buffer));
+        if (d_shuffled) CUDA_CHECK(cudaFree(d_shuffled));
         CUDA_CHECK(cudaFree(d_input));
         CUDA_CHECK(cudaStreamDestroy(stream));
         close(fd_input);
         return -1;
     } else {
-        printf("✓ PASSED: Decompressed data matches original input perfectly!\n");
-        printf("  Data integrity verified: %lu bytes verified byte-by-byte\n", file_size);
+        if (shuffle_element_size > 0) {
+            printf("✓ PASSED: Full round-trip verification successful!\n");
+            printf("  Shuffle → Compress → Decompress → Unshuffle restored original data perfectly!\n");
+            printf("  Data integrity verified: %lu bytes verified byte-by-byte\n", file_size);
+        } else {
+            printf("✓ PASSED: Decompressed data matches original input perfectly!\n");
+            printf("  Data integrity verified: %lu bytes verified byte-by-byte\n", file_size);
+        }
     }
     
     // Clean up verification resources
@@ -292,7 +445,8 @@ int main(int argc, char* argv[]) {
         if (input_buf_registered) cuFileBufDeregister(d_input);
         cuFileHandleDeregister(cf_handle_in);
         cuFileDriverClose();
-        CUDA_CHECK(cudaFree(d_compressed));
+        CUDA_CHECK(cudaFree(d_output_buffer));
+        if (d_shuffled) CUDA_CHECK(cudaFree(d_shuffled));
         CUDA_CHECK(cudaFree(d_input));
         close(fd_input);
         return -1;
@@ -312,47 +466,49 @@ int main(int argc, char* argv[]) {
         if (input_buf_registered) cuFileBufDeregister(d_input);
         cuFileHandleDeregister(cf_handle_in);
         cuFileDriverClose();
-        CUDA_CHECK(cudaFree(d_compressed));
+        CUDA_CHECK(cudaFree(d_output_buffer));
+        if (d_shuffled) CUDA_CHECK(cudaFree(d_shuffled));
         CUDA_CHECK(cudaFree(d_input));
         close(fd_input);
         return -1;
     }
 
-    // Register output buffer
+    // Register output buffer (header + compressed data)
     bool output_buf_registered = true;
-    status = cuFileBufRegister(d_compressed, aligned_compressed_size, 0);
+    status = cuFileBufRegister(d_output_buffer, aligned_total_size, 0);
     if (status.err != CU_FILE_SUCCESS) {
         printf("Warning: Output buffer registration failed\n");
         output_buf_registered = false;
     }
 
-    // Write compressed data from GPU to file using GDS
-    ssize_t bytes_written = cuFileWrite(cf_handle_out, d_compressed, final_aligned_size, 0, 0);
+    // Write entire buffer (header + compressed data) from GPU to file using GDS
+    ssize_t bytes_written = cuFileWrite(cf_handle_out, d_output_buffer, final_aligned_size, 0, 0);
     if (bytes_written != (ssize_t)final_aligned_size) {
         printf("Error: cuFileWrite returned %ld instead of %lu\n", bytes_written, final_aligned_size);
-        if (output_buf_registered) cuFileBufDeregister(d_compressed);
+        if (output_buf_registered) cuFileBufDeregister(d_output_buffer);
         cuFileHandleDeregister(cf_handle_out);
         close(fd_out);
         if (input_buf_registered) cuFileBufDeregister(d_input);
         cuFileHandleDeregister(cf_handle_in);
         cuFileDriverClose();
-        CUDA_CHECK(cudaFree(d_compressed));
+        CUDA_CHECK(cudaFree(d_output_buffer));
+        if (d_shuffled) CUDA_CHECK(cudaFree(d_shuffled));
         CUDA_CHECK(cudaFree(d_input));
         close(fd_input);
         return -1;
     }
     
-    printf("✓ Wrote %ld bytes to %s via GDS\n", bytes_written, output_file);
+    printf("✓ Wrote %ld bytes (header + compressed data) to %s via GDS\n", bytes_written, output_file);
     
-    // Truncate file to actual compressed size (remove padding)
-    ftruncate(fd_out, compressed_size);
+    // Truncate file to actual size (header + compressed, remove padding)
+    ftruncate(fd_out, total_output_size);
     
     // nvtxRangePop();
 
     // ========== Step 9: Cleanup ==========
     // nvtxRangePushA("Cleanup");
     
-    if (output_buf_registered) cuFileBufDeregister(d_compressed);
+    if (output_buf_registered) cuFileBufDeregister(d_output_buffer);
     if (input_buf_registered) cuFileBufDeregister(d_input);
     
     cuFileHandleDeregister(cf_handle_out);
@@ -363,7 +519,10 @@ int main(int argc, char* argv[]) {
     compressor.reset();  // Manually destroy the nvcomp manager
     
     CUDA_CHECK(cudaStreamDestroy(stream));
-    CUDA_CHECK(cudaFree(d_compressed));
+    CUDA_CHECK(cudaFree(d_output_buffer));  // Free output buffer (contains header + compressed)
+    if (d_shuffled != nullptr) {
+        CUDA_CHECK(cudaFree(d_shuffled));
+    }
     CUDA_CHECK(cudaFree(d_input));
     
     close(fd_out);
@@ -378,8 +537,12 @@ int main(int argc, char* argv[]) {
     printf("           SUCCESS!\n");
     printf("========================================\n");
     printf("Algorithm: %s\n", getAlgorithmName(algo).c_str());
+    printf("Shuffle: %s\n", shuffle_element_size > 0 ? 
+           (std::to_string(shuffle_element_size) + "-byte").c_str() : "None");
     printf("Input:  %s (%.2f MB)\n", input_file, file_size / (1024.0 * 1024.0));
-    printf("Output: %s (%.2f MB)\n", output_file, compressed_size / (1024.0 * 1024.0));
+    printf("Output: %s (%.2f MB, includes metadata header)\n", 
+           output_file, total_output_size / (1024.0 * 1024.0));
+    printf("Compressed data only: %.2f MB\n", compressed_size / (1024.0 * 1024.0));
     printf("Compression ratio: %.2fx\n", (double)file_size / compressed_size);
     printf("Space saved: %.2f MB (%.1f%%)\n", 
            (file_size - compressed_size) / (1024.0 * 1024.0),
