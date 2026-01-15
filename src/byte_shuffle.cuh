@@ -217,8 +217,8 @@ enum class ShuffleKernelType {
  * This is the SIMPLEST API - just pass your device buffer!
  * 
  * How it works:
- * 1. Chunks your buffer using chunkDeviceBuffer() from util.cu
- * 2. Allocates output buffer
+ * 1. Allocates output buffer
+ * 2. Creates chunk arrays directly on GPU (zero memcpy overhead!)
  * 3. Shuffles all chunks in parallel
  * 4. Returns pointer to shuffled output
  * 
