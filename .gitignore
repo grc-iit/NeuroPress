@@ -5,3 +5,5 @@ GPU_LZ4.cu
 build/
 cufile.log
 .venv
+test_data/*.csv
+

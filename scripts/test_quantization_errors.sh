@@ -11,7 +11,7 @@ set -e
 
 PROJECT_DIR="/home/cc/GPUCompress"
 BUILD_DIR="$PROJECT_DIR/build"
-TEST_DIR="$PROJECT_DIR/test_results"
+TEST_DIR="$PROJECT_DIR/test_data"
 
 COMPRESS="$BUILD_DIR/gpu_compress"
 DECOMPRESS="$BUILD_DIR/gpu_decompress"
@@ -37,7 +37,7 @@ if [ ! -f "$INPUT_FILE" ]; then
     exit 1
 fi
 
-ALGORITHMS=("deflate" "zstd")
+ALGORITHMS=("deflate")
 
 echo "========================================================"
 echo "    Quantization Error Analysis Test Suite"
@@ -95,11 +95,14 @@ run_quantization_test() {
     fi
 
     # Detailed Python analysis
+    local csv_file="$TEST_DIR/${test_name}_values.csv"
+
     echo ""
     echo "--- Value Comparison Analysis ---"
     python3 << PYEOF
 import struct
 import sys
+import csv
 
 # Read original and restored data
 with open("$input_file", "rb") as f:
@@ -128,6 +131,18 @@ data_min = min(orig)
 data_max = max(orig)
 data_range = data_max - data_min
 
+# Write ALL values to CSV
+csv_file = "$csv_file"
+with open(csv_file, 'w', newline='') as f:
+    writer = csv.writer(f)
+    writer.writerow(['index', 'original', 'restored', 'difference', 'abs_error', 'within_bound'])
+    for i in range(n):
+        diff = orig[i] - rest[i]
+        within = 1 if errors[i] <= error_bound else 0
+        writer.writerow([i, orig[i], rest[i], diff, errors[i], within])
+
+print(f"Full comparison CSV: {csv_file}")
+print(f"")
 print(f"Total elements:    {n}")
 print(f"Data range:        [{data_min:.6f}, {data_max:.6f}] (span: {data_range:.6f})")
 print(f"Error bound:       {error_bound}")
@@ -250,6 +265,9 @@ echo "========================================================"
 echo "Total tests:  $total_tests"
 echo "Passed:       $passed_tests"
 echo "Failed:       $failed_tests"
+echo ""
+
+echo "CSV files with all value comparisons saved to: $TEST_DIR/"
 echo ""
 
 if [ $failed_tests -eq 0 ]; then

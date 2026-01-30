@@ -4,6 +4,18 @@
 # 2. Compression + shuffle (no quantization)
 # 3. Compression + quantization (no shuffle)
 # 4. Compression + quantization + shuffle
+#
+# Usage: ./run_simple_tests.sh [input1] [input2] ...
+#   Inputs can be:
+#     - Pattern names: smooth, periodic, noisy (maps to test_float32_<pattern>.bin)
+#     - File paths: /path/to/file.bin or relative/path/file.bin
+#
+#   Examples:
+#     ./run_simple_tests.sh                        # Run all default patterns
+#     ./run_simple_tests.sh noisy                  # Run only noisy pattern
+#     ./run_simple_tests.sh smooth noisy           # Run smooth and noisy patterns
+#     ./run_simple_tests.sh /path/to/mydata.bin   # Run with custom file
+#     ./run_simple_tests.sh test_data/custom.bin  # Run with relative path
 
 set -e
 
@@ -15,14 +27,57 @@ COMPRESS="$BUILD_DIR/gpu_compress"
 DECOMPRESS="$BUILD_DIR/gpu_decompress"
 COMPARE="$BUILD_DIR/compare_data"
 
-PATTERNS=("smooth" "periodic" "noisy")
+# Use command-line arguments if provided, otherwise default to all patterns
+if [ $# -gt 0 ]; then
+    INPUTS=("$@")
+else
+    INPUTS=("smooth" "periodic" "noisy")
+fi
+
 ALGORITHMS=("deflate")
 ERROR_BOUNDS=("0.01" "0.001" "0.0001")
+
+# Function to resolve input to file path and pattern name
+resolve_input() {
+    local input="$1"
+
+    # Check if it's a file path (contains / or ends with .bin)
+    if [[ "$input" == *"/"* ]] || [[ "$input" == *.bin ]]; then
+        # It's a file path - check multiple locations
+        if [ -f "$input" ]; then
+            # Found at given path (absolute or relative to cwd)
+            INPUT_FILE="$input"
+        elif [ -f "$TEST_DIR/$input" ]; then
+            # Found in test_data directory
+            INPUT_FILE="$TEST_DIR/$input"
+        elif [ -f "$PROJECT_DIR/$input" ]; then
+            # Found relative to project directory
+            INPUT_FILE="$PROJECT_DIR/$input"
+        else
+            echo "Error: File not found: $input"
+            echo "  Checked: $input"
+            echo "  Checked: $TEST_DIR/$input"
+            echo "  Checked: $PROJECT_DIR/$input"
+            exit 1
+        fi
+        PATTERN_NAME=$(basename "$INPUT_FILE" .bin)
+    else
+        # It's a pattern name
+        INPUT_FILE="$TEST_DIR/test_float32_${input}.bin"
+        PATTERN_NAME="$input"
+        if [ ! -f "$INPUT_FILE" ]; then
+            echo "Error: File not found: $INPUT_FILE"
+            exit 1
+        fi
+    fi
+}
 
 CSV_FILE="$TEST_DIR/compression_results.csv"
 
 echo "========================================================"
 echo "    GPU Compression Test Suite"
+echo "========================================================"
+echo "Inputs: ${INPUTS[*]}"
 echo "========================================================"
 
 # Write CSV header
@@ -108,10 +163,11 @@ run_test() {
 # =============================================================================
 echo ""
 echo "=== CONFIG 1: COMPRESSION ONLY (baseline) ==="
-for pattern in "${PATTERNS[@]}"; do
-    echo "Pattern: $pattern"
+for input in "${INPUTS[@]}"; do
+    resolve_input "$input"
+    echo "Input: $PATTERN_NAME ($INPUT_FILE)"
     for algo in "${ALGORITHMS[@]}"; do
-        run_test "$TEST_DIR/test_float32_${pattern}.bin" "$algo" "" "" "0" "$pattern"
+        run_test "$INPUT_FILE" "$algo" "" "" "0" "$PATTERN_NAME"
     done
 done
 
@@ -120,10 +176,11 @@ done
 # =============================================================================
 echo ""
 echo "=== CONFIG 2: COMPRESSION + SHUFFLE ==="
-for pattern in "${PATTERNS[@]}"; do
-    echo "Pattern: $pattern"
+for input in "${INPUTS[@]}"; do
+    resolve_input "$input"
+    echo "Input: $PATTERN_NAME ($INPUT_FILE)"
     for algo in "${ALGORITHMS[@]}"; do
-        run_test "$TEST_DIR/test_float32_${pattern}.bin" "$algo" "" "" "4" "$pattern"
+        run_test "$INPUT_FILE" "$algo" "" "" "4" "$PATTERN_NAME"
     done
 done
 
@@ -132,11 +189,12 @@ done
 # =============================================================================
 echo ""
 echo "=== CONFIG 3: COMPRESSION + QUANTIZATION (linear) ==="
-for pattern in "${PATTERNS[@]}"; do
-    echo "Pattern: $pattern"
+for input in "${INPUTS[@]}"; do
+    resolve_input "$input"
+    echo "Input: $PATTERN_NAME ($INPUT_FILE)"
     for algo in "${ALGORITHMS[@]}"; do
         for eb in "${ERROR_BOUNDS[@]}"; do
-            run_test "$TEST_DIR/test_float32_${pattern}.bin" "$algo" "linear" "$eb" "0" "$pattern"
+            run_test "$INPUT_FILE" "$algo" "linear" "$eb" "0" "$PATTERN_NAME"
         done
     done
 done
@@ -146,11 +204,12 @@ done
 # =============================================================================
 echo ""
 echo "=== CONFIG 4: COMPRESSION + QUANTIZATION + SHUFFLE ==="
-for pattern in "${PATTERNS[@]}"; do
-    echo "Pattern: $pattern"
+for input in "${INPUTS[@]}"; do
+    resolve_input "$input"
+    echo "Input: $PATTERN_NAME ($INPUT_FILE)"
     for algo in "${ALGORITHMS[@]}"; do
         for eb in "${ERROR_BOUNDS[@]}"; do
-            run_test "$TEST_DIR/test_float32_${pattern}.bin" "$algo" "linear" "$eb" "4" "$pattern"
+            run_test "$INPUT_FILE" "$algo" "linear" "$eb" "4" "$PATTERN_NAME"
         done
     done
 done
