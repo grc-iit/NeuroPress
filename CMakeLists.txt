@@ -19,7 +19,7 @@ find_package(CUDAToolkit REQUIRED)
 
 # Include directories
 include_directories(
-    $ENV{HOME}/.local/lib/python3.12/site-packages/nvidia/libnvcomp/include
+    /tmp/include
     /usr/local/cuda/include
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -27,7 +27,7 @@ include_directories(
 
 # Link directories
 link_directories(
-    $ENV{HOME}/.local/lib/python3.12/site-packages/nvidia/libnvcomp/lib64
+    /tmp/lib
 )
 
 # Source files
@@ -82,15 +82,33 @@ set_target_properties(gpu_decompress PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
 )
 
+# ========== Executable 3: Quantization Test Suite ==========
+add_executable(test_quantization
+    tests/quantization/test_quantization_suite.cu
+    src/byte_shuffle_kernels.cu
+    src/quantization_kernels.cu
+)
+
+target_link_libraries(test_quantization
+    PRIVATE
+    CUDA::cudart
+    CUDA::curand
+)
+
+set_target_properties(test_quantization PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+)
+
 # Display build configuration
 message(STATUS "Building GPU Compression/Decompression with modular factory pattern")
 message(STATUS "Executables:")
 message(STATUS "  - gpu_compress: Compression with data verification and preprocessing")
 message(STATUS "  - gpu_decompress: Decompression (auto-detects algorithm and preprocessing)")
+message(STATUS "  - test_quantization: Quantization test suite for correctness and metrics")
 message(STATUS "Features:")
 message(STATUS "  - CompressionFactory.cpp/hpp (Factory pattern)")
 message(STATUS "  - nvcomp library support (LZ4, Snappy, Deflate, Gdeflate, Zstd, ANS, Cascaded, Bitcomp)")
-message(STATUS "  - Error-bound quantization (Linear, Lorenzo 1D, Block Transform)")
+message(STATUS "  - Error-bound quantization (Linear)")
 message(STATUS "  - Byte shuffle preprocessing for better compression ratios")
 message(STATUS "  - GPUDirect Storage (cuFile) support for direct GPU<->NVMe transfers")
 message(STATUS "  - 4KB alignment for optimal GDS performance")

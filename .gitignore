@@ -1,5 +1,7 @@
+test_results/
 GPU_LZ4.cu
 *.bin
 *.o
 build/
 cufile.log
+.venv

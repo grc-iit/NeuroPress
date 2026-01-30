@@ -84,17 +84,16 @@ void usage(const char* prog) {
     printf("  bitcomp   - Lossless for scientific data\n");
     printf("\nOptions:\n");
     printf("  --shuffle <size>            Byte shuffle element size: 2, 4, 8 (default: 0 = disabled)\n");
-    printf("  --quant-type <type>         Quantization method: linear, lorenzo, block (default: none)\n");
+    printf("  --quant-type <type>         Quantization method: linear (default: none)\n");
     printf("  --error-bound <value>       Absolute error bound (required if quant-type set)\n");
-    printf("\nQuantization methods:\n");
-    printf("  linear    - Simple linear quantization, fast baseline\n");
-    printf("  lorenzo   - Lorenzo 1D prediction, better for smooth data\n");
-    printf("  block     - ZFP-style block transform, best for structured data\n");
+    printf("\nQuantization:\n");
+    printf("  Linear quantization trades controlled precision loss for better compression.\n");
+    printf("  Use with --error-bound to set max allowed deviation from original values.\n");
     printf("\nExamples:\n");
     printf("  %s input.bin output.bin lz4                                    # No preprocessing\n", prog);
     printf("  %s input.bin output.bin lz4 --shuffle 4                        # With 4-byte shuffle\n", prog);
     printf("  %s input.bin output.bin lz4 --quant-type linear --error-bound 0.001\n", prog);
-    printf("  %s input.bin output.bin zstd --quant-type lorenzo --error-bound 0.0001 --shuffle 4\n", prog);
+    printf("  %s input.bin output.bin zstd --quant-type linear --error-bound 0.0001 --shuffle 4\n", prog);
     exit(1);
 }
 
@@ -131,7 +130,7 @@ int main(int argc, char* argv[]) {
             quant_type = parseQuantizationType(argv[arg_idx + 1]);
             if (quant_type == QuantizationType::NONE) {
                 printf("Error: Unknown quantization type '%s'\n", argv[arg_idx + 1]);
-                printf("Valid types: linear, lorenzo, block\n");
+                printf("Valid type: linear\n");
                 return -1;
             }
             arg_idx += 2;

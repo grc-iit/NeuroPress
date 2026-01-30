@@ -226,10 +226,11 @@ int main(int argc, char* argv[]) {
     
 
     // ========== Step 7: Decompress data on GPU ==========
-    
+
     printf("\n--- Decompressing data on GPU ---\n");
     decompressor->decompress(d_decompressed, d_compressed_data, decomp_config);
-    
+    CUDA_CHECK(cudaStreamSynchronize(stream));  // Ensure decompression completes
+
     printf("✓ Decompressed %lu bytes -> %lu bytes\n", header.compressed_size, decompressed_size);
     printf("  Decompression ratio: %.2fx\n", (double)decompressed_size / header.compressed_size);
     
@@ -283,13 +284,7 @@ int main(int argc, char* argv[]) {
     if (header.hasQuantizationApplied()) {
         printf("\n###### Applying dequantization (quantization was applied during compression) ######\n");
 
-        const char* type_str = "Unknown";
-        switch (header.getQuantizationType()) {
-            case 0: type_str = "None"; break;
-            case 1: type_str = "Linear"; break;
-            case 2: type_str = "Lorenzo 1D"; break;
-            case 3: type_str = "Block Transform"; break;
-        }
+        const char* type_str = (header.getQuantizationType() == 1) ? "Linear" : "Unknown";
 
         printf("Quantization method: %s\n", type_str);
         printf("Precision: %d bits\n", header.getQuantizationPrecision());
@@ -468,13 +463,7 @@ int main(int argc, char* argv[]) {
     printf("Algorithm: Auto-detected\n");
 
     if (header.hasQuantizationApplied()) {
-        const char* type_str = "Unknown";
-        switch (header.getQuantizationType()) {
-            case 0: type_str = "None"; break;
-            case 1: type_str = "Linear"; break;
-            case 2: type_str = "Lorenzo 1D"; break;
-            case 3: type_str = "Block Transform"; break;
-        }
+        const char* type_str = (header.getQuantizationType() == 1) ? "Linear" : "Unknown";
         printf("Quantization: %s (error bound: %.2e, %d-bit) - LOSSY\n",
                type_str, header.quant_error_bound, header.getQuantizationPrecision());
     } else {

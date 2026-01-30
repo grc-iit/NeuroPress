@@ -8,8 +8,6 @@
  *
  * Supported quantization methods:
  * 1. LINEAR: Simple quantization using round(value / (2 * error_bound))
- * 2. LORENZO_1D: Prediction-based quantization for smooth data
- * 3. BLOCK_TRANSFORM: ZFP-style 4-element block orthogonal transform
  *
  * Error bound guarantee:
  * - ABS (Absolute): |original - decompressed| <= error_bound
@@ -38,9 +36,7 @@
  */
 enum class QuantizationType : uint32_t {
     NONE = 0,           // No quantization applied
-    LINEAR = 1,         // Simple linear quantization: round(value / (2*eb))
-    LORENZO_1D = 2,     // Lorenzo 1D prediction-based quantization
-    BLOCK_TRANSFORM = 3 // ZFP-style 4-element block transform
+    LINEAR = 1          // Simple linear quantization: round(value / (2*eb))
 };
 
 /**
@@ -162,8 +158,6 @@ struct QuantizationResult {
         switch (type) {
             case QuantizationType::NONE: type_str = "None"; break;
             case QuantizationType::LINEAR: type_str = "Linear"; break;
-            case QuantizationType::LORENZO_1D: type_str = "Lorenzo 1D"; break;
-            case QuantizationType::BLOCK_TRANSFORM: type_str = "Block Transform"; break;
         }
 
         printf("Quantization Result:\n");
@@ -289,7 +283,7 @@ void* dequantize_simple(
 /**
  * @brief Parse quantization type from string
  *
- * @param str String representation ("linear", "lorenzo", "block")
+ * @param str String representation ("linear")
  * @return QuantizationType enum value, NONE if invalid
  */
 inline QuantizationType parseQuantizationType(const char* str) {
@@ -305,10 +299,6 @@ inline QuantizationType parseQuantizationType(const char* str) {
     lower[len] = '\0';
 
     if (strcmp(lower, "linear") == 0) return QuantizationType::LINEAR;
-    if (strcmp(lower, "lorenzo") == 0 || strcmp(lower, "lorenzo1d") == 0 ||
-        strcmp(lower, "lorenzo_1d") == 0) return QuantizationType::LORENZO_1D;
-    if (strcmp(lower, "block") == 0 || strcmp(lower, "blocktransform") == 0 ||
-        strcmp(lower, "block_transform") == 0) return QuantizationType::BLOCK_TRANSFORM;
 
     return QuantizationType::NONE;
 }
@@ -320,8 +310,6 @@ inline const char* getQuantizationTypeName(QuantizationType type) {
     switch (type) {
         case QuantizationType::NONE: return "None";
         case QuantizationType::LINEAR: return "Linear";
-        case QuantizationType::LORENZO_1D: return "Lorenzo 1D";
-        case QuantizationType::BLOCK_TRANSFORM: return "Block Transform";
         default: return "Unknown";
     }
 }

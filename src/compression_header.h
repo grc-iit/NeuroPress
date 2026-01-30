@@ -105,7 +105,7 @@ struct CompressionHeader {
 
     /**
      * @brief Get quantization type from flags
-     * @return 0=NONE, 1=LINEAR, 2=LORENZO_1D, 3=BLOCK_TRANSFORM
+     * @return 0=NONE, 1=LINEAR
      */
     uint32_t getQuantizationType() const {
         return quant_flags & 0x0F;
@@ -127,7 +127,7 @@ struct CompressionHeader {
 
     /**
      * @brief Set quantization flags
-     * @param type 0=NONE, 1=LINEAR, 2=LORENZO_1D, 3=BLOCK_TRANSFORM
+     * @param type 0=NONE, 1=LINEAR
      * @param precision 8, 16, or 32 bits
      * @param enabled Whether quantization is enabled
      */
@@ -163,13 +163,7 @@ struct CompressionHeader {
 
         // Print quantization info if enabled
         if (hasQuantizationApplied()) {
-            const char* type_str = "Unknown";
-            switch (getQuantizationType()) {
-                case 0: type_str = "None"; break;
-                case 1: type_str = "Linear"; break;
-                case 2: type_str = "Lorenzo 1D"; break;
-                case 3: type_str = "Block Transform"; break;
-            }
+            const char* type_str = (getQuantizationType() == 1) ? "Linear" : "Unknown";
             printf("  Quantization: Yes (%s, %d-bit)\n", type_str, getQuantizationPrecision());
             printf("    Error bound: %.6e\n", quant_error_bound);
             printf("    Scale factor: %.6e\n", quant_scale);

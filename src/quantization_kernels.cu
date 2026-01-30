@@ -2,12 +2,9 @@
  * @file quantization_kernels.cu
  * @brief GPU Kernels for Error-Bound Quantization
  *
- * Implements three quantization methods:
- * 1. Linear: Simple round(value / (2 * error_bound))
- * 2. Lorenzo 1D: Prediction-based quantization
- * 3. Block Transform: ZFP-style 4-element orthogonal transform
+ * Implements linear quantization: round(value / (2 * error_bound))
  *
- * All methods support float32 and float64 with adaptive output precision.
+ * Supports float32 and float64 with adaptive output precision.
  */
 
 #include "quantization.cuh"
@@ -22,7 +19,6 @@
 
 #define WARP_SIZE 32
 #define BLOCK_SIZE 256
-#define BLOCK_TRANSFORM_SIZE 4  // ZFP-style uses 4-element blocks
 
 // ============================================================================
 // Min/Max Reduction Kernels for Data Range Computation
@@ -114,27 +110,23 @@ __global__ void compute_min_max_float_kernel(
         }
 
         if (lane == 0) {
-            // Use atomicMin/Max via integer reinterpretation for floats
-            // This works because IEEE 754 floats sort like integers for positive values
-            // For a general solution, we use a simple atomic exchange with comparison
+            // Atomic min for floats using CAS
+            // Must use float comparison (not bit comparison) to handle negative values
             float old_min = *d_min;
             while (thread_min < old_min) {
-                float assumed = old_min;
-                old_min = atomicCAS((unsigned int*)d_min,
-                                    __float_as_uint(assumed),
-                                    __float_as_uint(thread_min));
-                old_min = __uint_as_float(__float_as_uint(old_min));
-                if (old_min == assumed) break;
+                unsigned int assumed = __float_as_uint(old_min);
+                unsigned int result = atomicCAS((unsigned int*)d_min, assumed, __float_as_uint(thread_min));
+                if (result == assumed) break;
+                old_min = __uint_as_float(result);
             }
 
+            // Atomic max for floats
             float old_max = *d_max;
             while (thread_max > old_max) {
-                float assumed = old_max;
-                old_max = atomicCAS((unsigned int*)d_max,
-                                    __float_as_uint(assumed),
-                                    __float_as_uint(thread_max));
-                old_max = __uint_as_float(__float_as_uint(old_max));
-                if (old_max == assumed) break;
+                unsigned int assumed = __float_as_uint(old_max);
+                unsigned int result = atomicCAS((unsigned int*)d_max, assumed, __float_as_uint(thread_max));
+                if (result == assumed) break;
+                old_max = __uint_as_float(result);
             }
         }
     }
@@ -259,297 +251,6 @@ __global__ void dequantize_linear_kernel(
 }
 
 // ============================================================================
-// LORENZO 1D PREDICTION KERNELS
-// ============================================================================
-
-/**
- * Lorenzo 1D quantization: quantizes the difference from predicted value
- * prediction[i] = value[i-1], so residual[i] = value[i] - value[i-1]
- *
- * This is inherently parallel because we're quantizing differences,
- * not cumulative values.
- */
-template<typename InputT, typename OutputT>
-__global__ void quantize_lorenzo1d_kernel(
-    const InputT* input,
-    OutputT* output,
-    size_t num_elements,
-    double scale,
-    double offset
-) {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    size_t stride = gridDim.x * blockDim.x;
-
-    for (size_t i = idx; i < num_elements; i += stride) {
-        double val = static_cast<double>(input[i]);
-        double pred;
-
-        if (i == 0) {
-            // First element: no prediction, use offset
-            pred = offset;
-        } else {
-            // Predict from previous element
-            pred = static_cast<double>(input[i - 1]);
-        }
-
-        double residual = val - pred;
-        double quantized = round(residual * scale);
-
-        // Clamp to output type range
-        if (sizeof(OutputT) == 1) {
-            quantized = fmax(-128.0, fmin(127.0, quantized));
-        } else if (sizeof(OutputT) == 2) {
-            quantized = fmax(-32768.0, fmin(32767.0, quantized));
-        }
-
-        output[i] = static_cast<OutputT>(quantized);
-    }
-}
-
-/**
- * Lorenzo 1D dequantization requires sequential reconstruction
- * because each value depends on the previous restored value.
- *
- * We use a block-parallel approach: each block processes a segment
- * sequentially within the block, then combines results.
- */
-template<typename InputT, typename OutputT>
-__global__ void dequantize_lorenzo1d_kernel(
-    const OutputT* input,
-    InputT* output,
-    size_t num_elements,
-    double inv_scale,
-    double offset
-) {
-    // Simple sequential implementation within block
-    // For better performance, a parallel prefix scan could be used
-    size_t block_start = blockIdx.x * blockDim.x;
-    size_t block_end = min(block_start + blockDim.x, num_elements);
-
-    if (threadIdx.x != 0) return;  // Only first thread per block processes
-
-    for (size_t i = block_start; i < block_end; i++) {
-        double quantized = static_cast<double>(input[i]);
-        double residual = quantized * inv_scale;
-
-        double pred;
-        if (i == 0) {
-            pred = offset;
-        } else {
-            pred = static_cast<double>(output[i - 1]);
-        }
-
-        output[i] = static_cast<InputT>(pred + residual);
-    }
-}
-
-/**
- * Parallel Lorenzo 1D dequantization using prefix sum
- * Works in two phases:
- * 1. Each thread computes residuals for its elements
- * 2. Inclusive scan to accumulate predictions
- */
-template<typename InputT, typename OutputT>
-__global__ void dequantize_lorenzo1d_parallel_kernel(
-    const OutputT* input,
-    InputT* output,
-    size_t num_elements,
-    double inv_scale,
-    double offset,
-    InputT* d_block_sums,  // Output: last value of each block for inter-block scan
-    size_t blocks_per_grid
-) {
-    typedef cub::BlockScan<double, BLOCK_SIZE> BlockScan;
-    __shared__ typename BlockScan::TempStorage temp_storage;
-
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-    double residual = 0.0;
-    if (idx < num_elements) {
-        residual = static_cast<double>(input[idx]) * inv_scale;
-    }
-
-    double accumulated;
-    BlockScan(temp_storage).InclusiveSum(residual, accumulated);
-
-    // Add offset for first element of first block
-    if (blockIdx.x == 0) {
-        accumulated += offset;
-    }
-
-    if (idx < num_elements) {
-        output[idx] = static_cast<InputT>(accumulated);
-    }
-
-    // Save last value of each block for inter-block propagation
-    if (threadIdx.x == blockDim.x - 1 || idx == num_elements - 1) {
-        if (d_block_sums != nullptr) {
-            d_block_sums[blockIdx.x] = static_cast<InputT>(accumulated);
-        }
-    }
-}
-
-// Second pass to add block prefixes
-template<typename T>
-__global__ void add_block_prefix_kernel(
-    T* output,
-    const T* block_sums,
-    size_t num_elements
-) {
-    if (blockIdx.x == 0) return;  // First block doesn't need adjustment
-
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= num_elements) return;
-
-    T prefix = block_sums[blockIdx.x - 1];
-    output[idx] = output[idx] + prefix;
-}
-
-// ============================================================================
-// BLOCK TRANSFORM KERNELS (ZFP-style)
-// ============================================================================
-
-/**
- * ZFP-style 4-element block orthogonal transform
- *
- * Forward transform (lifting steps):
- *   y[0] = (x[0] + x[3]) / 2
- *   y[1] = (x[0] - x[3])
- *   y[2] = (x[1] + x[2]) / 2
- *   y[3] = (x[1] - x[2])
- *
- * Then apply decorrelation:
- *   z[0] = (y[0] + y[2]) / 2
- *   z[1] = y[1]
- *   z[2] = (y[0] - y[2])
- *   z[3] = y[3]
- *
- * This concentrates energy in z[0] for smooth data.
- */
-__device__ __forceinline__ void forward_block_transform_4(
-    double x0, double x1, double x2, double x3,
-    double& z0, double& z1, double& z2, double& z3
-) {
-    // First stage
-    double y0 = (x0 + x3) * 0.5;
-    double y1 = x0 - x3;
-    double y2 = (x1 + x2) * 0.5;
-    double y3 = x1 - x2;
-
-    // Second stage (decorrelation)
-    z0 = (y0 + y2) * 0.5;
-    z1 = y1;
-    z2 = y0 - y2;
-    z3 = y3;
-}
-
-/**
- * Inverse transform (reverse lifting steps)
- */
-__device__ __forceinline__ void inverse_block_transform_4(
-    double z0, double z1, double z2, double z3,
-    double& x0, double& x1, double& x2, double& x3
-) {
-    // Reverse second stage
-    double y0 = z0 + z2 * 0.5;
-    double y1 = z1;
-    double y2 = z0 - z2 * 0.5;
-    double y3 = z3;
-
-    // Reverse first stage
-    x0 = y0 + y1 * 0.5;
-    x3 = y0 - y1 * 0.5;
-    x1 = y2 + y3 * 0.5;
-    x2 = y2 - y3 * 0.5;
-}
-
-template<typename InputT, typename OutputT>
-__global__ void quantize_block_transform_kernel(
-    const InputT* input,
-    OutputT* output,
-    size_t num_elements,
-    double scale,
-    double offset
-) {
-    // Each thread handles one 4-element block
-    size_t block_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    size_t num_blocks = (num_elements + BLOCK_TRANSFORM_SIZE - 1) / BLOCK_TRANSFORM_SIZE;
-
-    if (block_idx >= num_blocks) return;
-
-    size_t base = block_idx * BLOCK_TRANSFORM_SIZE;
-
-    // Load 4 elements (pad with offset for incomplete blocks)
-    double x0 = (base + 0 < num_elements) ? static_cast<double>(input[base + 0]) - offset : 0.0;
-    double x1 = (base + 1 < num_elements) ? static_cast<double>(input[base + 1]) - offset : 0.0;
-    double x2 = (base + 2 < num_elements) ? static_cast<double>(input[base + 2]) - offset : 0.0;
-    double x3 = (base + 3 < num_elements) ? static_cast<double>(input[base + 3]) - offset : 0.0;
-
-    // Apply forward transform
-    double z0, z1, z2, z3;
-    forward_block_transform_4(x0, x1, x2, x3, z0, z1, z2, z3);
-
-    // Quantize transformed coefficients
-    z0 = round(z0 * scale);
-    z1 = round(z1 * scale);
-    z2 = round(z2 * scale);
-    z3 = round(z3 * scale);
-
-    // Clamp to output type range
-    double max_val, min_val;
-    if (sizeof(OutputT) == 1) {
-        min_val = -128.0; max_val = 127.0;
-    } else if (sizeof(OutputT) == 2) {
-        min_val = -32768.0; max_val = 32767.0;
-    } else {
-        min_val = -2147483648.0; max_val = 2147483647.0;
-    }
-
-    z0 = fmax(min_val, fmin(max_val, z0));
-    z1 = fmax(min_val, fmin(max_val, z1));
-    z2 = fmax(min_val, fmin(max_val, z2));
-    z3 = fmax(min_val, fmin(max_val, z3));
-
-    // Store (only valid elements)
-    if (base + 0 < num_elements) output[base + 0] = static_cast<OutputT>(z0);
-    if (base + 1 < num_elements) output[base + 1] = static_cast<OutputT>(z1);
-    if (base + 2 < num_elements) output[base + 2] = static_cast<OutputT>(z2);
-    if (base + 3 < num_elements) output[base + 3] = static_cast<OutputT>(z3);
-}
-
-template<typename InputT, typename OutputT>
-__global__ void dequantize_block_transform_kernel(
-    const OutputT* input,
-    InputT* output,
-    size_t num_elements,
-    double inv_scale,
-    double offset
-) {
-    size_t block_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    size_t num_blocks = (num_elements + BLOCK_TRANSFORM_SIZE - 1) / BLOCK_TRANSFORM_SIZE;
-
-    if (block_idx >= num_blocks) return;
-
-    size_t base = block_idx * BLOCK_TRANSFORM_SIZE;
-
-    // Load quantized coefficients
-    double z0 = (base + 0 < num_elements) ? static_cast<double>(input[base + 0]) * inv_scale : 0.0;
-    double z1 = (base + 1 < num_elements) ? static_cast<double>(input[base + 1]) * inv_scale : 0.0;
-    double z2 = (base + 2 < num_elements) ? static_cast<double>(input[base + 2]) * inv_scale : 0.0;
-    double z3 = (base + 3 < num_elements) ? static_cast<double>(input[base + 3]) * inv_scale : 0.0;
-
-    // Apply inverse transform
-    double x0, x1, x2, x3;
-    inverse_block_transform_4(z0, z1, z2, z3, x0, x1, x2, x3);
-
-    // Restore offset and store
-    if (base + 0 < num_elements) output[base + 0] = static_cast<InputT>(x0 + offset);
-    if (base + 1 < num_elements) output[base + 1] = static_cast<InputT>(x1 + offset);
-    if (base + 2 < num_elements) output[base + 2] = static_cast<InputT>(x2 + offset);
-    if (base + 3 < num_elements) output[base + 3] = static_cast<InputT>(x3 + offset);
-}
-
-// ============================================================================
 // ERROR VERIFICATION KERNEL
 // ============================================================================
 
@@ -646,6 +347,7 @@ static void compute_data_range(
         cudaMalloc(&d_min, sizeof(float));
         cudaMalloc(&d_max, sizeof(float));
 
+        // Init min to largest value, max to smallest value
         float init_min = FLT_MAX;
         float init_max = -FLT_MAX;
         cudaMemcpyAsync(d_min, &init_min, sizeof(float), cudaMemcpyHostToDevice, stream);
@@ -689,14 +391,13 @@ static void compute_data_range(
 }
 
 /**
- * Launch appropriate quantization kernel based on config
+ * Launch linear quantization kernel
  */
 template<typename InputT, typename OutputT>
 static void launch_quantize_kernel(
     const InputT* d_input,
     OutputT* d_output,
     size_t num_elements,
-    QuantizationType type,
     double scale,
     double offset,
     cudaStream_t stream
@@ -704,41 +405,18 @@ static void launch_quantize_kernel(
     int num_blocks = (num_elements + BLOCK_SIZE - 1) / BLOCK_SIZE;
     num_blocks = min(num_blocks, 65535);
 
-    switch (type) {
-        case QuantizationType::LINEAR:
-            quantize_linear_kernel<InputT, OutputT><<<num_blocks, BLOCK_SIZE, 0, stream>>>(
-                d_input, d_output, num_elements, scale, offset);
-            break;
-
-        case QuantizationType::LORENZO_1D:
-            quantize_lorenzo1d_kernel<InputT, OutputT><<<num_blocks, BLOCK_SIZE, 0, stream>>>(
-                d_input, d_output, num_elements, scale, offset);
-            break;
-
-        case QuantizationType::BLOCK_TRANSFORM: {
-            size_t num_transform_blocks = (num_elements + BLOCK_TRANSFORM_SIZE - 1) / BLOCK_TRANSFORM_SIZE;
-            int kernel_blocks = (num_transform_blocks + BLOCK_SIZE - 1) / BLOCK_SIZE;
-            kernel_blocks = min(kernel_blocks, 65535);
-            quantize_block_transform_kernel<InputT, OutputT><<<kernel_blocks, BLOCK_SIZE, 0, stream>>>(
-                d_input, d_output, num_elements, scale, offset);
-            break;
-        }
-
-        default:
-            // Should not reach here
-            break;
-    }
+    quantize_linear_kernel<InputT, OutputT><<<num_blocks, BLOCK_SIZE, 0, stream>>>(
+        d_input, d_output, num_elements, scale, offset);
 }
 
 /**
- * Launch appropriate dequantization kernel based on config
+ * Launch linear dequantization kernel
  */
 template<typename InputT, typename OutputT>
 static void launch_dequantize_kernel(
     const OutputT* d_input,
     InputT* d_output,
     size_t num_elements,
-    QuantizationType type,
     double inv_scale,
     double offset,
     cudaStream_t stream
@@ -746,31 +424,8 @@ static void launch_dequantize_kernel(
     int num_blocks = (num_elements + BLOCK_SIZE - 1) / BLOCK_SIZE;
     num_blocks = min(num_blocks, 65535);
 
-    switch (type) {
-        case QuantizationType::LINEAR:
-            dequantize_linear_kernel<InputT, OutputT><<<num_blocks, BLOCK_SIZE, 0, stream>>>(
-                d_input, d_output, num_elements, inv_scale, offset);
-            break;
-
-        case QuantizationType::LORENZO_1D:
-            // Use simple sequential version for correctness
-            // For large data, consider parallel prefix sum approach
-            dequantize_lorenzo1d_kernel<InputT, OutputT><<<num_blocks, BLOCK_SIZE, 0, stream>>>(
-                d_input, d_output, num_elements, inv_scale, offset);
-            break;
-
-        case QuantizationType::BLOCK_TRANSFORM: {
-            size_t num_transform_blocks = (num_elements + BLOCK_TRANSFORM_SIZE - 1) / BLOCK_TRANSFORM_SIZE;
-            int kernel_blocks = (num_transform_blocks + BLOCK_SIZE - 1) / BLOCK_SIZE;
-            kernel_blocks = min(kernel_blocks, 65535);
-            dequantize_block_transform_kernel<InputT, OutputT><<<kernel_blocks, BLOCK_SIZE, 0, stream>>>(
-                d_input, d_output, num_elements, inv_scale, offset);
-            break;
-        }
-
-        default:
-            break;
-    }
+    dequantize_linear_kernel<InputT, OutputT><<<num_blocks, BLOCK_SIZE, 0, stream>>>(
+        d_input, d_output, num_elements, inv_scale, offset);
 }
 
 // ============================================================================
@@ -811,10 +466,62 @@ QuantizationResult quantize_simple(
         data_range = 1.0;  // Handle constant data
     }
 
-    // Step 2: Determine precision
+    // Step 2: Compute effective error bound accounting for ALL error sources
+    //
+    // Total error comes from two sources:
+    //   1. Quantization rounding error: max = effective_eb (from scale = 1/(2*effective_eb))
+    //   2. Float32 representation error when converting double back to float32:
+    //      max ≈ |restored_value| * FLT_EPSILON ≈ max(|data_min|, |data_max|) * 1.19e-7
+    //
+    // To guarantee total error <= user_error_bound:
+    //   effective_eb + float_repr_error <= user_error_bound
+    //   effective_eb <= user_error_bound - float_repr_error
+    //
+    double max_abs_value = fmax(fabs(data_min), fabs(data_max));
+
+    // Use FLT_EPSILON with safety multiplier to account for accumulated rounding
+    // FLT_EPSILON ≈ 1.19e-7, use 2x for safety in multi-step operations
+    double float_repr_error = max_abs_value * 2.4e-7;
+
+    // Reserve space for float representation error plus safety margin
+    double available_for_quant = config.error_bound - float_repr_error;
+
+    // Apply additional 5% safety margin for numeric stability in scale calculations
+    double safety_margin = config.error_bound * 0.05;
+    available_for_quant -= safety_margin;
+
+    // Compute minimum effective_eb that won't overflow int32 quantized values
+    // max_quantized = data_range * scale = data_range / (2 * effective_eb)
+    // For int32: data_range / (2 * effective_eb) <= 2^31 - 1
+    // So: effective_eb >= data_range / (2^32 - 2)
+    double min_eb_for_int32 = data_range / 4.0e9;  // Conservative limit for int32
+
+    double effective_eb;
+    if (available_for_quant <= 0) {
+        // Error bound is too tight for float32 precision with this data range
+        // Use maximum safe precision (limited by int32 quantized value range)
+        double min_achievable = fmax(float_repr_error, min_eb_for_int32);
+
+        fprintf(stderr, "Warning: Error bound %.2e is below float32 precision limit for data range [%.2e, %.2e]\n",
+                config.error_bound, data_min, data_max);
+        fprintf(stderr, "  Float32 representation error: %.2e\n", float_repr_error);
+        fprintf(stderr, "  Minimum achievable error: ~%.2e\n", min_achievable);
+        fprintf(stderr, "  Using maximum precision quantization (error may exceed bound)\n");
+
+        // Use maximum safe precision
+        effective_eb = fmax(min_eb_for_int32, float_repr_error * 0.1);
+    } else {
+        effective_eb = available_for_quant;
+    }
+
+    // Ensure effective_eb doesn't cause overflow
+    effective_eb = fmax(effective_eb, min_eb_for_int32);
+
+    // Step 3: Determine precision using effective error bound
+    // This ensures the selected precision can hold all quantized values
     int precision;
     if (config.precision == QuantizationPrecision::AUTO) {
-        precision = compute_required_precision(data_range, config.error_bound);
+        precision = compute_required_precision(data_range, effective_eb);
     } else {
         switch (config.precision) {
             case QuantizationPrecision::INT8:  precision = 8; break;
@@ -824,9 +531,8 @@ QuantizationResult quantize_simple(
         }
     }
 
-    // Step 3: Compute quantization scale
-    double scale = 1.0 / (2.0 * config.error_bound);
-    double inv_scale = 2.0 * config.error_bound;
+    // Compute quantization scale from effective error bound
+    double scale = 1.0 / (2.0 * effective_eb);
 
     // Step 4: Allocate output buffer
     size_t output_bytes = num_elements * precision_to_bytes(precision);
@@ -843,34 +549,30 @@ QuantizationResult quantize_simple(
         if (precision == 8) {
             launch_quantize_kernel<float, int8_t>(
                 static_cast<float*>(d_input), static_cast<int8_t*>(d_output),
-                num_elements, config.type, scale, data_min, stream);
+                num_elements, scale, data_min, stream);
         } else if (precision == 16) {
             launch_quantize_kernel<float, int16_t>(
                 static_cast<float*>(d_input), static_cast<int16_t*>(d_output),
-                num_elements, config.type, scale, data_min, stream);
+                num_elements, scale, data_min, stream);
         } else {
             launch_quantize_kernel<float, int32_t>(
                 static_cast<float*>(d_input), static_cast<int32_t*>(d_output),
-                num_elements, config.type, scale, data_min, stream);
+                num_elements, scale, data_min, stream);
         }
     } else {
         // Double input
         if (precision == 8) {
-            launch_dequantize_kernel<double, int8_t>(
-                static_cast<int8_t*>(d_output), static_cast<double*>(d_input),
-                num_elements, config.type, inv_scale, data_min, stream);
-            // Oops, wrong direction. Let me fix:
             launch_quantize_kernel<double, int8_t>(
                 static_cast<double*>(d_input), static_cast<int8_t*>(d_output),
-                num_elements, config.type, scale, data_min, stream);
+                num_elements, scale, data_min, stream);
         } else if (precision == 16) {
             launch_quantize_kernel<double, int16_t>(
                 static_cast<double*>(d_input), static_cast<int16_t*>(d_output),
-                num_elements, config.type, scale, data_min, stream);
+                num_elements, scale, data_min, stream);
         } else {
             launch_quantize_kernel<double, int32_t>(
                 static_cast<double*>(d_input), static_cast<int32_t*>(d_output),
-                num_elements, config.type, scale, data_min, stream);
+                num_elements, scale, data_min, stream);
         }
     }
 
@@ -910,7 +612,8 @@ void* dequantize_simple(
         return nullptr;
     }
 
-    double inv_scale = 2.0 * metadata.error_bound;
+    // Use the stored scale factor (accounts for safety margin used during quantization)
+    double inv_scale = 1.0 / metadata.scale_factor;
 
     // Launch dequantization kernel
     if (metadata.original_element_size == 4) {
@@ -918,30 +621,30 @@ void* dequantize_simple(
         if (metadata.actual_precision == 8) {
             launch_dequantize_kernel<float, int8_t>(
                 static_cast<int8_t*>(d_quantized), static_cast<float*>(d_output),
-                metadata.num_elements, metadata.type, inv_scale, metadata.data_min, stream);
+                metadata.num_elements, inv_scale, metadata.data_min, stream);
         } else if (metadata.actual_precision == 16) {
             launch_dequantize_kernel<float, int16_t>(
                 static_cast<int16_t*>(d_quantized), static_cast<float*>(d_output),
-                metadata.num_elements, metadata.type, inv_scale, metadata.data_min, stream);
+                metadata.num_elements, inv_scale, metadata.data_min, stream);
         } else {
             launch_dequantize_kernel<float, int32_t>(
                 static_cast<int32_t*>(d_quantized), static_cast<float*>(d_output),
-                metadata.num_elements, metadata.type, inv_scale, metadata.data_min, stream);
+                metadata.num_elements, inv_scale, metadata.data_min, stream);
         }
     } else {
         // Double output
         if (metadata.actual_precision == 8) {
             launch_dequantize_kernel<double, int8_t>(
                 static_cast<int8_t*>(d_quantized), static_cast<double*>(d_output),
-                metadata.num_elements, metadata.type, inv_scale, metadata.data_min, stream);
+                metadata.num_elements, inv_scale, metadata.data_min, stream);
         } else if (metadata.actual_precision == 16) {
             launch_dequantize_kernel<double, int16_t>(
                 static_cast<int16_t*>(d_quantized), static_cast<double*>(d_output),
-                metadata.num_elements, metadata.type, inv_scale, metadata.data_min, stream);
+                metadata.num_elements, inv_scale, metadata.data_min, stream);
         } else {
             launch_dequantize_kernel<double, int32_t>(
                 static_cast<int32_t*>(d_quantized), static_cast<double*>(d_output),
-                metadata.num_elements, metadata.type, inv_scale, metadata.data_min, stream);
+                metadata.num_elements, inv_scale, metadata.data_min, stream);
         }
     }
 
