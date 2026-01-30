@@ -45,9 +45,10 @@ set_source_files_properties(
 )
 
 # ========== Executable 1: GPU Compress (with verification) ==========
-add_executable(gpu_compress 
+add_executable(gpu_compress
     src/GPU_Compress.cpp
     src/byte_shuffle_kernels.cu
+    src/quantization_kernels.cu
     ${FACTORY_SOURCES}
 )
 
@@ -63,9 +64,10 @@ set_target_properties(gpu_compress PROPERTIES
 )
 
 # ========== Executable 2: GPU Decompress ==========
-add_executable(gpu_decompress 
+add_executable(gpu_decompress
     src/GPU_Decompress.cpp
     src/byte_shuffle_kernels.cu
+    src/quantization_kernels.cu
     ${FACTORY_SOURCES}
 )
 
@@ -83,11 +85,13 @@ set_target_properties(gpu_decompress PROPERTIES
 # Display build configuration
 message(STATUS "Building GPU Compression/Decompression with modular factory pattern")
 message(STATUS "Executables:")
-message(STATUS "  - gpu_compress: Compression with data verification")
-message(STATUS "  - gpu_decompress: Decompression (auto-detects algorithm)")
+message(STATUS "  - gpu_compress: Compression with data verification and preprocessing")
+message(STATUS "  - gpu_decompress: Decompression (auto-detects algorithm and preprocessing)")
 message(STATUS "Features:")
 message(STATUS "  - CompressionFactory.cpp/hpp (Factory pattern)")
 message(STATUS "  - nvcomp library support (LZ4, Snappy, Deflate, Gdeflate, Zstd, ANS, Cascaded, Bitcomp)")
+message(STATUS "  - Error-bound quantization (Linear, Lorenzo 1D, Block Transform)")
+message(STATUS "  - Byte shuffle preprocessing for better compression ratios")
 message(STATUS "  - GPUDirect Storage (cuFile) support for direct GPU<->NVMe transfers")
 message(STATUS "  - 4KB alignment for optimal GDS performance")
 message(STATUS "Note: Using .cpp extension with CUDA compilation")

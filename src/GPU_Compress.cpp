@@ -35,6 +35,9 @@
 // Compression header for metadata
 #include "compression_header.h"
 
+// Quantization for lossy preprocessing
+#include "quantization.cuh"
+
 using namespace nvcomp;
 
 // CUDA error checking macro
@@ -65,9 +68,9 @@ __global__ void compare_buffers(const uint8_t* ref, const uint8_t* val, int* inv
 
 // Usage information
 void usage(const char* prog) {
-    printf("Usage: %s <input_file> <output_file> [algorithm] [element_size_for_shuffle]\n", prog);
+    printf("Usage: %s <input_file> <output_file> [algorithm] [options]\n", prog);
     printf("\nReads uncompressed data from input_file using GDS,\n");
-    printf("optionally applies byte shuffle preprocessing,\n");
+    printf("optionally applies quantization and/or byte shuffle preprocessing,\n");
     printf("compresses it on GPU with nvcomp, and writes\n");
     printf("compressed data to output_file using GDS.\n");
     printf("\nAvailable algorithms:\n");
@@ -79,51 +82,109 @@ void usage(const char* prog) {
     printf("  ans       - Entropy coding, numerical data\n");
     printf("  cascaded  - High compression for floating-point\n");
     printf("  bitcomp   - Lossless for scientific data\n");
-    printf("\nOptional shuffle parameter:\n");
-    printf("  element_size - If specified, applies byte shuffle with this element size\n");
-    printf("                 Common values: 2, 4, 8 (bytes)\n");
-    printf("                 0 or omitted = no shuffle (default)\n");
+    printf("\nOptions:\n");
+    printf("  --shuffle <size>            Byte shuffle element size: 2, 4, 8 (default: 0 = disabled)\n");
+    printf("  --quant-type <type>         Quantization method: linear, lorenzo, block (default: none)\n");
+    printf("  --error-bound <value>       Absolute error bound (required if quant-type set)\n");
+    printf("\nQuantization methods:\n");
+    printf("  linear    - Simple linear quantization, fast baseline\n");
+    printf("  lorenzo   - Lorenzo 1D prediction, better for smooth data\n");
+    printf("  block     - ZFP-style block transform, best for structured data\n");
     printf("\nExamples:\n");
-    printf("  %s noisy_pattern.bin output.bin lz4          # No shuffle\n", prog);
-    printf("  %s noisy_pattern.bin output.bin lz4 4        # With 4-byte shuffle\n", prog);
-    printf("  %s noisy_pattern.bin output.bin zstd 8       # With 8-byte shuffle\n", prog);
+    printf("  %s input.bin output.bin lz4                                    # No preprocessing\n", prog);
+    printf("  %s input.bin output.bin lz4 --shuffle 4                        # With 4-byte shuffle\n", prog);
+    printf("  %s input.bin output.bin lz4 --quant-type linear --error-bound 0.001\n", prog);
+    printf("  %s input.bin output.bin zstd --quant-type lorenzo --error-bound 0.0001 --shuffle 4\n", prog);
     exit(1);
 }
 
 int main(int argc, char* argv[]) {
-    if (argc < 3 || argc > 5) {
+    if (argc < 3) {
         usage(argv[0]);
     }
 
     const char* input_file = argv[1];
     const char* output_file = argv[2];
-    
-    // Default to LZ4 if no algorithm specified
+
+    // Default settings
     CompressionAlgorithm algo = CompressionAlgorithm::LZ4;
-    if (argc >= 4) {
-        algo = parseCompressionAlgorithm(argv[3]);
-    }
-    
-    // Parse optional shuffle element size
     unsigned shuffle_element_size = 0;  // 0 = no shuffle
-    if (argc == 5) {
-        shuffle_element_size = atoi(argv[4]);
-        if (shuffle_element_size > 0) {
-            printf("========================================\n");
-            printf("   GPU Direct Storage Compression\n");
-            printf("   WITH BYTE SHUFFLE PREPROCESSING\n");
-            printf("========================================\n");
-            printf("Algorithm: %s\n", getAlgorithmName(algo).c_str());
-            printf("Shuffle element size: %u bytes\n\n", shuffle_element_size);
+    QuantizationType quant_type = QuantizationType::NONE;
+    double error_bound = 0.0;
+    size_t quant_element_size = sizeof(float);  // Default to float32
+
+    // Parse arguments
+    int arg_idx = 3;
+
+    // Check if next argument is an algorithm (not starting with --)
+    if (argc > 3 && argv[3][0] != '-') {
+        algo = parseCompressionAlgorithm(argv[3]);
+        arg_idx = 4;
+    }
+
+    // Parse options
+    while (arg_idx < argc) {
+        if (strcmp(argv[arg_idx], "--shuffle") == 0 && arg_idx + 1 < argc) {
+            shuffle_element_size = atoi(argv[arg_idx + 1]);
+            arg_idx += 2;
+        } else if (strcmp(argv[arg_idx], "--quant-type") == 0 && arg_idx + 1 < argc) {
+            quant_type = parseQuantizationType(argv[arg_idx + 1]);
+            if (quant_type == QuantizationType::NONE) {
+                printf("Error: Unknown quantization type '%s'\n", argv[arg_idx + 1]);
+                printf("Valid types: linear, lorenzo, block\n");
+                return -1;
+            }
+            arg_idx += 2;
+        } else if (strcmp(argv[arg_idx], "--error-bound") == 0 && arg_idx + 1 < argc) {
+            error_bound = atof(argv[arg_idx + 1]);
+            if (error_bound <= 0.0) {
+                printf("Error: Error bound must be positive, got %s\n", argv[arg_idx + 1]);
+                return -1;
+            }
+            arg_idx += 2;
+        } else if (strcmp(argv[arg_idx], "--element-size") == 0 && arg_idx + 1 < argc) {
+            quant_element_size = atoi(argv[arg_idx + 1]);
+            if (quant_element_size != 4 && quant_element_size != 8) {
+                printf("Error: Element size must be 4 (float) or 8 (double), got %s\n", argv[arg_idx + 1]);
+                return -1;
+            }
+            arg_idx += 2;
+        } else {
+            printf("Error: Unknown option '%s'\n", argv[arg_idx]);
+            usage(argv[0]);
         }
     }
-    
-    if (shuffle_element_size == 0) {
-        printf("========================================\n");
-        printf("   GPU Direct Storage Compression\n");
-        printf("========================================\n");
-        printf("Algorithm: %s\n\n", getAlgorithmName(algo).c_str());
+
+    // Validate quantization settings
+    if (quant_type != QuantizationType::NONE && error_bound <= 0.0) {
+        printf("Error: --error-bound is required when using --quant-type\n");
+        return -1;
     }
+
+    // Print header
+    printf("========================================\n");
+    printf("   GPU Direct Storage Compression\n");
+    if (quant_type != QuantizationType::NONE || shuffle_element_size > 0) {
+        printf("   WITH ");
+        if (quant_type != QuantizationType::NONE) {
+            printf("QUANTIZATION");
+            if (shuffle_element_size > 0) printf(" + ");
+        }
+        if (shuffle_element_size > 0) {
+            printf("BYTE SHUFFLE");
+        }
+        printf(" PREPROCESSING\n");
+    }
+    printf("========================================\n");
+    printf("Algorithm: %s\n", getAlgorithmName(algo).c_str());
+    if (shuffle_element_size > 0) {
+        printf("Shuffle element size: %u bytes\n", shuffle_element_size);
+    }
+    if (quant_type != QuantizationType::NONE) {
+        printf("Quantization: %s (error bound: %.2e)\n",
+               getQuantizationTypeName(quant_type), error_bound);
+    }
+    printf("\n");
 
     // ========== Step 1: Open input file for reading ==========
     
@@ -212,30 +273,41 @@ int main(int argc, char* argv[]) {
         close(fd_input);
         return -1;
     }
-    printf("✓ Read %ld bytes directly to GPU (bypassed CPU!)\n", bytes_read);
-    
-    // ========== Step 5.5: Apply byte shuffle if requested ==========
-    
+    printf("Read %ld bytes directly to GPU (bypassed CPU!)\n", bytes_read);
+
+    // ========== Step 5.4: Apply quantization if requested ==========
+
     uint8_t* d_compress_input = d_input;  // Default: compress original input
-    uint8_t* d_shuffled = nullptr;
-    
-    if (shuffle_element_size > 0) {
-        printf("\n###### Applying byte shuffle preprocessing ######\n");
-        printf("Element size: %u bytes\n", shuffle_element_size);
-        
-        // Apply shuffle using the simple API
-        const size_t SHUFFLE_CHUNK_SIZE = 256 * 1024;  // 256KB chunks
-        d_shuffled = byte_shuffle_simple(
+    uint8_t* d_quantized = nullptr;
+    QuantizationResult quant_result;
+    size_t data_size_for_compression = file_size;  // Size to use for compression
+
+    if (quant_type != QuantizationType::NONE) {
+        printf("\n###### Applying %s quantization preprocessing ######\n",
+               getQuantizationTypeName(quant_type));
+        printf("Error bound: %.2e\n", error_bound);
+        printf("Element size: %zu bytes (%s)\n", quant_element_size,
+               quant_element_size == 4 ? "float32" : "float64");
+
+        size_t num_elements = file_size / quant_element_size;
+
+        QuantizationConfig quant_config(
+            quant_type,
+            error_bound,
+            num_elements,
+            quant_element_size
+        );
+
+        quant_result = quantize_simple(
             d_input,
-            file_size,
-            shuffle_element_size,
-            SHUFFLE_CHUNK_SIZE,
-            ShuffleKernelType::AUTO,
+            num_elements,
+            quant_element_size,
+            quant_config,
             stream
         );
-        
-        if (d_shuffled == nullptr) {
-            printf("Error: Byte shuffle failed!\n");
+
+        if (!quant_result.isValid()) {
+            printf("Error: Quantization failed!\n");
             if (input_buf_registered) cuFileBufDeregister(d_input);
             cuFileHandleDeregister(cf_handle_in);
             cuFileDriverClose();
@@ -244,27 +316,70 @@ int main(int argc, char* argv[]) {
             close(fd_input);
             return -1;
         }
-        
+
+        printf("Quantization complete:\n");
+        printf("  Data range: [%.6e, %.6e]\n", quant_result.data_min, quant_result.data_max);
+        printf("  Precision: %d bits\n", quant_result.actual_precision);
+        printf("  Quantized size: %zu bytes (%.2fx reduction)\n",
+               quant_result.quantized_bytes, quant_result.getQuantizationRatio());
+
+        d_quantized = static_cast<uint8_t*>(quant_result.d_quantized);
+        d_compress_input = d_quantized;
+        data_size_for_compression = quant_result.quantized_bytes;
+    }
+
+    // ========== Step 5.5: Apply byte shuffle if requested ==========
+
+    uint8_t* d_shuffled = nullptr;
+
+    if (shuffle_element_size > 0) {
+        printf("\n###### Applying byte shuffle preprocessing ######\n");
+        printf("Element size: %u bytes\n", shuffle_element_size);
+
+        // Apply shuffle using the simple API
+        const size_t SHUFFLE_CHUNK_SIZE = 256 * 1024;  // 256KB chunks
+        d_shuffled = byte_shuffle_simple(
+            d_compress_input,
+            data_size_for_compression,
+            shuffle_element_size,
+            SHUFFLE_CHUNK_SIZE,
+            ShuffleKernelType::AUTO,
+            stream
+        );
+
+        if (d_shuffled == nullptr) {
+            printf("Error: Byte shuffle failed!\n");
+            if (d_quantized) CUDA_CHECK(cudaFree(d_quantized));
+            if (input_buf_registered) cuFileBufDeregister(d_input);
+            cuFileHandleDeregister(cf_handle_in);
+            cuFileDriverClose();
+            CUDA_CHECK(cudaFree(d_input));
+            CUDA_CHECK(cudaStreamDestroy(stream));
+            close(fd_input);
+            return -1;
+        }
+
         CUDA_CHECK(cudaStreamSynchronize(stream));
-        printf("✓ Byte shuffle complete - data reorganized for better compression\n");
-        
+        printf("Byte shuffle complete - data reorganized for better compression\n");
+
         // Compress the shuffled data instead
         d_compress_input = d_shuffled;
     }
     
     // ========== Step 6: Setup compression ==========
-    
+
     printf("\n###### Setting up %s compression ######\n", getAlgorithmName(algo).c_str());
-    
+
     // Create compression manager using factory
     const size_t CHUNK_SIZE = 1 << 16; // 64KB chunks
     auto compressor = createCompressionManager(algo, CHUNK_SIZE, stream, d_compress_input);
-    
+
     // Configure compression and get max output size
-    const CompressionConfig comp_config = compressor->configure_compression(file_size);
+    // Use data_size_for_compression which accounts for quantization
+    const CompressionConfig comp_config = compressor->configure_compression(data_size_for_compression);
     size_t max_compressed_size = comp_config.max_compressed_buffer_size;
     
-    // Add space for compression header (32 bytes)
+    // Add space for compression header (64 bytes for version 2)
     size_t header_size = sizeof(CompressionHeader);
     size_t max_total_size = header_size + max_compressed_size;
     
@@ -287,32 +402,53 @@ int main(int argc, char* argv[]) {
     
 
     // ========== Step 7: Compress data on GPU ==========
-    
+
     printf("\n###### Compressing data on GPU ######\n");
     compressor->compress(d_compress_input, d_compressed, comp_config);
-    
+
     // Get actual compressed size
     const size_t compressed_size = compressor->get_compressed_output_size(d_compressed);
-    
-    printf("✓ Compressed %lu bytes -> %lu bytes\n", file_size, compressed_size);
-    printf("  Compression ratio: %.2fx\n", (double)file_size / compressed_size);
-    
+
+    printf("Compressed %lu bytes -> %lu bytes\n", data_size_for_compression, compressed_size);
+    printf("  Compression ratio: %.2fx\n", (double)data_size_for_compression / compressed_size);
+    if (quant_type != QuantizationType::NONE) {
+        printf("  Total reduction (with quantization): %.2fx\n", (double)file_size / compressed_size);
+    }
+
     // ========== Step 7.3: Write compression header with metadata ==========
-    
+
     printf("\n###### Writing compression header with metadata ######\n");
-    
+
     CompressionHeader header;
     header.magic = COMPRESSION_MAGIC;
     header.version = COMPRESSION_HEADER_VERSION;
     header.shuffle_element_size = shuffle_element_size;
-    header.reserved = 0;
     header.original_size = file_size;
     header.compressed_size = compressed_size;
-    
+
+    // Set quantization metadata if enabled
+    if (quant_type != QuantizationType::NONE) {
+        header.setQuantizationFlags(
+            static_cast<uint32_t>(quant_type),
+            quant_result.actual_precision,
+            true  // enabled
+        );
+        header.quant_error_bound = error_bound;
+        header.quant_scale = quant_result.scale_factor;
+        header.data_min = quant_result.data_min;
+        header.data_max = quant_result.data_max;
+    } else {
+        header.quant_flags = 0;
+        header.quant_error_bound = 0.0;
+        header.quant_scale = 0.0;
+        header.data_min = 0.0;
+        header.data_max = 0.0;
+    }
+
     // Write header to device memory (at beginning of output buffer)
     writeHeaderToDevice(d_output_buffer, header, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    
+
     printf("Header written:\n");
     header.print();
     
@@ -324,43 +460,45 @@ int main(int argc, char* argv[]) {
     printf("Aligned for GDS write: %lu bytes\n", final_aligned_size);
         
     // ========== Step 7.5: Verify compression with decompression ==========
-    
+
     printf("\n###### Verifying data integrity ######\n");
-    
+
     // Configure decompression using the same compressor manager
     DecompressionConfig decomp_config = compressor->configure_decompression(d_compressed);
-    
+
     printf("Decompressed size: %lu bytes\n", decomp_config.decomp_data_size);
-    
+
     // Allocate buffer for decompressed data
     uint8_t* d_decompressed;
     CUDA_CHECK(cudaMalloc(&d_decompressed, decomp_config.decomp_data_size));
 
     // Decompress the data
     compressor->decompress(d_decompressed, d_compressed, decomp_config);
-    
+
     // ========== Step 7.6: Apply unshuffle if shuffle was used ==========
-    
-    uint8_t* d_verify_input = d_input;      // Default: compare to original input
+
+    uint8_t* d_verify_data = d_decompressed;
     uint8_t* d_unshuffled = nullptr;
-    
+    size_t verify_data_size = decomp_config.decomp_data_size;
+
     if (shuffle_element_size > 0) {
         printf("Applying byte unshuffle to restore original data format...\n");
-        
-        // Unshuffle the decompressed data to restore original format
-        const size_t SHUFFLE_CHUNK_SIZE = 256 * 1024;  // Same as shuffle
+
+        // Unshuffle the decompressed data
+        const size_t SHUFFLE_CHUNK_SIZE = 256 * 1024;
         d_unshuffled = byte_unshuffle_simple(
             d_decompressed,
-            file_size,
+            verify_data_size,
             shuffle_element_size,
             SHUFFLE_CHUNK_SIZE,
             ShuffleKernelType::AUTO,
             stream
         );
-        
+
         if (d_unshuffled == nullptr) {
             printf("Error: Byte unshuffle failed!\n");
             CUDA_CHECK(cudaFree(d_decompressed));
+            if (d_quantized) CUDA_CHECK(cudaFree(d_quantized));
             if (input_buf_registered) cuFileBufDeregister(d_input);
             cuFileHandleDeregister(cf_handle_in);
             cuFileDriverClose();
@@ -371,44 +509,125 @@ int main(int argc, char* argv[]) {
             close(fd_input);
             return -1;
         }
-        
+
         CUDA_CHECK(cudaStreamSynchronize(stream));
-        printf("✓ Byte unshuffle complete - data restored to original format\n");
-        
-        // Free the still-shuffled decompressed buffer, verify against unshuffled
+        printf("Byte unshuffle complete\n");
+
         CUDA_CHECK(cudaFree(d_decompressed));
-        d_decompressed = d_unshuffled;  // Point to unshuffled data for verification
+        d_verify_data = d_unshuffled;
     }
-    
-    // Verify that decompressed (and unshuffled if applicable) data matches original input
-    int* d_invalid;
-    CUDA_CHECK(cudaMallocHost(&d_invalid, sizeof(int)));
-    *d_invalid = 0;
-    
-    // Get device properties for optimal grid size
-    cudaDeviceProp deviceProp;
-    CUDA_CHECK(cudaGetDeviceProperties(&deviceProp, 0));
-    int sm_count = deviceProp.multiProcessorCount;
-    
-    // Launch comparison kernel - compare unshuffled decompressed data to original input
-    compare_buffers<<<2 * sm_count, 1024, 0, stream>>>(
-        d_verify_input, d_decompressed, d_invalid, file_size);
-    
-    // Synchronize and check result
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    
-    if (*d_invalid) {
-        if (shuffle_element_size > 0) {
-            printf("✗ FAILED: Shuffle → Compress → Decompress → Unshuffle did NOT restore original data!\n");
-            printf("  Data integrity check failed - full round-trip verification error!\n");
-        } else {
-            printf("✗ FAILED: Decompressed data does NOT match original input!\n");
-            printf("  Data integrity check failed - compression/decompression error!\n");
+
+    // ========== Step 7.7: Apply dequantization if quantization was used ==========
+
+    void* d_dequantized = nullptr;
+
+    if (quant_type != QuantizationType::NONE) {
+        printf("Applying dequantization to restore original values...\n");
+
+        d_dequantized = dequantize_simple(d_verify_data, quant_result, stream);
+
+        if (d_dequantized == nullptr) {
+            printf("Error: Dequantization failed!\n");
+            if (d_unshuffled) CUDA_CHECK(cudaFree(d_unshuffled));
+            if (d_quantized) CUDA_CHECK(cudaFree(d_quantized));
+            if (input_buf_registered) cuFileBufDeregister(d_input);
+            cuFileHandleDeregister(cf_handle_in);
+            cuFileDriverClose();
+            CUDA_CHECK(cudaFree(d_output_buffer));
+            if (d_shuffled) CUDA_CHECK(cudaFree(d_shuffled));
+            CUDA_CHECK(cudaFree(d_input));
+            CUDA_CHECK(cudaStreamDestroy(stream));
+            close(fd_input);
+            return -1;
         }
-        
-        // Cleanup and exit
+
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        printf("Dequantization complete\n");
+
+        // Free intermediate buffer
+        if (d_unshuffled) {
+            CUDA_CHECK(cudaFree(d_unshuffled));
+            d_unshuffled = nullptr;
+        } else {
+            CUDA_CHECK(cudaFree(d_decompressed));
+        }
+        d_verify_data = static_cast<uint8_t*>(d_dequantized);
+    }
+
+    // ========== Step 7.8: Verify data integrity ==========
+
+    bool verification_passed = false;
+
+    if (quant_type != QuantizationType::NONE) {
+        // For lossy quantization: verify error bound is respected
+        printf("Verifying error bound (lossy quantization)...\n");
+
+        double max_error = 0.0;
+        size_t num_elements = file_size / quant_element_size;
+
+        bool error_bound_ok = verify_error_bound(
+            d_input,
+            d_verify_data,
+            num_elements,
+            quant_element_size,
+            error_bound,
+            stream,
+            &max_error
+        );
+
+        if (error_bound_ok) {
+            printf("PASSED: Error bound verified!\n");
+            printf("  Max error: %.6e (bound: %.6e)\n", max_error, error_bound);
+            printf("  All %lu elements within specified error bound\n", num_elements);
+            verification_passed = true;
+        } else {
+            printf("FAILED: Error bound violated!\n");
+            printf("  Max error: %.6e exceeds bound: %.6e\n", max_error, error_bound);
+            verification_passed = false;
+        }
+    } else {
+        // For lossless: verify exact match
+        int* d_invalid;
+        CUDA_CHECK(cudaMallocHost(&d_invalid, sizeof(int)));
+        *d_invalid = 0;
+
+        cudaDeviceProp deviceProp;
+        CUDA_CHECK(cudaGetDeviceProperties(&deviceProp, 0));
+        int sm_count = deviceProp.multiProcessorCount;
+
+        compare_buffers<<<2 * sm_count, 1024, 0, stream>>>(
+            d_input, d_verify_data, d_invalid, file_size);
+
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        if (*d_invalid) {
+            if (shuffle_element_size > 0) {
+                printf("FAILED: Shuffle -> Compress -> Decompress -> Unshuffle did NOT restore original data!\n");
+            } else {
+                printf("FAILED: Decompressed data does NOT match original input!\n");
+            }
+            verification_passed = false;
+        } else {
+            if (shuffle_element_size > 0) {
+                printf("PASSED: Full round-trip verification successful!\n");
+                printf("  Shuffle -> Compress -> Decompress -> Unshuffle restored original data perfectly!\n");
+            } else {
+                printf("PASSED: Decompressed data matches original input perfectly!\n");
+            }
+            printf("  Data integrity verified: %lu bytes verified byte-by-byte\n", file_size);
+            verification_passed = true;
+        }
+
         CUDA_CHECK(cudaFreeHost(d_invalid));
-        CUDA_CHECK(cudaFree(d_decompressed));
+    }
+
+    // Clean up verification resources
+    if (d_dequantized) CUDA_CHECK(cudaFree(d_dequantized));
+    else if (d_unshuffled) CUDA_CHECK(cudaFree(d_unshuffled));
+    else CUDA_CHECK(cudaFree(d_decompressed));
+
+    if (!verification_passed) {
+        if (d_quantized) CUDA_CHECK(cudaFree(d_quantized));
         if (input_buf_registered) cuFileBufDeregister(d_input);
         cuFileHandleDeregister(cf_handle_in);
         cuFileDriverClose();
@@ -418,20 +637,7 @@ int main(int argc, char* argv[]) {
         CUDA_CHECK(cudaStreamDestroy(stream));
         close(fd_input);
         return -1;
-    } else {
-        if (shuffle_element_size > 0) {
-            printf("✓ PASSED: Full round-trip verification successful!\n");
-            printf("  Shuffle → Compress → Decompress → Unshuffle restored original data perfectly!\n");
-            printf("  Data integrity verified: %lu bytes verified byte-by-byte\n", file_size);
-        } else {
-            printf("✓ PASSED: Decompressed data matches original input perfectly!\n");
-            printf("  Data integrity verified: %lu bytes verified byte-by-byte\n", file_size);
-        }
     }
-    
-    // Clean up verification resources
-    CUDA_CHECK(cudaFreeHost(d_invalid));
-    CUDA_CHECK(cudaFree(d_decompressed));
 
     // ========== Step 8: Open output file and write compressed data ==========
     
@@ -523,28 +729,35 @@ int main(int argc, char* argv[]) {
     if (d_shuffled != nullptr) {
         CUDA_CHECK(cudaFree(d_shuffled));
     }
+    if (d_quantized != nullptr) {
+        CUDA_CHECK(cudaFree(d_quantized));
+    }
     CUDA_CHECK(cudaFree(d_input));
-    
+
     close(fd_out);
     close(fd_input);
-    
-    printf("✓ Cleanup complete\n");
-    
-    // nvtxRangePop();
+
+    printf("Cleanup complete\n");
 
     // ========== Summary ==========
     printf("\n========================================\n");
     printf("           SUCCESS!\n");
     printf("========================================\n");
     printf("Algorithm: %s\n", getAlgorithmName(algo).c_str());
-    printf("Shuffle: %s\n", shuffle_element_size > 0 ? 
+    if (quant_type != QuantizationType::NONE) {
+        printf("Quantization: %s (error bound: %.2e)\n",
+               getQuantizationTypeName(quant_type), error_bound);
+    } else {
+        printf("Quantization: None (lossless)\n");
+    }
+    printf("Shuffle: %s\n", shuffle_element_size > 0 ?
            (std::to_string(shuffle_element_size) + "-byte").c_str() : "None");
     printf("Input:  %s (%.2f MB)\n", input_file, file_size / (1024.0 * 1024.0));
-    printf("Output: %s (%.2f MB, includes metadata header)\n", 
+    printf("Output: %s (%.2f MB, includes metadata header)\n",
            output_file, total_output_size / (1024.0 * 1024.0));
     printf("Compressed data only: %.2f MB\n", compressed_size / (1024.0 * 1024.0));
     printf("Compression ratio: %.2fx\n", (double)file_size / compressed_size);
-    printf("Space saved: %.2f MB (%.1f%%)\n", 
+    printf("Space saved: %.2f MB (%.1f%%)\n",
            (file_size - compressed_size) / (1024.0 * 1024.0),
            100.0 * (1.0 - (double)compressed_size / file_size));
     printf("\n");

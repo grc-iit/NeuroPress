@@ -31,6 +31,9 @@
 #include "compression_header.h"
 #include "byte_shuffle.cuh"
 
+// Quantization for lossy preprocessing
+#include "quantization.cuh"
+
 using namespace nvcomp;
 
 // CUDA error checking macro
@@ -48,14 +51,17 @@ using namespace nvcomp;
 void usage(const char* prog) {
     printf("Usage: %s <compressed_input_file> <decompressed_output_file>\n", prog);
     printf("\nReads compressed data from input_file using GDS,\n");
-    printf("decompresses it on GPU with nvcomp (auto-detects algorithm), and writes\n");
+    printf("decompresses it on GPU with nvcomp (auto-detects algorithm),\n");
+    printf("applies unshuffle and/or dequantization as needed, and writes\n");
     printf("decompressed data to output_file using GDS.\n");
     printf("\nSupported compression formats:\n");
     printf("  - LZ4, Snappy, Deflate, Gdeflate, Zstd, ANS, Cascaded, Bitcomp\n");
     printf("  - Algorithm is automatically detected from compressed data header\n");
+    printf("\nPreprocessing support:\n");
+    printf("  - Byte shuffle: automatically reversed if applied during compression\n");
+    printf("  - Quantization: automatically reversed (lossy) if applied during compression\n");
     printf("\nExample:\n");
-    printf("  %s compressed.bin.lz4 decompressed.bin\n", prog);
-    printf("  %s compressed.bin.zst decompressed.bin\n", prog);
+    printf("  %s compressed.bin decompressed.bin\n", prog);
     exit(1);
 }
 
@@ -228,15 +234,15 @@ int main(int argc, char* argv[]) {
     printf("  Decompression ratio: %.2fx\n", (double)decompressed_size / header.compressed_size);
     
     // ========== Step 7.5: Apply unshuffle if shuffle was used ==========
-    
-    uint8_t* d_final_output = d_decompressed;  // Default: output decompressed data as-is
+
+    uint8_t* d_processing = d_decompressed;  // Current data being processed
     uint8_t* d_unshuffled = nullptr;
-    size_t final_output_allocated_size = aligned_decompressed_size;  // Track actual allocated size
-    
+    size_t processing_size = decompressed_size;
+
     if (header.hasShuffleApplied()) {
         printf("\n###### Applying byte unshuffle (shuffle was applied during compression) ######\n");
         printf("Element size: %u bytes\n", header.shuffle_element_size);
-        
+
         // Apply unshuffle to restore original data format
         const size_t SHUFFLE_CHUNK_SIZE = 256 * 1024;  // 256KB chunks
         d_unshuffled = byte_unshuffle_simple(
@@ -247,9 +253,9 @@ int main(int argc, char* argv[]) {
             ShuffleKernelType::AUTO,
             stream
         );
-        
+
         if (d_unshuffled == nullptr) {
-            printf("✗ Error: Byte unshuffle failed!\n");
+            printf("Error: Byte unshuffle failed!\n");
             if (input_buf_registered) cuFileBufDeregister(d_compressed);
             cuFileHandleDeregister(cf_handle_in);
             cuFileDriverClose();
@@ -259,26 +265,102 @@ int main(int argc, char* argv[]) {
             close(fd_input);
             return -1;
         }
-        
+
         CUDA_CHECK(cudaStreamSynchronize(stream));
-        printf("✓ Byte unshuffle complete - original data format restored\n");
-        
+        printf("Byte unshuffle complete\n");
+
         // Free the still-shuffled decompressed buffer
         CUDA_CHECK(cudaFree(d_decompressed));
-        d_final_output = d_unshuffled;  // Output the unshuffled data
-        
-        // IMPORTANT: byte_unshuffle_simple allocates exact size, not aligned
-        // We need to reallocate with proper alignment for GDS or adjust our write size
-        final_output_allocated_size = decompressed_size;  // Actual allocated size
+        d_processing = d_unshuffled;
     }
-    
-    size_t final_aligned_size = ((decompressed_size + 4095) / 4096) * 4096;
-    printf("  Aligned for GDS write: %lu bytes\n", final_aligned_size);
+
+    // ========== Step 7.6: Apply dequantization if quantization was used ==========
+
+    uint8_t* d_final_output = d_processing;  // Final output (may be dequantized)
+    void* d_dequantized = nullptr;
+    size_t final_output_size = header.original_size;  // True original size
+
+    if (header.hasQuantizationApplied()) {
+        printf("\n###### Applying dequantization (quantization was applied during compression) ######\n");
+
+        const char* type_str = "Unknown";
+        switch (header.getQuantizationType()) {
+            case 0: type_str = "None"; break;
+            case 1: type_str = "Linear"; break;
+            case 2: type_str = "Lorenzo 1D"; break;
+            case 3: type_str = "Block Transform"; break;
+        }
+
+        printf("Quantization method: %s\n", type_str);
+        printf("Precision: %d bits\n", header.getQuantizationPrecision());
+        printf("Error bound: %.6e\n", header.quant_error_bound);
+        printf("Data range: [%.6e, %.6e]\n", header.data_min, header.data_max);
+
+        // Determine original element size based on original_size and quantized size
+        size_t num_quantized_bytes = processing_size;
+        size_t precision_bytes = header.getQuantizationPrecision() / 8;
+        size_t num_elements = num_quantized_bytes / precision_bytes;
+        size_t original_element_size = header.original_size / num_elements;
+
+        if (original_element_size != 4 && original_element_size != 8) {
+            // Fallback: assume float32
+            original_element_size = 4;
+            num_elements = header.original_size / original_element_size;
+        }
+
+        // Build QuantizationResult metadata for dequantization
+        QuantizationResult quant_metadata;
+        quant_metadata.d_quantized = d_processing;
+        quant_metadata.quantized_bytes = num_quantized_bytes;
+        quant_metadata.actual_precision = header.getQuantizationPrecision();
+        quant_metadata.data_min = header.data_min;
+        quant_metadata.data_max = header.data_max;
+        quant_metadata.scale_factor = header.quant_scale;
+        quant_metadata.error_bound = header.quant_error_bound;
+        quant_metadata.type = static_cast<QuantizationType>(header.getQuantizationType());
+        quant_metadata.num_elements = num_elements;
+        quant_metadata.original_element_size = original_element_size;
+
+        printf("Dequantizing %zu elements (%zu bytes -> %zu bytes)...\n",
+               num_elements, num_quantized_bytes, header.original_size);
+
+        d_dequantized = dequantize_simple(d_processing, quant_metadata, stream);
+
+        if (d_dequantized == nullptr) {
+            printf("Error: Dequantization failed!\n");
+            if (d_unshuffled) CUDA_CHECK(cudaFree(d_unshuffled));
+            else CUDA_CHECK(cudaFree(d_decompressed));
+            if (input_buf_registered) cuFileBufDeregister(d_compressed);
+            cuFileHandleDeregister(cf_handle_in);
+            cuFileDriverClose();
+            CUDA_CHECK(cudaFree(d_compressed));
+            CUDA_CHECK(cudaStreamDestroy(stream));
+            close(fd_input);
+            return -1;
+        }
+
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        printf("Dequantization complete - original values restored (within error bound)\n");
+
+        // Free intermediate buffer
+        if (d_unshuffled) {
+            CUDA_CHECK(cudaFree(d_unshuffled));
+        } else {
+            CUDA_CHECK(cudaFree(d_decompressed));
+        }
+
+        d_final_output = static_cast<uint8_t*>(d_dequantized);
+    } else {
+        // No quantization - output size is decompressed size
+        final_output_size = decompressed_size;
+    }
+
+    size_t final_output_allocated_size = final_output_size;  // Actual allocated size
 
     // ========== Step 8: Open output file and write decompressed data ==========
-    
-    printf("\n--- Writing decompressed data via GDS ---\n");
-    
+
+    printf("\n###### Writing decompressed data via GDS ######\n");
+
     // Open output file with O_DIRECT for GDS
     int fd_out = open(output_file, O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT, 0666);
     if (fd_out == -1) {
@@ -287,7 +369,7 @@ int main(int argc, char* argv[]) {
         if (input_buf_registered) cuFileBufDeregister(d_compressed);
         cuFileHandleDeregister(cf_handle_in);
         cuFileDriverClose();
-        CUDA_CHECK(cudaFree(d_decompressed));
+        CUDA_CHECK(cudaFree(d_final_output));
         CUDA_CHECK(cudaFree(d_compressed));
         close(fd_input);
         return -1;
@@ -298,7 +380,7 @@ int main(int argc, char* argv[]) {
     memset(&cf_descr_out, 0, sizeof(CUfileDescr_t));
     cf_descr_out.handle.fd = fd_out;
     cf_descr_out.type = CU_FILE_HANDLE_TYPE_OPAQUE_FD;
-    
+
     CUfileHandle_t cf_handle_out;
     status = cuFileHandleRegister(&cf_handle_out, &cf_descr_out);
     if (status.err != CU_FILE_SUCCESS) {
@@ -307,13 +389,13 @@ int main(int argc, char* argv[]) {
         if (input_buf_registered) cuFileBufDeregister(d_compressed);
         cuFileHandleDeregister(cf_handle_in);
         cuFileDriverClose();
-        CUDA_CHECK(cudaFree(d_decompressed));
+        CUDA_CHECK(cudaFree(d_final_output));
         CUDA_CHECK(cudaFree(d_compressed));
         close(fd_input);
         return -1;
     }
 
-    // Register output buffer (final output data - either decompressed or unshuffled)
+    // Register output buffer (final output data - may be decompressed, unshuffled, or dequantized)
     // Use actual allocated size to avoid buffer overrun
     bool output_buf_registered = true;
     status = cuFileBufRegister(d_final_output, final_output_allocated_size, 0);
@@ -323,10 +405,10 @@ int main(int argc, char* argv[]) {
     }
 
     // Write final output data from GPU to file using GDS
-    // Write only the actual data size, not aligned size (GDS can handle unaligned writes for last chunk)
-    ssize_t bytes_written = cuFileWrite(cf_handle_out, d_final_output, decompressed_size, 0, 0);
-    if (bytes_written != (ssize_t)decompressed_size) {
-        printf("Error: cuFileWrite returned %ld instead of %lu\n", bytes_written, decompressed_size);
+    // Use final_output_size which is the true original size
+    ssize_t bytes_written = cuFileWrite(cf_handle_out, d_final_output, final_output_size, 0, 0);
+    if (bytes_written != (ssize_t)final_output_size) {
+        printf("Error: cuFileWrite returned %ld instead of %lu\n", bytes_written, final_output_size);
         if (output_buf_registered) cuFileBufDeregister(d_final_output);
         cuFileHandleDeregister(cf_handle_out);
         close(fd_out);
@@ -339,51 +421,75 @@ int main(int argc, char* argv[]) {
         return -1;
     }
     
-    printf("✓ Wrote %ld bytes of %s data to %s via GDS\n", 
-           bytes_written, 
-           header.hasShuffleApplied() ? "unshuffled" : "decompressed",
+    const char* output_desc = "restored original";
+    if (header.hasQuantizationApplied() && header.hasShuffleApplied()) {
+        output_desc = "dequantized + unshuffled";
+    } else if (header.hasQuantizationApplied()) {
+        output_desc = "dequantized";
+    } else if (header.hasShuffleApplied()) {
+        output_desc = "unshuffled";
+    } else {
+        output_desc = "decompressed";
+    }
+
+    printf("Wrote %ld bytes of %s data to %s via GDS\n",
+           bytes_written,
+           output_desc,
            output_file);
-    
-    // Truncate file to actual decompressed size (remove padding)
-    ftruncate(fd_out, decompressed_size);
-    
-    // nvtxRangePop();
+
+    // Truncate file to actual size (remove padding)
+    ftruncate(fd_out, final_output_size);
 
     // ========== Step 9: Cleanup ==========
-    
+
     if (output_buf_registered) cuFileBufDeregister(d_final_output);
     if (input_buf_registered) cuFileBufDeregister(d_compressed);
-    
+
     cuFileHandleDeregister(cf_handle_out);
     cuFileHandleDeregister(cf_handle_in);
     cuFileDriverClose();
-    
+
     // IMPORTANT: Destroy decompressor BEFORE destroying the stream it uses
     decompressor.reset();  // Manually destroy the nvcomp manager
-    
+
     CUDA_CHECK(cudaStreamDestroy(stream));
     CUDA_CHECK(cudaFree(d_final_output));
     CUDA_CHECK(cudaFree(d_compressed));
-    
+
     close(fd_out);
     close(fd_input);
-    
-    printf("✓ Cleanup complete\n");
+
+    printf("Cleanup complete\n");
 
     // ========== Summary ==========
     printf("\n========================================\n");
     printf("           SUCCESS!\n");
     printf("========================================\n");
     printf("Algorithm: Auto-detected\n");
-    printf("Shuffle: %s\n", header.hasShuffleApplied() ? 
+
+    if (header.hasQuantizationApplied()) {
+        const char* type_str = "Unknown";
+        switch (header.getQuantizationType()) {
+            case 0: type_str = "None"; break;
+            case 1: type_str = "Linear"; break;
+            case 2: type_str = "Lorenzo 1D"; break;
+            case 3: type_str = "Block Transform"; break;
+        }
+        printf("Quantization: %s (error bound: %.2e, %d-bit) - LOSSY\n",
+               type_str, header.quant_error_bound, header.getQuantizationPrecision());
+    } else {
+        printf("Quantization: None (lossless)\n");
+    }
+
+    printf("Shuffle: %s\n", header.hasShuffleApplied() ?
            (std::to_string(header.shuffle_element_size) + "-byte (unshuffled)").c_str() : "None");
-    printf("Input (compressed):  %s (%.2f MB, includes metadata)\n", 
+    printf("Input (compressed):  %s (%.2f MB, includes metadata)\n",
            input_file, file_size / (1024.0 * 1024.0));
-    printf("Output (original): %s (%.2f MB)\n", 
-           output_file, decompressed_size / (1024.0 * 1024.0));
-    printf("Decompression ratio: %.2fx\n", (double)decompressed_size / header.compressed_size);
-    printf("Data expanded: %.2f MB\n", 
-           (decompressed_size - header.compressed_size) / (1024.0 * 1024.0));
+    printf("Output (original): %s (%.2f MB)\n",
+           output_file, final_output_size / (1024.0 * 1024.0));
+    printf("Decompression ratio: %.2fx\n", (double)final_output_size / header.compressed_size);
+    printf("Data expanded: %.2f MB\n",
+           (final_output_size - header.compressed_size) / (1024.0 * 1024.0));
     printf("\n");
 
     return 0;
