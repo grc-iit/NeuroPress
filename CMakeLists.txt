@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.18)
 
 # Project configuration
-project(GPUCompression LANGUAGES CXX CUDA)
+project(GPUCompression LANGUAGES CXX CUDA C)
 
 # C++ standard
 set(CMAKE_CXX_STANDARD 14)
@@ -9,20 +9,29 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 14)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-# Debug symbols
-set(CMAKE_BUILD_TYPE Debug)
+# Build type
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
+endif()
+
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
 set(CMAKE_CUDA_FLAGS_DEBUG "-g -G -O0")
+set(CMAKE_CXX_FLAGS_RELEASE "-O3")
+set(CMAKE_CUDA_FLAGS_RELEASE "-O3")
 
 # Find CUDA
 find_package(CUDAToolkit REQUIRED)
 
+# Optional: Find HDF5 for filter plugin
+find_package(HDF5 COMPONENTS C)
+
 # Include directories
 include_directories(
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
     /tmp/include
     /usr/local/cuda/include
     ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
 # Link directories
@@ -30,10 +39,23 @@ link_directories(
     /tmp/lib
 )
 
-# Source files
+# ============================================================
+# Core Sources (reusable across targets)
+# ============================================================
 set(FACTORY_SOURCES
     src/CompressionFactory.cpp
     src/CompressionFactory.hpp
+)
+
+set(PREPROCESSING_SOURCES
+    src/byte_shuffle_kernels.cu
+    src/quantization_kernels.cu
+)
+
+set(LIB_SOURCES
+    src/lib/gpucompress_api.cpp
+    src/lib/entropy_kernel.cu
+    src/lib/qtable_gpu.cu
 )
 
 # Set language property for .cpp files that use CUDA
@@ -41,14 +63,89 @@ set_source_files_properties(
     src/CompressionFactory.cpp
     src/GPU_Compress.cpp
     src/GPU_Decompress.cpp
+    src/lib/gpucompress_api.cpp
     PROPERTIES LANGUAGE CUDA
 )
 
-# ========== Executable 1: GPU Compress (with verification) ==========
+# ============================================================
+# Shared Library: libgpucompress.so
+# ============================================================
+add_library(gpucompress SHARED
+    ${LIB_SOURCES}
+    ${PREPROCESSING_SOURCES}
+    ${FACTORY_SOURCES}
+)
+
+target_include_directories(gpucompress
+    PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+    PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+target_link_libraries(gpucompress
+    PRIVATE
+    nvcomp
+    CUDA::cudart
+)
+
+set_target_properties(gpucompress PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    POSITION_INDEPENDENT_CODE ON
+    VERSION 1.0.0
+    SOVERSION 1
+    OUTPUT_NAME gpucompress
+)
+
+# ============================================================
+# HDF5 Filter Plugin: libH5Zgpucompress.so (Optional)
+# ============================================================
+if(HDF5_FOUND)
+    message(STATUS "HDF5 found: ${HDF5_VERSION}")
+    message(STATUS "  Include dirs: ${HDF5_INCLUDE_DIRS}")
+    message(STATUS "  Libraries: ${HDF5_C_LIBRARIES}")
+
+    add_library(H5Zgpucompress SHARED
+        src/hdf5/H5Zgpucompress.c
+    )
+
+    target_include_directories(H5Zgpucompress
+        PRIVATE
+        ${HDF5_INCLUDE_DIRS}
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/hdf5
+    )
+
+    target_link_libraries(H5Zgpucompress
+        PRIVATE
+        gpucompress
+        ${HDF5_C_LIBRARIES}
+    )
+
+    set_target_properties(H5Zgpucompress PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+        VERSION 1.0.0
+        SOVERSION 1
+        OUTPUT_NAME H5Zgpucompress
+    )
+
+    # Define for plugin exports
+    target_compile_definitions(H5Zgpucompress PRIVATE GPUCOMPRESS_BUILD_HDF5_PLUGIN)
+
+else()
+    message(STATUS "HDF5 not found - skipping filter plugin libH5Zgpucompress.so")
+    message(STATUS "  To build HDF5 plugin, install HDF5 development libraries:")
+    message(STATUS "    Ubuntu/Debian: sudo apt-get install libhdf5-dev")
+    message(STATUS "    RHEL/CentOS:   sudo yum install hdf5-devel")
+endif()
+
+# ============================================================
+# Executable 1: GPU Compress (with verification)
+# ============================================================
 add_executable(gpu_compress
     src/GPU_Compress.cpp
-    src/byte_shuffle_kernels.cu
-    src/quantization_kernels.cu
+    ${PREPROCESSING_SOURCES}
     ${FACTORY_SOURCES}
 )
 
@@ -63,11 +160,12 @@ set_target_properties(gpu_compress PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
 )
 
-# ========== Executable 2: GPU Decompress ==========
+# ============================================================
+# Executable 2: GPU Decompress
+# ============================================================
 add_executable(gpu_decompress
     src/GPU_Decompress.cpp
-    src/byte_shuffle_kernels.cu
-    src/quantization_kernels.cu
+    ${PREPROCESSING_SOURCES}
     ${FACTORY_SOURCES}
 )
 
@@ -82,11 +180,12 @@ set_target_properties(gpu_decompress PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
 )
 
-# ========== Executable 3: Quantization Test Suite ==========
+# ============================================================
+# Executable 3: Quantization Test Suite
+# ============================================================
 add_executable(test_quantization
     tests/quantization/test_quantization_suite.cu
-    src/byte_shuffle_kernels.cu
-    src/quantization_kernels.cu
+    ${PREPROCESSING_SOURCES}
 )
 
 target_link_libraries(test_quantization
@@ -99,18 +198,60 @@ set_target_properties(test_quantization PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
 )
 
-# Display build configuration
-message(STATUS "Building GPU Compression/Decompression with modular factory pattern")
-message(STATUS "Executables:")
-message(STATUS "  - gpu_compress: Compression with data verification and preprocessing")
-message(STATUS "  - gpu_decompress: Decompression (auto-detects algorithm and preprocessing)")
-message(STATUS "  - test_quantization: Quantization test suite for correctness and metrics")
-message(STATUS "Features:")
-message(STATUS "  - CompressionFactory.cpp/hpp (Factory pattern)")
-message(STATUS "  - nvcomp library support (LZ4, Snappy, Deflate, Gdeflate, Zstd, ANS, Cascaded, Bitcomp)")
-message(STATUS "  - Error-bound quantization (Linear)")
-message(STATUS "  - Byte shuffle preprocessing for better compression ratios")
-message(STATUS "  - GPUDirect Storage (cuFile) support for direct GPU<->NVMe transfers")
-message(STATUS "  - 4KB alignment for optimal GDS performance")
-message(STATUS "Note: Using .cpp extension with CUDA compilation")
+# ============================================================
+# Installation
+# ============================================================
+include(GNUInstallDirs)
 
+# Install shared library
+install(TARGETS gpucompress
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+
+# Install headers
+install(DIRECTORY include/
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    FILES_MATCHING PATTERN "*.h"
+)
+
+# Install executables
+install(TARGETS gpu_compress gpu_decompress
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+
+# Install HDF5 plugin to standard plugin directory
+if(HDF5_FOUND)
+    install(TARGETS H5Zgpucompress
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/hdf5/plugin
+    )
+endif()
+
+# ============================================================
+# Build Summary
+# ============================================================
+message(STATUS "")
+message(STATUS "=== GPUCompress Build Configuration ===")
+message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
+message(STATUS "")
+message(STATUS "Targets:")
+message(STATUS "  - libgpucompress.so    (shared library with C API)")
+message(STATUS "  - gpu_compress         (compression executable)")
+message(STATUS "  - gpu_decompress       (decompression executable)")
+message(STATUS "  - test_quantization    (quantization test suite)")
+if(HDF5_FOUND)
+    message(STATUS "  - libH5Zgpucompress.so (HDF5 filter plugin)")
+endif()
+message(STATUS "")
+message(STATUS "Features:")
+message(STATUS "  - 8 compression algorithms (LZ4, Snappy, Deflate, Gdeflate, Zstd, ANS, Cascaded, Bitcomp)")
+message(STATUS "  - GPU-accelerated entropy calculation")
+message(STATUS "  - Q-Table based RL algorithm selection")
+message(STATUS "  - Error-bound quantization (lossy)")
+message(STATUS "  - Byte shuffle preprocessing")
+message(STATUS "  - GPUDirect Storage (GDS) support")
+if(HDF5_FOUND)
+    message(STATUS "  - HDF5 filter plugin (set HDF5_PLUGIN_PATH to use)")
+endif()
+message(STATUS "")
