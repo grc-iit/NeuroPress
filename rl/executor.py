@@ -114,33 +114,44 @@ class CompressionExecutor:
 
     def calculate_mad(self, data: np.ndarray) -> float:
         """
-        Calculate Mean Absolute Deviation of data.
+        Calculate normalized Mean Absolute Deviation of data.
+
+        Formula: mean(|data - mean|) / (max - min)
+        Normalized to [0, ~0.5] so it's scale-invariant.
 
         Args:
             data: Input data as numpy array
 
         Returns:
-            Mean absolute deviation
+            Normalized mean absolute deviation (0.0 for constant data)
         """
-        mean = np.mean(data, dtype=np.float64)
-        return float(np.mean(np.abs(data.astype(np.float64) - mean)))
+        flat = data.flatten().astype(np.float64)
+        data_range = float(flat.max() - flat.min())
+        if data_range == 0.0:
+            return 0.0
+        mean = np.mean(flat)
+        return float(np.mean(np.abs(flat - mean))) / data_range
 
     def calculate_first_derivative(self, data: np.ndarray) -> float:
         """
-        Calculate mean absolute first derivative of data.
+        Calculate normalized mean absolute first derivative of data.
 
-        Formula: mean(|data[i+1] - data[i]|)
+        Formula: mean(|data[i+1] - data[i]|) / (max - min)
+        Normalized to [0, 1] so it's scale-invariant.
 
         Args:
             data: Input data as numpy array
 
         Returns:
-            Mean absolute first derivative
+            Normalized mean absolute first derivative (0.0 for constant data)
         """
         if data.size < 2:
             return 0.0
         flat = data.flatten().astype(np.float64)
-        return float(np.mean(np.abs(np.diff(flat))))
+        data_range = float(flat.max() - flat.min())
+        if data_range == 0.0:
+            return 0.0
+        return float(np.mean(np.abs(np.diff(flat)))) / data_range
 
     def calculate_all_metrics(self, data: np.ndarray) -> dict:
         """

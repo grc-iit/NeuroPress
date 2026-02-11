@@ -11,7 +11,10 @@ Main training loop that:
 """
 
 import argparse
+import csv
 import random
+import time
+import sys
 import numpy as np
 from pathlib import Path
 from typing import List, Optional
@@ -106,6 +109,50 @@ class QTableTrainer:
 
         return sorted(files)
 
+    @staticmethod
+    def _format_eta(seconds: float) -> str:
+        """Format seconds into human-readable ETA string."""
+        if seconds < 0 or not np.isfinite(seconds):
+            return "--:--"
+        seconds = int(seconds)
+        if seconds < 60:
+            return f"{seconds}s"
+        elif seconds < 3600:
+            return f"{seconds // 60}m {seconds % 60:02d}s"
+        else:
+            h = seconds // 3600
+            m = (seconds % 3600) // 60
+            return f"{h}h {m:02d}m"
+
+    def _print_progress(self, episode: int, total_episodes: int,
+                        epoch: int, n_epochs: int,
+                        file_idx: int, n_files: int,
+                        elapsed: float, avg_reward: float):
+        """Print a single-line progress bar that updates in-place."""
+        pct = episode / total_episodes * 100
+        eps = self.policy.get_epsilon()
+
+        # ETA from elapsed time and episodes done
+        if episode > 0:
+            eta = elapsed / episode * (total_episodes - episode)
+        else:
+            eta = 0.0
+
+        # Build progress bar (20 chars wide)
+        bar_width = 20
+        filled = int(bar_width * episode / total_episodes)
+        bar = '█' * filled + '░' * (bar_width - filled)
+
+        line = (f"\r  {bar} {pct:5.1f}% | "
+                f"Ep {epoch+1}/{n_epochs} File {file_idx+1}/{n_files} | "
+                f"Ep#{episode}/{total_episodes} | "
+                f"ε={eps:.3f} | "
+                f"avg_r={avg_reward:.3f} | "
+                f"ETA: {self._format_eta(eta)}")
+
+        sys.stdout.write(line)
+        sys.stdout.flush()
+
     def train(
         self,
         n_epochs: int = DEFAULT_EPOCHS,
@@ -124,71 +171,132 @@ class QTableTrainer:
             print("Error: No training files found!")
             return
 
+        n_files = len(self.training_files)
+        n_eb = len(self.error_bounds)
+        total_episodes = n_epochs * n_files * n_eb
+
         print(f"\n{'='*60}")
         print("Q-Table Training for Compression Algorithm Selection")
         print(f"{'='*60}")
-        print(f"Training files: {len(self.training_files)}")
-        print(f"Epochs: {n_epochs}")
-        print(f"Reward preset: {self.reward_preset}")
+        print(f"Training files:   {n_files}")
+        print(f"Epochs:           {n_epochs}")
+        print(f"Error bounds:     {self.error_bounds} ({n_eb} levels)")
+        print(f"Total episodes:   {total_episodes}")
+        print(f"Reward preset:    {self.reward_preset}")
         print(f"  → {get_preset_description(self.reward_preset)}")
-        print(f"Error bounds: {self.error_bounds}")
+        print(f"Save policy:      after every file (crash-safe)")
         print(f"{'='*60}\n")
 
         # Create output directory
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        json_path = self.output_dir / 'qtable.json'
 
-        for epoch in range(n_epochs):
-            epoch_rewards = []
-            epoch_ratios = []
+        # Open benchmark CSV (append if resuming, otherwise new)
+        csv_path = self.output_dir / 'benchmark_results.csv'
+        csv_exists = csv_path.exists() and csv_path.stat().st_size > 0
+        csv_file = open(csv_path, 'a', newline='')
+        csv_fieldnames = [
+            'epoch', 'episode', 'filename', 'error_bound',
+            'entropy', 'mad', 'first_derivative',
+            'state', 'entropy_bin', 'error_level', 'mad_bin', 'deriv_bin',
+            'action', 'algorithm', 'quantization', 'shuffle_size',
+            'exploration', 'epsilon',
+            'original_size', 'compressed_size',
+            'ratio', 'throughput_mbps', 'psnr_db',
+            'reward', 'old_q', 'new_q', 'td_error'
+        ]
+        csv_writer = csv.DictWriter(csv_file, fieldnames=csv_fieldnames)
+        if not csv_exists:
+            csv_writer.writeheader()
+            csv_file.flush()
 
-            # Shuffle training files each epoch
-            files = self.training_files.copy()
-            random.shuffle(files)
+        print(f"Benchmark CSV:    {csv_path}")
 
-            for i, filepath in enumerate(files):
-                for eb in self.error_bounds:
-                    if verbose and i % 10 == 0 and eb == self.error_bounds[0]:
-                        print(f"Epoch {epoch+1}/{n_epochs}, File {i+1}/{len(files)}, "
-                              f"ε={self.policy.get_epsilon():.3f}")
+        episode_count = 0
+        running_reward = 0.0
+        start_time = time.time()
 
-                    # Run training episode with this error bound
-                    reward, ratio = self._train_episode(filepath, eb)
+        try:
+            for epoch in range(n_epochs):
+                epoch_rewards = []
+                epoch_ratios = []
 
-                    if reward is not None:
-                        epoch_rewards.append(reward)
-                        epoch_ratios.append(ratio)
+                # Shuffle training files each epoch
+                files = self.training_files.copy()
+                random.shuffle(files)
 
-            # Decay epsilon
-            self.policy.decay()
+                for i, filepath in enumerate(files):
+                    for eb in self.error_bounds:
+                        # Run training episode with this error bound
+                        reward, ratio = self._train_episode(
+                            filepath, eb, epoch, episode_count, csv_writer
+                        )
+                        episode_count += 1
 
-            # Record epoch statistics
-            if epoch_rewards:
-                avg_reward = np.mean(epoch_rewards)
-                avg_ratio = np.mean(epoch_ratios)
-                self.episode_rewards.append(avg_reward)
-                self.episode_ratios.append(avg_ratio)
+                        if reward is not None:
+                            epoch_rewards.append(reward)
+                            epoch_ratios.append(ratio)
+                            # Exponential moving average for display
+                            running_reward = 0.95 * running_reward + 0.05 * reward
 
-                if verbose:
-                    print(f"Epoch {epoch+1}: avg_reward={avg_reward:.4f}, "
-                          f"avg_ratio={avg_ratio:.2f}x, ε={self.policy.get_epsilon():.3f}")
+                        # Update progress bar
+                        if verbose:
+                            self._print_progress(
+                                episode_count, total_episodes,
+                                epoch, n_epochs, i, n_files,
+                                time.time() - start_time, running_reward
+                            )
 
-            # Save checkpoint
-            if (epoch + 1) % checkpoint_interval == 0:
-                self._save_checkpoint(epoch + 1)
+                    # Save Q-table after each file (all its error bounds)
+                    self.qtable.save(str(json_path))
+                    csv_file.flush()
 
-        # Save final model
+                # Decay epsilon
+                self.policy.decay()
+
+                # Record epoch statistics
+                if epoch_rewards:
+                    avg_reward = np.mean(epoch_rewards)
+                    avg_ratio = np.mean(epoch_ratios)
+                    self.episode_rewards.append(avg_reward)
+                    self.episode_ratios.append(avg_ratio)
+
+                    if verbose:
+                        elapsed = time.time() - start_time
+                        print(f"\n  Epoch {epoch+1}/{n_epochs} done: "
+                              f"avg_reward={avg_reward:.4f}, avg_ratio={avg_ratio:.2f}x, "
+                              f"ε={self.policy.get_epsilon():.3f}, "
+                              f"elapsed={self._format_eta(elapsed)}")
+
+                # Save epoch checkpoint
+                if (epoch + 1) % checkpoint_interval == 0:
+                    self._save_checkpoint(epoch + 1)
+
+        finally:
+            csv_file.close()
+
+        # Save final model (JSON + binary)
         self._save_final()
+
+        elapsed_total = time.time() - start_time
+        print(f"\nTotal training time: {self._format_eta(elapsed_total)}")
+        print(f"Benchmark results:  {csv_path}")
 
         # Print summary
         self._print_summary()
 
-    def _train_episode(self, filepath: Path, error_bound: float) -> tuple:
+    def _train_episode(self, filepath: Path, error_bound: float,
+                       epoch: int = 0, episode: int = 0,
+                       csv_writer=None) -> tuple:
         """
         Run one training episode on a single file.
 
         Args:
             filepath: Path to training data file
             error_bound: Error bound for this episode
+            epoch: Current epoch number
+            episode: Global episode counter
+            csv_writer: CSV DictWriter for benchmark logging
 
         Returns:
             Tuple of (reward, compression_ratio) or (None, None) on error
@@ -199,10 +307,10 @@ class QTableTrainer:
 
             # Load data and calculate all metrics
             data = np.fromfile(filepath, dtype=np.float32)
-            metrics = self.executor.calculate_all_metrics(data)
-            entropy = metrics['entropy']
-            mad = metrics['mad']
-            first_derivative = metrics['first_derivative']
+            input_metrics = self.executor.calculate_all_metrics(data)
+            entropy = input_metrics['entropy']
+            mad = input_metrics['mad']
+            first_derivative = input_metrics['first_derivative']
             print(f"  [METRICS] {filename}: entropy={entropy:.4f} bits "
                   f"(bin={min(NUM_ENTROPY_BINS - 1, int(entropy * 2))}), "
                   f"mad={mad:.6f}, deriv={first_derivative:.6f}")
@@ -244,29 +352,61 @@ class QTableTrainer:
                   f"shuffle_size={action_config['shuffle_size']}")
 
             # Execute compression
-            metrics = self.executor.execute_action(
+            comp_metrics = self.executor.execute_action(
                 input_file=str(filepath),
                 action_config=action_config,
                 error_bound=error_bound
             )
 
-            if not metrics['success']:
-                print(f"  [RESULT] FAILED: {metrics.get('error', 'unknown error')}")
+            if not comp_metrics['success']:
+                print(f"  [RESULT] FAILED: {comp_metrics.get('error', 'unknown error')}")
                 return None, None
 
             # Compute reward
-            reward = compute_reward_from_metrics(metrics, self.reward_preset)
+            reward = compute_reward_from_metrics(comp_metrics, self.reward_preset)
 
             # Update Q-table
-            old_q = self.qtable.q_values[state, action]
+            old_q = float(self.qtable.q_values[state, action])
             td_error = self.qtable.update(state, action, reward)
-            new_q = self.qtable.q_values[state, action]
+            new_q = float(self.qtable.q_values[state, action])
 
             print(f"  [REWARD] reward={reward:.4f} (preset={self.reward_preset})")
             print(f"  [Q-UPDATE] Q[{state}][{action}]: {old_q:.4f} -> {new_q:.4f} "
                   f"(td_error={td_error:.4f}, lr={self.qtable.learning_rate})")
 
-            return reward, metrics['ratio']
+            # Write benchmark row to CSV
+            if csv_writer is not None:
+                csv_writer.writerow({
+                    'epoch': epoch + 1,
+                    'episode': episode + 1,
+                    'filename': filename,
+                    'error_bound': error_bound,
+                    'entropy': f"{entropy:.6f}",
+                    'mad': f"{mad:.6f}",
+                    'first_derivative': f"{first_derivative:.6f}",
+                    'state': state,
+                    'entropy_bin': entropy_bin,
+                    'error_level': error_names[error_level],
+                    'mad_bin': mad_bin,
+                    'deriv_bin': deriv_bin,
+                    'action': action,
+                    'algorithm': action_config['algorithm'],
+                    'quantization': action_config['quantization'],
+                    'shuffle_size': action_config['shuffle_size'],
+                    'exploration': was_exploration,
+                    'epsilon': f"{self.policy.get_epsilon():.4f}",
+                    'original_size': comp_metrics.get('original_size', ''),
+                    'compressed_size': comp_metrics.get('compressed_size', ''),
+                    'ratio': f"{comp_metrics['ratio']:.4f}",
+                    'throughput_mbps': f"{comp_metrics['throughput_mbps']:.2f}",
+                    'psnr_db': f"{comp_metrics['psnr_db']:.2f}" if comp_metrics.get('psnr_db') is not None else '',
+                    'reward': f"{reward:.6f}",
+                    'old_q': f"{old_q:.6f}",
+                    'new_q': f"{new_q:.6f}",
+                    'td_error': f"{td_error:.6f}"
+                })
+
+            return reward, comp_metrics['ratio']
 
         except Exception as e:
             print(f"Error processing {filepath}: {e}")
@@ -375,6 +515,12 @@ def main():
         help='Reduce output verbosity'
     )
     parser.add_argument(
+        '--max-files',
+        type=int,
+        default=None,
+        help='Limit number of training files (default: use all)'
+    )
+    parser.add_argument(
         '--clean',
         action='store_true',
         help='Remove all Q-table files from output directory'
@@ -420,6 +566,11 @@ def main():
         resume_path=args.resume,
         use_c_api=args.use_c_api
     )
+
+    # Limit training files if requested
+    if args.max_files and args.max_files < len(trainer.training_files):
+        trainer.training_files = trainer.training_files[:args.max_files]
+        print(f"Limited to {args.max_files} training files")
 
     # Run training
     trainer.train(

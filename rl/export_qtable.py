@@ -160,16 +160,13 @@ def dump_qtable(qtable_path: str, output_path: str):
     lines.append("=" * 100)
     lines.append("Best Action per State")
     lines.append("=" * 100)
-    lines.append(f"{'Entropy':<10} {'Error':<12} {'MAD':<8} {'Deriv':<8} {'Best Action':<28} {'Q-Value':<10} {'Visits':<8}")
+    lines.append(f"  {'State':<6} {'Entropy':<10} {'Error':<12} {'MAD':<8} {'Deriv':<8} {'Best Action':<28} {'Q-Value':<10} {'Visits':<8}")
     lines.append("-" * 100)
 
     for state in range(NUM_STATES):
         entropy_bin, error_level, mad_bin, deriv_bin = QTable.decode_state(state)
         best_action, q_value = qt.get_best_action(state)
         total_visits = int(qt.visit_counts[state].sum())
-
-        if q_value == 0.0 and total_visits == 0:
-            continue
 
         action_config = QTable.decode_action(best_action)
         entropy_label = f"{entropy_bin * 0.5:.1f}-{(entropy_bin + 1) * 0.5:.1f}"
@@ -180,23 +177,23 @@ def dump_qtable(qtable_path: str, output_path: str):
         if action_config['shuffle_size'] > 0:
             action_str += f"+shuffle{action_config['shuffle_size']}"
 
-        lines.append(f"{entropy_label:<10} {error_names[error_level]:<12} "
+        visited = "*" if total_visits > 0 else " "
+        lines.append(f"{visited} {state:<6} {entropy_label:<10} {error_names[error_level]:<12} "
                      f"{mad_names[mad_bin]:<8} {deriv_names[deriv_bin]:<8} "
                      f"{action_str:<28} {q_value:<10.4f} {total_visits:<8}")
 
     lines.append("")
+    lines.append("(* = visited during training)")
+    lines.append("")
 
-    # Full Q-values per visited state (top 5 actions)
+    # Full Q-values per state (top 5 actions)
     lines.append("=" * 100)
-    lines.append("Top 5 Actions per Visited State")
+    lines.append("Top 5 Actions per State")
     lines.append("=" * 100)
 
     for state in range(NUM_STATES):
         entropy_bin, error_level, mad_bin, deriv_bin = QTable.decode_state(state)
         total_visits = int(qt.visit_counts[state].sum())
-
-        if total_visits == 0:
-            continue
 
         entropy_label = f"{entropy_bin * 0.5:.1f}-{(entropy_bin + 1) * 0.5:.1f}"
         lines.append(f"\nState {state}: entropy={entropy_label}, error={error_names[error_level]}, "
@@ -208,8 +205,6 @@ def dump_qtable(qtable_path: str, output_path: str):
         top_indices = np.argsort(q_row)[::-1][:5]
 
         for rank, action in enumerate(top_indices, 1):
-            if q_row[action] == 0 and qt.visit_counts[state, action] == 0:
-                continue
             action_config = QTable.decode_action(action)
             action_str = action_config['algorithm']
             if action_config['quantization']:
@@ -233,8 +228,6 @@ def dump_qtable(qtable_path: str, output_path: str):
     lines.append("-" * (8 + NUM_ACTIONS * 8))
 
     for state in range(NUM_STATES):
-        if qt.visit_counts[state].sum() == 0:
-            continue
         row = f"{state:<8}"
         for a in range(NUM_ACTIONS):
             row += f"{qt.q_values[state, a]:<8.4f}"
