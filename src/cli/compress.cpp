@@ -186,7 +186,8 @@ int main(int argc, char* argv[]) {
     printf("\n");
 
     // ========== Step 1: Open input file for reading ==========
-    
+    printf("\n[START] Step 1: Open input file for reading\n");
+
     int fd_input = open(input_file, O_RDONLY | O_DIRECT);
     if (fd_input == -1) {
         printf("Error: Cannot open input file: %s\n", input_file);
@@ -205,23 +206,29 @@ int main(int argc, char* argv[]) {
     
     printf("Input file: %s\n", input_file);
     printf("File size: %lu bytes (%.2f MB)\n", file_size, file_size / (1024.0 * 1024.0));
-    
+    printf("[END] Step 1: Open input file for reading\n");
+
     // ========== Step 2: Initialize GPU ==========
+    printf("\n[START] Step 2: Initialize GPU\n");
     
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
-    
+    printf("[END] Step 2: Initialize GPU\n");
+
     // ========== Step 3: Allocate GPU memory for input data ==========
+    printf("\n[START] Step 3: Allocate GPU memory for input data\n");
     
     // Align to 4KB for GDS optimal performance
     size_t aligned_input_size = ((file_size + 4095) / 4096) * 4096;
     
     uint8_t* d_input;
     CUDA_CHECK(cudaMalloc(&d_input, aligned_input_size));
-    printf("\nAllocated %lu bytes (%.2f MB) on GPU for input\n", 
+    printf("\nAllocated %lu bytes (%.2f MB) on GPU for input\n",
            aligned_input_size, aligned_input_size / (1024.0 * 1024.0));
-    
+    printf("[END] Step 3: Allocate GPU memory for input data\n");
+
     // ========== Step 4: Initialize GDS (cuFile) ==========
+    printf("\n[START] Step 4: Initialize GDS (cuFile)\n");
     
     CUfileError_t status = cuFileDriverOpen();
     if (status.err != CU_FILE_SUCCESS) {
@@ -258,8 +265,10 @@ int main(int argc, char* argv[]) {
     } else {
         printf("✓ Input buffer registered\n");
     }
-    
+    printf("[END] Step 4: Initialize GDS (cuFile)\n");
+
     // ========== Step 5: Read data from file to GPU using GDS ==========
+    printf("\n[START] Step 5: Read data from file to GPU using GDS\n");
     
     printf("\n###### Reading data from file to GPU via GDS ######\n");
     ssize_t bytes_read = cuFileRead(cf_handle_in, d_input, aligned_input_size, 0, 0);
@@ -273,6 +282,7 @@ int main(int argc, char* argv[]) {
         return -1;
     }
     printf("Read %ld bytes directly to GPU (bypassed CPU!)\n", bytes_read);
+    printf("[END] Step 5: Read data from file to GPU using GDS\n");
 
     // ========== Step 5.4: Apply quantization if requested ==========
 
@@ -282,7 +292,8 @@ int main(int argc, char* argv[]) {
     size_t data_size_for_compression = file_size;  // Size to use for compression
 
     if (quant_type != QuantizationType::NONE) {
-        printf("\n###### Applying %s quantization preprocessing ######\n",
+        printf("\n[START] Step 5.4: Apply quantization preprocessing\n");
+        printf("###### Applying %s quantization preprocessing ######\n",
                getQuantizationTypeName(quant_type));
         printf("Error bound: %.2e\n", error_bound);
         printf("Element size: %zu bytes (%s)\n", quant_element_size,
@@ -325,6 +336,7 @@ int main(int argc, char* argv[]) {
         d_quantized = static_cast<uint8_t*>(quant_result.d_quantized);
         d_compress_input = d_quantized;
         data_size_for_compression = quant_result.quantized_bytes;
+        printf("[END] Step 5.4: Apply quantization preprocessing\n");
     }
 
     // ========== Step 5.5: Apply byte shuffle if requested ==========
@@ -332,7 +344,8 @@ int main(int argc, char* argv[]) {
     uint8_t* d_shuffled = nullptr;
 
     if (shuffle_element_size > 0) {
-        printf("\n###### Applying byte shuffle preprocessing ######\n");
+        printf("\n[START] Step 5.5: Apply byte shuffle preprocessing\n");
+        printf("###### Applying byte shuffle preprocessing ######\n");
         printf("Element size: %u bytes\n", shuffle_element_size);
 
         // Apply shuffle using the simple API
@@ -360,12 +373,14 @@ int main(int argc, char* argv[]) {
 
         CUDA_CHECK(cudaStreamSynchronize(stream));
         printf("Byte shuffle complete - data reorganized for better compression\n");
+        printf("[END] Step 5.5: Apply byte shuffle preprocessing\n");
 
         // Compress the shuffled data instead
         d_compress_input = d_shuffled;
     }
-    
+
     // ========== Step 6: Setup compression ==========
+    printf("\n[START] Step 6: Setup compression\n");
 
     printf("\n###### Setting up %s compression ######\n", getAlgorithmName(algo).c_str());
 
@@ -398,9 +413,10 @@ int main(int argc, char* argv[]) {
            max_total_size, max_total_size / (1024.0 * 1024.0));
     printf("Aligned total size for GDS: %lu bytes (%.2f MB)\n",
            aligned_total_size, aligned_total_size / (1024.0 * 1024.0));
-    
+    printf("[END] Step 6: Setup compression\n");
 
     // ========== Step 7: Compress data on GPU ==========
+    printf("\n[START] Step 7: Compress data on GPU\n");
 
     printf("\n###### Compressing data on GPU ######\n");
     compressor->compress(d_compress_input, d_compressed, comp_config);
@@ -413,8 +429,10 @@ int main(int argc, char* argv[]) {
     if (quant_type != QuantizationType::NONE) {
         printf("  Total reduction (with quantization): %.2fx\n", (double)file_size / compressed_size);
     }
+    printf("[END] Step 7: Compress data on GPU\n");
 
     // ========== Step 7.3: Write compression header with metadata ==========
+    printf("\n[START] Step 7.3: Write compression header with metadata\n");
 
     printf("\n###### Writing compression header with metadata ######\n");
 
@@ -457,10 +475,11 @@ int main(int argc, char* argv[]) {
     printf("\nTotal output size: %lu bytes (%.2f MB)\n", 
            total_output_size, total_output_size / (1024.0 * 1024.0));
     printf("Aligned for GDS write: %lu bytes\n", final_aligned_size);
-        
-    // ========== Step 7.5: Verify compression with decompression ==========
+    printf("[END] Step 7.3: Write compression header with metadata\n");
 
-    printf("\n###### Verifying data integrity ######\n");
+    // ========== Step 7.5: Verify compression with decompression ==========
+    printf("\n[START] Step 7.5: Verify compression with decompression\n");
+    printf("###### Verifying data integrity ######\n");
 
     // Configure decompression using the same compressor manager
     DecompressionConfig decomp_config = compressor->configure_decompression(d_compressed);
@@ -481,6 +500,7 @@ int main(int argc, char* argv[]) {
     size_t verify_data_size = decomp_config.decomp_data_size;
 
     if (shuffle_element_size > 0) {
+        printf("\n[START] Step 7.6: Apply unshuffle for verification\n");
         printf("Applying byte unshuffle to restore original data format...\n");
 
         // Unshuffle the decompressed data
@@ -514,6 +534,7 @@ int main(int argc, char* argv[]) {
 
         CUDA_CHECK(cudaFree(d_decompressed));
         d_verify_data = d_unshuffled;
+        printf("[END] Step 7.6: Apply unshuffle for verification\n");
     }
 
     // ========== Step 7.7: Apply dequantization if quantization was used ==========
@@ -521,6 +542,7 @@ int main(int argc, char* argv[]) {
     void* d_dequantized = nullptr;
 
     if (quant_type != QuantizationType::NONE) {
+        printf("\n[START] Step 7.7: Apply dequantization for verification\n");
         printf("Applying dequantization to restore original values...\n");
 
         d_dequantized = dequantize_simple(d_verify_data, quant_result, stream);
@@ -551,9 +573,11 @@ int main(int argc, char* argv[]) {
             CUDA_CHECK(cudaFree(d_decompressed));
         }
         d_verify_data = static_cast<uint8_t*>(d_dequantized);
+        printf("[END] Step 7.7: Apply dequantization for verification\n");
     }
 
     // ========== Step 7.8: Verify data integrity ==========
+    printf("\n[START] Step 7.8: Verify data integrity\n");
 
     bool verification_passed = false;
 
@@ -619,6 +643,8 @@ int main(int argc, char* argv[]) {
 
         CUDA_CHECK(cudaFreeHost(d_invalid));
     }
+    printf("[END] Step 7.8: Verify data integrity\n");
+    printf("[END] Step 7.5: Verify compression with decompression\n");
 
     // Clean up verification resources
     if (d_dequantized) CUDA_CHECK(cudaFree(d_dequantized));
@@ -639,8 +665,8 @@ int main(int argc, char* argv[]) {
     }
 
     // ========== Step 8: Open output file and write compressed data ==========
-    
-    printf("\n###### Writing compressed data via GDS ######\n");
+    printf("\n[START] Step 8: Open output file and write compressed data\n");
+    printf("###### Writing compressed data via GDS ######\n");
     
     // Open output file with O_DIRECT for GDS
     int fd_out = open(output_file, O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT, 0666);
@@ -707,10 +733,10 @@ int main(int argc, char* argv[]) {
     
     // Truncate file to actual size (header + compressed, remove padding)
     ftruncate(fd_out, total_output_size);
-    
-    // nvtxRangePop();
+    printf("[END] Step 8: Open output file and write compressed data\n");
 
     // ========== Step 9: Cleanup ==========
+    printf("\n[START] Step 9: Cleanup\n");
     // nvtxRangePushA("Cleanup");
     
     if (output_buf_registered) cuFileBufDeregister(d_output_buffer);
@@ -737,6 +763,7 @@ int main(int argc, char* argv[]) {
     close(fd_input);
 
     printf("Cleanup complete\n");
+    printf("[END] Step 9: Cleanup\n");
 
     // ========== Summary ==========
     printf("\n========================================\n");

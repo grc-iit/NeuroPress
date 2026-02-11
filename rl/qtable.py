@@ -7,12 +7,14 @@ persistence (save/load), and action selection.
 
 import numpy as np
 import json
-from typing import Tuple, Optional
+from typing import Tuple
 from pathlib import Path
 
 from .config import (
     NUM_STATES, NUM_ACTIONS, NUM_ENTROPY_BINS, NUM_ERROR_LEVELS,
-    LEARNING_RATE, ALGORITHM_NAMES, ERROR_LEVEL_THRESHOLDS
+    NUM_MAD_BINS, NUM_DERIV_BINS,
+    LEARNING_RATE, ALGORITHM_NAMES, ERROR_LEVEL_THRESHOLDS,
+    MAD_BIN_THRESHOLDS, DERIV_BIN_THRESHOLDS
 )
 
 
@@ -20,7 +22,7 @@ class QTable:
     """
     Q-Table for reinforcement learning based compression selection.
 
-    State: (entropy_bin, error_level) encoded as single integer
+    State: (entropy_bin, error_level, mad_bin, deriv_bin) encoded as single integer
     Action: (algorithm, quantization, shuffle) encoded as single integer
     """
 
@@ -31,32 +33,66 @@ class QTable:
         self.learning_rate = learning_rate
 
     @staticmethod
-    def encode_state(entropy: float, error_bound: float) -> int:
+    def _value_to_bin(value: float, thresholds: list) -> int:
+        """Map a continuous value to a bin index using thresholds."""
+        for i, t in enumerate(thresholds):
+            if value < t:
+                return i
+        return len(thresholds)
+
+    @staticmethod
+    def encode_state(entropy: float, error_bound: float,
+                     mad: float = 0.0, first_derivative: float = 0.0) -> int:
         """
-        Encode entropy and error bound into state index.
+        Encode data characteristics into state index.
 
         Args:
             entropy: Shannon entropy in bits (0.0 to 8.0+)
             error_bound: Quantization error bound (0 for lossless)
+            mad: Mean Absolute Deviation (default 0.0 for backward compat)
+            first_derivative: Mean absolute first derivative (default 0.0)
 
         Returns:
             State index (0 to NUM_STATES-1)
         """
-        # Discretize entropy to bin (0-9)
-        entropy_bin = int(entropy)
+        # Discretize entropy to 0.5-width bins (0-15)
+        entropy_bin = int(entropy * 2)
         entropy_bin = max(0, min(NUM_ENTROPY_BINS - 1, entropy_bin))
 
         # Determine error level
         if error_bound <= 0:
-            error_level = 2  # Lossless = most precise
+            error_level = 3  # Lossless (no quantization, zero error)
         elif error_bound >= ERROR_LEVEL_THRESHOLDS[0]:
-            error_level = 0  # Aggressive
+            error_level = 0  # Aggressive lossy (>= 0.1)
         elif error_bound >= ERROR_LEVEL_THRESHOLDS[1]:
-            error_level = 1  # Balanced
+            error_level = 1  # Moderate lossy (>= 0.01)
+        elif error_bound >= ERROR_LEVEL_THRESHOLDS[2]:
+            error_level = 2  # Precise lossy (>= 0.001)
         else:
-            error_level = 2  # Precise
+            error_level = 3  # Below 0.001 treated as lossless
 
-        return entropy_bin * NUM_ERROR_LEVELS + error_level
+        # Discretize MAD and first derivative
+        mad_bin = QTable._value_to_bin(mad, MAD_BIN_THRESHOLDS)
+        deriv_bin = QTable._value_to_bin(first_derivative, DERIV_BIN_THRESHOLDS)
+
+        return ((entropy_bin * NUM_ERROR_LEVELS + error_level)
+                * NUM_MAD_BINS + mad_bin) * NUM_DERIV_BINS + deriv_bin
+
+    @staticmethod
+    def decode_state(state: int) -> tuple:
+        """
+        Decode state index into component bins.
+
+        Returns:
+            (entropy_bin, error_level, mad_bin, deriv_bin)
+        """
+        deriv_bin = state % NUM_DERIV_BINS
+        state //= NUM_DERIV_BINS
+        mad_bin = state % NUM_MAD_BINS
+        state //= NUM_MAD_BINS
+        error_level = state % NUM_ERROR_LEVELS
+        entropy_bin = state // NUM_ERROR_LEVELS
+        return (entropy_bin, error_level, mad_bin, deriv_bin)
 
     @staticmethod
     def decode_action(action: int) -> dict:
@@ -79,25 +115,6 @@ class QTable:
             'quantization': use_quantization,
             'shuffle_size': shuffle_size
         }
-
-    @staticmethod
-    def encode_action(algorithm_idx: int, use_quantization: bool, use_shuffle: bool) -> int:
-        """
-        Encode compression configuration into action index.
-
-        Args:
-            algorithm_idx: Algorithm index (0-7)
-            use_quantization: Whether to apply quantization
-            use_shuffle: Whether to apply byte shuffle
-
-        Returns:
-            Action index (0 to NUM_ACTIONS-1)
-        """
-        return algorithm_idx + (1 if use_quantization else 0) * 8 + (1 if use_shuffle else 0) * 16
-
-    def get_q_value(self, state: int, action: int) -> float:
-        """Get Q-value for state-action pair."""
-        return self.q_values[state, action]
 
     def get_best_action(self, state: int) -> Tuple[int, float]:
         """
@@ -131,10 +148,6 @@ class QTable:
         self.visit_counts[state, action] += 1
         return td_error
 
-    def get_visit_count(self, state: int, action: int) -> int:
-        """Get number of times state-action pair was visited."""
-        return self.visit_counts[state, action]
-
     def get_state_coverage(self) -> dict:
         """Get statistics about state coverage during training."""
         total_visits = self.visit_counts.sum()
@@ -157,11 +170,13 @@ class QTable:
             filepath: Path to save file (.json)
         """
         data = {
-            'version': 1,
+            'version': 2,
             'n_states': NUM_STATES,
             'n_actions': NUM_ACTIONS,
             'n_entropy_bins': NUM_ENTROPY_BINS,
             'n_error_levels': NUM_ERROR_LEVELS,
+            'n_mad_bins': NUM_MAD_BINS,
+            'n_deriv_bins': NUM_DERIV_BINS,
             'learning_rate': self.learning_rate,
             'q_values': self.q_values.tolist(),
             'visit_counts': self.visit_counts.tolist()
@@ -218,19 +233,25 @@ class QTable:
             f.write(self.q_values.astype(np.float32).tobytes())
 
     def print_best_actions(self):
-        """Print best action for each state."""
+        """Print best action for each state (only visited or non-zero states)."""
+        error_names = ['aggressive', 'moderate', 'precise', 'lossless']
+        mad_names = ['low', 'med', 'high', 'vhigh']
+        deriv_names = ['smooth', 'mod', 'rough', 'noisy']
+
         print("\nBest Actions per State:")
-        print("=" * 70)
-        print(f"{'Entropy Bin':<12} {'Error Level':<12} {'Best Action':<30} {'Q-Value':<10}")
-        print("-" * 70)
+        print("=" * 95)
+        print(f"{'Entropy':<10} {'Error':<12} {'MAD':<8} {'Deriv':<8} {'Best Action':<28} {'Q-Value':<10}")
+        print("-" * 95)
 
         for state in range(NUM_STATES):
-            entropy_bin = state // NUM_ERROR_LEVELS
-            error_level = state % NUM_ERROR_LEVELS
-            error_names = ['aggressive', 'balanced', 'precise']
+            entropy_bin, error_level, mad_bin, deriv_bin = self.decode_state(state)
 
             best_action, q_value = self.get_best_action(state)
+            if q_value == 0.0 and self.visit_counts[state].sum() == 0:
+                continue
+
             action_config = self.decode_action(best_action)
+            entropy_label = f"{entropy_bin * 0.5:.1f}-{(entropy_bin + 1) * 0.5:.1f}"
 
             action_str = f"{action_config['algorithm']}"
             if action_config['quantization']:
@@ -238,4 +259,6 @@ class QTable:
             if action_config['shuffle_size'] > 0:
                 action_str += f"+shuffle{action_config['shuffle_size']}"
 
-            print(f"{entropy_bin:<12} {error_names[error_level]:<12} {action_str:<30} {q_value:<10.4f}")
+            print(f"{entropy_label:<10} {error_names[error_level]:<12} "
+                  f"{mad_names[mad_bin]:<8} {deriv_names[deriv_bin]:<8} "
+                  f"{action_str:<28} {q_value:<10.4f}")

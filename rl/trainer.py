@@ -10,22 +10,21 @@ Main training loop that:
 6. Saves trained model
 """
 
-import os
-import sys
 import argparse
 import random
 import numpy as np
 from pathlib import Path
 from typing import List, Optional
-from datetime import datetime
 
 from .qtable import QTable
 from .policy import EpsilonGreedyPolicy
 from .reward import compute_reward_from_metrics, get_preset_description
 from .executor import CompressionExecutor
 from .config import (
-    DEFAULT_EPOCHS, CHECKPOINT_INTERVAL, VALIDATION_SPLIT,
-    REWARD_PRESETS, ERROR_LEVEL_THRESHOLDS
+    DEFAULT_EPOCHS, CHECKPOINT_INTERVAL,
+    REWARD_PRESETS, ERROR_LEVEL_THRESHOLDS, NUM_ERROR_LEVELS,
+    NUM_ACTIONS, NUM_ENTROPY_BINS, NUM_STATES,
+    NUM_MAD_BINS, NUM_DERIV_BINS
 )
 
 
@@ -40,7 +39,8 @@ class QTableTrainer:
         output_dir: str = 'rl/models',
         gpu_compress_path: str = './build/gpu_compress',
         reward_preset: str = 'balanced',
-        error_bound: float = 0.001,
+        error_bounds: List[float] = None,
+        resume_path: str = None,
         use_c_api: bool = False
     ):
         """
@@ -51,21 +51,29 @@ class QTableTrainer:
             output_dir: Directory to save trained models
             gpu_compress_path: Path to gpu_compress binary
             reward_preset: Reward computation preset
-            error_bound: Error bound for quantization experiments
+            error_bounds: List of error bounds to train (cycles through all per epoch)
+            resume_path: Path to previous Q-table to resume from
             use_c_api: Whether to use C API for entropy calculation
         """
         self.data_dir = Path(data_dir)
         self.output_dir = Path(output_dir)
         self.reward_preset = reward_preset
-        self.error_bound = error_bound
+        self.error_bounds = error_bounds or [0.001]
 
         # Initialize components
         self.qtable = QTable()
         self.policy = EpsilonGreedyPolicy()
+        gpu_decompress_path = gpu_compress_path.replace('gpu_compress', 'gpu_decompress')
         self.executor = CompressionExecutor(
             gpu_compress_path=gpu_compress_path,
+            gpu_decompress_path=gpu_decompress_path,
             use_c_api=use_c_api
         )
+
+        # Resume from previous Q-table if provided
+        if resume_path and Path(resume_path).exists():
+            self.qtable.load(resume_path)
+            print(f"Resumed Q-table from: {resume_path}")
 
         # Collect training files
         self.training_files = self._collect_files()
@@ -75,6 +83,16 @@ class QTableTrainer:
         self.episode_ratios = []
         self.exploration_counts = 0
         self.exploitation_counts = 0
+
+    def _build_action_mask(self, error_bound: float) -> Optional[np.ndarray]:
+        """Build action mask based on error_bound. Masks out quantization actions for lossless."""
+        if error_bound <= 0:
+            mask = np.ones(NUM_ACTIONS, dtype=bool)
+            for a in range(NUM_ACTIONS):
+                if (a // 8) % 2 == 1:  # quantization bit is set
+                    mask[a] = False
+            return mask
+        return None
 
     def _collect_files(self) -> List[Path]:
         """Collect all binary training files from data directory."""
@@ -113,7 +131,7 @@ class QTableTrainer:
         print(f"Epochs: {n_epochs}")
         print(f"Reward preset: {self.reward_preset}")
         print(f"  → {get_preset_description(self.reward_preset)}")
-        print(f"Error bound: {self.error_bound}")
+        print(f"Error bounds: {self.error_bounds}")
         print(f"{'='*60}\n")
 
         # Create output directory
@@ -128,16 +146,17 @@ class QTableTrainer:
             random.shuffle(files)
 
             for i, filepath in enumerate(files):
-                if verbose and i % 10 == 0:
-                    print(f"Epoch {epoch+1}/{n_epochs}, File {i+1}/{len(files)}, "
-                          f"ε={self.policy.get_epsilon():.3f}")
+                for eb in self.error_bounds:
+                    if verbose and i % 10 == 0 and eb == self.error_bounds[0]:
+                        print(f"Epoch {epoch+1}/{n_epochs}, File {i+1}/{len(files)}, "
+                              f"ε={self.policy.get_epsilon():.3f}")
 
-                # Run training episode
-                reward, ratio = self._train_episode(filepath)
+                    # Run training episode with this error bound
+                    reward, ratio = self._train_episode(filepath, eb)
 
-                if reward is not None:
-                    epoch_rewards.append(reward)
-                    epoch_ratios.append(ratio)
+                    if reward is not None:
+                        epoch_rewards.append(reward)
+                        epoch_ratios.append(ratio)
 
             # Decay epsilon
             self.policy.decay()
@@ -163,24 +182,46 @@ class QTableTrainer:
         # Print summary
         self._print_summary()
 
-    def _train_episode(self, filepath: Path) -> tuple:
+    def _train_episode(self, filepath: Path, error_bound: float) -> tuple:
         """
         Run one training episode on a single file.
+
+        Args:
+            filepath: Path to training data file
+            error_bound: Error bound for this episode
 
         Returns:
             Tuple of (reward, compression_ratio) or (None, None) on error
         """
         try:
-            # Load data and calculate entropy
+            filename = filepath.name
+            print(f"\n  --- Episode: {filename} (eb={error_bound}) ---")
+
+            # Load data and calculate all metrics
             data = np.fromfile(filepath, dtype=np.float32)
-            entropy = self.executor.calculate_entropy(data)
+            metrics = self.executor.calculate_all_metrics(data)
+            entropy = metrics['entropy']
+            mad = metrics['mad']
+            first_derivative = metrics['first_derivative']
+            print(f"  [METRICS] {filename}: entropy={entropy:.4f} bits "
+                  f"(bin={min(NUM_ENTROPY_BINS - 1, int(entropy * 2))}), "
+                  f"mad={mad:.6f}, deriv={first_derivative:.6f}")
 
             # Encode state
-            state = QTable.encode_state(entropy, self.error_bound)
+            state = QTable.encode_state(entropy, error_bound,
+                                        mad=mad, first_derivative=first_derivative)
+            entropy_bin, error_level, mad_bin, deriv_bin = QTable.decode_state(state)
+            error_names = ['aggressive', 'moderate', 'precise', 'lossless']
+            entropy_label = f"{entropy_bin * 0.5:.1f}-{(entropy_bin + 1) * 0.5:.1f}"
+            print(f"  [STATE] state={state} "
+                  f"(entropy={entropy_label}, error={error_names[error_level]}, "
+                  f"mad_bin={mad_bin}, deriv_bin={deriv_bin}, "
+                  f"error_bound={error_bound})")
 
-            # Select action using policy
+            # Select action using policy (mask invalid actions for lossless)
             q_values = self.qtable.q_values[state]
-            action, was_exploration = self.policy.select_action(q_values)
+            action_mask = self._build_action_mask(error_bound)
+            action, was_exploration = self.policy.select_action(q_values, action_mask)
 
             if was_exploration:
                 self.exploration_counts += 1
@@ -189,22 +230,41 @@ class QTableTrainer:
 
             # Decode action
             action_config = QTable.decode_action(action)
+            action_str = action_config['algorithm']
+            if action_config['quantization']:
+                action_str += f"+quant(eb={error_bound})"
+            if action_config['shuffle_size'] > 0:
+                action_str += f"+shuffle{action_config['shuffle_size']}"
+
+            print(f"  [ACTION] action={action} -> {action_str} "
+                  f"({'EXPLORE' if was_exploration else 'EXPLOIT'}, "
+                  f"ε={self.policy.get_epsilon():.3f})")
+            print(f"  [ACTION DETAIL] algorithm={action_config['algorithm']}, "
+                  f"quantization={action_config['quantization']}, "
+                  f"shuffle_size={action_config['shuffle_size']}")
 
             # Execute compression
             metrics = self.executor.execute_action(
                 input_file=str(filepath),
                 action_config=action_config,
-                error_bound=self.error_bound
+                error_bound=error_bound
             )
 
             if not metrics['success']:
+                print(f"  [RESULT] FAILED: {metrics.get('error', 'unknown error')}")
                 return None, None
 
             # Compute reward
             reward = compute_reward_from_metrics(metrics, self.reward_preset)
 
             # Update Q-table
-            self.qtable.update(state, action, reward)
+            old_q = self.qtable.q_values[state, action]
+            td_error = self.qtable.update(state, action, reward)
+            new_q = self.qtable.q_values[state, action]
+
+            print(f"  [REWARD] reward={reward:.4f} (preset={self.reward_preset})")
+            print(f"  [Q-UPDATE] Q[{state}][{action}]: {old_q:.4f} -> {new_q:.4f} "
+                  f"(td_error={td_error:.4f}, lr={self.qtable.learning_rate})")
 
             return reward, metrics['ratio']
 
@@ -264,7 +324,7 @@ def main():
     parser.add_argument(
         '--data-dir', '-d',
         type=str,
-        required=True,
+        default=None,
         help='Directory containing training data files'
     )
     parser.add_argument(
@@ -288,9 +348,15 @@ def main():
     )
     parser.add_argument(
         '--error-bound',
-        type=float,
-        default=0.001,
-        help='Error bound for quantization (default: 0.001)'
+        type=str,
+        default='0.001',
+        help='Error bound: a number (e.g. 0.001) or "all" to train all 4 levels'
+    )
+    parser.add_argument(
+        '--resume',
+        type=str,
+        default=None,
+        help='Path to previous Q-table JSON to resume training from'
     )
     parser.add_argument(
         '--gpu-compress',
@@ -308,8 +374,41 @@ def main():
         action='store_true',
         help='Reduce output verbosity'
     )
+    parser.add_argument(
+        '--clean',
+        action='store_true',
+        help='Remove all Q-table files from output directory'
+    )
 
     args = parser.parse_args()
+
+    # Handle --clean mode
+    if args.clean:
+        output_dir = Path(args.output_dir)
+        patterns = ['qtable*.json', 'qtable*.bin', 'qtable_report.txt']
+        removed = 0
+        for pat in patterns:
+            for f in output_dir.glob(pat):
+                f.unlink()
+                print(f"Removed: {f}")
+                removed += 1
+        print(f"Cleaned {removed} files from {output_dir}")
+        return
+
+    # Require --data-dir for training
+    if not args.data_dir:
+        parser.error('--data-dir is required for training')
+
+    # Parse error bound(s)
+    if args.error_bound.lower() == 'all':
+        error_bounds = [
+            ERROR_LEVEL_THRESHOLDS[0],        # aggressive (0.1)
+            ERROR_LEVEL_THRESHOLDS[1],        # moderate   (0.01)
+            ERROR_LEVEL_THRESHOLDS[2],        # precise    (0.001)
+            0.0,                              # lossless
+        ]
+    else:
+        error_bounds = [float(args.error_bound)]
 
     # Create trainer
     trainer = QTableTrainer(
@@ -317,7 +416,8 @@ def main():
         output_dir=args.output_dir,
         gpu_compress_path=args.gpu_compress,
         reward_preset=args.preset,
-        error_bound=args.error_bound,
+        error_bounds=error_bounds,
+        resume_path=args.resume,
         use_c_api=args.use_c_api
     )
 

@@ -11,6 +11,7 @@
 #include <mutex>
 #include <cstring>
 #include <cstdio>
+#include <cmath>
 
 #include "gpucompress.h"
 #include "internal.hpp"
@@ -37,6 +38,7 @@ extern "C" {
     int gpucompress_qtable_is_loaded_impl(void);
     int gpucompress_qtable_get_best_action_impl(int state);
     void gpucompress_qtable_init_default_impl(void);
+    void gpucompress_qtable_cleanup_impl(void);
 }
 
 /* ============================================================
@@ -89,6 +91,35 @@ const char* ERROR_MESSAGES[] = {
     "Library not initialized",
     "Output buffer too small"
 };
+
+/**
+ * Calculate Mean Absolute Deviation of float data on host.
+ */
+double calculateMADHost(const float* data, size_t num_elements) {
+    if (num_elements == 0) return 0.0;
+    double sum = 0.0;
+    for (size_t i = 0; i < num_elements; i++) {
+        sum += static_cast<double>(data[i]);
+    }
+    double mean = sum / static_cast<double>(num_elements);
+    double mad_sum = 0.0;
+    for (size_t i = 0; i < num_elements; i++) {
+        mad_sum += std::abs(static_cast<double>(data[i]) - mean);
+    }
+    return mad_sum / static_cast<double>(num_elements);
+}
+
+/**
+ * Calculate mean absolute first derivative of float data on host.
+ */
+double calculateFirstDerivativeHost(const float* data, size_t num_elements) {
+    if (num_elements < 2) return 0.0;
+    double sum = 0.0;
+    for (size_t i = 1; i < num_elements; i++) {
+        sum += std::abs(static_cast<double>(data[i]) - static_cast<double>(data[i - 1]));
+    }
+    return sum / static_cast<double>(num_elements - 1);
+}
 
 } // anonymous namespace
 
@@ -143,6 +174,7 @@ extern "C" void gpucompress_cleanup(void) {
 
     if (old_ref <= 1) {
         // Last reference, cleanup
+        gpucompress_qtable_cleanup_impl();
         if (g_default_stream != nullptr) {
             cudaStreamDestroy(g_default_stream);
             g_default_stream = nullptr;
@@ -222,16 +254,27 @@ extern "C" gpucompress_error_t gpucompress_compress(
     double entropy = 0.0;
 
     // Auto algorithm selection using Q-Table
+    double mad = 0.0;
+    double first_derivative = 0.0;
+
     if (cfg.algorithm == GPUCOMPRESS_ALGO_AUTO) {
-        // Calculate entropy
+        // Calculate entropy on GPU
         entropy = gpucompress_entropy_gpu_impl(d_input, input_size, stream);
+
+        // Calculate MAD and first derivative on host (input is still available)
+        size_t num_elements = input_size / sizeof(float);
+        if (num_elements > 0) {
+            const float* h_floats = static_cast<const float*>(input);
+            mad = calculateMADHost(h_floats, num_elements);
+            first_derivative = calculateFirstDerivativeHost(h_floats, num_elements);
+        }
 
         if (entropy >= 0.0) {
             // Get error level
             int error_level = gpucompress::errorBoundToLevel(cfg.error_bound);
 
-            // Encode state
-            int state = gpucompress::encodeState(entropy, error_level);
+            // Encode state with all 4 dimensions
+            int state = gpucompress::encodeState(entropy, error_level, mad, first_derivative);
 
             // Get best action from Q-Table
             int action = gpucompress_qtable_get_best_action_impl(state);
@@ -431,6 +474,8 @@ extern "C" gpucompress_error_t gpucompress_compress(
         stats->compressed_size = total_size;
         stats->compression_ratio = static_cast<double>(input_size) / compressed_size;
         stats->entropy_bits = entropy;
+        stats->mad = mad;
+        stats->first_derivative = first_derivative;
         stats->algorithm_used = algo_to_use;
         stats->preprocessing_used = preproc_to_use;
         stats->throughput_mbps = 0.0;  // Would need timing to calculate
@@ -721,6 +766,8 @@ extern "C" int gpucompress_qtable_is_loaded(void) {
 extern "C" gpucompress_error_t gpucompress_recommend_config(
     double entropy,
     double error_bound,
+    double mad,
+    double first_derivative,
     gpucompress_algorithm_t* algorithm_out,
     unsigned int* preprocessing_out
 ) {
@@ -736,7 +783,7 @@ extern "C" gpucompress_error_t gpucompress_recommend_config(
     }
 
     int error_level = gpucompress::errorBoundToLevel(error_bound);
-    int state = gpucompress::encodeState(entropy, error_level);
+    int state = gpucompress::encodeState(entropy, error_level, mad, first_derivative);
     int action = gpucompress_qtable_get_best_action_impl(state);
     gpucompress::QTableAction decoded = gpucompress::decodeAction(action);
 

@@ -2,13 +2,13 @@
  * @file qtable_gpu.cu
  * @brief GPU Q-Table for RL-based compression algorithm selection
  *
- * Stores Q-Table in CUDA constant memory for fast inference.
+ * Stores Q-Table in CUDA global device memory for inference.
  * Supports loading from binary or JSON format.
  *
  * Q-Table structure:
- *   States: 30 (10 entropy bins x 3 error levels)
+ *   States: 1024 (16 entropy x 4 error x 4 MAD x 4 derivative)
  *   Actions: 32 (2 quantization x 2 shuffle x 8 algorithms)
- *   Total: 960 float values (~4KB)
+ *   Total: 32768 float values (~128KB)
  */
 
 #include <cuda_runtime.h>
@@ -25,14 +25,20 @@ namespace gpucompress {
  * Constants
  * ============================================================ */
 
-/** Number of entropy bins */
-constexpr int NUM_ENTROPY_BINS = 10;
+/** Number of entropy bins (0.5-width bins, byte entropy range [0, 8)) */
+constexpr int NUM_ENTROPY_BINS = 16;
 
-/** Number of error bound levels */
-constexpr int NUM_ERROR_LEVELS = 3;
+/** Number of error bound levels (aggressive, balanced, precise, lossless) */
+constexpr int NUM_ERROR_LEVELS = 4;
+
+/** Number of MAD bins */
+constexpr int NUM_MAD_BINS = 4;
+
+/** Number of first derivative bins */
+constexpr int NUM_DERIV_BINS = 4;
 
 /** Total number of states */
-constexpr int NUM_STATES = NUM_ENTROPY_BINS * NUM_ERROR_LEVELS;
+constexpr int NUM_STATES = NUM_ENTROPY_BINS * NUM_ERROR_LEVELS * NUM_MAD_BINS * NUM_DERIV_BINS;
 
 /** Total number of actions */
 constexpr int NUM_ACTIONS = 32;
@@ -41,14 +47,18 @@ constexpr int NUM_ACTIONS = 32;
 constexpr int QTABLE_SIZE = NUM_STATES * NUM_ACTIONS;
 
 /* ============================================================
- * Q-Table in Constant Memory
+ * Q-Table in Global Device Memory
  * ============================================================ */
 
 /**
- * Q-Table stored in constant memory for fast read access.
+ * Q-Table stored in global device memory.
  * Layout: q_values[state * NUM_ACTIONS + action]
+ *
+ * At 128KB, the table exceeds the 64KB CUDA constant memory limit,
+ * so we use cudaMalloc'd global memory instead. Performance impact
+ * is negligible since the lookup happens once per file, not per element.
  */
-__constant__ float d_qtable[QTABLE_SIZE];
+static float* d_qtable = nullptr;
 
 /**
  * Flag indicating if Q-Table is loaded
@@ -56,16 +66,16 @@ __constant__ float d_qtable[QTABLE_SIZE];
 static bool g_qtable_loaded = false;
 
 /**
- * Host copy of Q-Table for CPU access
+ * Host copy of Q-Table for CPU access (heap-allocated, 128KB too large for stack)
  */
-static float g_qtable_host[QTABLE_SIZE] = {0};
+static float* g_qtable_host = nullptr;
 
 /* ============================================================
  * Q-Table Loading
  * ============================================================ */
 
 /**
- * Load Q-Table to GPU constant memory.
+ * Load Q-Table to GPU global memory.
  *
  * @param h_qtable Host array of Q-Table values (NUM_STATES * NUM_ACTIONS floats)
  * @return CUDA error code
@@ -75,22 +85,47 @@ cudaError_t loadQTableToGPU(const float* h_qtable) {
         return cudaErrorInvalidValue;
     }
 
-    // Copy to constant memory
-    cudaError_t err = cudaMemcpyToSymbol(
+    // Allocate device memory if not yet allocated
+    if (d_qtable == nullptr) {
+        cudaError_t err = cudaMalloc(&d_qtable, QTABLE_SIZE * sizeof(float));
+        if (err != cudaSuccess) {
+            return err;
+        }
+    }
+
+    // Copy to global device memory
+    cudaError_t err = cudaMemcpy(
         d_qtable,
         h_qtable,
         QTABLE_SIZE * sizeof(float),
-        0,
         cudaMemcpyHostToDevice
     );
 
     if (err == cudaSuccess) {
-        // Also keep host copy
+        // Allocate host copy if not yet allocated
+        if (g_qtable_host == nullptr) {
+            g_qtable_host = new float[QTABLE_SIZE]();
+        }
         memcpy(g_qtable_host, h_qtable, QTABLE_SIZE * sizeof(float));
         g_qtable_loaded = true;
     }
 
     return err;
+}
+
+/**
+ * Free GPU Q-Table memory.
+ */
+void cleanupQTable() {
+    if (d_qtable != nullptr) {
+        cudaFree(d_qtable);
+        d_qtable = nullptr;
+    }
+    if (g_qtable_host != nullptr) {
+        delete[] g_qtable_host;
+        g_qtable_host = nullptr;
+    }
+    g_qtable_loaded = false;
 }
 
 /**
@@ -129,7 +164,7 @@ bool loadQTableFromBinary(const char* filepath) {
         return false;
     }
 
-    if (version != 1) {
+    if (version != 1 && version != 2) {
         fprintf(stderr, "Unsupported Q-Table version: %u\n", version);
         return false;
     }
@@ -277,12 +312,13 @@ bool loadQTable(const char* filepath) {
  * Used when no Q-Table file is provided.
  */
 void initializeDefaultQTable() {
-    float default_values[QTABLE_SIZE] = {0};
+    // Heap-allocate default values (128KB too large for stack)
+    std::vector<float> default_values(QTABLE_SIZE, 0.0f);
 
     // Could set some heuristic defaults here
     // For now, just use zeros which will cause random selection
 
-    loadQTableToGPU(default_values);
+    loadQTableToGPU(default_values.data());
 }
 
 /**
@@ -299,18 +335,19 @@ bool isQTableLoaded() {
 /**
  * Kernel to find best action for a state.
  *
+ * @param qtable      Q-Table in global device memory
  * @param state       State index
  * @param best_action Output: best action index
  */
-__global__ void qtableArgmaxKernel(int state, int* best_action) {
+__global__ void qtableArgmaxKernel(const float* qtable, int state, int* best_action) {
     __shared__ float s_values[NUM_ACTIONS];
     __shared__ int s_indices[NUM_ACTIONS];
 
     int tid = threadIdx.x;
 
-    // Load Q-values for this state
+    // Load Q-values for this state from global memory
     if (tid < NUM_ACTIONS) {
-        s_values[tid] = d_qtable[state * NUM_ACTIONS + tid];
+        s_values[tid] = qtable[state * NUM_ACTIONS + tid];
         s_indices[tid] = tid;
     }
     __syncthreads();
@@ -355,7 +392,7 @@ int getBestActionGPU(int state, cudaStream_t stream) {
         return 0;
     }
 
-    qtableArgmaxKernel<<<1, 32, 0, stream>>>(state, d_best_action);
+    qtableArgmaxKernel<<<1, 32, 0, stream>>>(d_qtable, state, d_best_action);
 
     err = cudaMemcpyAsync(&h_best_action, d_best_action, sizeof(int),
                           cudaMemcpyDeviceToHost, stream);
@@ -452,6 +489,13 @@ int gpucompress_qtable_get_best_action_impl(int state) {
  */
 void gpucompress_qtable_init_default_impl(void) {
     gpucompress::initializeDefaultQTable();
+}
+
+/**
+ * Cleanup Q-Table GPU memory.
+ */
+void gpucompress_qtable_cleanup_impl(void) {
+    gpucompress::cleanupQTable();
 }
 
 } // extern "C"

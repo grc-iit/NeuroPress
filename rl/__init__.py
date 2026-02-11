@@ -12,6 +12,8 @@ from .executor import CompressionExecutor
 from .trainer import QTableTrainer
 from .config import (
     NUM_STATES, NUM_ACTIONS, NUM_ENTROPY_BINS, NUM_ERROR_LEVELS,
+    NUM_MAD_BINS, NUM_DERIV_BINS,
+    MAD_BIN_THRESHOLDS, DERIV_BIN_THRESHOLDS,
     ALGORITHM_NAMES, REWARD_PRESETS
 )
 
@@ -27,6 +29,10 @@ __all__ = [
     'NUM_ACTIONS',
     'NUM_ENTROPY_BINS',
     'NUM_ERROR_LEVELS',
+    'NUM_MAD_BINS',
+    'NUM_DERIV_BINS',
+    'MAD_BIN_THRESHOLDS',
+    'DERIV_BIN_THRESHOLDS',
     'ALGORITHM_NAMES',
     'REWARD_PRESETS'
 ]

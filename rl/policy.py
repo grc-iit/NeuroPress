@@ -41,23 +41,31 @@ class EpsilonGreedyPolicy:
         self.epsilon_decay = epsilon_decay
         self.epoch = 0
 
-    def select_action(self, q_values: np.ndarray) -> Tuple[int, bool]:
+    def select_action(self, q_values: np.ndarray, action_mask: np.ndarray = None) -> Tuple[int, bool]:
         """
         Select action using epsilon-greedy strategy.
 
         Args:
             q_values: Array of Q-values for current state (NUM_ACTIONS,)
+            action_mask: Boolean array where True = valid action. None = all valid.
 
         Returns:
             Tuple of (action_index, was_exploration)
         """
-        if np.random.random() < self.epsilon:
-            # Explore: random action
-            action = np.random.randint(NUM_ACTIONS)
-            return action, True
+        if action_mask is not None:
+            valid_actions = np.where(action_mask)[0]
         else:
-            # Exploit: best action
-            action = np.argmax(q_values)
+            valid_actions = np.arange(NUM_ACTIONS)
+
+        if np.random.random() < self.epsilon:
+            # Explore: random valid action
+            action = np.random.choice(valid_actions)
+            return int(action), True
+        else:
+            # Exploit: best valid action
+            masked_q = np.full(NUM_ACTIONS, -np.inf)
+            masked_q[valid_actions] = q_values[valid_actions]
+            action = np.argmax(masked_q)
             return int(action), False
 
     def decay(self):
@@ -68,22 +76,9 @@ class EpsilonGreedyPolicy:
         )
         self.epoch += 1
 
-    def reset(self):
-        """Reset epsilon to initial value."""
-        self.epsilon = self.epsilon_start
-        self.epoch = 0
-
     def get_epsilon(self) -> float:
         """Get current epsilon value."""
         return self.epsilon
-
-    def get_stats(self) -> dict:
-        """Get policy statistics."""
-        return {
-            'epsilon': self.epsilon,
-            'epoch': self.epoch,
-            'exploration_pct': 100.0 * self.epsilon
-        }
 
 
 class GreedyPolicy:
@@ -92,8 +87,12 @@ class GreedyPolicy:
     Used for inference after training.
     """
 
-    def select_action(self, q_values: np.ndarray) -> Tuple[int, bool]:
-        """Select best action (argmax of Q-values)."""
+    def select_action(self, q_values: np.ndarray, action_mask: np.ndarray = None) -> Tuple[int, bool]:
+        """Select best valid action (argmax of Q-values)."""
+        if action_mask is not None:
+            masked_q = np.full(NUM_ACTIONS, -np.inf)
+            masked_q[action_mask] = q_values[action_mask]
+            return int(np.argmax(masked_q)), False
         return int(np.argmax(q_values)), False
 
     def decay(self):

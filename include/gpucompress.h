@@ -128,6 +128,8 @@ typedef struct {
     size_t compressed_size;              /**< Compressed size in bytes */
     double compression_ratio;            /**< original_size / compressed_size */
     double entropy_bits;                 /**< Calculated data entropy (0-8 bits) */
+    double mad;                          /**< Mean Absolute Deviation */
+    double first_derivative;             /**< Mean absolute first derivative */
     gpucompress_algorithm_t algorithm_used; /**< Algorithm actually used */
     unsigned int preprocessing_used;     /**< Preprocessing actually applied */
     double throughput_mbps;              /**< Compression throughput (MB/s) */
@@ -353,10 +355,12 @@ int gpucompress_qtable_is_loaded(void);
  * Get recommended configuration based on data characteristics.
  *
  * Uses loaded Q-Table to recommend algorithm and preprocessing
- * based on entropy and error bound level.
+ * based on entropy, error bound level, MAD, and first derivative.
  *
  * @param entropy           Data entropy in bits (0.0 to 8.0)
  * @param error_bound       Desired error bound (0 for lossless)
+ * @param mad               Mean Absolute Deviation (0.0 if unknown)
+ * @param first_derivative  Mean absolute first derivative (0.0 if unknown)
  * @param algorithm_out     Output: recommended algorithm
  * @param preprocessing_out Output: recommended preprocessing flags
  * @return GPUCOMPRESS_SUCCESS or error code
@@ -364,6 +368,8 @@ int gpucompress_qtable_is_loaded(void);
 gpucompress_error_t gpucompress_recommend_config(
     double entropy,
     double error_bound,
+    double mad,
+    double first_derivative,
     gpucompress_algorithm_t* algorithm_out,
     unsigned int* preprocessing_out
 );

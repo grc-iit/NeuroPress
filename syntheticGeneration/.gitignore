@@ -13,16 +13,6 @@ ENV/
 # Testing
 test_output/
 test_*.py
-*.h5
-
-# Large generated preset files
-config/presets_small.yaml
-config/presets_medium.yaml
-config/presets_large.yaml
-config/presets_ultra.yaml
-config/presets_extreme.yaml
-config/presets_filtered.yaml
-config/presets_targeted.yaml
 
 # IDE
 .vscode/
@@ -37,4 +27,16 @@ Thumbs.db
 
 # Generated datasets
 datasets/
+training_data/
+training_*/
+*.h5
 *.hdf5
+*.csv
+*.bin
+
+# CUDA logs
+cufile.log
+
+# Reference files (external, not part of this repo)
+newScript.cc
+data_stats.h

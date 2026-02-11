@@ -8,12 +8,32 @@ Defines hyperparameters, state/action spaces, and reward presets.
 # State Space
 # ============================================================
 
-NUM_ENTROPY_BINS = 10      # Entropy discretized to 0-9
-NUM_ERROR_LEVELS = 3       # 0=aggressive, 1=balanced, 2=precise
-NUM_STATES = NUM_ENTROPY_BINS * NUM_ERROR_LEVELS  # 30 states
+NUM_ENTROPY_BINS = 16      # Byte entropy range [0, 8), 0.5-width bins
+NUM_ERROR_LEVELS = 4       # 0=aggressive, 1=balanced, 2=precise, 3=lossless
+NUM_MAD_BINS = 4           # Mean Absolute Deviation bins
+NUM_DERIV_BINS = 4         # First derivative (smoothness) bins
+NUM_STATES = NUM_ENTROPY_BINS * NUM_ERROR_LEVELS * NUM_MAD_BINS * NUM_DERIV_BINS  # 1024 states
 
 # Error bound thresholds for levels
-ERROR_LEVEL_THRESHOLDS = [0.01, 0.001]  # Level 0 >= 0.01, Level 1 >= 0.001, Level 2 < 0.001
+# Level 0: error_bound >= 0.1     (aggressive lossy)
+# Level 1: error_bound >= 0.01    (moderate lossy)
+# Level 2: error_bound >= 0.001   (precise lossy)
+# Level 3: error_bound <= 0       (lossless, no quantization)
+ERROR_LEVEL_THRESHOLDS = [0.1, 0.01, 0.001]
+
+# MAD bin thresholds (3 thresholds → 4 bins)
+# Bin 0: MAD < 0.05   (very clustered data)
+# Bin 1: MAD < 0.15   (moderately clustered)
+# Bin 2: MAD < 0.30   (spread out)
+# Bin 3: MAD >= 0.30  (highly variable)
+MAD_BIN_THRESHOLDS = [0.05, 0.15, 0.30]
+
+# First derivative bin thresholds (3 thresholds → 4 bins)
+# Bin 0: deriv < 0.05  (very smooth data)
+# Bin 1: deriv < 0.15  (moderately smooth)
+# Bin 2: deriv < 0.35  (rough)
+# Bin 3: deriv >= 0.35 (very rough / noisy)
+DERIV_BIN_THRESHOLDS = [0.05, 0.15, 0.35]
 
 # ============================================================
 # Action Space
@@ -54,9 +74,9 @@ VALIDATION_SPLIT = 0.2     # Fraction for validation
 
 REWARD_PRESETS = {
     'balanced': {
-        'ratio': 0.4,
+        'ratio': 0.5,
         'throughput': 0.3,
-        'psnr': 0.3
+        'psnr': 0.2
     },
     'max_ratio': {
         'ratio': 0.8,

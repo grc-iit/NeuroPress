@@ -33,17 +33,29 @@ constexpr size_t SHUFFLE_CHUNK_SIZE = 256 * 1024;
 /** Alignment for GPU memory (4KB for optimal performance) */
 constexpr size_t GPU_ALIGNMENT = 4096;
 
-/** Number of entropy bins for Q-Table state */
-constexpr int NUM_ENTROPY_BINS = 10;
+/** Number of entropy bins for Q-Table state (0.5-width bins) */
+constexpr int NUM_ENTROPY_BINS = 16;
 
-/** Number of error bound levels */
-constexpr int NUM_ERROR_LEVELS = 3;
+/** Number of error bound levels (aggressive, balanced, precise, lossless) */
+constexpr int NUM_ERROR_LEVELS = 4;
 
-/** Number of Q-Table states (entropy_bins * error_levels) */
-constexpr int NUM_STATES = NUM_ENTROPY_BINS * NUM_ERROR_LEVELS;
+/** Number of MAD (Mean Absolute Deviation) bins */
+constexpr int NUM_MAD_BINS = 4;
+
+/** Number of first derivative bins */
+constexpr int NUM_DERIV_BINS = 4;
+
+/** Number of Q-Table states (entropy * error * MAD * derivative) */
+constexpr int NUM_STATES = NUM_ENTROPY_BINS * NUM_ERROR_LEVELS * NUM_MAD_BINS * NUM_DERIV_BINS;
 
 /** Number of Q-Table actions (quantization * shuffle * algorithms) */
 constexpr int NUM_ACTIONS = 32;  // 2 * 2 * 8
+
+/** MAD bin thresholds (3 thresholds → 4 bins) */
+constexpr double MAD_BIN_THRESHOLDS[3] = {0.05, 0.15, 0.30};
+
+/** First derivative bin thresholds (3 thresholds → 4 bins) */
+constexpr double DERIV_BIN_THRESHOLDS[3] = {0.05, 0.15, 0.35};
 
 /* ============================================================
  * Algorithm Mapping
@@ -97,13 +109,41 @@ struct QTableAction {
 };
 
 /**
- * Encode Q-Table state from entropy and error level.
+ * Map a value to a bin using thresholds array.
  */
-inline int encodeState(double entropy, int error_level) {
-    int entropy_bin = static_cast<int>(entropy);
+inline int valueToBin(double value, const double* thresholds, int n_thresholds) {
+    for (int i = 0; i < n_thresholds; i++) {
+        if (value < thresholds[i]) return i;
+    }
+    return n_thresholds;
+}
+
+/**
+ * Map MAD value to bin index (0-3).
+ */
+inline int madToBin(double mad) {
+    return valueToBin(mad, MAD_BIN_THRESHOLDS, 3);
+}
+
+/**
+ * Map first derivative value to bin index (0-3).
+ */
+inline int derivToBin(double first_derivative) {
+    return valueToBin(first_derivative, DERIV_BIN_THRESHOLDS, 3);
+}
+
+/**
+ * Encode Q-Table state from entropy, error level, MAD, and first derivative.
+ */
+inline int encodeState(double entropy, int error_level,
+                       double mad = 0.0, double first_derivative = 0.0) {
+    int entropy_bin = static_cast<int>(entropy * 2);
     if (entropy_bin < 0) entropy_bin = 0;
     if (entropy_bin >= NUM_ENTROPY_BINS) entropy_bin = NUM_ENTROPY_BINS - 1;
-    return entropy_bin * NUM_ERROR_LEVELS + error_level;
+    int mad_bin = madToBin(mad);
+    int deriv_bin = derivToBin(first_derivative);
+    return ((entropy_bin * NUM_ERROR_LEVELS + error_level)
+            * NUM_MAD_BINS + mad_bin) * NUM_DERIV_BINS + deriv_bin;
 }
 
 /**
@@ -120,17 +160,19 @@ inline QTableAction decodeAction(int action_id) {
 }
 
 /**
- * Map error bound to error level (0, 1, or 2).
+ * Map error bound to error level (0, 1, 2, or 3).
  *
- * Level 0: error_bound >= 0.01 (aggressive)
- * Level 1: 0.001 <= error_bound < 0.01 (balanced)
- * Level 2: error_bound < 0.001 or lossless (precise)
+ * Level 0: error_bound >= 0.01        (aggressive lossy)
+ * Level 1: 0.01 <= error_bound < 0.1  (moderate lossy)
+ * Level 2: 0.001 <= error_bound < 0.01 (precise lossy)
+ * Level 3: error_bound <= 0           (lossless, no quantization)
  */
 inline int errorBoundToLevel(double error_bound) {
-    if (error_bound <= 0.0) return 2;  // Lossless = most precise
-    if (error_bound >= 0.01) return 0;
-    if (error_bound >= 0.001) return 1;
-    return 2;
+    if (error_bound <= 0.0) return 3;   // Lossless
+    if (error_bound >= 0.1) return 0;   // Aggressive
+    if (error_bound >= 0.01) return 1;  // Moderate
+    if (error_bound >= 0.001) return 2; // Precise
+    return 3;                           // Below 0.001 treated as lossless
 }
 
 /* ============================================================
@@ -218,12 +260,17 @@ double calculateEntropyGPU(const void* d_data, size_t num_bytes, cudaStream_t st
  * ============================================================ */
 
 /**
- * Load Q-Table to GPU constant memory.
+ * Load Q-Table to GPU global memory.
  *
  * @param h_qtable Host array of Q-Table values (NUM_STATES * NUM_ACTIONS floats)
  * @return CUDA error code
  */
 cudaError_t loadQTableToGPU(const float* h_qtable);
+
+/**
+ * Free GPU Q-Table memory. Called during library cleanup.
+ */
+void cleanupQTable();
 
 /**
  * Get best action from Q-Table on GPU.
