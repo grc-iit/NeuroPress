@@ -93,32 +93,52 @@ const char* ERROR_MESSAGES[] = {
 };
 
 /**
- * Calculate Mean Absolute Deviation of float data on host.
+ * Calculate normalized Mean Absolute Deviation of float data on host.
+ * Normalized by (max - min) to produce values in [0, 1] range,
+ * matching the benchmark and Q-Table bin thresholds.
  */
 double calculateMADHost(const float* data, size_t num_elements) {
     if (num_elements == 0) return 0.0;
     double sum = 0.0;
+    double vmin = static_cast<double>(data[0]);
+    double vmax = static_cast<double>(data[0]);
     for (size_t i = 0; i < num_elements; i++) {
-        sum += static_cast<double>(data[i]);
+        double v = static_cast<double>(data[i]);
+        sum += v;
+        if (v < vmin) vmin = v;
+        if (v > vmax) vmax = v;
     }
+    double data_range = vmax - vmin;
+    if (data_range == 0.0) return 0.0;
     double mean = sum / static_cast<double>(num_elements);
     double mad_sum = 0.0;
     for (size_t i = 0; i < num_elements; i++) {
         mad_sum += std::abs(static_cast<double>(data[i]) - mean);
     }
-    return mad_sum / static_cast<double>(num_elements);
+    return (mad_sum / static_cast<double>(num_elements)) / data_range;
 }
 
 /**
- * Calculate mean absolute first derivative of float data on host.
+ * Calculate normalized mean absolute first derivative of float data on host.
+ * Normalized by (max - min) to produce values in [0, 1] range,
+ * matching the benchmark and Q-Table bin thresholds.
  */
 double calculateFirstDerivativeHost(const float* data, size_t num_elements) {
     if (num_elements < 2) return 0.0;
+    double vmin = static_cast<double>(data[0]);
+    double vmax = static_cast<double>(data[0]);
+    for (size_t i = 0; i < num_elements; i++) {
+        double v = static_cast<double>(data[i]);
+        if (v < vmin) vmin = v;
+        if (v > vmax) vmax = v;
+    }
+    double data_range = vmax - vmin;
+    if (data_range == 0.0) return 0.0;
     double sum = 0.0;
     for (size_t i = 1; i < num_elements; i++) {
         sum += std::abs(static_cast<double>(data[i]) - static_cast<double>(data[i - 1]));
     }
-    return sum / static_cast<double>(num_elements - 1);
+    return (sum / static_cast<double>(num_elements - 1)) / data_range;
 }
 
 } // anonymous namespace
@@ -258,45 +278,30 @@ extern "C" gpucompress_error_t gpucompress_compress(
     double first_derivative = 0.0;
 
     if (cfg.algorithm == GPUCOMPRESS_ALGO_AUTO) {
-        // Calculate entropy on GPU
-        entropy = gpucompress_entropy_gpu_impl(d_input, input_size, stream);
-
-        // Calculate MAD and first derivative on host (input is still available)
         size_t num_elements = input_size / sizeof(float);
-        if (num_elements > 0) {
-            const float* h_floats = static_cast<const float*>(input);
-            mad = calculateMADHost(h_floats, num_elements);
-            first_derivative = calculateFirstDerivativeHost(h_floats, num_elements);
-        }
-
-        if (entropy >= 0.0) {
-            // Get error level
+        if (num_elements > 0 && gpucompress_qtable_is_loaded_impl()) {
             int error_level = gpucompress::errorBoundToLevel(cfg.error_bound);
-
-            // Encode state with all 4 dimensions
-            int state = gpucompress::encodeState(entropy, error_level, mad, first_derivative);
-
-            // Get best action from Q-Table
-            int action = gpucompress_qtable_get_best_action_impl(state);
-
-            // Decode action
-            gpucompress::QTableAction decoded = gpucompress::decodeAction(action);
-
-            // Map algorithm
-            algo_to_use = static_cast<gpucompress_algorithm_t>(decoded.algorithm + 1);
-
-            // Set preprocessing
-            preproc_to_use = 0;
-            if (decoded.shuffle_size > 0) {
-                preproc_to_use |= (decoded.shuffle_size == 4) ?
-                                  GPUCOMPRESS_PREPROC_SHUFFLE_4 :
-                                  GPUCOMPRESS_PREPROC_SHUFFLE_2;
-            }
-            if (decoded.use_quantization) {
-                preproc_to_use |= GPUCOMPRESS_PREPROC_QUANTIZE;
+            int action = 0;
+            int rc = gpucompress::runAutoStatsPipeline(
+                d_input, input_size, error_level,
+                gpucompress::getQTableDevicePtr(), stream,
+                &action,
+                stats ? &entropy : nullptr,
+                stats ? &mad : nullptr,
+                stats ? &first_derivative : nullptr);
+            if (rc == 0) {
+                gpucompress::QTableAction decoded = gpucompress::decodeAction(action);
+                algo_to_use = static_cast<gpucompress_algorithm_t>(decoded.algorithm + 1);
+                preproc_to_use = 0;
+                if (decoded.shuffle_size > 0)
+                    preproc_to_use |= (decoded.shuffle_size == 4) ?
+                        GPUCOMPRESS_PREPROC_SHUFFLE_4 : GPUCOMPRESS_PREPROC_SHUFFLE_2;
+                if (decoded.use_quantization)
+                    preproc_to_use |= GPUCOMPRESS_PREPROC_QUANTIZE;
+            } else {
+                algo_to_use = GPUCOMPRESS_ALGO_LZ4;
             }
         } else {
-            // Entropy calculation failed, fall back to LZ4
             algo_to_use = GPUCOMPRESS_ALGO_LZ4;
         }
     }

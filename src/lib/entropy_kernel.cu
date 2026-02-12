@@ -321,6 +321,50 @@ double calculateEntropyGPUWithBuffers(
     return entropy;
 }
 
+/**
+ * Launch entropy kernels asynchronously without D->H copy or sync.
+ *
+ * Fire-and-forget variant for use in the auto-stats GPU pipeline.
+ * Writes entropy result directly to a device pointer.
+ *
+ * @param d_data         Data buffer (GPU memory)
+ * @param num_bytes      Size in bytes
+ * @param d_histogram    Pre-allocated histogram buffer (256 * sizeof(unsigned int))
+ * @param d_entropy_out  Device pointer to write entropy result
+ * @param stream         CUDA stream
+ */
+void launchEntropyKernelsAsync(
+    const void* d_data,
+    size_t num_bytes,
+    unsigned int* d_histogram,
+    double* d_entropy_out,
+    cudaStream_t stream
+) {
+    if (d_data == nullptr || num_bytes == 0) {
+        return;
+    }
+
+    // Initialize histogram to zero
+    cudaMemsetAsync(d_histogram, 0, NUM_BINS * sizeof(unsigned int), stream);
+
+    // Calculate grid size
+    int num_blocks = static_cast<int>((num_bytes + HIST_BLOCK_SIZE - 1) / HIST_BLOCK_SIZE);
+    num_blocks = min(num_blocks, 1024);
+
+    // Launch histogram kernel
+    if (num_bytes >= 1024 && (reinterpret_cast<uintptr_t>(d_data) % 4) == 0) {
+        histogramKernelVec4<<<num_blocks, HIST_BLOCK_SIZE, 0, stream>>>(
+            static_cast<const uint8_t*>(d_data), num_bytes, d_histogram);
+    } else {
+        histogramKernel<<<num_blocks, HIST_BLOCK_SIZE, 0, stream>>>(
+            static_cast<const uint8_t*>(d_data), num_bytes, d_histogram);
+    }
+
+    // Launch entropy kernel - writes directly to device pointer
+    entropyFromHistogramKernel<<<1, ENTROPY_BLOCK_SIZE, 0, stream>>>(
+        d_histogram, num_bytes, d_entropy_out);
+}
+
 } // namespace gpucompress
 
 /* ============================================================

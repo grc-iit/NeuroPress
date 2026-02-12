@@ -281,6 +281,66 @@ void cleanupQTable();
  */
 int getBestActionGPU(int state, cudaStream_t stream);
 
+/* ============================================================
+ * Auto-Stats GPU Pipeline
+ * ============================================================ */
+
+/**
+ * Run the complete ALGO_AUTO statistics pipeline on GPU.
+ *
+ * Computes entropy, MAD, first derivative, encodes state, and
+ * performs Q-Table argmax lookup entirely on GPU. Only copies
+ * back the final action int (4 bytes) plus optional stats.
+ *
+ * @param d_input      Float data already on GPU
+ * @param input_size   Size in bytes
+ * @param error_level  From errorBoundToLevel(), 0-3
+ * @param d_qtable     Q-Table in GPU memory
+ * @param stream       CUDA stream
+ * @param out_action   [out] Best action index
+ * @param out_entropy  [out] Nullable, entropy for stats reporting
+ * @param out_mad      [out] Nullable, normalized MAD for stats reporting
+ * @param out_deriv    [out] Nullable, normalized derivative for stats reporting
+ * @return 0 on success, -1 on error
+ */
+int runAutoStatsPipeline(
+    const void* d_input,
+    size_t input_size,
+    int error_level,
+    const float* d_qtable,
+    cudaStream_t stream,
+    int* out_action,
+    double* out_entropy = nullptr,
+    double* out_mad = nullptr,
+    double* out_deriv = nullptr
+);
+
+/**
+ * Launch entropy kernels asynchronously without D->H copy.
+ *
+ * Fire-and-forget variant that writes entropy to a device pointer.
+ *
+ * @param d_data         Data buffer (GPU memory)
+ * @param num_bytes      Size in bytes
+ * @param d_histogram    Pre-allocated histogram buffer (256 uints)
+ * @param d_entropy_out  Device pointer to write entropy result
+ * @param stream         CUDA stream
+ */
+void launchEntropyKernelsAsync(
+    const void* d_data,
+    size_t num_bytes,
+    unsigned int* d_histogram,
+    double* d_entropy_out,
+    cudaStream_t stream
+);
+
+/**
+ * Get device pointer to Q-Table in GPU global memory.
+ *
+ * @return Device pointer to Q-Table, or nullptr if not loaded
+ */
+const float* getQTableDevicePtr();
+
 } // namespace gpucompress
 
 #endif /* INTERNAL_HPP */

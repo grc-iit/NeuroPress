@@ -56,6 +56,7 @@ set(LIB_SOURCES
     src/lib/gpucompress_api.cpp
     src/lib/entropy_kernel.cu
     src/lib/qtable_gpu.cu
+    src/lib/stats_kernel.cu
 )
 
 # Set language property for .cpp files that use CUDA

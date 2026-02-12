@@ -328,6 +328,18 @@ bool isQTableLoaded() {
     return g_qtable_loaded;
 }
 
+/**
+ * Get device pointer to Q-Table in GPU global memory.
+ *
+ * Used by the auto-stats GPU pipeline to pass the Q-Table
+ * directly to the finalizeAndLookupKernel.
+ *
+ * @return Device pointer to Q-Table, or nullptr if not loaded
+ */
+const float* getQTableDevicePtr() {
+    return d_qtable;
+}
+
 /* ============================================================
  * Q-Table Inference Kernel
  * ============================================================ */
