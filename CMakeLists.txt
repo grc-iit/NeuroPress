@@ -199,6 +199,12 @@ set_target_properties(test_quantization PROPERTIES
 )
 
 # ============================================================
+# Executable 4: Benchmark
+# ============================================================
+add_executable(benchmark scripts/benchmark.cpp)
+target_link_libraries(benchmark PRIVATE gpucompress pthread)
+
+# ============================================================
 # Installation
 # ============================================================
 include(GNUInstallDirs)
