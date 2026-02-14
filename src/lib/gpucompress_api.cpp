@@ -19,6 +19,7 @@
 #include "core/compression_header.h"
 #include "preprocessing/byte_shuffle.cuh"
 #include "preprocessing/quantization.cuh"
+#include "experience_buffer.h"
 
 #include "nvcomp.hpp"
 #include "nvcomp/nvcompManagerFactory.hpp"
@@ -39,6 +40,12 @@ extern "C" {
     int gpucompress_qtable_get_best_action_impl(int state);
     void gpucompress_qtable_init_default_impl(void);
     void gpucompress_qtable_cleanup_impl(void);
+
+    // From nn_gpu.cu
+    int gpucompress_nn_load_impl(const char* filepath);
+    int gpucompress_nn_is_loaded_impl(void);
+    void gpucompress_nn_cleanup_impl(void);
+    void gpucompress_nn_set_criterion_impl(int criterion);
 }
 
 /* ============================================================
@@ -64,6 +71,11 @@ int g_cuda_device = 0;
 
 /** Version string */
 const char* VERSION_STRING = "1.0.0";
+
+/** Active learning state */
+bool g_active_learning_enabled = false;
+double g_exploration_threshold = 0.20;  // 20% MAPE
+char g_experience_path[512] = "";
 
 /** Algorithm names */
 const char* ALGORITHM_NAMES[] = {
@@ -91,55 +103,6 @@ const char* ERROR_MESSAGES[] = {
     "Library not initialized",
     "Output buffer too small"
 };
-
-/**
- * Calculate normalized Mean Absolute Deviation of float data on host.
- * Normalized by (max - min) to produce values in [0, 1] range,
- * matching the benchmark and Q-Table bin thresholds.
- */
-double calculateMADHost(const float* data, size_t num_elements) {
-    if (num_elements == 0) return 0.0;
-    double sum = 0.0;
-    double vmin = static_cast<double>(data[0]);
-    double vmax = static_cast<double>(data[0]);
-    for (size_t i = 0; i < num_elements; i++) {
-        double v = static_cast<double>(data[i]);
-        sum += v;
-        if (v < vmin) vmin = v;
-        if (v > vmax) vmax = v;
-    }
-    double data_range = vmax - vmin;
-    if (data_range == 0.0) return 0.0;
-    double mean = sum / static_cast<double>(num_elements);
-    double mad_sum = 0.0;
-    for (size_t i = 0; i < num_elements; i++) {
-        mad_sum += std::abs(static_cast<double>(data[i]) - mean);
-    }
-    return (mad_sum / static_cast<double>(num_elements)) / data_range;
-}
-
-/**
- * Calculate normalized mean absolute first derivative of float data on host.
- * Normalized by (max - min) to produce values in [0, 1] range,
- * matching the benchmark and Q-Table bin thresholds.
- */
-double calculateFirstDerivativeHost(const float* data, size_t num_elements) {
-    if (num_elements < 2) return 0.0;
-    double vmin = static_cast<double>(data[0]);
-    double vmax = static_cast<double>(data[0]);
-    for (size_t i = 0; i < num_elements; i++) {
-        double v = static_cast<double>(data[i]);
-        if (v < vmin) vmin = v;
-        if (v > vmax) vmax = v;
-    }
-    double data_range = vmax - vmin;
-    if (data_range == 0.0) return 0.0;
-    double sum = 0.0;
-    for (size_t i = 1; i < num_elements; i++) {
-        sum += std::abs(static_cast<double>(data[i]) - static_cast<double>(data[i - 1]));
-    }
-    return (sum / static_cast<double>(num_elements - 1)) / data_range;
-}
 
 } // anonymous namespace
 
@@ -172,11 +135,25 @@ extern "C" gpucompress_error_t gpucompress_init(const char* qtable_path) {
         return GPUCOMPRESS_ERROR_CUDA_FAILED;
     }
 
-    // Load Q-Table if path provided
+    // Load model if path provided (auto-detect .nnwt vs Q-Table)
     if (qtable_path != nullptr && qtable_path[0] != '\0') {
-        if (gpucompress_qtable_load_impl(qtable_path) != 0) {
-            // Warning but don't fail - can still use without Q-Table
-            fprintf(stderr, "Warning: Failed to load Q-Table from %s\n", qtable_path);
+        std::string path(qtable_path);
+        bool loaded = false;
+
+        // Try NN weights if .nnwt extension
+        if (path.size() >= 5 && path.substr(path.size() - 5) == ".nnwt") {
+            if (gpucompress_nn_load_impl(qtable_path) == 0) {
+                loaded = true;
+            } else {
+                fprintf(stderr, "Warning: Failed to load NN weights from %s\n", qtable_path);
+            }
+        }
+
+        // Try Q-Table if not .nnwt or NN load failed
+        if (!loaded) {
+            if (gpucompress_qtable_load_impl(qtable_path) != 0) {
+                fprintf(stderr, "Warning: Failed to load Q-Table from %s\n", qtable_path);
+            }
         }
     } else {
         // Initialize default Q-Table
@@ -194,6 +171,9 @@ extern "C" void gpucompress_cleanup(void) {
 
     if (old_ref <= 1) {
         // Last reference, cleanup
+        experience_buffer_cleanup();
+        g_active_learning_enabled = false;
+        gpucompress_nn_cleanup_impl();
         gpucompress_qtable_cleanup_impl();
         if (g_default_stream != nullptr) {
             cudaStreamDestroy(g_default_stream);
@@ -273,34 +253,68 @@ extern "C" gpucompress_error_t gpucompress_compress(
     unsigned int preproc_to_use = cfg.preprocessing;
     double entropy = 0.0;
 
-    // Auto algorithm selection using Q-Table
+    // Auto algorithm selection
     double mad = 0.0;
     double first_derivative = 0.0;
+    bool nn_was_used = false;
+    int nn_action = 0;
+    float predicted_ratio = 0.0f;
+    int top_actions[32] = {0};
+    bool is_ood = false;
 
     if (cfg.algorithm == GPUCOMPRESS_ALGO_AUTO) {
         size_t num_elements = input_size / sizeof(float);
-        if (num_elements > 0 && gpucompress_qtable_is_loaded_impl()) {
+        int action = 0;
+        int rc = -1;
+
+        if (num_elements > 0 && gpucompress_nn_is_loaded_impl()) {
+            // Neural Network inference (preferred)
+            // Always get stats when active learning is enabled
+            bool need_stats = (stats != nullptr) || g_active_learning_enabled;
+            float* p_ratio = g_active_learning_enabled ? &predicted_ratio : nullptr;
+            int* p_top = g_active_learning_enabled ? top_actions : nullptr;
+
+            rc = gpucompress::runAutoStatsNNPipeline(
+                d_input, input_size, cfg.error_bound, stream,
+                &action,
+                need_stats ? &entropy : nullptr,
+                need_stats ? &mad : nullptr,
+                need_stats ? &first_derivative : nullptr,
+                p_ratio,
+                p_top);
+
+            if (rc == 0) {
+                nn_was_used = true;
+                nn_action = action;
+
+                // Check OOD
+                if (g_active_learning_enabled) {
+                    is_ood = gpucompress::isInputOOD(
+                        entropy, mad, first_derivative,
+                        input_size, cfg.error_bound);
+                }
+            }
+        } else if (num_elements > 0 && gpucompress_qtable_is_loaded_impl()) {
+            // Q-Table fallback
             int error_level = gpucompress::errorBoundToLevel(cfg.error_bound);
-            int action = 0;
-            int rc = gpucompress::runAutoStatsPipeline(
+            rc = gpucompress::runAutoStatsPipeline(
                 d_input, input_size, error_level,
                 gpucompress::getQTableDevicePtr(), stream,
                 &action,
                 stats ? &entropy : nullptr,
                 stats ? &mad : nullptr,
                 stats ? &first_derivative : nullptr);
-            if (rc == 0) {
-                gpucompress::QTableAction decoded = gpucompress::decodeAction(action);
-                algo_to_use = static_cast<gpucompress_algorithm_t>(decoded.algorithm + 1);
-                preproc_to_use = 0;
-                if (decoded.shuffle_size > 0)
-                    preproc_to_use |= (decoded.shuffle_size == 4) ?
-                        GPUCOMPRESS_PREPROC_SHUFFLE_4 : GPUCOMPRESS_PREPROC_SHUFFLE_2;
-                if (decoded.use_quantization)
-                    preproc_to_use |= GPUCOMPRESS_PREPROC_QUANTIZE;
-            } else {
-                algo_to_use = GPUCOMPRESS_ALGO_LZ4;
-            }
+        }
+
+        if (rc == 0) {
+            gpucompress::QTableAction decoded = gpucompress::decodeAction(action);
+            algo_to_use = static_cast<gpucompress_algorithm_t>(decoded.algorithm + 1);
+            preproc_to_use = 0;
+            if (decoded.shuffle_size > 0)
+                preproc_to_use |= (decoded.shuffle_size == 4) ?
+                    GPUCOMPRESS_PREPROC_SHUFFLE_4 : GPUCOMPRESS_PREPROC_SHUFFLE_2;
+            if (decoded.use_quantization)
+                preproc_to_use |= GPUCOMPRESS_PREPROC_QUANTIZE;
         } else {
             algo_to_use = GPUCOMPRESS_ALGO_LZ4;
         }
@@ -460,18 +474,205 @@ extern "C" gpucompress_error_t gpucompress_compress(
 
     cuda_err = cudaStreamSynchronize(stream);
 
-    // Cleanup GPU memory
+    // Cleanup GPU output and preprocessing buffers (but keep d_input for exploration)
     cudaFree(d_output);
     if (d_quantized) cudaFree(d_quantized);
     if (d_shuffled) cudaFree(d_shuffled);
-    cudaFree(d_input);
 
     if (cuda_err != cudaSuccess) {
+        cudaFree(d_input);
         return GPUCOMPRESS_ERROR_CUDA_FAILED;
     }
 
     // Set output size
     *output_size = total_size;
+
+    // Active learning: Level 1 passive collection + Level 2 exploration
+    if (cfg.algorithm == GPUCOMPRESS_ALGO_AUTO && nn_was_used &&
+        g_active_learning_enabled) {
+        double actual_ratio = static_cast<double>(input_size) /
+                              static_cast<double>(compressed_size);
+
+        // Level 1: Store passive sample
+        ExperienceSample sample;
+        sample.entropy = entropy;
+        sample.mad = mad;
+        sample.first_derivative = first_derivative;
+        sample.data_size = input_size;
+        sample.error_bound = cfg.error_bound;
+        sample.action = nn_action;
+        sample.actual_ratio = actual_ratio;
+        sample.actual_comp_time_ms = 0.0;  // Not timed in this path
+        experience_buffer_append(&sample);
+
+        // Check prediction error
+        double pred_ratio_d = static_cast<double>(predicted_ratio);
+        double error_pct = (actual_ratio > 0.0) ?
+            std::abs(pred_ratio_d - actual_ratio) / actual_ratio : 0.0;
+
+        if (error_pct > g_exploration_threshold || is_ood) {
+            // Level 2: Explore alternatives
+            // Determine K (number of alternatives to try)
+            int K;
+            if (is_ood) {
+                K = 31;  // Try all 32 configs (minus original)
+            } else if (error_pct > 0.50) {
+                K = 9;
+            } else {
+                K = 4;
+            }
+
+            // Try top-K alternative configs
+            double best_ratio = actual_ratio;
+            (void)best_ratio;  // Updated in loop, used for tracking
+
+            for (int i = 1; i <= K && i < 32; i++) {
+                int alt_action = top_actions[i];
+                if (alt_action == nn_action) continue;
+
+                gpucompress::QTableAction alt = gpucompress::decodeAction(alt_action);
+                gpucompress_algorithm_t alt_algo =
+                    static_cast<gpucompress_algorithm_t>(alt.algorithm + 1);
+                unsigned int alt_preproc = 0;
+                if (alt.shuffle_size > 0)
+                    alt_preproc |= (alt.shuffle_size == 4) ?
+                        GPUCOMPRESS_PREPROC_SHUFFLE_4 : GPUCOMPRESS_PREPROC_SHUFFLE_2;
+                if (alt.use_quantization)
+                    alt_preproc |= GPUCOMPRESS_PREPROC_QUANTIZE;
+
+                // Compress with alternative config
+                uint8_t* d_alt_input = d_input;
+                size_t alt_compress_size = input_size;
+                uint8_t* d_alt_quant = nullptr;
+                uint8_t* d_alt_shuf = nullptr;
+                QuantizationResult alt_quant_result;
+
+                // Apply quantization
+                if ((alt_preproc & GPUCOMPRESS_PREPROC_QUANTIZE) && cfg.error_bound > 0.0) {
+                    size_t num_el = input_size / sizeof(float);
+                    if (num_el > 0) {
+                        QuantizationConfig qcfg(
+                            QuantizationType::LINEAR, cfg.error_bound,
+                            num_el, sizeof(float));
+                        alt_quant_result = quantize_simple(
+                            d_alt_input, num_el, sizeof(float), qcfg, stream);
+                        if (alt_quant_result.isValid()) {
+                            d_alt_quant = static_cast<uint8_t*>(alt_quant_result.d_quantized);
+                            d_alt_input = d_alt_quant;
+                            alt_compress_size = alt_quant_result.quantized_bytes;
+                        }
+                    }
+                }
+
+                // Apply shuffle
+                unsigned int alt_shuf_size = GPUCOMPRESS_GET_SHUFFLE_SIZE(alt_preproc);
+                if (alt_shuf_size > 0) {
+                    uint8_t* shuf = byte_shuffle_simple(
+                        d_alt_input, alt_compress_size, alt_shuf_size,
+                        gpucompress::SHUFFLE_CHUNK_SIZE,
+                        ShuffleKernelType::AUTO, stream);
+                    if (shuf) {
+                        d_alt_shuf = shuf;
+                        d_alt_input = d_alt_shuf;
+                    }
+                }
+
+                cudaStreamSynchronize(stream);
+
+                // Compress
+                CompressionAlgorithm alt_internal =
+                    gpucompress::toInternalAlgorithm(alt_algo);
+                auto alt_comp = createCompressionManager(
+                    alt_internal, gpucompress::DEFAULT_CHUNK_SIZE,
+                    stream, d_alt_input);
+
+                size_t alt_comp_size = 0;
+
+                if (alt_comp) {
+                    try {
+                        CompressionConfig alt_cc =
+                            alt_comp->configure_compression(alt_compress_size);
+                        size_t alt_max = alt_cc.max_compressed_buffer_size;
+                        uint8_t* d_alt_out = nullptr;
+                        if (cudaMalloc(&d_alt_out, alt_max) == cudaSuccess) {
+                            alt_comp->compress(d_alt_input, d_alt_out, alt_cc);
+                            alt_comp_size = alt_comp->get_compressed_output_size(d_alt_out);
+
+                            double alt_ratio = static_cast<double>(input_size) /
+                                               static_cast<double>(alt_comp_size);
+
+                            // Store alternative experience
+                            ExperienceSample alt_sample;
+                            alt_sample.entropy = entropy;
+                            alt_sample.mad = mad;
+                            alt_sample.first_derivative = first_derivative;
+                            alt_sample.data_size = input_size;
+                            alt_sample.error_bound = cfg.error_bound;
+                            alt_sample.action = alt_action;
+                            alt_sample.actual_ratio = alt_ratio;
+                            alt_sample.actual_comp_time_ms = 0.0;
+                            experience_buffer_append(&alt_sample);
+
+                            // Track if this is better than current best
+                            if (alt_ratio > best_ratio) {
+                                best_ratio = alt_ratio;
+
+                                // Copy better result to output
+                                size_t header_sz = GPUCOMPRESS_HEADER_SIZE;
+                                size_t alt_total = header_sz + alt_comp_size;
+                                if (alt_total <= *output_size) {
+                                    // Build header for alternative
+                                    CompressionHeader alt_hdr;
+                                    alt_hdr.magic = COMPRESSION_MAGIC;
+                                    alt_hdr.version = COMPRESSION_HEADER_VERSION;
+                                    alt_hdr.shuffle_element_size = alt_shuf_size;
+                                    alt_hdr.original_size = input_size;
+                                    alt_hdr.compressed_size = alt_comp_size;
+
+                                    if (d_alt_quant && alt_quant_result.isValid()) {
+                                        alt_hdr.setQuantizationFlags(
+                                            static_cast<uint32_t>(alt_quant_result.type),
+                                            alt_quant_result.actual_precision, true);
+                                        alt_hdr.quant_error_bound = alt_quant_result.error_bound;
+                                        alt_hdr.quant_scale = alt_quant_result.scale_factor;
+                                        alt_hdr.data_min = alt_quant_result.data_min;
+                                        alt_hdr.data_max = alt_quant_result.data_max;
+                                    } else {
+                                        alt_hdr.quant_flags = 0;
+                                        alt_hdr.quant_error_bound = 0.0;
+                                        alt_hdr.quant_scale = 0.0;
+                                        alt_hdr.data_min = 0.0;
+                                        alt_hdr.data_max = 0.0;
+                                    }
+
+                                    // Write header + compressed data to host output
+                                    memcpy(output, &alt_hdr, sizeof(CompressionHeader));
+                                    cudaMemcpy(
+                                        static_cast<uint8_t*>(output) + header_sz,
+                                        d_alt_out, alt_comp_size,
+                                        cudaMemcpyDeviceToHost);
+                                    *output_size = alt_total;
+                                    total_size = alt_total;
+                                    compressed_size = alt_comp_size;
+                                    algo_to_use = alt_algo;
+                                    preproc_to_use = alt_preproc;
+                                }
+                            }
+                            cudaFree(d_alt_out);
+                        }
+                    } catch (...) {
+                        // Compression failed for this config, skip it
+                    }
+                }
+
+                if (d_alt_quant) cudaFree(d_alt_quant);
+                if (d_alt_shuf) cudaFree(d_alt_shuf);
+            }
+        }
+    }
+
+    // Now free d_input
+    cudaFree(d_input);
 
     // Fill stats if requested
     if (stats != nullptr) {
@@ -752,6 +953,59 @@ extern "C" gpucompress_error_t gpucompress_calculate_entropy_gpu(
 }
 
 /* ============================================================
+ * Statistical Analysis
+ * ============================================================ */
+
+extern "C" gpucompress_error_t gpucompress_compute_stats(
+    const void* data,
+    size_t size,
+    double* entropy,
+    double* mad,
+    double* first_derivative
+) {
+    if (!g_initialized.load()) {
+        return GPUCOMPRESS_ERROR_NOT_INITIALIZED;
+    }
+
+    if (data == nullptr || entropy == nullptr || mad == nullptr ||
+        first_derivative == nullptr || size == 0) {
+        return GPUCOMPRESS_ERROR_INVALID_INPUT;
+    }
+
+    if (size % sizeof(float) != 0) {
+        return GPUCOMPRESS_ERROR_INVALID_INPUT;
+    }
+
+    cudaStream_t stream = g_default_stream;
+    cudaError_t cuda_err;
+
+    // Allocate GPU buffer and copy data
+    uint8_t* d_data = nullptr;
+    cuda_err = cudaMalloc(&d_data, size);
+    if (cuda_err != cudaSuccess) {
+        return GPUCOMPRESS_ERROR_OUT_OF_MEMORY;
+    }
+
+    cuda_err = cudaMemcpyAsync(d_data, data, size, cudaMemcpyHostToDevice, stream);
+    if (cuda_err != cudaSuccess) {
+        cudaFree(d_data);
+        return GPUCOMPRESS_ERROR_CUDA_FAILED;
+    }
+
+    // Run stats-only pipeline on GPU
+    int rc = gpucompress::runStatsOnlyPipeline(
+        d_data, size, stream, entropy, mad, first_derivative);
+
+    cudaFree(d_data);
+
+    if (rc != 0) {
+        return GPUCOMPRESS_ERROR_CUDA_FAILED;
+    }
+
+    return GPUCOMPRESS_SUCCESS;
+}
+
+/* ============================================================
  * Q-Table Management
  * ============================================================ */
 
@@ -808,6 +1062,23 @@ extern "C" gpucompress_error_t gpucompress_recommend_config(
 }
 
 /* ============================================================
+ * Neural Network Management
+ * ============================================================ */
+
+extern "C" gpucompress_error_t gpucompress_load_nn(const char* filepath) {
+    if (filepath == nullptr) {
+        return GPUCOMPRESS_ERROR_INVALID_INPUT;
+    }
+
+    int result = gpucompress_nn_load_impl(filepath);
+    return (result == 0) ? GPUCOMPRESS_SUCCESS : GPUCOMPRESS_ERROR_INVALID_INPUT;
+}
+
+extern "C" int gpucompress_nn_is_loaded(void) {
+    return gpucompress_nn_is_loaded_impl();
+}
+
+/* ============================================================
  * Utility Functions
  * ============================================================ */
 
@@ -843,6 +1114,68 @@ extern "C" const char* gpucompress_error_string(gpucompress_error_t error) {
 
 extern "C" const char* gpucompress_version(void) {
     return VERSION_STRING;
+}
+
+/* ============================================================
+ * Active Learning API
+ * ============================================================ */
+
+extern "C" gpucompress_error_t gpucompress_enable_active_learning(
+    const char* experience_path
+) {
+    if (experience_path == nullptr || experience_path[0] == '\0') {
+        return GPUCOMPRESS_ERROR_INVALID_INPUT;
+    }
+
+    std::lock_guard<std::mutex> lock(g_init_mutex);
+
+    // Initialize experience buffer
+    if (experience_buffer_init(experience_path) != 0) {
+        return GPUCOMPRESS_ERROR_INVALID_INPUT;
+    }
+
+    strncpy(g_experience_path, experience_path, sizeof(g_experience_path) - 1);
+    g_experience_path[sizeof(g_experience_path) - 1] = '\0';
+    g_active_learning_enabled = true;
+
+    return GPUCOMPRESS_SUCCESS;
+}
+
+extern "C" void gpucompress_disable_active_learning(void) {
+    std::lock_guard<std::mutex> lock(g_init_mutex);
+
+    g_active_learning_enabled = false;
+    experience_buffer_cleanup();
+    g_experience_path[0] = '\0';
+}
+
+extern "C" int gpucompress_active_learning_enabled(void) {
+    return g_active_learning_enabled ? 1 : 0;
+}
+
+extern "C" void gpucompress_set_exploration_threshold(double threshold) {
+    if (threshold > 0.0 && threshold < 1.0) {
+        g_exploration_threshold = threshold;
+    }
+}
+
+extern "C" size_t gpucompress_experience_count(void) {
+    return experience_buffer_count();
+}
+
+extern "C" gpucompress_error_t gpucompress_reload_nn(const char* filepath) {
+    if (filepath == nullptr) {
+        return GPUCOMPRESS_ERROR_INVALID_INPUT;
+    }
+
+    std::lock_guard<std::mutex> lock(g_init_mutex);
+
+    // Clean up old weights
+    gpucompress_nn_cleanup_impl();
+
+    // Load new weights
+    int result = gpucompress_nn_load_impl(filepath);
+    return (result == 0) ? GPUCOMPRESS_SUCCESS : GPUCOMPRESS_ERROR_INVALID_INPUT;
 }
 
 /* ============================================================

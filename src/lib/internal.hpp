@@ -341,6 +341,112 @@ void launchEntropyKernelsAsync(
  */
 const float* getQTableDevicePtr();
 
+/* ============================================================
+ * Neural Network GPU Functions
+ * ============================================================ */
+
+/**
+ * Load neural network weights from binary file (.nnwt).
+ *
+ * @param filepath Path to .nnwt weights file
+ * @return true on success
+ */
+bool loadNNFromBinary(const char* filepath);
+
+/**
+ * Free neural network GPU memory.
+ */
+void cleanupNN();
+
+/**
+ * Check if neural network is loaded.
+ */
+bool isNNLoaded();
+
+/**
+ * Check if input features are out-of-distribution.
+ *
+ * @return true if any continuous feature is outside training bounds
+ */
+bool isInputOOD(double entropy, double mad, double deriv,
+                size_t data_size, double error_bound);
+
+/**
+ * Run neural network inference to find best compression config.
+ *
+ * @param entropy             Shannon entropy (0-8)
+ * @param mad_norm            Normalized MAD (0-1)
+ * @param deriv_norm          Normalized 1st derivative (0-1)
+ * @param data_size           Data size in bytes
+ * @param error_bound         Error bound (0 for lossless)
+ * @param stream              CUDA stream
+ * @param out_predicted_ratio [out] Nullable, predicted compression ratio for winner
+ * @param out_top_actions     [out] Nullable, all 32 action IDs sorted by rank
+ * @return Best action ID (0-31)
+ */
+int runNNInference(
+    double entropy,
+    double mad_norm,
+    double deriv_norm,
+    size_t data_size,
+    double error_bound,
+    cudaStream_t stream,
+    float* out_predicted_ratio = nullptr,
+    int* out_top_actions = nullptr
+);
+
+/**
+ * Run stats-only pipeline on GPU (no NN inference or Q-Table lookup).
+ *
+ * Computes entropy, normalized MAD, and normalized first derivative
+ * entirely on GPU. Used by gpucompress_compute_stats() public API.
+ *
+ * @param d_input      Float data already on GPU
+ * @param input_size   Size in bytes
+ * @param stream       CUDA stream
+ * @param out_entropy  [out] Shannon entropy (0-8 bits)
+ * @param out_mad      [out] Normalized MAD (0-1)
+ * @param out_deriv    [out] Normalized first derivative (0-1)
+ * @return 0 on success, -1 on error
+ */
+int runStatsOnlyPipeline(
+    const void* d_input,
+    size_t input_size,
+    cudaStream_t stream,
+    double* out_entropy,
+    double* out_mad,
+    double* out_deriv
+);
+
+/**
+ * Run the complete ALGO_AUTO statistics + NN inference pipeline on GPU.
+ *
+ * Same stats computation as runAutoStatsPipeline but uses neural network
+ * instead of Q-Table for action selection.
+ *
+ * @param d_input      Float data already on GPU
+ * @param input_size   Size in bytes
+ * @param error_bound  Raw error bound value
+ * @param stream       CUDA stream
+ * @param out_action   [out] Best action index
+ * @param out_entropy  [out] Nullable, entropy for stats reporting
+ * @param out_mad      [out] Nullable, normalized MAD for stats reporting
+ * @param out_deriv    [out] Nullable, normalized derivative for stats reporting
+ * @return 0 on success, -1 on error
+ */
+int runAutoStatsNNPipeline(
+    const void* d_input,
+    size_t input_size,
+    double error_bound,
+    cudaStream_t stream,
+    int* out_action,
+    double* out_entropy = nullptr,
+    double* out_mad = nullptr,
+    double* out_deriv = nullptr,
+    float* out_predicted_ratio = nullptr,
+    int* out_top_actions = nullptr
+);
+
 } // namespace gpucompress
 
 #endif /* INTERNAL_HPP */

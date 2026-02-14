@@ -342,6 +342,41 @@ __global__ void finalizeAndLookupKernel(
 }
 
 /* ============================================================
+ * Kernel 6: finalizeStatsOnlyKernel (for NN pipeline)
+ * ============================================================ */
+
+/**
+ * Single thread. Normalizes MAD and derivative without Q-Table lookup.
+ * Used by the NN pipeline which needs raw normalized values instead of
+ * binned states.
+ */
+__global__ void finalizeStatsOnlyKernel(
+    AutoStatsGPU* __restrict__ stats
+) {
+    if (threadIdx.x != 0) return;
+
+    size_t n = stats->num_elements;
+    double range = static_cast<double>(stats->vmax) - static_cast<double>(stats->vmin);
+
+    // Normalize MAD
+    double mad_norm = 0.0;
+    if (range > 0.0 && n > 0) {
+        mad_norm = (stats->mad_sum / static_cast<double>(n)) / range;
+    }
+
+    // Normalize derivative
+    double deriv_norm = 0.0;
+    if (range > 0.0 && n > 1) {
+        deriv_norm = (stats->abs_diff_sum / static_cast<double>(n - 1)) / range;
+    }
+
+    stats->mad_normalized = mad_norm;
+    stats->deriv_normalized = deriv_norm;
+    stats->state = -1;   // Not used in NN mode
+    stats->action = -1;  // Will be set by NN inference
+}
+
+/* ============================================================
  * External declarations for entropy pipeline
  * ============================================================ */
 
@@ -357,8 +392,138 @@ void launchEntropyKernelsAsync(
 // From qtable_gpu.cu
 const float* getQTableDevicePtr();
 
+// From nn_gpu.cu
+bool isNNLoaded();
+int runNNInference(
+    double entropy,
+    double mad_norm,
+    double deriv_norm,
+    size_t data_size,
+    double error_bound,
+    cudaStream_t stream,
+    float* out_predicted_ratio = nullptr,
+    int* out_top_actions = nullptr
+);
+
 /* ============================================================
- * Host Pipeline Function
+ * Internal helper: run stats kernels, copy results, free workspace
+ * ============================================================ */
+
+/**
+ * Shared stats-only kernel sequence used by runStatsOnlyPipeline and
+ * runAutoStatsNNPipeline. Allocates workspace, runs all stats kernels
+ * with finalizeStatsOnlyKernel, copies entropy/mad/deriv back to host,
+ * synchronizes, and frees workspace.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+static int runStatsKernels(
+    const void* d_input,
+    size_t input_size,
+    cudaStream_t stream,
+    double* out_entropy,
+    double* out_mad,
+    double* out_deriv
+) {
+    size_t num_elements = input_size / sizeof(float);
+    if (num_elements == 0 || d_input == nullptr) {
+        return -1;
+    }
+
+    cudaError_t err;
+
+    // Allocate workspace: AutoStatsGPU + 256-uint histogram
+    size_t workspace_size = sizeof(AutoStatsGPU) + 256 * sizeof(unsigned int);
+    void* d_workspace = nullptr;
+    err = cudaMalloc(&d_workspace, workspace_size);
+    if (err != cudaSuccess) {
+        return -1;
+    }
+
+    AutoStatsGPU* d_stats = static_cast<AutoStatsGPU*>(d_workspace);
+    unsigned int* d_histogram = reinterpret_cast<unsigned int*>(
+        static_cast<uint8_t*>(d_workspace) + sizeof(AutoStatsGPU));
+
+    // Initialize workspace to zero
+    err = cudaMemsetAsync(d_workspace, 0, workspace_size, stream);
+    if (err != cudaSuccess) {
+        cudaFree(d_workspace);
+        return -1;
+    }
+
+    // Initialize AutoStatsGPU fields
+    AutoStatsGPU h_init;
+    memset(&h_init, 0, sizeof(h_init));
+    h_init.vmin = FLT_MAX;
+    h_init.vmax = -FLT_MAX;
+    h_init.num_elements = num_elements;
+    h_init.error_level = 0;
+
+    err = cudaMemcpyAsync(d_stats, &h_init, sizeof(AutoStatsGPU),
+                          cudaMemcpyHostToDevice, stream);
+    if (err != cudaSuccess) {
+        cudaFree(d_workspace);
+        return -1;
+    }
+
+    // Kernel 1: statsPass1 - sum, min, max, derivative_sum
+    int num_blocks = static_cast<int>((num_elements + STATS_BLOCK_SIZE - 1) / STATS_BLOCK_SIZE);
+    if (num_blocks > STATS_MAX_BLOCKS) num_blocks = STATS_MAX_BLOCKS;
+
+    statsPass1Kernel<<<num_blocks, STATS_BLOCK_SIZE, 0, stream>>>(
+        static_cast<const float*>(d_input), num_elements, d_stats);
+
+    // Kernels 2/3: Entropy pipeline
+    launchEntropyKernelsAsync(d_input, input_size, d_histogram,
+                              &d_stats->entropy, stream);
+
+    // Kernel 4: madPass2 - sum(|x - mean|)
+    madPass2Kernel<<<num_blocks, STATS_BLOCK_SIZE, 0, stream>>>(
+        static_cast<const float*>(d_input), num_elements, d_stats);
+
+    // Kernel 5: finalize stats only (no Q-Table or NN)
+    finalizeStatsOnlyKernel<<<1, 1, 0, stream>>>(d_stats);
+
+    // Copy results back to host
+    struct StatsResultBlock {
+        double entropy;
+        double mad_normalized;
+        double deriv_normalized;
+    };
+    StatsResultBlock h_result;
+
+    err = cudaMemcpyAsync(&h_result.entropy, &d_stats->entropy, sizeof(double),
+                          cudaMemcpyDeviceToHost, stream);
+    if (err != cudaSuccess) {
+        cudaFree(d_workspace);
+        return -1;
+    }
+
+    err = cudaMemcpyAsync(&h_result.mad_normalized, &d_stats->mad_normalized,
+                          2 * sizeof(double),
+                          cudaMemcpyDeviceToHost, stream);
+    if (err != cudaSuccess) {
+        cudaFree(d_workspace);
+        return -1;
+    }
+
+    err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess) {
+        cudaFree(d_workspace);
+        return -1;
+    }
+
+    cudaFree(d_workspace);
+
+    *out_entropy = h_result.entropy;
+    *out_mad = h_result.mad_normalized;
+    *out_deriv = h_result.deriv_normalized;
+
+    return 0;
+}
+
+/* ============================================================
+ * Host Pipeline Function (Q-Table mode)
  * ============================================================ */
 
 int runAutoStatsPipeline(
@@ -476,6 +641,69 @@ int runAutoStatsPipeline(
 
     cudaFree(d_workspace);
     return 0;
+}
+
+/* ============================================================
+ * Host Pipeline Function (Neural Network mode)
+ * ============================================================ */
+
+int runAutoStatsNNPipeline(
+    const void* d_input,
+    size_t input_size,
+    double error_bound,
+    cudaStream_t stream,
+    int* out_action,
+    double* out_entropy,
+    double* out_mad,
+    double* out_deriv,
+    float* out_predicted_ratio,
+    int* out_top_actions
+) {
+    if (!isNNLoaded()) {
+        return -1;
+    }
+
+    double entropy, mad_norm, deriv_norm;
+    int rc = runStatsKernels(d_input, input_size, stream,
+                             &entropy, &mad_norm, &deriv_norm);
+    if (rc != 0) {
+        return -1;
+    }
+
+    // Run neural network inference
+    int action = runNNInference(
+        entropy, mad_norm, deriv_norm,
+        input_size, error_bound, stream,
+        out_predicted_ratio, out_top_actions
+    );
+
+    // Write outputs
+    *out_action = action;
+    if (out_entropy) *out_entropy = entropy;
+    if (out_mad) *out_mad = mad_norm;
+    if (out_deriv) *out_deriv = deriv_norm;
+
+    return 0;
+}
+
+/* ============================================================
+ * Host Pipeline Function (Stats-only mode, no inference)
+ * ============================================================ */
+
+int runStatsOnlyPipeline(
+    const void* d_input,
+    size_t input_size,
+    cudaStream_t stream,
+    double* out_entropy,
+    double* out_mad,
+    double* out_deriv
+) {
+    if (out_entropy == nullptr || out_mad == nullptr || out_deriv == nullptr) {
+        return -1;
+    }
+
+    return runStatsKernels(d_input, input_size, stream,
+                           out_entropy, out_mad, out_deriv);
 }
 
 } // namespace gpucompress

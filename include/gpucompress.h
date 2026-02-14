@@ -330,6 +330,32 @@ gpucompress_error_t gpucompress_calculate_entropy_gpu(
 );
 
 /* ============================================================
+ * Statistical Analysis (GPU-accelerated)
+ * ============================================================ */
+
+/**
+ * Compute data statistics on GPU: entropy, MAD, first derivative.
+ *
+ * Interprets data as float32 array for MAD and derivative computation.
+ * Entropy is computed at byte level (0.0 to 8.0 bits).
+ * MAD and first derivative are normalized by data range to [0, 1].
+ *
+ * @param data              Data buffer (host memory, float32 array)
+ * @param size              Size in bytes (must be multiple of 4)
+ * @param entropy           Output: Shannon entropy in bits (0.0 to 8.0)
+ * @param mad               Output: normalized Mean Absolute Deviation (0.0 to 1.0)
+ * @param first_derivative  Output: normalized mean |x[i+1]-x[i]| (0.0 to 1.0)
+ * @return GPUCOMPRESS_SUCCESS or error code
+ */
+gpucompress_error_t gpucompress_compute_stats(
+    const void* data,
+    size_t size,
+    double* entropy,
+    double* mad,
+    double* first_derivative
+);
+
+/* ============================================================
  * Q-Table / RL Management
  * ============================================================ */
 
@@ -373,6 +399,88 @@ gpucompress_error_t gpucompress_recommend_config(
     gpucompress_algorithm_t* algorithm_out,
     unsigned int* preprocessing_out
 );
+
+/* ============================================================
+ * Neural Network Model Management
+ * ============================================================ */
+
+/**
+ * Load neural network weights for ML-based algorithm selection.
+ *
+ * When loaded, ALGO_AUTO will use the neural network instead of Q-Table.
+ * The NN predicts compression metrics for all configs and ranks them.
+ *
+ * @param filepath Path to .nnwt weights file
+ * @return GPUCOMPRESS_SUCCESS or error code
+ */
+gpucompress_error_t gpucompress_load_nn(const char* filepath);
+
+/**
+ * Check if neural network is loaded.
+ *
+ * @return 1 if NN is loaded, 0 otherwise
+ */
+int gpucompress_nn_is_loaded(void);
+
+/* ============================================================
+ * Active Learning API
+ * ============================================================ */
+
+/**
+ * Enable active learning with experience collection.
+ *
+ * When enabled, each ALGO_AUTO compression call will:
+ *   - Store the (data_stats, config, actual_result) as a CSV row
+ *   - Check if the NN prediction was accurate
+ *   - If prediction error exceeds threshold, explore alternative configs
+ *
+ * Off by default. Call gpucompress_disable_active_learning() to stop.
+ *
+ * @param experience_path Path to CSV file for storing experience samples
+ * @return GPUCOMPRESS_SUCCESS or error code
+ */
+gpucompress_error_t gpucompress_enable_active_learning(
+    const char* experience_path);
+
+/**
+ * Disable active learning and close the experience file.
+ */
+void gpucompress_disable_active_learning(void);
+
+/**
+ * Check if active learning is currently enabled.
+ *
+ * @return 1 if enabled, 0 otherwise
+ */
+int gpucompress_active_learning_enabled(void);
+
+/**
+ * Set the exploration threshold for active learning.
+ *
+ * When the NN's predicted compression ratio differs from actual ratio
+ * by more than this fraction, Level 2 exploration triggers.
+ *
+ * @param threshold Fractional threshold (default 0.20 = 20% MAPE)
+ */
+void gpucompress_set_exploration_threshold(double threshold);
+
+/**
+ * Get the number of experience samples collected this session.
+ *
+ * @return Number of samples written since active learning was enabled
+ */
+size_t gpucompress_experience_count(void);
+
+/**
+ * Hot-reload neural network weights from a new .nnwt file.
+ *
+ * Replaces the current NN model without restarting the library.
+ * Thread-safe: holds the init mutex during reload.
+ *
+ * @param filepath Path to new .nnwt weights file
+ * @return GPUCOMPRESS_SUCCESS or error code
+ */
+gpucompress_error_t gpucompress_reload_nn(const char* filepath);
 
 /* ============================================================
  * Utility Functions

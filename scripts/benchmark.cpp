@@ -289,73 +289,6 @@ static FileMetadata parse_filename(const std::string& filename) {
 }
 
 // ============================================================
-// Input statistics (normalized, matching Python benchmark)
-// ============================================================
-
-static double compute_entropy(const float* data, size_t n) {
-    const unsigned char* bytes = reinterpret_cast<const unsigned char*>(data);
-    size_t num_bytes = n * sizeof(float);
-
-    size_t histogram[256] = {0};
-    for (size_t i = 0; i < num_bytes; ++i) {
-        histogram[bytes[i]]++;
-    }
-
-    double entropy = 0.0;
-    double inv_n = 1.0 / static_cast<double>(num_bytes);
-    for (int i = 0; i < 256; ++i) {
-        if (histogram[i] > 0) {
-            double p = static_cast<double>(histogram[i]) * inv_n;
-            entropy -= p * std::log2(p);
-        }
-    }
-    return entropy;
-}
-
-static double compute_mad(const float* data, size_t n) {
-    if (n == 0) return 0.0;
-
-    double sum = 0.0;
-    double vmin = static_cast<double>(data[0]);
-    double vmax = static_cast<double>(data[0]);
-    for (size_t i = 0; i < n; ++i) {
-        double v = static_cast<double>(data[i]);
-        sum += v;
-        if (v < vmin) vmin = v;
-        if (v > vmax) vmax = v;
-    }
-    double data_range = vmax - vmin;
-    if (data_range == 0.0) return 0.0;
-
-    double mean = sum / static_cast<double>(n);
-    double mad_sum = 0.0;
-    for (size_t i = 0; i < n; ++i) {
-        mad_sum += std::abs(static_cast<double>(data[i]) - mean);
-    }
-    return (mad_sum / static_cast<double>(n)) / data_range;
-}
-
-static double compute_first_derivative(const float* data, size_t n) {
-    if (n < 2) return 0.0;
-
-    double vmin = static_cast<double>(data[0]);
-    double vmax = static_cast<double>(data[0]);
-    for (size_t i = 0; i < n; ++i) {
-        double v = static_cast<double>(data[i]);
-        if (v < vmin) vmin = v;
-        if (v > vmax) vmax = v;
-    }
-    double data_range = vmax - vmin;
-    if (data_range == 0.0) return 0.0;
-
-    double deriv_sum = 0.0;
-    for (size_t i = 0; i < n - 1; ++i) {
-        deriv_sum += std::abs(static_cast<double>(data[i + 1]) - static_cast<double>(data[i]));
-    }
-    return (deriv_sum / static_cast<double>(n - 1)) / data_range;
-}
-
-// ============================================================
 // Quality metrics (PSNR, max_error, RMSE)
 // ============================================================
 
@@ -511,10 +444,16 @@ static std::vector<BenchmarkRow> benchmark_file(
     size_t num_elements = file_size / sizeof(float);
     size_t input_size = file_size;
 
-    // Compute stats once
-    double entropy = compute_entropy(data, num_elements);
-    double mad = compute_mad(data, num_elements);
-    double first_deriv = compute_first_derivative(data, num_elements);
+    // Compute stats once (GPU-accelerated via public API)
+    double entropy, mad, first_deriv;
+    gpucompress_error_t stats_err = gpucompress_compute_stats(
+        data, num_elements * sizeof(float),
+        &entropy, &mad, &first_deriv);
+    if (stats_err != GPUCOMPRESS_SUCCESS) {
+        std::cerr << "Warning: gpucompress_compute_stats failed for "
+                  << filepath << std::endl;
+        return rows;
+    }
 
     // Allocate buffers
     size_t max_out = gpucompress_max_compressed_size(input_size);
