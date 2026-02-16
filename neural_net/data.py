@@ -159,6 +159,51 @@ def encode_and_split(df: pd.DataFrame, val_fraction: float = 0.2,
     }
 
 
+def compute_stats_cpu(raw_bytes):
+    """Compute entropy, MAD, and first_derivative on CPU.
+
+    Mirrors the GPU implementation in stats_kernel.cu and entropy_kernel.cu:
+      - Entropy: byte-level Shannon entropy (256-bin histogram, log2) in bits
+      - MAD: mean absolute deviation from mean, normalized by data range
+      - First derivative: mean |x[i] - x[i-1]|, normalized by data range
+    """
+    arr = np.frombuffer(raw_bytes, dtype=np.float32)
+
+    # Entropy: byte-level histogram (same as GPU's 256-bin approach)
+    byte_data = np.frombuffer(raw_bytes, dtype=np.uint8)
+    hist = np.bincount(byte_data, minlength=256).astype(np.float64)
+    probs = hist[hist > 0] / len(byte_data)
+    entropy = -np.sum(probs * np.log2(probs))
+
+    # Data range for normalization
+    vmin = float(arr.min())
+    vmax = float(arr.max())
+    data_range = vmax - vmin
+
+    if data_range < 1e-30 or len(arr) < 2:
+        return entropy, 0.0, 0.0
+
+    # MAD: mean absolute deviation, normalized by range
+    mean_val = np.mean(arr.astype(np.float64))
+    mad = np.mean(np.abs(arr.astype(np.float64) - mean_val)) / data_range
+
+    # First derivative: mean |diff|, normalized by range
+    first_derivative = np.mean(np.abs(np.diff(arr.astype(np.float64)))) / data_range
+
+    return float(entropy), float(mad), float(first_derivative)
+
+
+def load_from_csv(csv_paths, val_fraction=0.2, seed=42):
+    """Load benchmark data from one or more CSV files and prepare for training.
+
+    Each CSV must contain the columns expected by encode_and_split().
+    """
+    frames = [pd.read_csv(p) for p in csv_paths]
+    df = pd.concat(frames, ignore_index=True)
+    print(f"Loaded {len(df)} rows from {len(csv_paths)} CSV file(s)")
+    return encode_and_split(df, val_fraction, seed)
+
+
 def inverse_transform_outputs(Y_norm: np.ndarray, y_means: np.ndarray,
                                y_stds: np.ndarray) -> Dict[str, np.ndarray]:
     """

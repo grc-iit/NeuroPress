@@ -2,7 +2,10 @@
 Training script for compression performance predictor.
 
 Usage:
-    # Train from binary files (default)
+    # Train from CSV (no GPU needed)
+    python neural_net/train.py --csv benchmark_results--1.csv
+
+    # Train from binary files
     python neural_net/train.py --data-dir syntheticGeneration/training_data/ --lib-path build/libgpucompress.so
 
     # Export weights (unchanged)
@@ -56,7 +59,7 @@ def train_model_with_data(data: dict, epochs: int = 200, batch_size: int = 512,
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=10, verbose=False)
+        optimizer, mode='min', factor=0.5, patience=10)
 
     best_val_loss = float('inf')
     best_epoch = 0
@@ -200,7 +203,9 @@ def train_model_with_data(data: dict, epochs: int = 200, batch_size: int = 512,
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description='Train compression performance predictor')
-    parser.add_argument('--data-dir', type=str, required=True,
+    parser.add_argument('--csv', type=str, nargs='+', default=None,
+                        help='One or more CSV files with benchmark results')
+    parser.add_argument('--data-dir', type=str, default=None,
                         help='Directory containing .bin files for on-the-fly benchmarking')
     parser.add_argument('--lib-path', type=str, default=None,
                         help='Path to libgpucompress.so')
@@ -213,9 +218,16 @@ if __name__ == '__main__':
     parser.add_argument('--hidden-dim', type=int, default=128)
     args = parser.parse_args()
 
-    from binary_data import load_and_prepare_from_binary
-    data = load_and_prepare_from_binary(
-        args.data_dir, lib_path=args.lib_path, max_files=args.max_files)
+    if args.csv:
+        from data import load_from_csv
+        data = load_from_csv(args.csv)
+    elif args.data_dir:
+        from binary_data import load_and_prepare_from_binary
+        data = load_and_prepare_from_binary(
+            args.data_dir, lib_path=args.lib_path, max_files=args.max_files)
+    else:
+        parser.error("Provide --csv or --data-dir")
+
     model, data = train_model_with_data(
         data, epochs=args.epochs, batch_size=args.batch_size,
         lr=args.lr, patience=args.patience, hidden_dim=args.hidden_dim)

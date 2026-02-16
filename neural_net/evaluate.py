@@ -8,6 +8,7 @@ For each file in the validation set:
 4. Report top-1, top-3 accuracy and regret
 
 Usage:
+    python neural_net/evaluate.py --csv benchmark_results--1.csv
     python neural_net/evaluate.py --data-dir syntheticGeneration/training_data/ --lib-path build/libgpucompress.so
 """
 
@@ -220,7 +221,9 @@ def show_sample_predictions(model, data: Dict, device: torch.device, n_samples: 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description='Evaluate compression predictor ranking accuracy')
-    parser.add_argument('--data-dir', type=str, required=True,
+    parser.add_argument('--csv', type=str, nargs='+', default=None,
+                        help='One or more CSV files with benchmark results')
+    parser.add_argument('--data-dir', type=str, default=None,
                         help='Directory containing .bin files for benchmarking')
     parser.add_argument('--lib-path', type=str, default=None,
                         help='Path to libgpucompress.so')
@@ -241,10 +244,16 @@ if __name__ == '__main__':
     model, checkpoint = load_trained_model(weights_path, device)
     print(f"Loaded model from {weights_path} (epoch {checkpoint['best_epoch']})")
 
-    # Load data from binary files
-    from binary_data import load_and_prepare_from_binary
-    data = load_and_prepare_from_binary(
-        args.data_dir, lib_path=args.lib_path, max_files=args.max_files)
+    # Load data
+    if args.csv:
+        from data import load_from_csv
+        data = load_from_csv(args.csv)
+    elif args.data_dir:
+        from binary_data import load_and_prepare_from_binary
+        data = load_and_prepare_from_binary(
+            args.data_dir, lib_path=args.lib_path, max_files=args.max_files)
+    else:
+        parser.error("Provide --csv or --data-dir")
 
     # Evaluate ranking for different criteria
     for criterion in ['compression_ratio', 'compression_time_ms', 'psnr_db']:
