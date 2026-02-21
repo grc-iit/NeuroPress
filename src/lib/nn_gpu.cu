@@ -108,7 +108,7 @@ static bool g_has_bounds = false;
  * @param weights       NN weights in GPU global memory
  * @param entropy       Shannon entropy of data (raw, not standardized)
  * @param mad_norm      Normalized MAD (already divided by range)
- * @param deriv_norm    Normalized 1st derivative (already divided by range)
+ * @param deriv_norm    Normalized 2nd derivative (already divided by range)
  * @param data_size     Data size in bytes
  * @param error_bound   Error bound (0 for lossless)
  * @param criterion         Which output to rank by
@@ -166,7 +166,7 @@ __global__ void nnInferenceKernel(
     // MAD (feature 13) - already normalized by range
     input_raw[13] = static_cast<float>(mad_norm);
 
-    // First derivative (feature 14) - already normalized by range
+    // Second derivative (feature 14) - already normalized by range
     input_raw[14] = static_cast<float>(deriv_norm);
 
     // ---- Standardize input features ----
@@ -543,7 +543,7 @@ NNRankCriterion getNNRankCriterion() {
  *
  * @param entropy             Shannon entropy (0-8)
  * @param mad_norm            Normalized MAD (0-1)
- * @param deriv_norm          Normalized 1st derivative (0-1)
+ * @param deriv_norm          Normalized 2nd derivative (0-1)
  * @param data_size           Data size in bytes
  * @param error_bound         Error bound (0 for lossless)
  * @param stream              CUDA stream

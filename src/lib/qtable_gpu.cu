@@ -34,7 +34,7 @@ constexpr int NUM_ERROR_LEVELS = 4;
 /** Number of MAD bins */
 constexpr int NUM_MAD_BINS = 4;
 
-/** Number of first derivative bins */
+/** Number of second derivative bins */
 constexpr int NUM_DERIV_BINS = 4;
 
 /** Total number of states */

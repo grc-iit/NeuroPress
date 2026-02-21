@@ -132,26 +132,27 @@ class CompressionExecutor:
         mean = np.mean(flat)
         return float(np.mean(np.abs(flat - mean))) / data_range
 
-    def calculate_first_derivative(self, data: np.ndarray) -> float:
+    def calculate_second_derivative(self, data: np.ndarray) -> float:
         """
-        Calculate normalized mean absolute first derivative of data.
+        Calculate normalized mean absolute second derivative of data.
 
-        Formula: mean(|data[i+1] - data[i]|) / (max - min)
+        Formula: mean(|data[i+1] - 2*data[i] + data[i-1]|) / (max - min)
         Normalized to [0, 1] so it's scale-invariant.
 
         Args:
             data: Input data as numpy array
 
         Returns:
-            Normalized mean absolute first derivative (0.0 for constant data)
+            Normalized mean absolute second derivative (0.0 for constant data)
         """
-        if data.size < 2:
+        if data.size < 3:
             return 0.0
         flat = data.flatten().astype(np.float64)
         data_range = float(flat.max() - flat.min())
         if data_range == 0.0:
             return 0.0
-        return float(np.mean(np.abs(np.diff(flat)))) / data_range
+        second_deriv = flat[2:] - 2.0 * flat[1:-1] + flat[:-2]
+        return float(np.mean(np.abs(second_deriv))) / data_range
 
     def calculate_all_metrics(self, data: np.ndarray) -> dict:
         """
@@ -161,12 +162,12 @@ class CompressionExecutor:
             data: Input data as numpy array
 
         Returns:
-            Dictionary with 'entropy', 'mad', 'first_derivative'
+            Dictionary with 'entropy', 'mad', 'second_derivative'
         """
         return {
             'entropy': self.calculate_entropy(data),
             'mad': self.calculate_mad(data),
-            'first_derivative': self.calculate_first_derivative(data),
+            'second_derivative': self.calculate_second_derivative(data),
         }
 
     def _compute_psnr(self, original_file: str, compressed_file: str) -> Optional[float]:

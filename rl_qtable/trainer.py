@@ -197,7 +197,7 @@ class QTableTrainer:
         csv_file = open(csv_path, 'a', newline='')
         csv_fieldnames = [
             'epoch', 'episode', 'filename', 'error_bound',
-            'entropy', 'mad', 'first_derivative',
+            'entropy', 'mad', 'second_derivative',
             'state', 'entropy_bin', 'error_level', 'mad_bin', 'deriv_bin',
             'action', 'algorithm', 'quantization', 'shuffle_size',
             'exploration', 'epsilon',
@@ -310,14 +310,14 @@ class QTableTrainer:
             input_metrics = self.executor.calculate_all_metrics(data)
             entropy = input_metrics['entropy']
             mad = input_metrics['mad']
-            first_derivative = input_metrics['first_derivative']
+            second_derivative = input_metrics['second_derivative']
             print(f"  [METRICS] {filename}: entropy={entropy:.4f} bits "
                   f"(bin={min(NUM_ENTROPY_BINS - 1, int(entropy * 2))}), "
-                  f"mad={mad:.6f}, deriv={first_derivative:.6f}")
+                  f"mad={mad:.6f}, deriv={second_derivative:.6f}")
 
             # Encode state
             state = QTable.encode_state(entropy, error_bound,
-                                        mad=mad, first_derivative=first_derivative)
+                                        mad=mad, second_derivative=second_derivative)
             entropy_bin, error_level, mad_bin, deriv_bin = QTable.decode_state(state)
             error_names = ['aggressive', 'moderate', 'precise', 'lossless']
             entropy_label = f"{entropy_bin * 0.5:.1f}-{(entropy_bin + 1) * 0.5:.1f}"
@@ -383,7 +383,7 @@ class QTableTrainer:
                     'error_bound': error_bound,
                     'entropy': f"{entropy:.6f}",
                     'mad': f"{mad:.6f}",
-                    'first_derivative': f"{first_derivative:.6f}",
+                    'second_derivative': f"{second_derivative:.6f}",
                     'state': state,
                     'entropy_bin': entropy_bin,
                     'error_level': error_names[error_level],

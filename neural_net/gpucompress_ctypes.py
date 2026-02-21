@@ -3,7 +3,7 @@ Python ctypes wrapper for libgpucompress.so.
 
 Provides a GPUCompressLib class that wraps the C API for:
 - Library init/cleanup
-- Computing data statistics (entropy, MAD, first_derivative) on GPU
+- Computing data statistics (entropy, MAD, second_derivative) on GPU
 - Compressing/decompressing data with explicit configs
 - Getting max compressed size
 """
@@ -64,7 +64,7 @@ class gpucompress_stats_t(ctypes.Structure):
         ('compression_ratio', ctypes.c_double),
         ('entropy_bits', ctypes.c_double),
         ('mad', ctypes.c_double),
-        ('first_derivative', ctypes.c_double),
+        ('second_derivative', ctypes.c_double),
         ('algorithm_used', ctypes.c_int),
         ('preprocessing_used', ctypes.c_uint),
         ('throughput_mbps', ctypes.c_double),
@@ -169,13 +169,13 @@ class GPUCompressLib:
         return s.decode() if s else f"error {code}"
 
     def compute_stats(self, data: bytes):
-        """Compute entropy, MAD, first_derivative on GPU.
+        """Compute entropy, MAD, second_derivative on GPU.
 
         Args:
             data: Raw bytes (float32 array).
 
         Returns:
-            (entropy, mad, first_derivative) tuple of floats.
+            (entropy, mad, second_derivative) tuple of floats.
         """
         entropy = ctypes.c_double()
         mad = ctypes.c_double()

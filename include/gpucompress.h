@@ -129,7 +129,7 @@ typedef struct {
     double compression_ratio;            /**< original_size / compressed_size */
     double entropy_bits;                 /**< Calculated data entropy (0-8 bits) */
     double mad;                          /**< Mean Absolute Deviation */
-    double first_derivative;             /**< Mean absolute first derivative */
+    double second_derivative;            /**< Mean absolute second derivative */
     gpucompress_algorithm_t algorithm_used; /**< Algorithm actually used */
     unsigned int preprocessing_used;     /**< Preprocessing actually applied */
     double throughput_mbps;              /**< Compression throughput (MB/s) */
@@ -334,17 +334,17 @@ gpucompress_error_t gpucompress_calculate_entropy_gpu(
  * ============================================================ */
 
 /**
- * Compute data statistics on GPU: entropy, MAD, first derivative.
+ * Compute data statistics on GPU: entropy, MAD, second derivative.
  *
  * Interprets data as float32 array for MAD and derivative computation.
  * Entropy is computed at byte level (0.0 to 8.0 bits).
- * MAD and first derivative are normalized by data range to [0, 1].
+ * MAD and second derivative are normalized by data range to [0, 1].
  *
- * @param data              Data buffer (host memory, float32 array)
- * @param size              Size in bytes (must be multiple of 4)
- * @param entropy           Output: Shannon entropy in bits (0.0 to 8.0)
- * @param mad               Output: normalized Mean Absolute Deviation (0.0 to 1.0)
- * @param first_derivative  Output: normalized mean |x[i+1]-x[i]| (0.0 to 1.0)
+ * @param data               Data buffer (host memory, float32 array)
+ * @param size               Size in bytes (must be multiple of 4)
+ * @param entropy            Output: Shannon entropy in bits (0.0 to 8.0)
+ * @param mad                Output: normalized Mean Absolute Deviation (0.0 to 1.0)
+ * @param second_derivative  Output: normalized mean |x[i+1]-2x[i]+x[i-1]| (0.0 to 1.0)
  * @return GPUCOMPRESS_SUCCESS or error code
  */
 gpucompress_error_t gpucompress_compute_stats(
@@ -352,7 +352,7 @@ gpucompress_error_t gpucompress_compute_stats(
     size_t size,
     double* entropy,
     double* mad,
-    double* first_derivative
+    double* second_derivative
 );
 
 /* ============================================================
@@ -381,21 +381,21 @@ int gpucompress_qtable_is_loaded(void);
  * Get recommended configuration based on data characteristics.
  *
  * Uses loaded Q-Table to recommend algorithm and preprocessing
- * based on entropy, error bound level, MAD, and first derivative.
+ * based on entropy, error bound level, MAD, and second derivative.
  *
- * @param entropy           Data entropy in bits (0.0 to 8.0)
- * @param error_bound       Desired error bound (0 for lossless)
- * @param mad               Mean Absolute Deviation (0.0 if unknown)
- * @param first_derivative  Mean absolute first derivative (0.0 if unknown)
- * @param algorithm_out     Output: recommended algorithm
- * @param preprocessing_out Output: recommended preprocessing flags
+ * @param entropy            Data entropy in bits (0.0 to 8.0)
+ * @param error_bound        Desired error bound (0 for lossless)
+ * @param mad                Mean Absolute Deviation (0.0 if unknown)
+ * @param second_derivative  Mean absolute second derivative (0.0 if unknown)
+ * @param algorithm_out      Output: recommended algorithm
+ * @param preprocessing_out  Output: recommended preprocessing flags
  * @return GPUCOMPRESS_SUCCESS or error code
  */
 gpucompress_error_t gpucompress_recommend_config(
     double entropy,
     double error_bound,
     double mad,
-    double first_derivative,
+    double second_derivative,
     gpucompress_algorithm_t* algorithm_out,
     unsigned int* preprocessing_out
 );

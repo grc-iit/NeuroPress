@@ -50,7 +50,7 @@ def prepare_fold(df_train, df_val):
     algo_cols = [f'alg_{a}' for a in ALGORITHM_NAMES]
     feature_cols = algo_cols + ['quant_enc', 'shuffle_enc',
                                 'error_bound_enc', 'data_size_enc',
-                                'entropy', 'mad', 'first_derivative']
+                                'entropy', 'mad', 'second_derivative']
     output_cols = ['comp_time_log', 'decomp_time_log', 'ratio_log', 'psnr_clamped']
 
     # Normalization from training set
@@ -82,16 +82,16 @@ def prepare_fold(df_train, df_val):
     return train_X, train_Y, val_X, val_Y, y_means, y_stds
 
 
-def train_one_fold(train_X, train_Y, val_X, val_Y, epochs=100, batch_size=512,
+def train_one_fold(train_X, train_Y, val_X, val_Y, epochs=100, batch_size=4096,
                    lr=1e-3, patience=15, hidden_dim=128):
     """Train model on one fold, return best val predictions (normalized)."""
 
-    device = torch.device('cpu')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    tX = torch.from_numpy(train_X)
-    tY = torch.from_numpy(train_Y)
-    vX = torch.from_numpy(val_X)
-    vY = torch.from_numpy(val_Y)
+    tX = torch.from_numpy(train_X).to(device)
+    tY = torch.from_numpy(train_Y).to(device)
+    vX = torch.from_numpy(val_X).to(device)
+    vY = torch.from_numpy(val_Y).to(device)
 
     train_loader = DataLoader(TensorDataset(tX, tY), batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(TensorDataset(vX, vY), batch_size=batch_size * 2)
@@ -112,12 +112,17 @@ def train_one_fold(train_X, train_Y, val_X, val_Y, epochs=100, batch_size=512,
 
     for epoch in range(1, epochs + 1):
         model.train()
+        train_loss_sum = 0.0
+        train_n = 0
         for bx, by in train_loader:
             pred = model(bx)
             loss = criterion(pred, by)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            train_loss_sum += loss.item() * bx.size(0)
+            train_n += bx.size(0)
+        train_loss = train_loss_sum / train_n
 
         model.eval()
         val_loss_sum = 0.0
@@ -131,20 +136,34 @@ def train_one_fold(train_X, train_Y, val_X, val_Y, epochs=100, batch_size=512,
 
         scheduler.step(val_loss)
 
+        marker = ''
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_state = {k: v.clone() for k, v in model.state_dict().items()}
             no_improve = 0
+            marker = ' *best*'
         else:
             no_improve += 1
 
+        lr_now = optimizer.param_groups[0]['lr']
+        bar_len = 30
+        progress = epoch / epochs
+        filled = int(bar_len * progress)
+        bar = '=' * filled + '-' * (bar_len - filled)
+        print(f'\r  [{bar}] {epoch:3d}/{epochs}  '
+              f'train={train_loss:.4f}  val={val_loss:.4f}  '
+              f'lr={lr_now:.1e}{marker}', end='', flush=True)
+
         if no_improve >= patience:
+            print(f'\n  Early stop at epoch {epoch} (patience={patience})')
             break
+
+    print()  # newline after progress bar
 
     model.load_state_dict(best_state)
     model.eval()
     with torch.no_grad():
-        val_pred_norm = model(vX).numpy()
+        val_pred_norm = model(vX).cpu().numpy()
 
     return val_pred_norm, best_val_loss, epoch
 

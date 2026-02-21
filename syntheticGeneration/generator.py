@@ -35,11 +35,13 @@ generate -- Create a single dataset file
 
 batch -- Generate full dataset collection
   -o, --output-dir PATH    Output directory (default: datasets)
-  -s, --size TEXT          Size per dataset (default: 4MB)
+  -s, --size TEXT          Size(s) per dataset, comma-separated
+                           (e.g. 128KB or 16KB,256KB,1MB)
+                           Training default: 16KB,64KB,256KB,1MB,4MB
   -m, --mode TEXT          Batch mode [training|comprehensive]
                            (default: training)
                              training:      7 palettes x 7 widths x 8 perts
-                                            x 4 fills = 1568 per dtype
+                                            x 5 fills x 5 sizes = 9800/dtype
                              comprehensive: 7 palettes x 7 widths x 8 perts
                                             x 5 fills = 1960 per dtype
   -d, --dtypes TEXT        Comma-separated dtypes (default: float32 for
@@ -107,7 +109,8 @@ COMPREHENSIVE_PERTURBATIONS = [0.0, 0.05, 0.1, 0.2, 0.325, 0.5, 0.75, 0.9]
 
 TRAINING_BIN_WIDTHS = [0.1, 0.12, 0.15, 0.25, 0.5, 1.0, 16.0]
 TRAINING_PERTURBATIONS = [0.0, 0.1, 0.2, 0.325, 0.5, 0.75, 0.95, 1.0]
-TRAINING_FILL_MODES = ['constant', 'linear', 'quadratic', 'random']
+TRAINING_FILL_MODES = ['constant', 'linear', 'quadratic', 'sinusoidal', 'random']
+TRAINING_SIZES = ['16KB', '64KB', '256KB', '1MB', '4MB']
 
 
 # ============================================================
@@ -617,7 +620,9 @@ def cmd_generate(palette, perturbation, fill_mode, bin_width, dtype, size,
 
 @cli.command()
 @click.option('--output-dir', '-o', default='datasets', help='Output directory')
-@click.option('--size', '-s', type=str, default='4MB', help='Size per dataset')
+@click.option('--size', '-s', type=str, default=None,
+              help='Size(s) per dataset, comma-separated (e.g. 128KB or 16KB,256KB,1MB). '
+                   'Training mode defaults to TRAINING_SIZES if omitted.')
 @click.option('--mode', '-m', type=click.Choice(['comprehensive', 'training']),
               default='training', help='Batch mode')
 @click.option('--dtypes', '-d', type=str, default=None,
@@ -634,12 +639,29 @@ def batch(output_dir, size, mode, dtypes, repeats, fmt, quiet, threads):
 
     \b
     Modes (matching newScript.cc):
-      training:       7 palettes x 7 widths x 8 perturbations x 4 fills = 1568 per dtype
+      training:       7 palettes x 7 widths x 8 perturbations x 5 fills
+                      x 5 sizes = 9800 per dtype (default sizes: 16KB..4MB)
       comprehensive:  7 palettes x 7 widths x 8 perturbations x 5 fills = 1960 per dtype
+    \b
+    Size can be a single value or comma-separated list:
+      -s 128KB            Single size
+      -s 16KB,256KB,4MB   Multiple sizes (encoded in filename)
+    Training mode defaults to TRAINING_SIZES (16KB,64KB,256KB,1MB,4MB) if -s is omitted.
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    size_bytes = parse_size(size)
+    # Parse sizes: comma-separated list or single value
+    if size is None:
+        if mode == 'training':
+            size_list = list(TRAINING_SIZES)
+        else:
+            size_list = ['4MB']
+    else:
+        size_list = [s.strip() for s in size.split(',')]
+
+    size_bytes_list = [(s, parse_size(s)) for s in size_list]
+    multi_size = len(size_bytes_list) > 1
+
     n_workers = threads or os.cpu_count() or 4
 
     if dtypes:
@@ -663,41 +685,46 @@ def batch(output_dir, size, mode, dtypes, repeats, fmt, quiet, threads):
         perturbations = TRAINING_PERTURBATIONS
         fill_modes = TRAINING_FILL_MODES
 
-    combos = [(dt, p, w, pert, fm)
+    combos = [(dt, p, w, pert, fm, sz_label, sz_bytes)
               for dt in dtype_list
               for p in PALETTES
               for w in bin_widths
               for pert in perturbations
-              for fm in fill_modes]
+              for fm in fill_modes
+              for sz_label, sz_bytes in size_bytes_list]
 
     total = len(combos) * repeats
 
     if not quiet:
+        size_display = ','.join(size_list)
         click.echo(f"Generating {total} datasets "
-                    f"({len(combos)} combos x {repeats} repeats, {size} each)")
+                    f"({len(combos)} combos x {repeats} repeats)")
         click.echo(f"  Data types:    {dtype_list}")
         click.echo(f"  Palettes:      {PALETTES}")
         click.echo(f"  Bin widths:    {bin_widths}")
         click.echo(f"  Perturbations: {perturbations}")
         click.echo(f"  Fill modes:    {fill_modes}")
+        click.echo(f"  Sizes:         {size_display}")
         click.echo(f"  Workers:       {n_workers}")
         click.echo(f"  Output:        {output_dir}/\n")
 
     # Build work items
     work_items = []
-    for i, (dt, pal, bw, pert, fm) in enumerate(combos):
+    for i, (dt, pal, bw, pert, fm, sz_label, sz_bytes) in enumerate(combos):
         for r in range(repeats):
             seed = i * repeats + r + 1
             w_enc = int(round(bw * 100))
             p_enc = int(round(pert * 1000))
             base = f"{dt}_{pal}_w{w_enc}_p{p_enc}_{fill_mode_short(fm)}"
+            if multi_size:
+                base = f"{base}_{sz_label.lower()}"
             if repeats > 1:
                 name = f"{base}_s{seed}"
             else:
                 name = base
             filepath = os.path.join(output_dir, f"{name}.{fmt}")
             dtype_bytes = np.dtype(_TYPE_CONFIG[dt]['np_dtype']).itemsize
-            num_elements = size_bytes // dtype_bytes
+            num_elements = sz_bytes // dtype_bytes
             work_items.append((filepath, num_elements, pal, pert, fm, bw, dt, seed))
 
     # Generate files in parallel

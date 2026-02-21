@@ -44,8 +44,8 @@ def predict_all_configs(bin_path, weights_path, rank_by='compression_ratio'):
 
     # Compute stats on CPU
     print("Computing data statistics on CPU...")
-    entropy, mad, first_derivative = compute_stats_cpu(raw_bytes)
-    print(f"  entropy={entropy:.4f}  mad={mad:.6f}  first_derivative={first_derivative:.6f}")
+    entropy, mad, second_derivative = compute_stats_cpu(raw_bytes)
+    print(f"  entropy={entropy:.4f}  mad={mad:.6f}  second_derivative={second_derivative:.6f}")
 
     # Load model
     device = torch.device('cpu')
@@ -79,7 +79,7 @@ def predict_all_configs(bin_path, weights_path, rank_by='compression_ratio'):
 
                 feature_vec = algo_features + [
                     quant_enc, shuffle_enc, error_bound_enc,
-                    data_size_enc, entropy, mad, first_derivative
+                    data_size_enc, entropy, mad, second_derivative
                 ]
                 rows.append(feature_vec)
                 configs.append((algo, quant, shuffle, error_bound))

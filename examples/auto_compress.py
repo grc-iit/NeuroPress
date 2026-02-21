@@ -154,7 +154,7 @@ def main():
     data = open(args.input, "rb").read()
 
     # Compute stats on GPU
-    entropy, mad, first_deriv = lib.compute_stats(data)
+    entropy, mad, second_deriv = lib.compute_stats(data)
 
     print(f"Input:      {args.input}")
     print(f"Size:       {len(data):,} bytes")
@@ -163,12 +163,12 @@ def main():
     print(f"Data stats (GPU-computed):")
     print(f"  Entropy:    {entropy:.4f} bits")
     print(f"  MAD:        {mad:.4f}")
-    print(f"  1st Deriv:  {first_deriv:.4f}")
+    print(f"  2nd Deriv:  {second_deriv:.4f}")
     print()
 
     # Run NN forward pass in Python for all 32 configs
     predictions = nn_predict_all(
-        args.model_pt, entropy, mad, first_deriv, len(data), args.error_bound)
+        args.model_pt, entropy, mad, second_deriv, len(data), args.error_bound)
 
     print("NN predictions for all 32 configs (ranked by predicted ratio):")
     print(f"{'Rank':>4}  {'Action':>6}  {'Algorithm':>10}  {'Quant':>5}  {'Shuf':>4}  "

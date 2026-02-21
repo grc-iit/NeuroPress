@@ -120,7 +120,7 @@ data = load_and_prepare_from_binary(
 
 For each `.bin` file:
 1. Reads raw bytes
-2. Calls `gpucompress_compute_stats()` on GPU → entropy, MAD, first_derivative
+2. Calls `gpucompress_compute_stats()` on GPU → entropy, MAD, second_derivative
 3. For each of 64 configs: compress, decompress, time both, compute PSNR for lossy configs
 4. Builds a DataFrame, passes it to `encode_and_split()` from `data.py`
 
@@ -139,7 +139,7 @@ The 64 configs per file are: 8 algorithms × 2 shuffle options (0, 4) × 4 quant
 | 11    | `data_size_enc` | `log2(original_size)` | ~[10, 25] |
 | 12    | `entropy` | Raw Shannon entropy (byte-level, 256-bin) | [0, 8] |
 | 13    | `mad` | Normalized MAD (divided by range) | [0, 1] |
-| 14    | `first_derivative` | Normalized mean abs derivative | [0, 1] |
+| 14    | `second_derivative` | Normalized mean abs derivative | [0, 1] |
 
 Design decisions:
 - **One-hot for algorithm**: No ordinal relationship between algorithms.
@@ -197,14 +197,14 @@ val_files = files[20%:]
 A pure-numpy fallback that mirrors the GPU implementation. Used by `predict.py` for CPU-only inference:
 - **Entropy**: byte-level Shannon entropy (256-bin histogram, log2)
 - **MAD**: mean absolute deviation from mean, normalized by data range
-- **First derivative**: mean |x[i] - x[i-1]|, normalized by data range
+- **Second derivative**: mean |x[i+1] - 2*x[i] + x[i-1]|, normalized by data range
 
 ### 3.8 Python ctypes Wrapper
 
 **File: `neural_net/gpucompress_ctypes.py`**
 
 Wraps `libgpucompress.so` via ctypes. Context-managed `GPUCompressLib` class with methods:
-- `compute_stats(data)` → (entropy, mad, first_derivative)
+- `compute_stats(data)` → (entropy, mad, second_derivative)
 - `compress(data, config)` → compressed bytes
 - `decompress(compressed, original_size)` → decompressed bytes
 - `make_config(algo, shuffle, quantize, error_bound)` → `gpucompress_config_t`
@@ -388,7 +388,7 @@ Before the NN runs, three data statistics are computed on GPU in multiple kernel
 ```
 d_input (float array on GPU)
     │
-    ├── statsPass1Kernel ──> sum, min, max, |x[i]-x[i-1]| sum
+    ├── statsPass1Kernel ──> sum, min, max, |x[i+1]-2*x[i]+x[i-1]| sum
     │
     ├── Entropy kernels ───> 256-bin byte histogram → Shannon entropy
     │
@@ -547,7 +547,7 @@ gpucompress_compress(data, size, output, &out_size, &config, &stats)
 ├── 2. runAutoStatsNNPipeline(d_input, size, ...)       [src/lib/stats_kernel.cu]
 │      │
 │      ├── 2a. statsPass1Kernel<<<N, 256>>>
-│      │        Per-block: sum, min, max, |x[i]-x[i-1]|
+│      │        Per-block: sum, min, max, |x[i+1]-2*x[i]+x[i-1]|
 │      │
 │      ├── 2b. launchEntropyKernelsAsync()
 │      │        256-bin byte histogram → Shannon entropy
@@ -623,7 +623,7 @@ gpucompress_error_t gpucompress_compute_stats(
     size_t size,             // Size in bytes
     double* entropy,         // Out: Shannon entropy (0-8 bits)
     double* mad,             // Out: normalized MAD (0-1)
-    double* first_derivative // Out: normalized first derivative (0-1)
+    double* second_derivative // Out: normalized second derivative (0-1)
 );
 ```
 
@@ -762,7 +762,7 @@ void experience_buffer_cleanup(void);
 
 CSV format:
 ```
-entropy,mad,first_derivative,original_size,error_bound,algorithm,quantization,shuffle,compression_ratio,compression_time_ms
+entropy,mad,second_derivative,original_size,error_bound,algorithm,quantization,shuffle,compression_ratio,compression_time_ms
 ```
 
 The action integer is decoded back to human-readable strings (e.g., action=13 → algorithm=`ans`, quantization=`linear`, shuffle=0).
@@ -849,7 +849,7 @@ NNWeightsGPU (nn_gpu.cu)          AutoStatsGPU (stats_kernel.cu)
 └── x_maxs[15]  (v2)              └── action
 
 QTableAction (internal.hpp)       ExperienceSample (experience_buffer.h)
-├── algorithm      (0-7)          ├── entropy, mad, first_derivative
+├── algorithm      (0-7)          ├── entropy, mad, second_derivative
 ├── use_quantization               ├── data_size, error_bound
 └── shuffle_size   (0 or 4)       ├── action (0-31)
                                    ├── actual_ratio

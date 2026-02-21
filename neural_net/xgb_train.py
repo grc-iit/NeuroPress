@@ -32,7 +32,7 @@ FEATURE_LABELS = {
     'quant_enc': 'Quantization', 'shuffle_enc': 'Shuffle',
     'algo_aggregate': 'Compression Library',
     'error_bound_enc': 'Error Bound', 'data_size_enc': 'Data Size',
-    'entropy': 'Entropy', 'mad': 'MAD', 'first_derivative': 'First Derivative',
+    'entropy': 'Entropy', 'mad': 'MAD', 'second_derivative': 'Second Derivative',
 }
 
 OUTPUT_LABELS = {
@@ -48,7 +48,7 @@ DISPLAY_FEATURES = [
     'quant_enc', 'shuffle_enc',          # preprocessors (grouped)
     'algo_aggregate',                     # compression library (aggregated)
     'data_size_enc',                      # data size
-    'entropy', 'mad', 'first_derivative', # data characteristics
+    'entropy', 'mad', 'second_derivative', # data characteristics
 ]
 
 ALGO_COLS = {f'alg_{a}' for a in ALGORITHM_NAMES}

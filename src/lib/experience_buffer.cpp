@@ -7,7 +7,7 @@
  * can concatenate directly.
  *
  * CSV columns:
- *   entropy, mad, first_derivative, original_size, error_bound,
+ *   entropy, mad, second_derivative, original_size, error_bound,
  *   algorithm, quantization, shuffle, compression_ratio, compression_time_ms
  */
 
@@ -31,7 +31,7 @@ static std::mutex g_mutex;
 static std::atomic<size_t> g_count{0};
 
 static const char* CSV_HEADER =
-    "entropy,mad,first_derivative,original_size,error_bound,"
+    "entropy,mad,second_derivative,original_size,error_bound,"
     "algorithm,quantization,shuffle,compression_ratio,compression_time_ms\n";
 
 } // anonymous namespace
@@ -92,7 +92,7 @@ extern "C" int experience_buffer_append(const ExperienceSample* sample) {
             "%.6f,%.6f,%.6f,%zu,%.10g,%s,%s,%d,%.6f,%.6f\n",
             sample->entropy,
             sample->mad,
-            sample->first_derivative,
+            sample->second_derivative,
             sample->data_size,
             sample->error_bound,
             algo_name,

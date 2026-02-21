@@ -42,7 +42,7 @@ constexpr int NUM_ERROR_LEVELS = 4;
 /** Number of MAD (Mean Absolute Deviation) bins */
 constexpr int NUM_MAD_BINS = 4;
 
-/** Number of first derivative bins */
+/** Number of second derivative bins */
 constexpr int NUM_DERIV_BINS = 4;
 
 /** Number of Q-Table states (entropy * error * MAD * derivative) */
@@ -54,7 +54,7 @@ constexpr int NUM_ACTIONS = 32;  // 2 * 2 * 8
 /** MAD bin thresholds (3 thresholds → 4 bins) */
 constexpr double MAD_BIN_THRESHOLDS[3] = {0.05, 0.15, 0.30};
 
-/** First derivative bin thresholds (3 thresholds → 4 bins) */
+/** Second derivative bin thresholds (3 thresholds → 4 bins) */
 constexpr double DERIV_BIN_THRESHOLDS[3] = {0.05, 0.15, 0.35};
 
 /* ============================================================
@@ -126,22 +126,22 @@ inline int madToBin(double mad) {
 }
 
 /**
- * Map first derivative value to bin index (0-3).
+ * Map second derivative value to bin index (0-3).
  */
-inline int derivToBin(double first_derivative) {
-    return valueToBin(first_derivative, DERIV_BIN_THRESHOLDS, 3);
+inline int derivToBin(double second_derivative) {
+    return valueToBin(second_derivative, DERIV_BIN_THRESHOLDS, 3);
 }
 
 /**
- * Encode Q-Table state from entropy, error level, MAD, and first derivative.
+ * Encode Q-Table state from entropy, error level, MAD, and second derivative.
  */
 inline int encodeState(double entropy, int error_level,
-                       double mad = 0.0, double first_derivative = 0.0) {
+                       double mad = 0.0, double second_derivative = 0.0) {
     int entropy_bin = static_cast<int>(entropy * 2);
     if (entropy_bin < 0) entropy_bin = 0;
     if (entropy_bin >= NUM_ENTROPY_BINS) entropy_bin = NUM_ENTROPY_BINS - 1;
     int mad_bin = madToBin(mad);
-    int deriv_bin = derivToBin(first_derivative);
+    int deriv_bin = derivToBin(second_derivative);
     return ((entropy_bin * NUM_ERROR_LEVELS + error_level)
             * NUM_MAD_BINS + mad_bin) * NUM_DERIV_BINS + deriv_bin;
 }
@@ -288,7 +288,7 @@ int getBestActionGPU(int state, cudaStream_t stream);
 /**
  * Run the complete ALGO_AUTO statistics pipeline on GPU.
  *
- * Computes entropy, MAD, first derivative, encodes state, and
+ * Computes entropy, MAD, second derivative, encodes state, and
  * performs Q-Table argmax lookup entirely on GPU. Only copies
  * back the final action int (4 bytes) plus optional stats.
  *
@@ -376,7 +376,7 @@ bool isInputOOD(double entropy, double mad, double deriv,
  *
  * @param entropy             Shannon entropy (0-8)
  * @param mad_norm            Normalized MAD (0-1)
- * @param deriv_norm          Normalized 1st derivative (0-1)
+ * @param deriv_norm          Normalized 2nd derivative (0-1)
  * @param data_size           Data size in bytes
  * @param error_bound         Error bound (0 for lossless)
  * @param stream              CUDA stream
@@ -398,7 +398,7 @@ int runNNInference(
 /**
  * Run stats-only pipeline on GPU (no NN inference or Q-Table lookup).
  *
- * Computes entropy, normalized MAD, and normalized first derivative
+ * Computes entropy, normalized MAD, and normalized second derivative
  * entirely on GPU. Used by gpucompress_compute_stats() public API.
  *
  * @param d_input      Float data already on GPU
@@ -406,7 +406,7 @@ int runNNInference(
  * @param stream       CUDA stream
  * @param out_entropy  [out] Shannon entropy (0-8 bits)
  * @param out_mad      [out] Normalized MAD (0-1)
- * @param out_deriv    [out] Normalized first derivative (0-1)
+ * @param out_deriv    [out] Normalized second derivative (0-1)
  * @return 0 on success, -1 on error
  */
 int runStatsOnlyPipeline(

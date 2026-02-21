@@ -211,19 +211,23 @@ target_link_libraries(benchmark PRIVATE gpucompress pthread)
 # ============================================================
 # Executable 5: Active Learning Integration Test
 # ============================================================
-add_executable(test_active_learning
-    neural_net/test_active_learning.cu
-)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/neural_net/test_active_learning.cu")
+    add_executable(test_active_learning
+        neural_net/test_active_learning.cu
+    )
 
-target_link_libraries(test_active_learning
-    PRIVATE
-    gpucompress
-    CUDA::cudart
-)
+    target_link_libraries(test_active_learning
+        PRIVATE
+        gpucompress
+        CUDA::cudart
+    )
 
-set_target_properties(test_active_learning PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-)
+    set_target_properties(test_active_learning PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+    )
+else()
+    message(STATUS "neural_net/test_active_learning.cu not found - skipping test_active_learning target")
+endif()
 
 # ============================================================
 # Installation

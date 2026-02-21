@@ -255,7 +255,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
 
     // Auto algorithm selection
     double mad = 0.0;
-    double first_derivative = 0.0;
+    double second_derivative = 0.0;
     bool nn_was_used = false;
     int nn_action = 0;
     float predicted_ratio = 0.0f;
@@ -279,7 +279,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
                 &action,
                 need_stats ? &entropy : nullptr,
                 need_stats ? &mad : nullptr,
-                need_stats ? &first_derivative : nullptr,
+                need_stats ? &second_derivative : nullptr,
                 p_ratio,
                 p_top);
 
@@ -290,7 +290,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
                 // Check OOD
                 if (g_active_learning_enabled) {
                     is_ood = gpucompress::isInputOOD(
-                        entropy, mad, first_derivative,
+                        entropy, mad, second_derivative,
                         input_size, cfg.error_bound);
                 }
             }
@@ -303,7 +303,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
                 &action,
                 stats ? &entropy : nullptr,
                 stats ? &mad : nullptr,
-                stats ? &first_derivative : nullptr);
+                stats ? &second_derivative : nullptr);
         }
 
         if (rc == 0) {
@@ -497,7 +497,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
         ExperienceSample sample;
         sample.entropy = entropy;
         sample.mad = mad;
-        sample.first_derivative = first_derivative;
+        sample.second_derivative = second_derivative;
         sample.data_size = input_size;
         sample.error_bound = cfg.error_bound;
         sample.action = nn_action;
@@ -605,7 +605,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
                             ExperienceSample alt_sample;
                             alt_sample.entropy = entropy;
                             alt_sample.mad = mad;
-                            alt_sample.first_derivative = first_derivative;
+                            alt_sample.second_derivative = second_derivative;
                             alt_sample.data_size = input_size;
                             alt_sample.error_bound = cfg.error_bound;
                             alt_sample.action = alt_action;
@@ -681,7 +681,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
         stats->compression_ratio = static_cast<double>(input_size) / compressed_size;
         stats->entropy_bits = entropy;
         stats->mad = mad;
-        stats->first_derivative = first_derivative;
+        stats->second_derivative = second_derivative;
         stats->algorithm_used = algo_to_use;
         stats->preprocessing_used = preproc_to_use;
         stats->throughput_mbps = 0.0;  // Would need timing to calculate
@@ -961,14 +961,14 @@ extern "C" gpucompress_error_t gpucompress_compute_stats(
     size_t size,
     double* entropy,
     double* mad,
-    double* first_derivative
+    double* second_derivative
 ) {
     if (!g_initialized.load()) {
         return GPUCOMPRESS_ERROR_NOT_INITIALIZED;
     }
 
     if (data == nullptr || entropy == nullptr || mad == nullptr ||
-        first_derivative == nullptr || size == 0) {
+        second_derivative == nullptr || size == 0) {
         return GPUCOMPRESS_ERROR_INVALID_INPUT;
     }
 
@@ -994,7 +994,7 @@ extern "C" gpucompress_error_t gpucompress_compute_stats(
 
     // Run stats-only pipeline on GPU
     int rc = gpucompress::runStatsOnlyPipeline(
-        d_data, size, stream, entropy, mad, first_derivative);
+        d_data, size, stream, entropy, mad, second_derivative);
 
     cudaFree(d_data);
 
@@ -1026,7 +1026,7 @@ extern "C" gpucompress_error_t gpucompress_recommend_config(
     double entropy,
     double error_bound,
     double mad,
-    double first_derivative,
+    double second_derivative,
     gpucompress_algorithm_t* algorithm_out,
     unsigned int* preprocessing_out
 ) {
@@ -1042,7 +1042,7 @@ extern "C" gpucompress_error_t gpucompress_recommend_config(
     }
 
     int error_level = gpucompress::errorBoundToLevel(error_bound);
-    int state = gpucompress::encodeState(entropy, error_level, mad, first_derivative);
+    int state = gpucompress::encodeState(entropy, error_level, mad, second_derivative);
     int action = gpucompress_qtable_get_best_action_impl(state);
     gpucompress::QTableAction decoded = gpucompress::decodeAction(action);
 

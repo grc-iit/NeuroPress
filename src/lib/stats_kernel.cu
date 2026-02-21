@@ -2,12 +2,12 @@
  * @file stats_kernel.cu
  * @brief GPU kernels for ALGO_AUTO statistics pipeline
  *
- * Computes MAD, first derivative, entropy, state encoding, and Q-Table
+ * Computes MAD, second derivative, entropy, state encoding, and Q-Table
  * lookup entirely on GPU. Only copies back the final action int (4 bytes)
  * plus optional stats doubles for reporting.
  *
  * Pipeline:
- *   1. statsPass1Kernel:  sum + min + max + derivative_sum  (1 pass over float data)
+ *   1. statsPass1Kernel:  sum + min + max + second_deriv_sum (1 pass over float data)
  *   2. Entropy kernels:   histogram + entropy               (1 pass over byte data)
  *   3. madPass2Kernel:    sum(|x - mean|)                   (1 pass, needs mean from step 1)
  *   4. finalizeAndLookupKernel: normalize, bin, encode state, Q-Table argmax
@@ -28,7 +28,7 @@ namespace gpucompress {
 struct __align__(8) AutoStatsGPU {
     // Pass 1 outputs
     double sum;              // sum of all elements (for mean)
-    double abs_diff_sum;     // sum of |x[i+1] - x[i]|
+    double abs_diff_sum;     // sum of |x[i+1] - 2*x[i] + x[i-1]|
     float  vmin;             // data min
     float  vmax;             // data max
     size_t num_elements;
@@ -103,7 +103,7 @@ constexpr int STATS_BLOCK_SIZE = 256;
 constexpr int STATS_MAX_BLOCKS = 1024;
 
 /**
- * First pass over float data: compute sum, min, max, derivative_sum.
+ * First pass over float data: compute sum, min, max, second_derivative_sum.
  *
  * Uses warp shuffle reduction -> shared memory inter-warp reduction
  * -> atomic global reduction.
@@ -129,9 +129,9 @@ __global__ void statsPass1Kernel(
         t_min = fminf(t_min, val);
         t_max = fmaxf(t_max, val);
 
-        // Derivative: |data[i] - data[i-1]| for i > 0
-        if (i > 0) {
-            t_deriv += fabs(static_cast<double>(val) - static_cast<double>(data[i - 1]));
+        // Second derivative: |data[i+1] - 2*data[i] + data[i-1]| for 0 < i < n-1
+        if (i > 0 && i < num_elements - 1) {
+            t_deriv += fabs(static_cast<double>(data[i + 1]) - 2.0 * static_cast<double>(val) + static_cast<double>(data[i - 1]));
         }
     }
 
@@ -278,10 +278,10 @@ __global__ void finalizeAndLookupKernel(
             mad_norm = (stats->mad_sum / static_cast<double>(n)) / range;
         }
 
-        // Normalize derivative
+        // Normalize second derivative
         double deriv_norm = 0.0;
-        if (range > 0.0 && n > 1) {
-            deriv_norm = (stats->abs_diff_sum / static_cast<double>(n - 1)) / range;
+        if (range > 0.0 && n > 2) {
+            deriv_norm = (stats->abs_diff_sum / static_cast<double>(n - 2)) / range;
         }
 
         s_mad_norm = mad_norm;
@@ -364,10 +364,10 @@ __global__ void finalizeStatsOnlyKernel(
         mad_norm = (stats->mad_sum / static_cast<double>(n)) / range;
     }
 
-    // Normalize derivative
+    // Normalize second derivative
     double deriv_norm = 0.0;
-    if (range > 0.0 && n > 1) {
-        deriv_norm = (stats->abs_diff_sum / static_cast<double>(n - 1)) / range;
+    if (range > 0.0 && n > 2) {
+        deriv_norm = (stats->abs_diff_sum / static_cast<double>(n - 2)) / range;
     }
 
     stats->mad_normalized = mad_norm;

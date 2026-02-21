@@ -22,7 +22,7 @@ extern "C" {
 typedef struct {
     double entropy;
     double mad;
-    double first_derivative;
+    double second_derivative;
     size_t data_size;
     double error_bound;
     int action;                 /* algo + quant*8 + shuffle*16 */

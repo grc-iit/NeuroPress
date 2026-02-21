@@ -65,7 +65,7 @@ def benchmark_binary_files(
 
     Returns a raw DataFrame with columns matching the benchmark format:
         file, algorithm, quantization, shuffle, error_bound, original_size,
-        entropy, mad, first_derivative, compression_ratio,
+        entropy, mad, second_derivative, compression_ratio,
         compression_time_ms, decompression_time_ms, psnr_db, success
     """
     data_path = Path(data_dir)
@@ -151,7 +151,7 @@ def benchmark_binary_files(
                                 'original_size': original_size,
                                 'entropy': entropy,
                                 'mad': mad_val,
-                                'first_derivative': deriv_val,
+                                'second_derivative': deriv_val,
                                 'compression_ratio': ratio,
                                 'compression_time_ms': comp_time_ms,
                                 'decompression_time_ms': decomp_time_ms,
@@ -176,7 +176,7 @@ def benchmark_binary_files(
                                 'original_size': original_size,
                                 'entropy': entropy,
                                 'mad': mad_val,
-                                'first_derivative': deriv_val,
+                                'second_derivative': deriv_val,
                                 'compression_ratio': 1.0,
                                 'compression_time_ms': 0.0,
                                 'decompression_time_ms': 0.0,

@@ -183,7 +183,7 @@ def show_sample_predictions(model, data: Dict, device: torch.device, n_samples: 
 
         entropy = group['entropy'].iloc[0]
         mad = group['mad'].iloc[0]
-        deriv = group['first_derivative'].iloc[0]
+        deriv = group['second_derivative'].iloc[0]
 
         print(f"\n{'─' * 75}")
         print(f"File: {fname}")

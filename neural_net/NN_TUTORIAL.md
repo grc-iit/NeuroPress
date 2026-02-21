@@ -114,7 +114,7 @@ This benchmarks real data files **on the fly**. For each `.bin` file (raw float3
 1. **Compute 3 statistics** on the GPU (via `gpucompress_ctypes.py` calling the C library):
    - **Entropy**: How random the data is (0 = perfectly uniform, 8 = maximum randomness)
    - **MAD** (Mean Absolute Deviation): How spread out the values are, normalized by range
-   - **First Derivative**: How much consecutive values change, normalized by range
+   - **Second Derivative**: How much the rate of change varies (curvature), normalized by range
 
 2. **Try all 64 configs**: For each one, compress, measure time, decompress, measure time, compute PSNR (quality metric for lossy compression — see Step 4 for what PSNR means)
 
@@ -134,7 +134,7 @@ You can limit the number of files processed with `--max-files N` (useful for tes
 python neural_net/train.py --csv benchmark_results.csv
 ```
 
-If you already have benchmark results saved as CSV files, you can skip the GPU benchmarking step entirely. The CSV must contain the same columns: `file`, `algorithm`, `quantization`, `shuffle`, `error_bound`, `original_size`, `entropy`, `mad`, `first_derivative`, `compression_time_ms`, `decompression_time_ms`, `compression_ratio`, `psnr_db`, `success`. You can even pass multiple CSV files: `--csv file1.csv file2.csv`.
+If you already have benchmark results saved as CSV files, you can skip the GPU benchmarking step entirely. The CSV must contain the same columns: `file`, `algorithm`, `quantization`, `shuffle`, `error_bound`, `original_size`, `entropy`, `mad`, `second_derivative`, `compression_time_ms`, `decompression_time_ms`, `compression_ratio`, `psnr_db`, `success`. You can even pass multiple CSV files: `--csv file1.csv file2.csv`.
 
 This path exists so you can benchmark once, save results, and retrain later without a GPU.
 
@@ -200,7 +200,7 @@ Same idea — data sizes range from KB to GB:
 
 - **Feature 12**: Entropy (raw, range 0-8)
 - **Feature 13**: MAD normalized (range 0-1)
-- **Feature 14**: First derivative normalized (range 0-1)
+- **Feature 14**: Second derivative normalized (range 0-1)
 
 These 3 features describe *what the data looks like* — the NN uses them to figure out which algorithm will work best.
 
@@ -215,7 +215,7 @@ These 3 features describe *what the data looks like* — the NN uses them to fig
 | 11 | `data_size_enc` | `log2(original_size)` | ~[10, 25] |
 | 12 | `entropy` | Raw Shannon entropy (byte-level, 256-bin) | [0, 8] |
 | 13 | `mad` | Normalized MAD (divided by range) | [0, 1] |
-| 14 | `first_derivative` | Normalized mean abs derivative | [0, 1] |
+| 14 | `second_derivative` | Normalized mean abs derivative | [0, 1] |
 
 ---
 
@@ -689,7 +689,7 @@ When a user calls `gpucompress_compress(data, config=ALGO_AUTO)`:
 1. cudaMemcpy(d_input ← data)
 
 2. runAutoStatsNNPipeline(d_input, size, ...)
-   a. statsPass1Kernel      → per-block: sum, min, max, |x[i]-x[i-1]| sum
+   a. statsPass1Kernel      → per-block: sum, min, max, |x[i+1] - 2*x[i] + x[i-1]| sum
    b. launchEntropyKernelsAsync → 256-bin byte histogram → Shannon entropy
    c. madPass2Kernel        → sum(|x[i] - mean|)  (needs mean from pass 1)
    d. finalizeStatsOnlyKernel → normalize MAD and derivative by range
@@ -737,7 +737,7 @@ gpucompress_error_t gpucompress_compute_stats(
     size_t size,             // Size in bytes
     double* entropy,         // Out: Shannon entropy (0-8 bits)
     double* mad,             // Out: normalized MAD (0-1)
-    double* first_derivative // Out: normalized first derivative (0-1)
+    double* second_derivative // Out: normalized second derivative (0-1)
 );
 ```
 
@@ -775,7 +775,7 @@ For users without a GPU, this script:
 2. Computes statistics **on CPU** using `compute_stats_cpu()` from `data.py` (pure numpy implementation that mirrors the GPU kernels):
    - Entropy: byte-level 256-bin histogram → Shannon entropy
    - MAD: mean absolute deviation from mean, normalized by data range
-   - First derivative: mean |x[i] - x[i-1]|, normalized by data range
+   - Second derivative: mean |x[i+1] - 2*x[i] + x[i-1]|, normalized by data range
 3. Builds all 64 config input vectors
 4. Runs them through the PyTorch model on CPU
 5. Ranks by the chosen metric and prints the results
@@ -936,7 +936,7 @@ void   experience_buffer_cleanup(void);
 Each row in the CSV contains:
 
 ```
-entropy,mad,first_derivative,original_size,error_bound,algorithm,quantization,shuffle,compression_ratio,compression_time_ms
+entropy,mad,second_derivative,original_size,error_bound,algorithm,quantization,shuffle,compression_ratio,compression_time_ms
 ```
 
 The action integer is decoded back to human-readable strings before writing (e.g., action=13 becomes algorithm=`ans`, quantization=`linear`, shuffle=0).
@@ -1025,7 +1025,7 @@ HEADER_SIZE        = 64     # bytes prepended to every compressed output
 |--------|---------|
 | `init(model_path)` | Initialize the library (called automatically by `__enter__`) |
 | `cleanup()` | Free GPU resources (called automatically by `__exit__`) |
-| `compute_stats(data)` | Returns (entropy, mad, first_derivative) computed on GPU |
+| `compute_stats(data)` | Returns (entropy, mad, second_derivative) computed on GPU |
 | `compress(data, config)` | Compress bytes with a specific config |
 | `decompress(compressed, original_size)` | Decompress bytes |
 | `make_config(algo, shuffle, quantize, error_bound)` | Build a config struct |
@@ -1133,7 +1133,7 @@ NNWeightsGPU (nn_gpu.cu)          AutoStatsGPU (stats_kernel.cu)
 └── x_maxs[15]  (v2)              └── action
 
 QTableAction (internal.hpp)       ExperienceSample (experience_buffer.h)
-├── algorithm      (0-7)          ├── entropy, mad, first_derivative
+├── algorithm      (0-7)          ├── entropy, mad, second_derivative
 ├── use_quantization               ├── data_size, error_bound
 └── shuffle_size   (0 or 4)       ├── action (0-31)
                                    ├── actual_ratio

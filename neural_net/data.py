@@ -17,12 +17,12 @@ ALGORITHM_NAMES = ['lz4', 'snappy', 'deflate', 'gdeflate', 'zstd', 'ans', 'casca
 NUM_ALGORITHMS = len(ALGORITHM_NAMES)
 
 INPUT_COLUMNS = ['algorithm', 'quantization', 'shuffle', 'error_bound',
-                 'original_size', 'entropy', 'mad', 'first_derivative']
+                 'original_size', 'entropy', 'mad', 'second_derivative']
 
 OUTPUT_COLUMNS = ['compression_time_ms', 'decompression_time_ms',
                   'compression_ratio', 'psnr_db']
 
-CONTINUOUS_FEATURES = ['error_bound_enc', 'data_size_enc', 'entropy', 'mad', 'first_derivative']
+CONTINUOUS_FEATURES = ['error_bound_enc', 'data_size_enc', 'entropy', 'mad', 'second_derivative']
 
 
 def encode_and_split(df: pd.DataFrame, val_fraction: float = 0.2,
@@ -32,7 +32,7 @@ def encode_and_split(df: pd.DataFrame, val_fraction: float = 0.2,
 
     Expected DataFrame columns:
         file, algorithm, quantization, shuffle, error_bound, original_size,
-        entropy, mad, first_derivative, compression_time_ms,
+        entropy, mad, second_derivative, compression_time_ms,
         decompression_time_ms, compression_ratio, psnr_db, success
 
     Returns dict with:
@@ -97,7 +97,7 @@ def encode_and_split(df: pd.DataFrame, val_fraction: float = 0.2,
     algo_cols = [f'alg_{a}' for a in ALGORITHM_NAMES]
     feature_cols = algo_cols + ['quant_enc', 'shuffle_enc',
                                 'error_bound_enc', 'data_size_enc',
-                                'entropy', 'mad', 'first_derivative']
+                                'entropy', 'mad', 'second_derivative']
 
     output_cols = ['comp_time_log', 'decomp_time_log', 'ratio_log', 'psnr_clamped']
 
@@ -160,12 +160,12 @@ def encode_and_split(df: pd.DataFrame, val_fraction: float = 0.2,
 
 
 def compute_stats_cpu(raw_bytes):
-    """Compute entropy, MAD, and first_derivative on CPU.
+    """Compute entropy, MAD, and second_derivative on CPU.
 
     Mirrors the GPU implementation in stats_kernel.cu and entropy_kernel.cu:
       - Entropy: byte-level Shannon entropy (256-bin histogram, log2) in bits
       - MAD: mean absolute deviation from mean, normalized by data range
-      - First derivative: mean |x[i] - x[i-1]|, normalized by data range
+      - Second derivative: mean |x[i+1] - 2*x[i] + x[i-1]|, normalized by data range
     """
     arr = np.frombuffer(raw_bytes, dtype=np.float32)
 
@@ -180,17 +180,19 @@ def compute_stats_cpu(raw_bytes):
     vmax = float(arr.max())
     data_range = vmax - vmin
 
-    if data_range < 1e-30 or len(arr) < 2:
+    if data_range < 1e-30 or len(arr) < 3:
         return entropy, 0.0, 0.0
 
     # MAD: mean absolute deviation, normalized by range
     mean_val = np.mean(arr.astype(np.float64))
     mad = np.mean(np.abs(arr.astype(np.float64) - mean_val)) / data_range
 
-    # First derivative: mean |diff|, normalized by range
-    first_derivative = np.mean(np.abs(np.diff(arr.astype(np.float64)))) / data_range
+    # Second derivative: mean |x[i+1] - 2*x[i] + x[i-1]|, normalized by range
+    flat = arr.astype(np.float64)
+    second_deriv = flat[2:] - 2.0 * flat[1:-1] + flat[:-2]
+    second_derivative = np.mean(np.abs(second_deriv)) / data_range
 
-    return float(entropy), float(mad), float(first_derivative)
+    return float(entropy), float(mad), float(second_derivative)
 
 
 def load_from_csv(csv_paths, val_fraction=0.2, seed=42):

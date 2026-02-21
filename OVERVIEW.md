@@ -23,7 +23,7 @@ GPUCompress is a GPU-accelerated compression library that uses reinforcement lea
       v                                     gpucompress_compress()
  trainer.py                                        |
       |                                            |--- calculate entropy,
-      |--- load file                               |    MAD, 1st derivative
+      |--- load file                               |    MAD, 2nd derivative
       |--- calculate entropy, MAD, deriv           |
       |--- encode state (1024 states)              |--- encode state
       |--- select action (epsilon-greedy)          |--- Q-table lookup (GPU
@@ -75,7 +75,7 @@ gpucompress_cleanup();
 | `GPUCOMPRESS_HEADER_SIZE` | 64 bytes prepended to every compressed buffer |
 | `GPUCOMPRESS_MAGIC` | `0x43555047` ("GPUC" in little-endian) |
 | `gpucompress_config_t` | Algorithm, preprocessing bitmask, error bound, CUDA device/stream |
-| `gpucompress_stats_t` | Original/compressed sizes, ratio, entropy, MAD, 1st derivative, throughput |
+| `gpucompress_stats_t` | Original/compressed sizes, ratio, entropy, MAD, 2nd derivative, throughput |
 
 ### Algorithms
 
@@ -198,7 +198,7 @@ Each data block is characterized by four features, each discretized into bins:
 | Shannon entropy | 16 | 0.5-bit width: [0.0, 0.5), [0.5, 1.0), ..., [7.5, 8.0) | Byte-level randomness |
 | Error level | 4 | `>= 0.1` aggressive, `>= 0.01` moderate, `>= 0.001` precise, `<= 0` lossless | Quantization tolerance |
 | MAD | 4 | `< 0.05`, `< 0.15`, `< 0.30`, `>= 0.30` | Data spread |
-| 1st derivative | 4 | `< 0.05`, `< 0.15`, `< 0.35`, `>= 0.35` | Smoothness |
+| 2nd derivative | 4 | `< 0.05`, `< 0.15`, `< 0.35`, `>= 0.35` | Smoothness |
 
 **State encoding** (mixed-radix):
 
@@ -522,7 +522,7 @@ End-to-end pipeline from dataset generation through training to GPU inference:
 2. TRAIN Q-TABLE
    python -m rl.trainer -d train_data/ -o rl/models/ -e 100 -p balanced --error-bound all
    -> For each file, each error bound:
-      a. Load data, compute entropy + MAD + 1st derivative
+      a. Load data, compute entropy + MAD + 2nd derivative
       b. Encode state (1024 states)
       c. Select action via epsilon-greedy (32 actions)
       d. Run gpu_compress with that algorithm + preprocessing
@@ -540,7 +540,7 @@ End-to-end pipeline from dataset generation through training to GPU inference:
    cfg.algorithm = GPUCOMPRESS_ALGO_AUTO;
    gpucompress_compress(data, size, out, &out_size, &cfg, &stats);
    // Library internally:
-   //   a. Computes entropy, MAD, 1st derivative on GPU
+   //   a. Computes entropy, MAD, 2nd derivative on GPU
    //   b. Encodes state
    //   c. Looks up argmax Q(s,:) in constant memory
    //   d. Applies selected preprocessing + algorithm

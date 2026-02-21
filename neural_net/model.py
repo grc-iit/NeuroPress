@@ -14,7 +14,7 @@ class CompressionPredictor(nn.Module):
     Multi-output regression model.
 
     Given (algorithm_onehot, quantization, shuffle, error_bound,
-           data_size, entropy, mad, first_derivative)
+           data_size, entropy, mad, second_derivative)
     predicts (compression_time, decompression_time, ratio, psnr).
     """
 

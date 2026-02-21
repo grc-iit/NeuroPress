@@ -42,7 +42,7 @@ class QTable:
 
     @staticmethod
     def encode_state(entropy: float, error_bound: float,
-                     mad: float = 0.0, first_derivative: float = 0.0) -> int:
+                     mad: float = 0.0, second_derivative: float = 0.0) -> int:
         """
         Encode data characteristics into state index.
 
@@ -50,7 +50,7 @@ class QTable:
             entropy: Shannon entropy in bits (0.0 to 8.0+)
             error_bound: Quantization error bound (0 for lossless)
             mad: Mean Absolute Deviation (default 0.0 for backward compat)
-            first_derivative: Mean absolute first derivative (default 0.0)
+            second_derivative: Mean absolute second derivative (default 0.0)
 
         Returns:
             State index (0 to NUM_STATES-1)
@@ -71,9 +71,9 @@ class QTable:
         else:
             error_level = 3  # Below 0.001 treated as lossless
 
-        # Discretize MAD and first derivative
+        # Discretize MAD and second derivative
         mad_bin = QTable._value_to_bin(mad, MAD_BIN_THRESHOLDS)
-        deriv_bin = QTable._value_to_bin(first_derivative, DERIV_BIN_THRESHOLDS)
+        deriv_bin = QTable._value_to_bin(second_derivative, DERIV_BIN_THRESHOLDS)
 
         return ((entropy_bin * NUM_ERROR_LEVELS + error_level)
                 * NUM_MAD_BINS + mad_bin) * NUM_DERIV_BINS + deriv_bin

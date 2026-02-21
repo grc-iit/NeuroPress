@@ -10,7 +10,7 @@ Usage:
 
 The experience CSV is produced by the C++ active learning system (Level 1/2).
 Its columns are:
-    entropy, mad, first_derivative, original_size, error_bound,
+    entropy, mad, second_derivative, original_size, error_bound,
     algorithm, quantization, shuffle, compression_ratio, compression_time_ms
 
 This script:
@@ -53,7 +53,7 @@ def prepare_experience_data(experience_paths: list, original_df: pd.DataFrame) -
     result = pd.DataFrame()
     result['entropy'] = exp['entropy']
     result['mad'] = exp['mad']
-    result['first_derivative'] = exp['first_derivative']
+    result['second_derivative'] = exp['second_derivative']
     result['original_size'] = exp['original_size']
     result['error_bound'] = exp['error_bound']
     result['algorithm'] = exp['algorithm']

@@ -75,7 +75,7 @@ static const char* CSV_HEADER =
     "compression_time_ms,decompression_time_ms,"
     "compression_throughput_mbps,decompression_throughput_mbps,"
     "psnr_db,max_error,rmse,"
-    "entropy,mad,first_derivative,"
+    "entropy,mad,second_derivative,"
     "lib_throughput_mbps,exact_match,success\n";
 
 // ============================================================
@@ -97,6 +97,7 @@ struct FileMetadata {
     double bin_width;
     double perturbation;
     std::string fill_mode;
+    std::string size_label;  // e.g. "16kb", "1mb" (empty if single-size batch)
 };
 
 struct QualityMetrics {
@@ -128,7 +129,7 @@ struct BenchmarkRow {
     std::string rmse_str;
     double entropy;
     double mad;
-    double first_derivative;
+    double second_derivative;
     double lib_throughput_mbps;
     std::string exact_match;
     bool success;
@@ -247,8 +248,30 @@ static FileMetadata parse_filename(const std::string& filename) {
         meta.bin_width = std::stoi(parts[w_idx].substr(1)) / 100.0;
         meta.perturbation = std::stoi(parts[p_idx].substr(1)) / 1000.0;
 
+        // Check if last part is a size suffix (e.g. "16kb", "256kb", "1mb", "4mb")
+        int end_idx = (int)parts.size();
+        if (end_idx > p_idx + 1) {
+            const std::string& last = parts[end_idx - 1];
+            bool is_size_label = false;
+            if (last.size() >= 3) {
+                std::string suffix = last.substr(last.size() - 2);
+                if (suffix == "kb" || suffix == "mb" || suffix == "gb") {
+                    // Check that everything before the suffix is digits
+                    bool all_digits = true;
+                    for (size_t ci = 0; ci < last.size() - 2; ++ci) {
+                        if (!isdigit(last[ci])) { all_digits = false; break; }
+                    }
+                    is_size_label = all_digits;
+                }
+            }
+            if (is_size_label) {
+                meta.size_label = last;
+                end_idx--;
+            }
+        }
+
         std::string fill_mode;
-        for (int i = p_idx + 1; i < (int)parts.size(); ++i) {
+        for (int i = p_idx + 1; i < end_idx; ++i) {
             if (!fill_mode.empty()) fill_mode += "_";
             fill_mode += parts[i];
         }
@@ -403,7 +426,7 @@ static std::string format_row(const BenchmarkRow& r) {
         << r.rmse_str << ","
         << fmt_double(r.entropy, 6) << ","
         << fmt_double(r.mad, 6) << ","
-        << fmt_double(r.first_derivative, 6) << ","
+        << fmt_double(r.second_derivative, 6) << ","
         << fmt_double(r.lib_throughput_mbps, 2) << ","
         << r.exact_match << ","
         << (r.success ? "True" : "False") << "\n";
@@ -445,10 +468,10 @@ static std::vector<BenchmarkRow> benchmark_file(
     size_t input_size = file_size;
 
     // Compute stats once (GPU-accelerated via public API)
-    double entropy, mad, first_deriv;
+    double entropy, mad, second_deriv;
     gpucompress_error_t stats_err = gpucompress_compute_stats(
         data, num_elements * sizeof(float),
-        &entropy, &mad, &first_deriv);
+        &entropy, &mad, &second_deriv);
     if (stats_err != GPUCOMPRESS_SUCCESS) {
         std::cerr << "Warning: gpucompress_compute_stats failed for "
                   << filepath << std::endl;
@@ -475,7 +498,7 @@ static std::vector<BenchmarkRow> benchmark_file(
         row.original_size = input_size;
         row.entropy = entropy;
         row.mad = mad;
-        row.first_derivative = first_deriv;
+        row.second_derivative = second_deriv;
 
         // Setup config
         gpucompress_config_t c_cfg = gpucompress_default_config();

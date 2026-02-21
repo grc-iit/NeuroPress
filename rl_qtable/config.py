@@ -11,7 +11,7 @@ Defines hyperparameters, state/action spaces, and reward presets.
 NUM_ENTROPY_BINS = 16      # Byte entropy range [0, 8), 0.5-width bins
 NUM_ERROR_LEVELS = 4       # 0=aggressive, 1=balanced, 2=precise, 3=lossless
 NUM_MAD_BINS = 4           # Mean Absolute Deviation bins
-NUM_DERIV_BINS = 4         # First derivative (smoothness) bins
+NUM_DERIV_BINS = 4         # Second derivative (smoothness) bins
 NUM_STATES = NUM_ENTROPY_BINS * NUM_ERROR_LEVELS * NUM_MAD_BINS * NUM_DERIV_BINS  # 1024 states
 
 # Error bound thresholds for levels
@@ -28,11 +28,11 @@ ERROR_LEVEL_THRESHOLDS = [0.1, 0.01, 0.001]
 # Bin 3: MAD >= 0.30  (highly variable)
 MAD_BIN_THRESHOLDS = [0.05, 0.15, 0.30]
 
-# First derivative bin thresholds (3 thresholds → 4 bins)
+# Second derivative bin thresholds (3 thresholds → 4 bins)
 # Normalized by data range, so values are in [0, 1]
-# Bin 0: deriv < 0.02  (very smooth, slow gradients)
-# Bin 1: deriv < 0.10  (moderate transitions)
-# Bin 2: deriv < 0.30  (frequent jumps)
+# Bin 0: deriv < 0.02  (very smooth, slow curvature)
+# Bin 1: deriv < 0.10  (moderate curvature)
+# Bin 2: deriv < 0.30  (frequent curvature changes)
 # Bin 3: deriv >= 0.30 (noisy / random)
 DERIV_BIN_THRESHOLDS = [0.02, 0.10, 0.30]
 
