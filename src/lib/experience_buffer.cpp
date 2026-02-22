@@ -8,7 +8,8 @@
  *
  * CSV columns:
  *   entropy, mad, second_derivative, original_size, error_bound,
- *   algorithm, quantization, shuffle, compression_ratio, compression_time_ms
+ *   algorithm, quantization, shuffle, compression_ratio, compression_time_ms,
+ *   decompression_time_ms, psnr_db
  */
 
 #include "experience_buffer.h"
@@ -32,7 +33,8 @@ static std::atomic<size_t> g_count{0};
 
 static const char* CSV_HEADER =
     "entropy,mad,second_derivative,original_size,error_bound,"
-    "algorithm,quantization,shuffle,compression_ratio,compression_time_ms\n";
+    "algorithm,quantization,shuffle,compression_ratio,compression_time_ms,"
+    "decompression_time_ms,psnr_db\n";
 
 } // anonymous namespace
 
@@ -89,7 +91,7 @@ extern "C" int experience_buffer_append(const ExperienceSample* sample) {
     int shuffle_val = shuffle ? 4 : 0;
 
     fprintf(g_file,
-            "%.6f,%.6f,%.6f,%zu,%.10g,%s,%s,%d,%.6f,%.6f\n",
+            "%.6f,%.6f,%.6f,%zu,%.10g,%s,%s,%d,%.6f,%.6f,%.6f,%.6f\n",
             sample->entropy,
             sample->mad,
             sample->second_derivative,
@@ -99,7 +101,9 @@ extern "C" int experience_buffer_append(const ExperienceSample* sample) {
             quant_str,
             shuffle_val,
             sample->actual_ratio,
-            sample->actual_comp_time_ms);
+            sample->actual_comp_time_ms,
+            sample->actual_decomp_time_ms,
+            sample->actual_psnr);
 
     fflush(g_file);
     g_count.fetch_add(1);

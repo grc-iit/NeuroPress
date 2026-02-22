@@ -11,7 +11,8 @@ Usage:
 The experience CSV is produced by the C++ active learning system (Level 1/2).
 Its columns are:
     entropy, mad, second_derivative, original_size, error_bound,
-    algorithm, quantization, shuffle, compression_ratio, compression_time_ms
+    algorithm, quantization, shuffle, compression_ratio, compression_time_ms,
+    decompression_time_ms, psnr_db
 
 This script:
 1. Benchmarks original .bin files on GPU (no CSV needed)
@@ -65,14 +66,17 @@ def prepare_experience_data(experience_paths: list, original_df: pd.DataFrame) -
     result['success'] = True
     result['file'] = ['experience_' + str(i) for i in range(len(result))]
 
-    # Decompression time: use median from original benchmark data
-    decomp_median = original_df['decompression_time_ms'].median()
-    result['decompression_time_ms'] = decomp_median
+    # Decompression time: use values from experience CSV, fill zeros with median
+    result['decompression_time_ms'] = exp['decompression_time_ms']
+    decomp_mask = result['decompression_time_ms'] <= 0
+    result.loc[decomp_mask, 'decompression_time_ms'] = original_df['decompression_time_ms'].median()
 
-    # PSNR: 120.0 for lossless, median from original for lossy
-    psnr_median = original_df['psnr_db'].replace([np.inf], 120.0).median()
-    lossless_mask = result['error_bound'] <= 0
-    result['psnr_db'] = np.where(lossless_mask, 120.0, psnr_median)
+    # PSNR: use values from experience CSV, fill zeros with median/lossless defaults
+    result['psnr_db'] = exp['psnr_db']
+    psnr_mask = result['psnr_db'] <= 0
+    lossless = result['error_bound'] <= 0
+    result.loc[psnr_mask & lossless, 'psnr_db'] = 120.0
+    result.loc[psnr_mask & ~lossless, 'psnr_db'] = original_df['psnr_db'].replace([np.inf], 120.0).median()
 
     return result
 

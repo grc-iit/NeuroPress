@@ -31,8 +31,9 @@ namespace gpucompress {
 int runNNInference(double entropy, double mad_norm, double deriv_norm,
                    size_t data_size, double error_bound,
                    cudaStream_t stream,
-                   float* out_predicted_ratio,
-                   int* out_top_actions);
+                   float* out_predicted_ratio = nullptr,
+                   float* out_predicted_comp_time = nullptr,
+                   int* out_top_actions = nullptr);
 }
 
 /* ============================================================
@@ -220,7 +221,7 @@ static bool test_forward_parity(const NNWeightsGPU& h_weights) {
     int winner = gpucompress::runNNInference(
         TEST_ENTROPY, TEST_MAD, TEST_DERIV,
         TEST_DATA_SIZE, TEST_ERROR_BOUND,
-        nullptr, &gpu_ratio, top_actions);
+        nullptr, &gpu_ratio, nullptr, top_actions);
 
     if (winner < 0) {
         printf("  GPU inference failed\n  FAIL\n");
@@ -448,7 +449,7 @@ static bool test_sgd_smoke(const NNWeightsGPU& h_weights_orig) {
     // Reinforce: init, 10 samples, apply with lr=0.01
     nn_reinforce_init(d_weights);
     for (int i = 0; i < 10; i++)
-        nn_reinforce_add_sample(input_raw, static_cast<double>(target), 0.0);
+        nn_reinforce_add_sample(input_raw, static_cast<double>(target), 0.0, 0.0, 0.0);
     nn_reinforce_apply(d_weights, 0.01f);
 
     // Re-copy updated weights from GPU

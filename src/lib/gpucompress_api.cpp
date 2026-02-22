@@ -53,7 +53,9 @@ extern "C" {
     // From nn_reinforce.cpp
     int nn_reinforce_init(const void* d_weights);
     void nn_reinforce_add_sample(const float input_raw[15], double actual_ratio,
-                                 double actual_comp_time);
+                                 double actual_comp_time,
+                                 double actual_decomp_time,
+                                 double actual_psnr);
     int nn_reinforce_apply(void* d_weights, float learning_rate);
     void nn_reinforce_cleanup(void);
     void nn_reinforce_get_last_stats(float* grad_norm, int* num_samples,
@@ -559,7 +561,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
         double actual_ratio = static_cast<double>(input_size) /
                               static_cast<double>(compressed_size);
 
-        // Level 1: Store passive sample
+        // Level 1: Store passive sample (no decompress for primary — too expensive)
         ExperienceSample sample;
         sample.entropy = entropy;
         sample.mad = mad;
@@ -569,6 +571,8 @@ extern "C" gpucompress_error_t gpucompress_compress(
         sample.action = nn_action;
         sample.actual_ratio = actual_ratio;
         sample.actual_comp_time_ms = static_cast<double>(primary_comp_time_ms);
+        sample.actual_decomp_time_ms = 0.0;
+        sample.actual_psnr = 0.0;
         experience_buffer_append(&sample);
 
         // Check prediction error
@@ -577,10 +581,12 @@ extern "C" gpucompress_error_t gpucompress_compress(
             std::abs(pred_ratio_d - actual_ratio) / actual_ratio : 0.0;
 
         // Collect explored (action, ratio, comp_time) for reinforcement
-        struct ExploredResult { int action; double ratio; double comp_time_ms; };
+        struct ExploredResult { int action; double ratio; double comp_time_ms;
+                                double decomp_time_ms; double psnr; };
         std::vector<ExploredResult> explored_samples;
         explored_samples.push_back({nn_action, actual_ratio,
-                                    static_cast<double>(primary_comp_time_ms)});
+                                    static_cast<double>(primary_comp_time_ms),
+                                    0.0, 0.0});
 
         if (error_pct > g_exploration_threshold || is_ood) {
             // Level 2: Explore alternatives
@@ -690,8 +696,142 @@ extern "C" gpucompress_error_t gpucompress_compress(
                             double alt_ratio = static_cast<double>(input_size) /
                                                static_cast<double>(alt_comp_size);
 
+                            // --- Round-trip decompress + PSNR ---
+                            double alt_decomp_ms = 0.0;
+                            double alt_psnr = 0.0;
+                            {
+                                // Build a temporary header+compressed buffer on GPU for decompression
+                                size_t hdr_sz = GPUCOMPRESS_HEADER_SIZE;
+                                uint8_t* d_rt_buf = nullptr;
+                                if (cudaMalloc(&d_rt_buf, hdr_sz + alt_comp_size) == cudaSuccess) {
+                                    // Build header for this alternative
+                                    CompressionHeader rt_hdr;
+                                    rt_hdr.magic = COMPRESSION_MAGIC;
+                                    rt_hdr.version = COMPRESSION_HEADER_VERSION;
+                                    rt_hdr.shuffle_element_size = alt_shuf_size;
+                                    rt_hdr.original_size = input_size;
+                                    rt_hdr.compressed_size = alt_comp_size;
+                                    if (d_alt_quant && alt_quant_result.isValid()) {
+                                        rt_hdr.setQuantizationFlags(
+                                            static_cast<uint32_t>(alt_quant_result.type),
+                                            alt_quant_result.actual_precision, true);
+                                        rt_hdr.quant_error_bound = alt_quant_result.error_bound;
+                                        rt_hdr.quant_scale = alt_quant_result.scale_factor;
+                                        rt_hdr.data_min = alt_quant_result.data_min;
+                                        rt_hdr.data_max = alt_quant_result.data_max;
+                                    } else {
+                                        rt_hdr.quant_flags = 0;
+                                        rt_hdr.quant_error_bound = 0.0;
+                                        rt_hdr.quant_scale = 0.0;
+                                        rt_hdr.data_min = 0.0;
+                                        rt_hdr.data_max = 0.0;
+                                    }
+
+                                    // Decompress on GPU
+                                    auto rt_decomp = createDecompressionManager(d_alt_out, stream);
+                                    if (rt_decomp) {
+                                        DecompressionConfig rt_dc = rt_decomp->configure_decompression(d_alt_out);
+                                        size_t rt_decomp_size = rt_dc.decomp_data_size;
+                                        uint8_t* d_rt_decompressed = nullptr;
+                                        if (cudaMalloc(&d_rt_decompressed, rt_decomp_size) == cudaSuccess) {
+                                            cudaEvent_t dt0 = nullptr, dt1 = nullptr;
+                                            bool dt_ok = (cudaEventCreate(&dt0) == cudaSuccess &&
+                                                          cudaEventCreate(&dt1) == cudaSuccess);
+                                            if (dt_ok) cudaEventRecord(dt0, stream);
+
+                                            try {
+                                                rt_decomp->decompress(d_rt_decompressed, d_alt_out, rt_dc);
+                                            } catch (...) {
+                                                // Decompress failed, leave decomp_time and psnr at 0
+                                                if (dt_ok) { cudaEventDestroy(dt0); cudaEventDestroy(dt1); }
+                                                cudaFree(d_rt_decompressed);
+                                                cudaFree(d_rt_buf);
+                                                goto skip_roundtrip;
+                                            }
+
+                                            // Apply unshuffle if needed
+                                            uint8_t* d_rt_result = d_rt_decompressed;
+                                            uint8_t* d_rt_unshuf = nullptr;
+                                            if (alt_shuf_size > 0) {
+                                                d_rt_unshuf = byte_unshuffle_simple(
+                                                    d_rt_decompressed, rt_decomp_size,
+                                                    alt_shuf_size, gpucompress::SHUFFLE_CHUNK_SIZE,
+                                                    ShuffleKernelType::AUTO, stream);
+                                                if (d_rt_unshuf) d_rt_result = d_rt_unshuf;
+                                            }
+
+                                            // Apply dequantization if needed
+                                            void* d_rt_dequant = nullptr;
+                                            if (d_alt_quant && alt_quant_result.isValid()) {
+                                                QuantizationResult rt_qr;
+                                                rt_qr.scale_factor = alt_quant_result.scale_factor;
+                                                rt_qr.data_min = alt_quant_result.data_min;
+                                                rt_qr.data_max = alt_quant_result.data_max;
+                                                rt_qr.error_bound = alt_quant_result.error_bound;
+                                                rt_qr.type = alt_quant_result.type;
+                                                rt_qr.actual_precision = alt_quant_result.actual_precision;
+                                                rt_qr.num_elements = input_size / sizeof(float);
+                                                rt_qr.original_element_size = sizeof(float);
+                                                rt_qr.d_quantized = d_rt_result;
+                                                rt_qr.quantized_bytes = rt_decomp_size;
+                                                d_rt_dequant = dequantize_simple(d_rt_result, rt_qr, stream);
+                                                if (d_rt_dequant) d_rt_result = static_cast<uint8_t*>(d_rt_dequant);
+                                            }
+
+                                            if (dt_ok) {
+                                                cudaEventRecord(dt1, stream);
+                                                cudaEventSynchronize(dt1);
+                                                float dt_ms = 0.0f;
+                                                cudaEventElapsedTime(&dt_ms, dt0, dt1);
+                                                alt_decomp_ms = static_cast<double>(dt_ms);
+                                                cudaEventDestroy(dt0);
+                                                cudaEventDestroy(dt1);
+                                            }
+
+                                            // Compute PSNR (CPU-side for simplicity)
+                                            if (!d_alt_quant) {
+                                                // Lossless: hardcode 120.0
+                                                alt_psnr = 120.0;
+                                            } else {
+                                                // Lossy: copy both original and decompressed to host, compute MSE
+                                                size_t num_floats = input_size / sizeof(float);
+                                                std::vector<float> h_orig(num_floats);
+                                                std::vector<float> h_dec(num_floats);
+                                                cudaMemcpy(h_orig.data(), d_input, input_size, cudaMemcpyDeviceToHost);
+                                                cudaMemcpy(h_dec.data(), d_rt_result, input_size, cudaMemcpyDeviceToHost);
+
+                                                double mse = 0.0;
+                                                float dmin = h_orig[0], dmax = h_orig[0];
+                                                for (size_t fi = 0; fi < num_floats; fi++) {
+                                                    double diff = static_cast<double>(h_orig[fi]) - static_cast<double>(h_dec[fi]);
+                                                    mse += diff * diff;
+                                                    if (h_orig[fi] < dmin) dmin = h_orig[fi];
+                                                    if (h_orig[fi] > dmax) dmax = h_orig[fi];
+                                                }
+                                                mse /= static_cast<double>(num_floats);
+                                                double range = static_cast<double>(dmax) - static_cast<double>(dmin);
+                                                if (mse > 0.0 && range > 0.0) {
+                                                    alt_psnr = 10.0 * log10(range * range / mse);
+                                                } else {
+                                                    alt_psnr = 120.0;
+                                                }
+                                                alt_psnr = fmin(alt_psnr, 120.0);
+                                            }
+
+                                            // Cleanup round-trip buffers
+                                            if (d_rt_dequant) cudaFree(d_rt_dequant);
+                                            if (d_rt_unshuf) cudaFree(d_rt_unshuf);
+                                            cudaFree(d_rt_decompressed);
+                                        }
+                                    }
+                                    cudaFree(d_rt_buf);
+                                }
+                            }
+                            skip_roundtrip:
+
                             explored_samples.push_back({alt_action, alt_ratio,
-                                                        static_cast<double>(alt_ct_ms)});
+                                                        static_cast<double>(alt_ct_ms),
+                                                        alt_decomp_ms, alt_psnr});
 
                             // Store alternative experience
                             ExperienceSample alt_sample;
@@ -703,6 +843,8 @@ extern "C" gpucompress_error_t gpucompress_compress(
                             alt_sample.action = alt_action;
                             alt_sample.actual_ratio = alt_ratio;
                             alt_sample.actual_comp_time_ms = static_cast<double>(alt_ct_ms);
+                            alt_sample.actual_decomp_time_ms = alt_decomp_ms;
+                            alt_sample.actual_psnr = alt_psnr;
                             experience_buffer_append(&alt_sample);
 
                             // Track if this is better than current best
@@ -789,7 +931,9 @@ extern "C" gpucompress_error_t gpucompress_compress(
                                              entropy, mad, second_derivative);
                         nn_reinforce_add_sample(input_raw,
                                                 explored_samples[ei].ratio,
-                                                explored_samples[ei].comp_time_ms);
+                                                explored_samples[ei].comp_time_ms,
+                                                explored_samples[ei].decomp_time_ms,
+                                                explored_samples[ei].psnr);
                     }
 
                     // Batched SGD over all samples

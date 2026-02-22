@@ -28,6 +28,8 @@ typedef struct {
     int action;                 /* algo + quant*8 + shuffle*16 */
     double actual_ratio;
     double actual_comp_time_ms;
+    double actual_decomp_time_ms;
+    double actual_psnr;
 } ExperienceSample;
 
 /**

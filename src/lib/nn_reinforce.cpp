@@ -3,7 +3,7 @@
  * @brief Online NN reinforcement — CPU forward/backward pass + SGD.
  *
  * Pure C++ math plus one cudaMemcpy call in nn_reinforce_apply().
- * Trains on output index 2 (compression ratio) and index 0 (compression time).
+ * Trains on all 4 outputs: index 0 (comp_time), 1 (decomp_time), 2 (ratio), 3 (psnr).
  */
 
 #include <cuda_runtime.h>
@@ -73,7 +73,9 @@ extern "C" int nn_reinforce_init(const void* d_weights) {
 
 extern "C" void nn_reinforce_add_sample(const float input_raw[15],
                                          double actual_ratio,
-                                         double actual_comp_time) {
+                                         double actual_comp_time,
+                                         double actual_decomp_time,
+                                         double actual_psnr) {
     if (!g_initialized) return;
 
     // ---- Standardize input ----
@@ -127,6 +129,22 @@ extern "C" void nn_reinforce_add_sample(const float input_raw[15],
             (log1p(actual_comp_time) - h_weights.y_means[0]) / h_weights.y_stds[0]);
     }
 
+    // Output index 1 = decomp_time (log1p-transformed), only if available
+    bool train_decomp_time = (actual_decomp_time > 0.0);
+    float target_dt = 0.0f;
+    if (train_decomp_time) {
+        target_dt = static_cast<float>(
+            (log1p(actual_decomp_time) - h_weights.y_means[1]) / h_weights.y_stds[1]);
+    }
+
+    // Output index 3 = psnr (clamped, not logged), only if available
+    bool train_psnr = (actual_psnr > 0.0);
+    float target_psnr = 0.0f;
+    if (train_psnr) {
+        float clamped = static_cast<float>(fmin(actual_psnr, 120.0));
+        target_psnr = (clamped - h_weights.y_means[3]) / h_weights.y_stds[3];
+    }
+
     // ---- Backward pass (MSE loss on active outputs) ----
     // dL/dy for each output (factor of 2 absorbed into lr)
     float d3_out[NN_OUTPUT_DIM];
@@ -134,6 +152,12 @@ extern "C" void nn_reinforce_add_sample(const float input_raw[15],
     d3_out[2] = y[2] - target_ratio;
     if (train_comp_time) {
         d3_out[0] = y[0] - target_ct;
+    }
+    if (train_decomp_time) {
+        d3_out[1] = y[1] - target_dt;
+    }
+    if (train_psnr) {
+        d3_out[3] = y[3] - target_psnr;
     }
 
     // Layer 3 gradients (active outputs only)
