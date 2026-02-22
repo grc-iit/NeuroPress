@@ -55,6 +55,8 @@ extern "C" {
     void nn_reinforce_add_sample(const float input_raw[15], double actual_ratio);
     int nn_reinforce_apply(void* d_weights, float learning_rate);
     void nn_reinforce_cleanup(void);
+    void nn_reinforce_get_last_stats(float* grad_norm, int* num_samples,
+                                      int* was_clipped);
 }
 
 /* ============================================================
@@ -1241,6 +1243,12 @@ extern "C" void gpucompress_set_reinforcement(int enable, float learning_rate,
         nn_reinforce_cleanup();
         g_reinforce_initialized = false;
     }
+}
+
+extern "C" void gpucompress_reinforce_last_stats(float* grad_norm,
+                                                    int* num_samples,
+                                                    int* was_clipped) {
+    nn_reinforce_get_last_stats(grad_norm, num_samples, was_clipped);
 }
 
 extern "C" size_t gpucompress_experience_count(void) {

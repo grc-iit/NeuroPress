@@ -39,6 +39,15 @@ void nn_reinforce_add_sample(const float input_raw[15], double actual_ratio);
 int nn_reinforce_apply(void* d_weights, float learning_rate);
 
 /**
+ * Query stats from the last nn_reinforce_apply() call.
+ * @param grad_norm    Output: gradient L2 norm before clipping (NULL to skip)
+ * @param num_samples  Output: number of samples in the batch (NULL to skip)
+ * @param was_clipped  Output: 1 if gradient was clipped, 0 otherwise (NULL to skip)
+ */
+void nn_reinforce_get_last_stats(float* grad_norm, int* num_samples,
+                                  int* was_clipped);
+
+/**
  * Reset internal state (zero gradients, mark uninitialized).
  */
 void nn_reinforce_cleanup(void);

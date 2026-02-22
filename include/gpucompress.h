@@ -478,6 +478,16 @@ void gpucompress_set_exploration_threshold(double threshold);
 void gpucompress_set_reinforcement(int enable, float learning_rate, float mape_threshold);
 
 /**
+ * Get stats from the last online reinforcement SGD step.
+ *
+ * @param grad_norm    Output: gradient L2 norm before clipping (can be NULL)
+ * @param num_samples  Output: number of samples in the SGD batch (can be NULL)
+ * @param was_clipped  Output: 1 if gradient was clipped to unit norm (can be NULL)
+ */
+void gpucompress_reinforce_last_stats(float* grad_norm, int* num_samples,
+                                       int* was_clipped);
+
+/**
  * Get the number of experience samples collected this session.
  *
  * @return Number of samples written since active learning was enabled

@@ -62,6 +62,7 @@ struct EvalConfig {
     bool reinforce = false;
     float reinforce_lr = 1e-4f;
     float reinforce_threshold = 0.60f;
+    bool verbose = false;
 };
 
 // ============================================================
@@ -201,6 +202,7 @@ static void print_usage(const char* prog) {
               << "      --reinforce            Enable online reinforcement learning\n"
               << "      --reinforce-lr <f>     Reinforcement learning rate (default: 1e-4)\n"
               << "      --reinforce-threshold <f>  MAPE threshold for reinforcement (default: 0.60)\n"
+              << "  -v, --verbose              Detailed per-file reinforcement trace\n"
               << "  -h, --help                 Show this help\n";
 }
 
@@ -218,12 +220,13 @@ static EvalConfig parse_args(int argc, char** argv) {
         {"reinforce",             no_argument,       0, OPT_REINFORCE},
         {"reinforce-lr",          required_argument, 0, OPT_REINFORCE_LR},
         {"reinforce-threshold",   required_argument, 0, OPT_REINFORCE_THRESH},
+        {"verbose",               no_argument,       0, 'v'},
         {"help",                  no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
     int opt, option_index = 0;
-    while ((opt = getopt_long(argc, argv, "d:w:e:o:b:t:m:h",
+    while ((opt = getopt_long(argc, argv, "d:w:e:o:b:t:m:vh",
                               long_options, &option_index)) != -1) {
         switch (opt) {
             case 'd': config.data_dir = optarg; break;
@@ -236,6 +239,7 @@ static EvalConfig parse_args(int argc, char** argv) {
             case OPT_REINFORCE: config.reinforce = true; break;
             case OPT_REINFORCE_LR: config.reinforce_lr = std::atof(optarg); break;
             case OPT_REINFORCE_THRESH: config.reinforce_threshold = std::atof(optarg); break;
+            case 'v': config.verbose = true; break;
             case 'h': print_usage(argv[0]); exit(0);
             default: break;
         }
@@ -480,6 +484,9 @@ int main(int argc, char** argv) {
                                 ? "linear" : "none";
 
         // Print per-file summary
+        bool reinforced = config.reinforce &&
+                          (mape > static_cast<double>(config.reinforce_threshold));
+
         std::cout << "  [" << std::setw(3) << (fi + 1) << "/" << files.size() << "] "
                   << std::setw(50) << std::left << filename << std::right
                   << "  algo=" << std::setw(9) << algo_name
@@ -487,7 +494,31 @@ int main(int argc, char** argv) {
                   << "  mape=" << std::setprecision(1) << (mape * 100.0) << "%"
                   << "  exp_delta=" << exp_delta
                   << (explored ? " *EXPLORE*" : "")
+                  << (reinforced ? " *SGD*" : "")
                   << std::endl;
+
+        // Verbose: detailed reinforcement trace
+        if (config.verbose) {
+            std::cout << "           predicted=" << std::setprecision(4) << pred_ratio
+                      << "  actual=" << std::setprecision(4) << ratio
+                      << "  error=" << std::setprecision(1) << (mape * 100.0) << "%"
+                      << "  threshold=" << (config.reinforce_threshold * 100.0) << "%"
+                      << std::endl;
+
+            if (reinforced) {
+                float grad_norm = 0.0f;
+                int num_samples = 0, was_clipped = 0;
+                gpucompress_reinforce_last_stats(&grad_norm, &num_samples,
+                                                  &was_clipped);
+                std::cout << "           >>> SGD fired: "
+                          << num_samples << " samples"
+                          << "  grad_norm=" << std::setprecision(4) << grad_norm
+                          << (was_clipped ? " (CLIPPED)" : "")
+                          << "  lr=" << config.reinforce_lr
+                          << std::endl;
+            }
+            std::cout << std::endl;
+        }
 
         // Print rolling MAPE every ROLLING_WINDOW files
         if (rolling_idx > 0 && rolling_idx % ROLLING_WINDOW == 0) {

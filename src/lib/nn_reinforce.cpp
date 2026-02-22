@@ -31,6 +31,11 @@ static float db3[NN_OUTPUT_DIM];
 
 static int sample_count = 0;
 
+// Last-apply stats for external query
+static float g_last_grad_norm = 0.0f;
+static int   g_last_sample_count = 0;
+static bool  g_last_clipped = false;
+
 /* ============================================================
  * Helper: zero all gradient accumulators
  * ============================================================ */
@@ -191,6 +196,10 @@ extern "C" int nn_reinforce_apply(void* d_weights, float learning_rate) {
     for (int i = 0; i < NN_OUTPUT_DIM; i++)               norm_sq += db3[i] * db3[i];
 
     float norm = sqrtf(norm_sq);
+    g_last_grad_norm = norm;
+    g_last_sample_count = sample_count;
+    g_last_clipped = (norm > 1.0f);
+
     if (norm > 1.0f) {
         float scale = 1.0f / norm;
         for (int i = 0; i < NN_HIDDEN_DIM * NN_INPUT_DIM; i++) dw1[i] *= scale;
@@ -228,6 +237,13 @@ extern "C" int nn_reinforce_apply(void* d_weights, float learning_rate) {
     // ---- Reset for next batch ----
     zero_gradients();
     return 0;
+}
+
+extern "C" void nn_reinforce_get_last_stats(float* grad_norm, int* num_samples,
+                                              int* was_clipped) {
+    if (grad_norm)   *grad_norm   = g_last_grad_norm;
+    if (num_samples) *num_samples = g_last_sample_count;
+    if (was_clipped) *was_clipped = g_last_clipped ? 1 : 0;
 }
 
 extern "C" void nn_reinforce_cleanup(void) {
