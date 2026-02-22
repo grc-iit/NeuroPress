@@ -63,6 +63,7 @@ struct EvalConfig {
     bool reinforce = false;
     float reinforce_lr = 1e-4f;
     float reinforce_threshold = 0.60f;
+    float reinforce_ct_threshold = 0.0f;  // 0 = disabled
     bool verbose = false;
 };
 
@@ -202,14 +203,15 @@ static void print_usage(const char* prog) {
               << "  -m, --max-files <n>        Max files to process (0 = all, default: 0)\n"
               << "      --reinforce            Enable online reinforcement learning\n"
               << "      --reinforce-lr <f>     Reinforcement learning rate (default: 1e-4)\n"
-              << "      --reinforce-threshold <f>  MAPE threshold for reinforcement (default: 0.60)\n"
+              << "      --reinforce-threshold <f>  Ratio MAPE threshold for reinforcement (default: 0.60)\n"
+              << "      --reinforce-ct-threshold <f>  Comp time MAPE threshold (default: 0 = disabled)\n"
               << "  -v, --verbose              Detailed per-file reinforcement trace\n"
               << "  -h, --help                 Show this help\n";
 }
 
 static EvalConfig parse_args(int argc, char** argv) {
     EvalConfig config;
-    enum { OPT_REINFORCE = 256, OPT_REINFORCE_LR, OPT_REINFORCE_THRESH };
+    enum { OPT_REINFORCE = 256, OPT_REINFORCE_LR, OPT_REINFORCE_THRESH, OPT_REINFORCE_CT_THRESH };
     static struct option long_options[] = {
         {"data-dir",              required_argument, 0, 'd'},
         {"weights",               required_argument, 0, 'w'},
@@ -221,6 +223,7 @@ static EvalConfig parse_args(int argc, char** argv) {
         {"reinforce",             no_argument,       0, OPT_REINFORCE},
         {"reinforce-lr",          required_argument, 0, OPT_REINFORCE_LR},
         {"reinforce-threshold",   required_argument, 0, OPT_REINFORCE_THRESH},
+        {"reinforce-ct-threshold", required_argument, 0, OPT_REINFORCE_CT_THRESH},
         {"verbose",               no_argument,       0, 'v'},
         {"help",                  no_argument,       0, 'h'},
         {0, 0, 0, 0}
@@ -240,6 +243,7 @@ static EvalConfig parse_args(int argc, char** argv) {
             case OPT_REINFORCE: config.reinforce = true; break;
             case OPT_REINFORCE_LR: config.reinforce_lr = std::atof(optarg); break;
             case OPT_REINFORCE_THRESH: config.reinforce_threshold = std::atof(optarg); break;
+            case OPT_REINFORCE_CT_THRESH: config.reinforce_ct_threshold = std::atof(optarg); break;
             case 'v': config.verbose = true; break;
             case 'h': print_usage(argv[0]); exit(0);
             default: break;
@@ -317,10 +321,12 @@ int main(int argc, char** argv) {
     // 2b. Enable reinforcement if requested
     if (config.reinforce) {
         gpucompress_set_reinforcement(1, config.reinforce_lr,
-                                      config.reinforce_threshold);
+                                      config.reinforce_threshold,
+                                      config.reinforce_ct_threshold);
         std::cout << "  Reinforcement:   enabled (lr="
                   << config.reinforce_lr
-                  << ", threshold=" << config.reinforce_threshold << ")"
+                  << ", ratio_thresh=" << config.reinforce_threshold
+                  << ", ct_thresh=" << config.reinforce_ct_threshold << ")"
                   << std::endl;
     }
     std::cout << std::endl;

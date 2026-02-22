@@ -23,12 +23,15 @@ extern "C" {
 int nn_reinforce_init(const void* d_weights);
 
 /**
- * CPU forward + backward pass for one (config, actual_ratio) pair.
+ * CPU forward + backward pass for one (config, actual) pair.
  * Accumulates gradients into internal buffers.
- * @param input_raw    15-element raw feature vector (same encoding as GPU kernel)
- * @param actual_ratio Ground-truth compression ratio
+ * Trains on output index 2 (ratio) and optionally output index 0 (comp_time).
+ * @param input_raw          15-element raw feature vector (same encoding as GPU kernel)
+ * @param actual_ratio       Ground-truth compression ratio
+ * @param actual_comp_time   Ground-truth compression time in ms (0 to skip comp_time loss)
  */
-void nn_reinforce_add_sample(const float input_raw[15], double actual_ratio);
+void nn_reinforce_add_sample(const float input_raw[15], double actual_ratio,
+                             double actual_comp_time);
 
 /**
  * Average accumulated gradients, clip, SGD step, cudaMemcpy weights to GPU.

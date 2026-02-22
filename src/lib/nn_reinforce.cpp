@@ -3,7 +3,7 @@
  * @brief Online NN reinforcement — CPU forward/backward pass + SGD.
  *
  * Pure C++ math plus one cudaMemcpy call in nn_reinforce_apply().
- * Trains only on output index 2 (compression ratio, log1p-transformed).
+ * Trains on output index 2 (compression ratio) and index 0 (compression time).
  */
 
 #include <cuda_runtime.h>
@@ -72,7 +72,8 @@ extern "C" int nn_reinforce_init(const void* d_weights) {
 }
 
 extern "C" void nn_reinforce_add_sample(const float input_raw[15],
-                                         double actual_ratio) {
+                                         double actual_ratio,
+                                         double actual_comp_time) {
     if (!g_initialized) return;
 
     // ---- Standardize input ----
@@ -113,24 +114,45 @@ extern "C" void nn_reinforce_add_sample(const float input_raw[15],
         y[j] = sum;
     }
 
-    // ---- Target in normalized space (output index 2 = ratio_log) ----
-    float target_norm = static_cast<float>(
+    // ---- Targets in normalized space ----
+    // Output index 2 = ratio (log1p-transformed)
+    float target_ratio = static_cast<float>(
         (log1p(actual_ratio) - h_weights.y_means[2]) / h_weights.y_stds[2]);
 
-    // ---- Backward pass (MSE loss on output index 2 only) ----
-    // d3[2] = y[2] - target_norm   (dL/dy for MSE, factor of 2 absorbed into lr)
-    float d3 = y[2] - target_norm;
-
-    // Layer 3 gradients (only output index 2)
-    for (int i = 0; i < NN_HIDDEN_DIM; i++) {
-        dw3[2 * NN_HIDDEN_DIM + i] += d3 * h2[i];
+    // Output index 0 = comp_time (log1p-transformed), only if available
+    bool train_comp_time = (actual_comp_time > 0.0);
+    float target_ct = 0.0f;
+    if (train_comp_time) {
+        target_ct = static_cast<float>(
+            (log1p(actual_comp_time) - h_weights.y_means[0]) / h_weights.y_stds[0]);
     }
-    db3[2] += d3;
+
+    // ---- Backward pass (MSE loss on active outputs) ----
+    // dL/dy for each output (factor of 2 absorbed into lr)
+    float d3_out[NN_OUTPUT_DIM];
+    memset(d3_out, 0, sizeof(d3_out));
+    d3_out[2] = y[2] - target_ratio;
+    if (train_comp_time) {
+        d3_out[0] = y[0] - target_ct;
+    }
+
+    // Layer 3 gradients (active outputs only)
+    for (int out = 0; out < NN_OUTPUT_DIM; out++) {
+        if (d3_out[out] == 0.0f) continue;
+        for (int i = 0; i < NN_HIDDEN_DIM; i++) {
+            dw3[out * NN_HIDDEN_DIM + i] += d3_out[out] * h2[i];
+        }
+        db3[out] += d3_out[out];
+    }
 
     // Backprop through layer 3 to h2
     float dh2[NN_HIDDEN_DIM];
-    for (int i = 0; i < NN_HIDDEN_DIM; i++) {
-        dh2[i] = h_weights.w3[2 * NN_HIDDEN_DIM + i] * d3;
+    memset(dh2, 0, sizeof(dh2));
+    for (int out = 0; out < NN_OUTPUT_DIM; out++) {
+        if (d3_out[out] == 0.0f) continue;
+        for (int i = 0; i < NN_HIDDEN_DIM; i++) {
+            dh2[i] += h_weights.w3[out * NN_HIDDEN_DIM + i] * d3_out[out];
+        }
     }
 
     // ReLU backward for layer 2

@@ -52,7 +52,8 @@ extern "C" {
 
     // From nn_reinforce.cpp
     int nn_reinforce_init(const void* d_weights);
-    void nn_reinforce_add_sample(const float input_raw[15], double actual_ratio);
+    void nn_reinforce_add_sample(const float input_raw[15], double actual_ratio,
+                                 double actual_comp_time);
     int nn_reinforce_apply(void* d_weights, float learning_rate);
     void nn_reinforce_cleanup(void);
     void nn_reinforce_get_last_stats(float* grad_norm, int* num_samples,
@@ -91,7 +92,8 @@ char g_experience_path[512] = "";
 /** Online reinforcement state */
 bool g_reinforce_enabled = false;
 float g_reinforce_lr = 1e-4f;
-double g_reinforce_threshold = 0.60;  // 60% MAPE
+double g_reinforce_threshold = 0.60;  // 60% ratio MAPE
+double g_reinforce_ct_threshold = 0.60;  // 60% comp_time MAPE
 bool g_reinforce_initialized = false;
 
 /** Algorithm names */
@@ -431,15 +433,30 @@ extern "C" gpucompress_error_t gpucompress_compress(
     // Pointer to compressed data (after header)
     uint8_t* d_compressed = d_output + header_size;
 
-    // Compress
+    // Compress (with timing for reinforcement)
+    cudaEvent_t t_start, t_stop;
+    float primary_comp_time_ms = 0.0f;
+    bool timing_ok = (cudaEventCreate(&t_start) == cudaSuccess &&
+                      cudaEventCreate(&t_stop) == cudaSuccess);
+    if (timing_ok) cudaEventRecord(t_start, stream);
+
     try {
         compressor->compress(d_compress_input, d_compressed, comp_config);
     } catch (...) {
+        if (timing_ok) { cudaEventDestroy(t_start); cudaEventDestroy(t_stop); }
         cudaFree(d_output);
         if (d_quantized) cudaFree(d_quantized);
         if (d_shuffled) cudaFree(d_shuffled);
         cudaFree(d_input);
         return GPUCOMPRESS_ERROR_COMPRESSION;
+    }
+
+    if (timing_ok) {
+        cudaEventRecord(t_stop, stream);
+        cudaEventSynchronize(t_stop);
+        cudaEventElapsedTime(&primary_comp_time_ms, t_start, t_stop);
+        cudaEventDestroy(t_start);
+        cudaEventDestroy(t_stop);
     }
 
     // Get compressed size
@@ -545,9 +562,11 @@ extern "C" gpucompress_error_t gpucompress_compress(
                 K = 4;
             }
 
-            // Collect explored (action, ratio) pairs for reinforcement
-            std::vector<std::pair<int,double>> explored_samples;
-            explored_samples.push_back({nn_action, actual_ratio});
+            // Collect explored (action, ratio, comp_time) for reinforcement
+            struct ExploredResult { int action; double ratio; double comp_time_ms; };
+            std::vector<ExploredResult> explored_samples;
+            explored_samples.push_back({nn_action, actual_ratio,
+                                        static_cast<double>(primary_comp_time_ms)});
 
             // Try top-K alternative configs
             double best_ratio = actual_ratio;
@@ -622,13 +641,29 @@ extern "C" gpucompress_error_t gpucompress_compress(
                         size_t alt_max = alt_cc.max_compressed_buffer_size;
                         uint8_t* d_alt_out = nullptr;
                         if (cudaMalloc(&d_alt_out, alt_max) == cudaSuccess) {
+                            cudaEvent_t at0, at1;
+                            float alt_ct_ms = 0.0f;
+                            bool at_ok = (cudaEventCreate(&at0) == cudaSuccess &&
+                                          cudaEventCreate(&at1) == cudaSuccess);
+                            if (at_ok) cudaEventRecord(at0, stream);
+
                             alt_comp->compress(d_alt_input, d_alt_out, alt_cc);
+
+                            if (at_ok) {
+                                cudaEventRecord(at1, stream);
+                                cudaEventSynchronize(at1);
+                                cudaEventElapsedTime(&alt_ct_ms, at0, at1);
+                                cudaEventDestroy(at0);
+                                cudaEventDestroy(at1);
+                            }
+
                             alt_comp_size = alt_comp->get_compressed_output_size(d_alt_out);
 
                             double alt_ratio = static_cast<double>(input_size) /
                                                static_cast<double>(alt_comp_size);
 
-                            explored_samples.push_back({alt_action, alt_ratio});
+                            explored_samples.push_back({alt_action, alt_ratio,
+                                                        static_cast<double>(alt_ct_ms)});
 
                             // Store alternative experience
                             ExperienceSample alt_sample;
@@ -698,52 +733,60 @@ extern "C" gpucompress_error_t gpucompress_compress(
                 if (d_alt_shuf) cudaFree(d_alt_shuf);
             }
 
-            // Online reinforcement: if MAPE exceeds reinforce threshold,
-            // do CPU backward pass on all explored configs and update GPU weights
-            if (g_reinforce_enabled && error_pct > g_reinforce_threshold) {
-                void* d_weights = gpucompress_nn_get_device_ptr_impl();
-                if (d_weights) {
-                    // Lazy-init: copy GPU weights to host on first trigger
-                    if (!g_reinforce_initialized) {
-                        if (nn_reinforce_init(d_weights) == 0) {
-                            g_reinforce_initialized = true;
-                        }
+        }
+
+        // Online reinforcement: if ratio OR comp_time MAPE exceeds threshold,
+        // do CPU backward pass and update GPU weights.
+        // This runs independently of exploration so comp_time can be reinforced
+        // even when ratio predictions are already good.
+        double ct_error_pct = 0.0;
+        if (primary_comp_time_ms > 0.0f && predicted_comp_time > 0.0f) {
+            double pred_ct = static_cast<double>(predicted_comp_time);
+            double actual_ct = static_cast<double>(primary_comp_time_ms);
+            ct_error_pct = std::abs(pred_ct - actual_ct) / actual_ct;
+        }
+
+        if (g_reinforce_enabled &&
+            (error_pct > g_reinforce_threshold ||
+             ct_error_pct > g_reinforce_ct_threshold)) {
+            void* d_weights = gpucompress_nn_get_device_ptr_impl();
+            if (d_weights) {
+                // Lazy-init: copy GPU weights to host on first trigger
+                if (!g_reinforce_initialized) {
+                    if (nn_reinforce_init(d_weights) == 0) {
+                        g_reinforce_initialized = true;
                     }
+                }
 
-                    if (g_reinforce_initialized) {
-                        // Build input and add sample for each explored config
-                        for (auto& sp : explored_samples) {
-                            int action_id = sp.first;
-                            double ratio_val = sp.second;
+                if (g_reinforce_initialized) {
+                    // Build input for primary config (always available)
+                    int algo_idx = nn_action % 8;
+                    int quant_flag = (nn_action / 8) % 2;
+                    int shuffle_flag = (nn_action / 16) % 2;
 
-                            int algo_idx = action_id % 8;
-                            int quant_flag = (action_id / 8) % 2;
-                            int shuffle_flag = (action_id / 16) % 2;
+                    float input_raw[15];
+                    for (int f = 0; f < 8; f++)
+                        input_raw[f] = (f == algo_idx) ? 1.0f : 0.0f;
+                    input_raw[8] = static_cast<float>(quant_flag);
+                    input_raw[9] = static_cast<float>(shuffle_flag);
 
-                            float input_raw[15];
-                            for (int f = 0; f < 8; f++)
-                                input_raw[f] = (f == algo_idx) ? 1.0f : 0.0f;
-                            input_raw[8] = static_cast<float>(quant_flag);
-                            input_raw[9] = static_cast<float>(shuffle_flag);
+                    double eb_c = cfg.error_bound;
+                    if (eb_c < 1e-7) eb_c = 1e-7;
+                    input_raw[10] = static_cast<float>(log10(eb_c));
 
-                            double eb_c = cfg.error_bound;
-                            if (eb_c < 1e-7) eb_c = 1e-7;
-                            input_raw[10] = static_cast<float>(log10(eb_c));
+                    double ds = static_cast<double>(input_size);
+                    if (ds < 1.0) ds = 1.0;
+                    input_raw[11] = static_cast<float>(log2(ds));
 
-                            double ds = static_cast<double>(input_size);
-                            if (ds < 1.0) ds = 1.0;
-                            input_raw[11] = static_cast<float>(log2(ds));
+                    input_raw[12] = static_cast<float>(entropy);
+                    input_raw[13] = static_cast<float>(mad);
+                    input_raw[14] = static_cast<float>(second_derivative);
 
-                            input_raw[12] = static_cast<float>(entropy);
-                            input_raw[13] = static_cast<float>(mad);
-                            input_raw[14] = static_cast<float>(second_derivative);
+                    nn_reinforce_add_sample(input_raw, actual_ratio,
+                                            static_cast<double>(primary_comp_time_ms));
 
-                            nn_reinforce_add_sample(input_raw, ratio_val);
-                        }
-
-                        nn_reinforce_apply(d_weights, g_reinforce_lr);
-                        sgd_fired = true;
-                    }
+                    nn_reinforce_apply(d_weights, g_reinforce_lr);
+                    sgd_fired = true;
                 }
             }
         }
@@ -1241,10 +1284,12 @@ extern "C" void gpucompress_set_exploration_threshold(double threshold) {
 }
 
 extern "C" void gpucompress_set_reinforcement(int enable, float learning_rate,
-                                               float mape_threshold) {
+                                               float mape_threshold,
+                                               float ct_mape_threshold) {
     g_reinforce_enabled = (enable != 0);
     if (learning_rate > 0.0f) g_reinforce_lr = learning_rate;
     if (mape_threshold > 0.0f) g_reinforce_threshold = static_cast<double>(mape_threshold);
+    if (ct_mape_threshold > 0.0f) g_reinforce_ct_threshold = static_cast<double>(ct_mape_threshold);
 
     if (!g_reinforce_enabled) {
         nn_reinforce_cleanup();

@@ -473,11 +473,13 @@ void gpucompress_set_exploration_threshold(double threshold);
  * the NN weights are updated via single-sample SGD on CPU
  * and copied back to GPU immediately.
  *
- * @param enable         1 to enable, 0 to disable
- * @param learning_rate  SGD step size (default 1e-4)
- * @param mape_threshold MAPE threshold to trigger reinforcement (default 0.60)
+ * @param enable            1 to enable, 0 to disable
+ * @param learning_rate     SGD step size (default 1e-4)
+ * @param mape_threshold    Ratio MAPE threshold to trigger reinforcement (default 0.60)
+ * @param ct_mape_threshold Comp time MAPE threshold to trigger reinforcement (0 = disabled)
  */
-void gpucompress_set_reinforcement(int enable, float learning_rate, float mape_threshold);
+void gpucompress_set_reinforcement(int enable, float learning_rate,
+                                   float mape_threshold, float ct_mape_threshold);
 
 /**
  * Get stats from the last online reinforcement SGD step.
