@@ -368,11 +368,6 @@ int main(int argc, char** argv) {
 
     // MAPE tracking
     double total_mape = 0.0;
-    double first_half_mape = 0.0;
-    size_t first_half_count = 0;
-    double second_half_mape = 0.0;
-    size_t second_half_count = 0;
-    size_t half_point = files.size() / 2;
 
     // Rolling MAPE (circular buffer of last 20)
     const size_t ROLLING_WINDOW = 20;
@@ -461,13 +456,6 @@ int main(int argc, char** argv) {
             : 0.0;
 
         total_mape += mape;
-        if (fi < half_point) {
-            first_half_mape += mape;
-            first_half_count++;
-        } else {
-            second_half_mape += mape;
-            second_half_count++;
-        }
 
         // Rolling MAPE buffer
         rolling_mape[rolling_idx % ROLLING_WINDOW] = mape;
@@ -573,12 +561,6 @@ int main(int argc, char** argv) {
               << (files_processed > 0 ? total_ratio / files_processed : 0.0) << std::endl;
     std::cout << "  Mean MAPE:           " << std::setprecision(1)
               << (files_processed > 0 ? 100.0 * total_mape / files_processed : 0.0)
-              << "%" << std::endl;
-    std::cout << "  First-half MAPE:     " << std::setprecision(1)
-              << (first_half_count > 0 ? 100.0 * first_half_mape / first_half_count : 0.0)
-              << "%" << std::endl;
-    std::cout << "  Second-half MAPE:    " << std::setprecision(1)
-              << (second_half_count > 0 ? 100.0 * second_half_mape / second_half_count : 0.0)
               << "%" << std::endl;
     std::cout << "  Wall time:           " << std::setprecision(1) << wall_time << "s" << std::endl;
     std::cout << "  Output:              " << config.output << std::endl;
