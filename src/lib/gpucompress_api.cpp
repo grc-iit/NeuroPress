@@ -12,6 +12,8 @@
 #include <cstring>
 #include <cstdio>
 #include <cmath>
+#include <utility>
+#include <vector>
 
 #include "gpucompress.h"
 #include "internal.hpp"
@@ -46,6 +48,13 @@ extern "C" {
     int gpucompress_nn_is_loaded_impl(void);
     void gpucompress_nn_cleanup_impl(void);
     void gpucompress_nn_set_criterion_impl(int criterion);
+    void* gpucompress_nn_get_device_ptr_impl(void);
+
+    // From nn_reinforce.cpp
+    int nn_reinforce_init(const void* d_weights);
+    void nn_reinforce_add_sample(const float input_raw[15], double actual_ratio);
+    int nn_reinforce_apply(void* d_weights, float learning_rate);
+    void nn_reinforce_cleanup(void);
 }
 
 /* ============================================================
@@ -76,6 +85,12 @@ const char* VERSION_STRING = "1.0.0";
 bool g_active_learning_enabled = false;
 double g_exploration_threshold = 0.20;  // 20% MAPE
 char g_experience_path[512] = "";
+
+/** Online reinforcement state */
+bool g_reinforce_enabled = false;
+float g_reinforce_lr = 1e-4f;
+double g_reinforce_threshold = 0.60;  // 60% MAPE
+bool g_reinforce_initialized = false;
 
 /** Algorithm names */
 const char* ALGORITHM_NAMES[] = {
@@ -171,6 +186,8 @@ extern "C" void gpucompress_cleanup(void) {
 
     if (old_ref <= 1) {
         // Last reference, cleanup
+        nn_reinforce_cleanup();
+        g_reinforce_initialized = false;
         experience_buffer_cleanup();
         g_active_learning_enabled = false;
         gpucompress_nn_cleanup_impl();
@@ -271,7 +288,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
             // Neural Network inference (preferred)
             // Always get stats when active learning is enabled
             bool need_stats = (stats != nullptr) || g_active_learning_enabled;
-            float* p_ratio = g_active_learning_enabled ? &predicted_ratio : nullptr;
+            float* p_ratio = (stats != nullptr || g_active_learning_enabled) ? &predicted_ratio : nullptr;
             int* p_top = g_active_learning_enabled ? top_actions : nullptr;
 
             rc = gpucompress::runAutoStatsNNPipeline(
@@ -522,6 +539,10 @@ extern "C" gpucompress_error_t gpucompress_compress(
                 K = 4;
             }
 
+            // Collect explored (action, ratio) pairs for reinforcement
+            std::vector<std::pair<int,double>> explored_samples;
+            explored_samples.push_back({nn_action, actual_ratio});
+
             // Try top-K alternative configs
             double best_ratio = actual_ratio;
             (void)best_ratio;  // Updated in loop, used for tracking
@@ -601,6 +622,8 @@ extern "C" gpucompress_error_t gpucompress_compress(
                             double alt_ratio = static_cast<double>(input_size) /
                                                static_cast<double>(alt_comp_size);
 
+                            explored_samples.push_back({alt_action, alt_ratio});
+
                             // Store alternative experience
                             ExperienceSample alt_sample;
                             alt_sample.entropy = entropy;
@@ -668,6 +691,54 @@ extern "C" gpucompress_error_t gpucompress_compress(
                 if (d_alt_quant) cudaFree(d_alt_quant);
                 if (d_alt_shuf) cudaFree(d_alt_shuf);
             }
+
+            // Online reinforcement: if MAPE exceeds reinforce threshold,
+            // do CPU backward pass on all explored configs and update GPU weights
+            if (g_reinforce_enabled && error_pct > g_reinforce_threshold) {
+                void* d_weights = gpucompress_nn_get_device_ptr_impl();
+                if (d_weights) {
+                    // Lazy-init: copy GPU weights to host on first trigger
+                    if (!g_reinforce_initialized) {
+                        if (nn_reinforce_init(d_weights) == 0) {
+                            g_reinforce_initialized = true;
+                        }
+                    }
+
+                    if (g_reinforce_initialized) {
+                        // Build input and add sample for each explored config
+                        for (auto& sp : explored_samples) {
+                            int action_id = sp.first;
+                            double ratio_val = sp.second;
+
+                            int algo_idx = action_id % 8;
+                            int quant_flag = (action_id / 8) % 2;
+                            int shuffle_flag = (action_id / 16) % 2;
+
+                            float input_raw[15];
+                            for (int f = 0; f < 8; f++)
+                                input_raw[f] = (f == algo_idx) ? 1.0f : 0.0f;
+                            input_raw[8] = static_cast<float>(quant_flag);
+                            input_raw[9] = static_cast<float>(shuffle_flag);
+
+                            double eb_c = cfg.error_bound;
+                            if (eb_c < 1e-7) eb_c = 1e-7;
+                            input_raw[10] = static_cast<float>(log10(eb_c));
+
+                            double ds = static_cast<double>(input_size);
+                            if (ds < 1.0) ds = 1.0;
+                            input_raw[11] = static_cast<float>(log2(ds));
+
+                            input_raw[12] = static_cast<float>(entropy);
+                            input_raw[13] = static_cast<float>(mad);
+                            input_raw[14] = static_cast<float>(second_derivative);
+
+                            nn_reinforce_add_sample(input_raw, ratio_val);
+                        }
+
+                        nn_reinforce_apply(d_weights, g_reinforce_lr);
+                    }
+                }
+            }
         }
     }
 
@@ -685,6 +756,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
         stats->algorithm_used = algo_to_use;
         stats->preprocessing_used = preproc_to_use;
         stats->throughput_mbps = 0.0;  // Would need timing to calculate
+        stats->predicted_ratio = static_cast<double>(predicted_ratio);
     }
 
     return GPUCOMPRESS_SUCCESS;
@@ -1159,6 +1231,18 @@ extern "C" void gpucompress_set_exploration_threshold(double threshold) {
     }
 }
 
+extern "C" void gpucompress_set_reinforcement(int enable, float learning_rate,
+                                               float mape_threshold) {
+    g_reinforce_enabled = (enable != 0);
+    if (learning_rate > 0.0f) g_reinforce_lr = learning_rate;
+    if (mape_threshold > 0.0f) g_reinforce_threshold = static_cast<double>(mape_threshold);
+
+    if (!g_reinforce_enabled) {
+        nn_reinforce_cleanup();
+        g_reinforce_initialized = false;
+    }
+}
+
 extern "C" size_t gpucompress_experience_count(void) {
     return experience_buffer_count();
 }
@@ -1169,6 +1253,12 @@ extern "C" gpucompress_error_t gpucompress_reload_nn(const char* filepath) {
     }
 
     std::lock_guard<std::mutex> lock(g_init_mutex);
+
+    // Clean up reinforcement state (weights are about to change)
+    if (g_reinforce_initialized) {
+        nn_reinforce_cleanup();
+        g_reinforce_initialized = false;
+    }
 
     // Clean up old weights
     gpucompress_nn_cleanup_impl();

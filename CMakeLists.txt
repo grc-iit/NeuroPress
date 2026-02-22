@@ -57,6 +57,7 @@ set(LIB_SOURCES
     src/lib/entropy_kernel.cu
     src/lib/qtable_gpu.cu
     src/lib/nn_gpu.cu
+    src/lib/nn_reinforce.cpp
     src/lib/stats_kernel.cu
     src/lib/experience_buffer.cpp
 )
@@ -67,6 +68,7 @@ set_source_files_properties(
     src/cli/compress.cpp
     src/cli/decompress.cpp
     src/lib/gpucompress_api.cpp
+    src/lib/nn_reinforce.cpp
     src/lib/experience_buffer.cpp
     PROPERTIES LANGUAGE CUDA
 )
@@ -209,7 +211,20 @@ add_executable(benchmark scripts/benchmark.cpp)
 target_link_libraries(benchmark PRIVATE gpucompress pthread)
 
 # ============================================================
-# Executable 5: Active Learning Integration Test
+# Executable 5: NN Reinforce Test Suite
+# ============================================================
+add_executable(test_nn_reinforce tests/test_nn_reinforce.cpp)
+set_source_files_properties(tests/test_nn_reinforce.cpp PROPERTIES LANGUAGE CUDA)
+target_link_libraries(test_nn_reinforce PRIVATE gpucompress CUDA::cudart pthread)
+
+# ============================================================
+# Executable 6: Simulation Evaluation
+# ============================================================
+add_executable(eval_simulation eval/eval_simulation.cpp)
+target_link_libraries(eval_simulation PRIVATE gpucompress pthread)
+
+# ============================================================
+# Executable 7: Active Learning Integration Test
 # ============================================================
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/neural_net/test_active_learning.cu")
     add_executable(test_active_learning

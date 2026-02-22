@@ -45,7 +45,7 @@ static const char* CSV_HEADER =
     "file,field,scenario,timestep,entropy,mad,second_derivative,"
     "original_size,algorithm,shuffle,quantization,error_bound,"
     "compressed_size,compression_ratio,compress_time_ms,throughput_mbps,"
-    "experience_count,experience_delta\n";
+    "experience_count,experience_delta,predicted_ratio,mape\n";
 
 // ============================================================
 // CLI configuration
@@ -59,6 +59,9 @@ struct EvalConfig {
     double error_bound = 0.0;
     double threshold = 0.20;
     int max_files = 0;
+    bool reinforce = false;
+    float reinforce_lr = 1e-4f;
+    float reinforce_threshold = 0.60f;
 };
 
 // ============================================================
@@ -195,20 +198,27 @@ static void print_usage(const char* prog) {
               << "  -b, --error-bound <float>  Quantization error bound (default: 0.0 = lossless)\n"
               << "  -t, --threshold <float>    Exploration threshold (default: 0.20)\n"
               << "  -m, --max-files <n>        Max files to process (0 = all, default: 0)\n"
+              << "      --reinforce            Enable online reinforcement learning\n"
+              << "      --reinforce-lr <f>     Reinforcement learning rate (default: 1e-4)\n"
+              << "      --reinforce-threshold <f>  MAPE threshold for reinforcement (default: 0.60)\n"
               << "  -h, --help                 Show this help\n";
 }
 
 static EvalConfig parse_args(int argc, char** argv) {
     EvalConfig config;
+    enum { OPT_REINFORCE = 256, OPT_REINFORCE_LR, OPT_REINFORCE_THRESH };
     static struct option long_options[] = {
-        {"data-dir",    required_argument, 0, 'd'},
-        {"weights",     required_argument, 0, 'w'},
-        {"experience",  required_argument, 0, 'e'},
-        {"output",      required_argument, 0, 'o'},
-        {"error-bound", required_argument, 0, 'b'},
-        {"threshold",   required_argument, 0, 't'},
-        {"max-files",   required_argument, 0, 'm'},
-        {"help",        no_argument,       0, 'h'},
+        {"data-dir",              required_argument, 0, 'd'},
+        {"weights",               required_argument, 0, 'w'},
+        {"experience",            required_argument, 0, 'e'},
+        {"output",                required_argument, 0, 'o'},
+        {"error-bound",           required_argument, 0, 'b'},
+        {"threshold",             required_argument, 0, 't'},
+        {"max-files",             required_argument, 0, 'm'},
+        {"reinforce",             no_argument,       0, OPT_REINFORCE},
+        {"reinforce-lr",          required_argument, 0, OPT_REINFORCE_LR},
+        {"reinforce-threshold",   required_argument, 0, OPT_REINFORCE_THRESH},
+        {"help",                  no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
@@ -223,6 +233,9 @@ static EvalConfig parse_args(int argc, char** argv) {
             case 'b': config.error_bound = std::atof(optarg); break;
             case 't': config.threshold = std::atof(optarg); break;
             case 'm': config.max_files = std::atoi(optarg); break;
+            case OPT_REINFORCE: config.reinforce = true; break;
+            case OPT_REINFORCE_LR: config.reinforce_lr = std::atof(optarg); break;
+            case OPT_REINFORCE_THRESH: config.reinforce_threshold = std::atof(optarg); break;
             case 'h': print_usage(argv[0]); exit(0);
             default: break;
         }
@@ -295,6 +308,16 @@ int main(int argc, char** argv) {
     }
     gpucompress_set_exploration_threshold(config.threshold);
     std::cout << "  Active learning: enabled" << std::endl;
+
+    // 2b. Enable reinforcement if requested
+    if (config.reinforce) {
+        gpucompress_set_reinforcement(1, config.reinforce_lr,
+                                      config.reinforce_threshold);
+        std::cout << "  Reinforcement:   enabled (lr="
+                  << config.reinforce_lr
+                  << ", threshold=" << config.reinforce_threshold << ")"
+                  << std::endl;
+    }
     std::cout << std::endl;
 
     // 3. Open output CSV
@@ -327,7 +350,6 @@ int main(int argc, char** argv) {
 
             gpucompress_compress(buf.data(), sz, comp.data(), &out_sz,
                                  &warmup_cfg, &warmup_stats);
-            gpucompress_sync();
             std::cout << "  Warm-up complete" << std::endl << std::endl;
         }
     }
@@ -339,6 +361,20 @@ int main(int argc, char** argv) {
     size_t total_explorations = 0;
     double total_ratio = 0.0;
     size_t files_processed = 0;
+
+    // MAPE tracking
+    double total_mape = 0.0;
+    double first_half_mape = 0.0;
+    size_t first_half_count = 0;
+    double second_half_mape = 0.0;
+    size_t second_half_count = 0;
+    size_t half_point = files.size() / 2;
+
+    // Rolling MAPE (circular buffer of last 20)
+    const size_t ROLLING_WINDOW = 20;
+    std::vector<double> rolling_mape(ROLLING_WINDOW, 0.0);
+    size_t rolling_idx = 0;
+    size_t rolling_filled = 0;
 
     auto wall_start = std::chrono::steady_clock::now();
 
@@ -386,7 +422,6 @@ int main(int argc, char** argv) {
         gpucompress_stats_t stats;
         memset(&stats, 0, sizeof(stats));
 
-        gpucompress_sync();
         auto t0 = std::chrono::high_resolution_clock::now();
         int comp_rc = gpucompress_compress(
             raw.data(), file_size,
@@ -415,6 +450,26 @@ int main(int argc, char** argv) {
             ? (static_cast<double>(file_size) / (1024.0 * 1024.0)) / (comp_time / 1000.0)
             : 0.0;
 
+        // Compute MAPE from NN prediction
+        double pred_ratio = stats.predicted_ratio;
+        double mape = (ratio > 0.0)
+            ? std::abs(pred_ratio - ratio) / ratio
+            : 0.0;
+
+        total_mape += mape;
+        if (fi < half_point) {
+            first_half_mape += mape;
+            first_half_count++;
+        } else {
+            second_half_mape += mape;
+            second_half_count++;
+        }
+
+        // Rolling MAPE buffer
+        rolling_mape[rolling_idx % ROLLING_WINDOW] = mape;
+        rolling_idx++;
+        if (rolling_filled < ROLLING_WINDOW) rolling_filled++;
+
         total_ratio += ratio;
         files_processed++;
 
@@ -429,9 +484,21 @@ int main(int argc, char** argv) {
                   << std::setw(50) << std::left << filename << std::right
                   << "  algo=" << std::setw(9) << algo_name
                   << "  ratio=" << std::fixed << std::setprecision(3) << ratio
+                  << "  mape=" << std::setprecision(1) << (mape * 100.0) << "%"
                   << "  exp_delta=" << exp_delta
                   << (explored ? " *EXPLORE*" : "")
                   << std::endl;
+
+        // Print rolling MAPE every ROLLING_WINDOW files
+        if (rolling_idx > 0 && rolling_idx % ROLLING_WINDOW == 0) {
+            double rolling_sum = 0.0;
+            for (size_t ri = 0; ri < rolling_filled; ++ri)
+                rolling_sum += rolling_mape[ri];
+            double rolling_avg = rolling_sum / rolling_filled;
+            std::cout << "  Rolling MAPE (last " << ROLLING_WINDOW << "): "
+                      << std::fixed << std::setprecision(1)
+                      << (rolling_avg * 100.0) << "%" << std::endl;
+        }
 
         // Write CSV row
         csv_out << filename << ","
@@ -451,7 +518,9 @@ int main(int argc, char** argv) {
                 << fmt_double(comp_time, 4) << ","
                 << fmt_double(throughput, 2) << ","
                 << curr_experience << ","
-                << exp_delta << "\n";
+                << exp_delta << ","
+                << fmt_double(pred_ratio, 6) << ","
+                << fmt_double(mape, 6) << "\n";
     }
 
     csv_out.close();
@@ -471,6 +540,15 @@ int main(int argc, char** argv) {
               << "% of files)" << std::endl;
     std::cout << "  Mean ratio:          " << std::setprecision(4)
               << (files_processed > 0 ? total_ratio / files_processed : 0.0) << std::endl;
+    std::cout << "  Mean MAPE:           " << std::setprecision(1)
+              << (files_processed > 0 ? 100.0 * total_mape / files_processed : 0.0)
+              << "%" << std::endl;
+    std::cout << "  First-half MAPE:     " << std::setprecision(1)
+              << (first_half_count > 0 ? 100.0 * first_half_mape / first_half_count : 0.0)
+              << "%" << std::endl;
+    std::cout << "  Second-half MAPE:    " << std::setprecision(1)
+              << (second_half_count > 0 ? 100.0 * second_half_mape / second_half_count : 0.0)
+              << "%" << std::endl;
     std::cout << "  Wall time:           " << std::setprecision(1) << wall_time << "s" << std::endl;
     std::cout << "  Output:              " << config.output << std::endl;
     std::cout << "  Experience:          " << config.experience << std::endl;

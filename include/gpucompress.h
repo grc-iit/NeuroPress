@@ -133,6 +133,7 @@ typedef struct {
     gpucompress_algorithm_t algorithm_used; /**< Algorithm actually used */
     unsigned int preprocessing_used;     /**< Preprocessing actually applied */
     double throughput_mbps;              /**< Compression throughput (MB/s) */
+    double predicted_ratio;              /**< NN-predicted compression ratio (0.0 if not ALGO_AUTO/NN) */
 } gpucompress_stats_t;
 
 /* ============================================================
@@ -463,6 +464,18 @@ int gpucompress_active_learning_enabled(void);
  * @param threshold Fractional threshold (default 0.20 = 20% MAPE)
  */
 void gpucompress_set_exploration_threshold(double threshold);
+
+/**
+ * Enable/disable online reinforcement learning.
+ * When enabled and a prediction's MAPE exceeds the threshold,
+ * the NN weights are updated via single-sample SGD on CPU
+ * and copied back to GPU immediately.
+ *
+ * @param enable         1 to enable, 0 to disable
+ * @param learning_rate  SGD step size (default 1e-4)
+ * @param mape_threshold MAPE threshold to trigger reinforcement (default 0.60)
+ */
+void gpucompress_set_reinforcement(int enable, float learning_rate, float mape_threshold);
 
 /**
  * Get the number of experience samples collected this session.

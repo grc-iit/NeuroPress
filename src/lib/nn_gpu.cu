@@ -29,14 +29,12 @@
 namespace gpucompress {
 
 /* ============================================================
- * Constants
+ * Constants and shared weight layout
  * ============================================================ */
 
+#include "nn_weights.h"
+
 static constexpr uint32_t NN_MAGIC = 0x4E4E5754;  // "NNWT"
-static constexpr int NN_INPUT_DIM  = 15;
-static constexpr int NN_HIDDEN_DIM = 128;
-static constexpr int NN_OUTPUT_DIM = 4;
-static constexpr int NN_NUM_CONFIGS = 32;  // 8 algos × 2 quant × 2 shuffle
 
 /** Ranking criterion for selecting best config */
 enum NNRankCriterion {
@@ -44,35 +42,6 @@ enum NNRankCriterion {
     NN_RANK_BY_COMP_TIME = 1,   // Lowest compression time
     NN_RANK_BY_DECOMP_TIME = 2, // Lowest decompression time
     NN_RANK_BY_PSNR = 3         // Highest PSNR
-};
-
-/* ============================================================
- * Device-side weight storage
- * ============================================================ */
-
-/** All neural net weights packed contiguously in GPU global memory */
-struct NNWeightsGPU {
-    // Normalization parameters
-    float x_means[NN_INPUT_DIM];
-    float x_stds[NN_INPUT_DIM];
-    float y_means[NN_OUTPUT_DIM];
-    float y_stds[NN_OUTPUT_DIM];
-
-    // Layer 1: 15 → 128 (weight stored as [128][15])
-    float w1[NN_HIDDEN_DIM * NN_INPUT_DIM];
-    float b1[NN_HIDDEN_DIM];
-
-    // Layer 2: 128 → 128 (weight stored as [128][128])
-    float w2[NN_HIDDEN_DIM * NN_HIDDEN_DIM];
-    float b2[NN_HIDDEN_DIM];
-
-    // Layer 3: 128 → 4 (weight stored as [4][128])
-    float w3[NN_OUTPUT_DIM * NN_HIDDEN_DIM];
-    float b3[NN_OUTPUT_DIM];
-
-    // Feature bounds for OOD detection (v2+)
-    float x_mins[NN_INPUT_DIM];
-    float x_maxs[NN_INPUT_DIM];
 };
 
 /* ============================================================
@@ -667,6 +636,10 @@ void gpucompress_nn_cleanup_impl(void) {
 void gpucompress_nn_set_criterion_impl(int criterion) {
     gpucompress::setNNRankCriterion(
         static_cast<gpucompress::NNRankCriterion>(criterion));
+}
+
+void* gpucompress_nn_get_device_ptr_impl(void) {
+    return static_cast<void*>(gpucompress::d_nn_weights);
 }
 
 } // extern "C"
