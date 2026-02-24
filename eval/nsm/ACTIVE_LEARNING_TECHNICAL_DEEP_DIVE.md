@@ -7,11 +7,11 @@
 ## 1. Exploration Phase — How It's Triggered
 
 Every call to `gpucompress_compress()` with `ALGO_AUTO` follows this exact path
-inside `src/lib/gpucompress_api.cpp:269-676`:
+inside `src/api/gpucompress_api.cpp:269-676`:
 
 ### Step A — NN Predicts (GPU Kernel)
 
-The CUDA kernel `nnInferenceKernel` (`src/lib/nn_gpu.cu:119`) launches **32 threads
+The CUDA kernel `nnInferenceKernel` (`src/nn/nn_gpu.cu:119`) launches **32 threads
 in parallel**, one per configuration (8 algorithms x 2 shuffle options x 2 quantization
 options = 32). Each thread:
 
@@ -74,7 +74,7 @@ if (error_pct > g_exploration_threshold || is_ood) {
 | `error_pct > threshold` | NN predicted ratio was >20% off from actual |
 | `is_ood == true` | Input features fall outside training data range |
 
-**OOD Detection** (`src/lib/nn_gpu.cu`, function `isInputOOD()`): For each of the
+**OOD Detection** (`src/nn/nn_gpu.cu`, function `isInputOOD()`): For each of the
 5 continuous features (error_bound, data_size, entropy, MAD, derivative), the system
 checks if the value falls outside the training data min/max with a 10% margin:
 
@@ -161,7 +161,7 @@ is wrong are exactly the cases it needs to learn from.
 
 ### Experience CSV Format
 
-The experience buffer (`src/lib/experience_buffer.cpp`) writes rows matching the
+The experience buffer (`src/nn/experience_buffer.cpp`) writes rows matching the
 format the retraining script expects:
 
 ```
@@ -324,16 +324,16 @@ small data.
 
 | Component | File | Key Lines |
 |-----------|------|-----------|
-| NN inference kernel (32 threads) | `src/lib/nn_gpu.cu` | 119-332 |
-| Input feature construction | `src/lib/nn_gpu.cu` | 134-179 |
-| Parallel sort for top-K actions | `src/lib/nn_gpu.cu` | 270-309 |
-| OOD detection | `src/lib/nn_gpu.cu` | `isInputOOD()` |
-| ALGO_AUTO dispatch + stats pipeline | `src/lib/gpucompress_api.cpp` | 269-326 |
-| Level 1 passive sample | `src/lib/gpucompress_api.cpp` | 501-511 |
-| Prediction error check | `src/lib/gpucompress_api.cpp` | 514-517 |
-| Level 2 exploration trigger | `src/lib/gpucompress_api.cpp` | 518-528 |
-| Exploration loop (try K alternatives) | `src/lib/gpucompress_api.cpp` | 534-675 |
-| Experience buffer CSV writer | `src/lib/experience_buffer.cpp` | 74-107 |
-| Stats GPU kernels | `src/lib/stats_kernel.cu` | 420-490, 650-690 |
+| NN inference kernel (32 threads) | `src/nn/nn_gpu.cu` | 119-332 |
+| Input feature construction | `src/nn/nn_gpu.cu` | 134-179 |
+| Parallel sort for top-K actions | `src/nn/nn_gpu.cu` | 270-309 |
+| OOD detection | `src/nn/nn_gpu.cu` | `isInputOOD()` |
+| ALGO_AUTO dispatch + stats pipeline | `src/api/gpucompress_api.cpp` | 269-326 |
+| Level 1 passive sample | `src/api/gpucompress_api.cpp` | 501-511 |
+| Prediction error check | `src/api/gpucompress_api.cpp` | 514-517 |
+| Level 2 exploration trigger | `src/api/gpucompress_api.cpp` | 518-528 |
+| Exploration loop (try K alternatives) | `src/api/gpucompress_api.cpp` | 534-675 |
+| Experience buffer CSV writer | `src/nn/experience_buffer.cpp` | 74-107 |
+| Stats GPU kernels | `src/stats/stats_kernel.cu` | 420-490, 650-690 |
 | Retraining script | `neural_net/retrain.py` | full file |
 | Eval harness (measures exploration) | `eval/eval_simulation.cpp` | full file |

@@ -892,7 +892,7 @@ Level 2 (full, K=31):   32 total             31x extra
 
 ### OOD Detection
 
-**File: `src/lib/nn_gpu.cu`**, function `isInputOOD()`
+**File: `src/nn/nn_gpu.cu`**, function `isInputOOD()`
 
 Before trusting the NN prediction, the system checks if the 5 continuous input features (error_bound, data_size, entropy, MAD, derivative) fall within the training data range (with 10% margin):
 
@@ -922,7 +922,7 @@ The model pays upfront to learn, then amortizes that cost. After warmup, overhea
 
 ### Experience buffer
 
-**Files: `src/lib/experience_buffer.h`, `src/lib/experience_buffer.cpp`**
+**Files: `src/nn/experience_buffer.h`, `src/nn/experience_buffer.cpp`**
 
 The experience buffer is a thread-safe CSV writer protected by `std::mutex`. Its C API:
 

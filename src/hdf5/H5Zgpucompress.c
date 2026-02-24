@@ -21,11 +21,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #include <hdf5.h>
 #include <H5PLextern.h>
 
 #include "gpucompress.h"
+
+/* pack_double / unpack_double require unsigned int to be 4 bytes */
+_Static_assert(sizeof(unsigned int) == 4,
+               "pack_double assumes sizeof(unsigned int) == 4");
 
 /* ============================================================
  * Filter Constants
@@ -78,6 +83,22 @@ static int g_gpucompress_initialized = 0;
 /** Flag to track if filter is registered */
 static int g_filter_registered = 0;
 
+/** Per-chunk algorithm tracking (max 256 chunks) */
+#define MAX_TRACKED_CHUNKS 256
+static int g_chunk_algorithms[MAX_TRACKED_CHUNKS];
+static int g_chunk_count = 0;
+
+/** Verbose logging flag (set by GPUCOMPRESS_VERBOSE env var) */
+static int g_verbose = -1;  /* -1 = not checked yet */
+
+static int is_verbose(void) {
+    if (g_verbose < 0) {
+        const char* v = getenv("GPUCOMPRESS_VERBOSE");
+        g_verbose = (v != NULL && v[0] != '0') ? 1 : 0;
+    }
+    return g_verbose;
+}
+
 /* ============================================================
  * Helper Functions
  * ============================================================ */
@@ -110,10 +131,15 @@ static double unpack_double(unsigned int lo, unsigned int hi) {
 
 /**
  * Initialize GPUCompress library if not already done.
+ *
+ * Checks GPUCOMPRESS_WEIGHTS environment variable for NN weights path.
+ * When set, ALGO_AUTO will use the neural network for per-chunk algorithm
+ * selection. Without it, ALGO_AUTO falls back to LZ4.
  */
 static int ensure_initialized(void) {
     if (!g_gpucompress_initialized) {
-        gpucompress_error_t err = gpucompress_init(NULL);
+        const char* weights = getenv("GPUCOMPRESS_WEIGHTS");
+        gpucompress_error_t err = gpucompress_init(weights);
         if (err != GPUCOMPRESS_SUCCESS) {
             return -1;
         }
@@ -247,11 +273,15 @@ static size_t H5Z_filter_gpucompress(
     if (flags & H5Z_FLAG_REVERSE) {
         /* ==================== DECOMPRESSION ==================== */
 
-        /* Get original size from compressed header */
+        /* Check if data was actually compressed (has GPUCompress header).
+         * When compression didn't reduce size, the filter returns nbytes
+         * on write and HDF5 stores uncompressed data. On read, HDF5 still
+         * calls the filter, so we must detect this passthrough case. */
         size_t original_size;
         err = gpucompress_get_original_size(*buf, &original_size);
         if (err != GPUCOMPRESS_SUCCESS) {
-            return 0;
+            /* No valid header — data was stored uncompressed (passthrough) */
+            return nbytes;
         }
 
         /* Allocate output buffer */
@@ -289,16 +319,32 @@ static size_t H5Z_filter_gpucompress(
 
         /* Compress */
         new_size = max_out_size;
-        err = gpucompress_compress(*buf, nbytes, new_buf, &new_size, &config, NULL);
+        gpucompress_stats_t stats;
+        memset(&stats, 0, sizeof(stats));
+        err = gpucompress_compress(*buf, nbytes, new_buf, &new_size, &config, &stats);
 
         if (err != GPUCOMPRESS_SUCCESS) {
             H5free_memory(new_buf);
             return 0;
         }
 
+        if (is_verbose()) {
+            printf("[H5Zgpucompress] chunk %zu bytes -> %zu bytes (%.1f:1) algo=%s\n",
+                   nbytes, new_size, (double)nbytes / (new_size > 0 ? new_size : 1),
+                   gpucompress_algorithm_name(stats.algorithm_used));
+        }
+
+        /* Track algorithm for attribute writing */
+        if (g_chunk_count < MAX_TRACKED_CHUNKS) {
+            g_chunk_algorithms[g_chunk_count++] = (int)stats.algorithm_used;
+        }
+
         /* Only use compressed if it's smaller */
         if (new_size >= nbytes) {
             /* Compression didn't help, return original */
+            if (is_verbose()) {
+                printf("[H5Zgpucompress]   -> skipped (no size reduction), storing uncompressed\n");
+            }
             H5free_memory(new_buf);
             return nbytes;
         }
@@ -439,6 +485,100 @@ herr_t H5Pget_gpucompress(
  */
 const void* H5Z_gpucompress_get_filter_info(void) {
     return H5Z_GPUCOMPRESS;
+}
+
+/* ============================================================
+ * Per-Chunk Algorithm Tracking
+ * ============================================================ */
+
+/**
+ * Reset chunk algorithm tracking. Call before H5Dwrite.
+ */
+void H5Z_gpucompress_reset_chunk_tracking(void) {
+    g_chunk_count = 0;
+}
+
+/**
+ * Get the number of tracked chunks since last reset.
+ */
+int H5Z_gpucompress_get_chunk_count(void) {
+    return g_chunk_count;
+}
+
+/**
+ * Get the algorithm used for a specific chunk.
+ *
+ * @param chunk_idx  Chunk index (0-based)
+ * @return Algorithm enum value, or -1 if out of range
+ */
+int H5Z_gpucompress_get_chunk_algorithm(int chunk_idx) {
+    if (chunk_idx < 0 || chunk_idx >= g_chunk_count)
+        return -1;
+    return g_chunk_algorithms[chunk_idx];
+}
+
+/**
+ * Write per-chunk algorithm names as a string attribute on a dataset.
+ *
+ * Creates attribute "gpucompress_chunk_algorithms" with a comma-separated
+ * list of algorithm names, e.g. "zstd,zstd,ans,zstd".
+ *
+ * @param dset_id  Open dataset handle
+ * @return 0 on success, -1 on error
+ */
+herr_t H5Z_gpucompress_write_chunk_attr(hid_t dset_id) {
+    if (g_chunk_count <= 0)
+        return -1;
+
+    /* Build comma-separated algorithm string with bounds checking */
+    char attr_buf[4096];
+    size_t offset = 0;
+    size_t remaining = sizeof(attr_buf);
+    for (int i = 0; i < g_chunk_count && remaining > 1; i++) {
+        int written = snprintf(attr_buf + offset, remaining, "%s%s",
+            (i > 0) ? "," : "",
+            gpucompress_algorithm_name(
+                (gpucompress_algorithm_t)g_chunk_algorithms[i]));
+        if (written < 0 || (size_t)written >= remaining) break;
+        offset += (size_t)written;
+        remaining -= (size_t)written;
+    }
+
+    /* Create variable-length string attribute */
+    hid_t atype = H5Tcopy(H5T_C_S1);
+    H5Tset_size(atype, strlen(attr_buf) + 1);
+
+    hid_t aspace = H5Screate(H5S_SCALAR);
+    hid_t attr = H5Acreate2(dset_id, "gpucompress_chunk_algorithms",
+                             atype, aspace, H5P_DEFAULT, H5P_DEFAULT);
+    if (attr < 0) {
+        H5Sclose(aspace);
+        H5Tclose(atype);
+        return -1;
+    }
+
+    herr_t write_rc = H5Awrite(attr, atype, attr_buf);
+    H5Aclose(attr);
+    H5Sclose(aspace);
+    H5Tclose(atype);
+
+    return (write_rc < 0) ? -1 : 0;
+}
+
+/* ============================================================
+ * Automatic Cleanup on Plugin Unload
+ * ============================================================ */
+
+/**
+ * Called automatically when the shared library is unloaded.
+ * Ensures gpucompress_cleanup() is called to free CUDA resources.
+ */
+__attribute__((destructor))
+static void H5Z_gpucompress_fini(void) {
+    if (g_gpucompress_initialized) {
+        gpucompress_cleanup();
+        g_gpucompress_initialized = 0;
+    }
 }
 
 /* ============================================================

@@ -24,43 +24,7 @@
 // Min/Max Reduction Kernels for Data Range Computation
 // ============================================================================
 
-template<typename T>
-__global__ void compute_min_max_kernel(
-    const T* input,
-    size_t num_elements,
-    T* d_min,
-    T* d_max
-) {
-    typedef cub::BlockReduce<T, BLOCK_SIZE> BlockReduce;
-    __shared__ typename BlockReduce::TempStorage temp_storage_min;
-    __shared__ typename BlockReduce::TempStorage temp_storage_max;
-
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    size_t stride = gridDim.x * blockDim.x;
-
-    T thread_min = (idx < num_elements) ? input[idx] : input[0];
-    T thread_max = thread_min;
-
-    // Grid-stride loop to handle large arrays
-    for (size_t i = idx; i < num_elements; i += stride) {
-        T val = input[i];
-        thread_min = min(thread_min, val);
-        thread_max = max(thread_max, val);
-    }
-
-    // Block-level reduction
-    T block_min = BlockReduce(temp_storage_min).Reduce(thread_min, cub::Min());
-    __syncthreads();
-    T block_max = BlockReduce(temp_storage_max).Reduce(thread_max, cub::Max());
-
-    // First thread of each block writes result
-    if (threadIdx.x == 0) {
-        atomicMin((int*)d_min, __float_as_int(block_min));
-        atomicMax((int*)d_max, __float_as_int(block_max));
-    }
-}
-
-// Specialized version for float using atomic operations correctly
+// Float min/max using CAS-based atomics (correct for negative values)
 __global__ void compute_min_max_float_kernel(
     const float* input,
     size_t num_elements,
@@ -329,8 +293,9 @@ __global__ void verify_error_bound_kernel(
 
 /**
  * Compute min/max of data on GPU
+ * Returns 0 on success, -1 on error.
  */
-static void compute_data_range(
+static int compute_data_range(
     void* d_input,
     size_t num_elements,
     size_t element_size,
@@ -342,10 +307,14 @@ static void compute_data_range(
 
     if (element_size == 4) {
         // Float
-        float* d_min;
-        float* d_max;
-        cudaMalloc(&d_min, sizeof(float));
-        cudaMalloc(&d_max, sizeof(float));
+        float* d_min = nullptr;
+        float* d_max = nullptr;
+        if (cudaMalloc(&d_min, sizeof(float)) != cudaSuccess ||
+            cudaMalloc(&d_max, sizeof(float)) != cudaSuccess) {
+            cudaFree(d_min);
+            cudaFree(d_max);
+            return -1;
+        }
 
         // Init min to largest value, max to smallest value
         float init_min = FLT_MAX;
@@ -368,10 +337,14 @@ static void compute_data_range(
         cudaFree(d_max);
     } else {
         // Double
-        double* d_min_d;
-        double* d_max_d;
-        cudaMalloc(&d_min_d, sizeof(double));
-        cudaMalloc(&d_max_d, sizeof(double));
+        double* d_min_d = nullptr;
+        double* d_max_d = nullptr;
+        if (cudaMalloc(&d_min_d, sizeof(double)) != cudaSuccess ||
+            cudaMalloc(&d_max_d, sizeof(double)) != cudaSuccess) {
+            cudaFree(d_min_d);
+            cudaFree(d_max_d);
+            return -1;
+        }
 
         double init_min = DBL_MAX;
         double init_max = -DBL_MAX;
@@ -388,6 +361,7 @@ static void compute_data_range(
         cudaFree(d_min_d);
         cudaFree(d_max_d);
     }
+    return 0;
 }
 
 /**
@@ -459,7 +433,10 @@ QuantizationResult quantize_simple(
 
     // Step 1: Compute data range
     double data_min, data_max;
-    compute_data_range(d_input, num_elements, element_size, data_min, data_max, stream);
+    if (compute_data_range(d_input, num_elements, element_size, data_min, data_max, stream) != 0) {
+        fprintf(stderr, "quantize_simple: Failed to compute data range\n");
+        return result;
+    }
 
     double data_range = data_max - data_min;
     if (data_range <= 0.0) {
@@ -661,10 +638,14 @@ bool verify_error_bound(
     cudaStream_t stream,
     double* max_error_out
 ) {
-    int* d_violations;
-    double* d_max_error;
-    cudaMalloc(&d_violations, sizeof(int));
-    cudaMalloc(&d_max_error, sizeof(double));
+    int* d_violations = nullptr;
+    double* d_max_error = nullptr;
+    if (cudaMalloc(&d_violations, sizeof(int)) != cudaSuccess ||
+        cudaMalloc(&d_max_error, sizeof(double)) != cudaSuccess) {
+        cudaFree(d_violations);
+        cudaFree(d_max_error);
+        return false;
+    }
 
     int zero = 0;
     double init_max = 0.0;

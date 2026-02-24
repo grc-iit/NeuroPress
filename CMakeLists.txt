@@ -43,8 +43,8 @@ link_directories(
 # Core Sources (reusable across targets)
 # ============================================================
 set(FACTORY_SOURCES
-    src/core/compression_factory.cpp
-    src/core/compression_factory.hpp
+    src/compression/compression_factory.cpp
+    src/compression/compression_factory.hpp
 )
 
 set(PREPROCESSING_SOURCES
@@ -53,22 +53,22 @@ set(PREPROCESSING_SOURCES
 )
 
 set(LIB_SOURCES
-    src/lib/gpucompress_api.cpp
-    src/lib/entropy_kernel.cu
-    src/lib/nn_gpu.cu
-    src/lib/nn_reinforce.cpp
-    src/lib/stats_kernel.cu
-    src/lib/experience_buffer.cpp
+    src/api/gpucompress_api.cpp
+    src/stats/entropy_kernel.cu
+    src/nn/nn_gpu.cu
+    src/nn/nn_reinforce.cpp
+    src/stats/stats_kernel.cu
+    src/nn/experience_buffer.cpp
 )
 
 # Set language property for .cpp files that use CUDA
 set_source_files_properties(
-    src/core/compression_factory.cpp
+    src/compression/compression_factory.cpp
     src/cli/compress.cpp
     src/cli/decompress.cpp
-    src/lib/gpucompress_api.cpp
-    src/lib/nn_reinforce.cpp
-    src/lib/experience_buffer.cpp
+    src/api/gpucompress_api.cpp
+    src/nn/nn_reinforce.cpp
+    src/nn/experience_buffer.cpp
     PROPERTIES LANGUAGE CUDA
 )
 
@@ -137,6 +137,34 @@ if(HDF5_FOUND)
 
     # Define for plugin exports
     target_compile_definitions(H5Zgpucompress PRIVATE GPUCOMPRESS_BUILD_HDF5_PLUGIN)
+
+    # HDF5 filter integration test
+    add_executable(test_hdf5_filter tests/test_hdf5_filter.c)
+    target_include_directories(test_hdf5_filter PRIVATE
+        ${HDF5_INCLUDE_DIRS}
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    target_link_libraries(test_hdf5_filter PRIVATE
+        gpucompress
+        H5Zgpucompress
+        ${HDF5_C_LIBRARIES}
+        m
+    )
+
+    # HDF5 plugin unit tests
+    add_executable(test_hdf5_plugin tests/test_hdf5_plugin.c)
+    target_include_directories(test_hdf5_plugin PRIVATE
+        ${HDF5_INCLUDE_DIRS}
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    target_link_libraries(test_hdf5_plugin PRIVATE
+        gpucompress
+        H5Zgpucompress
+        ${HDF5_C_LIBRARIES}
+        m
+    )
 
 else()
     message(STATUS "HDF5 not found - skipping filter plugin libH5Zgpucompress.so")
@@ -208,6 +236,66 @@ set_target_properties(test_quantization PROPERTIES
 # ============================================================
 add_executable(benchmark scripts/benchmark.cpp)
 target_link_libraries(benchmark PRIVATE gpucompress pthread)
+
+# ============================================================
+# Executable: Compression Core Test Suite
+# ============================================================
+add_executable(test_compression_core
+    tests/test_compression_core.cu
+    ${PREPROCESSING_SOURCES}
+)
+target_link_libraries(test_compression_core PRIVATE CUDA::cudart)
+set_target_properties(test_compression_core PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+)
+
+# ============================================================
+# Executable: Preprocessing Test Suite
+# ============================================================
+add_executable(test_preprocessing
+    tests/test_preprocessing.cu
+    ${PREPROCESSING_SOURCES}
+)
+target_link_libraries(test_preprocessing PRIVATE CUDA::cudart)
+set_target_properties(test_preprocessing PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+)
+
+# ============================================================
+# Executable: Stats Test Suite
+# ============================================================
+add_executable(test_stats tests/test_stats.cu)
+target_link_libraries(test_stats PRIVATE gpucompress CUDA::cudart)
+set_target_properties(test_stats PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+)
+
+# ============================================================
+# Executable: CLI Test Suite
+# ============================================================
+add_executable(test_cli tests/test_cli.cu)
+target_link_libraries(test_cli PRIVATE gpucompress CUDA::cudart)
+set_target_properties(test_cli PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+)
+
+# ============================================================
+# Executable: NN Test Suite (nn/ fixes)
+# ============================================================
+add_executable(test_nn tests/test_nn.cu)
+target_link_libraries(test_nn PRIVATE gpucompress CUDA::cudart)
+set_target_properties(test_nn PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+)
+
+# ============================================================
+# Executable: API Test Suite
+# ============================================================
+add_executable(test_api tests/test_api.cu)
+target_link_libraries(test_api PRIVATE gpucompress CUDA::cudart)
+set_target_properties(test_api PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+)
 
 # ============================================================
 # Executable 5: NN Reinforce Test Suite

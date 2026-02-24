@@ -104,7 +104,7 @@ Preprocessing flags are OR'd together in `gpucompress_config_t.preprocessing`:
 
 **Byte shuffle** reorders bytes so that the most-significant bytes of consecutive elements are grouped together (improves entropy coding). **Quantization** maps float values to integers within an error bound: `scale = 1 / (2 * error_bound)`.
 
-### Compression Header (`src/core/compression_header.h`)
+### Compression Header (`src/compression/compression_header.h`)
 
 Every compressed buffer is prefixed with a 64-byte header:
 

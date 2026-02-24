@@ -13,8 +13,6 @@
 #include <cstring>
 #include <vector>
 
-#define WARP_SIZE 32
-
 // ============================================================================
 // CUDA Kernels
 // ============================================================================
@@ -672,6 +670,102 @@ template __global__ void byte_unshuffle_kernel_specialized<16>(
     const uint8_t**, uint8_t**, const size_t*, size_t);
 
 // ============================================================================
+// Device Chunk Array Helpers (moved from util.h to avoid kernel-in-header)
+// ============================================================================
+
+__global__ void populateChunkArraysKernel(
+    uint8_t** d_input_ptrs,
+    uint8_t** d_output_ptrs,
+    size_t* d_sizes,
+    uint8_t* base_input,
+    uint8_t* base_output,
+    size_t total_bytes,
+    size_t chunk_bytes,
+    size_t num_chunks)
+{
+    const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx >= num_chunks) return;
+
+    const size_t offset = idx * chunk_bytes;
+    const size_t remaining = total_bytes - offset;
+    const size_t size = (remaining < chunk_bytes) ? remaining : chunk_bytes;
+
+    d_input_ptrs[idx] = base_input + offset;
+    d_output_ptrs[idx] = base_output + offset;
+    d_sizes[idx] = size;
+}
+
+DeviceChunkArrays createDeviceChunkArrays(
+    void* device_input,
+    void* device_output,
+    size_t total_bytes,
+    size_t chunk_bytes,
+    cudaStream_t stream)
+{
+    if (!device_input || !device_output)
+        throw std::invalid_argument("device pointers are null");
+
+    if (chunk_bytes == 0)
+        throw std::invalid_argument("chunk_bytes must be > 0");
+
+    if (total_bytes == 0) {
+        return DeviceChunkArrays();
+    }
+
+    const size_t num_chunks = (total_bytes + chunk_bytes - 1) / chunk_bytes;
+
+    auto base_input = static_cast<uint8_t*>(device_input);
+    auto base_output = static_cast<uint8_t*>(device_output);
+
+    DeviceChunkArrays result;
+    result.num_chunks = num_chunks;
+
+    cudaError_t err;
+
+    err = cudaMalloc(&result.d_input_ptrs, num_chunks * sizeof(uint8_t*));
+    if (err != cudaSuccess) {
+        throw std::runtime_error("Failed to allocate d_input_ptrs");
+    }
+
+    err = cudaMalloc(&result.d_output_ptrs, num_chunks * sizeof(uint8_t*));
+    if (err != cudaSuccess) {
+        throw std::runtime_error("Failed to allocate d_output_ptrs");
+    }
+
+    err = cudaMalloc(&result.d_sizes, num_chunks * sizeof(size_t));
+    if (err != cudaSuccess) {
+        throw std::runtime_error("Failed to allocate d_sizes");
+    }
+
+    const int threads_per_block = 256;
+    const int num_blocks = (num_chunks + threads_per_block - 1) / threads_per_block;
+
+    populateChunkArraysKernel<<<num_blocks, threads_per_block, 0, stream>>>(
+        result.d_input_ptrs,
+        result.d_output_ptrs,
+        result.d_sizes,
+        base_input,
+        base_output,
+        total_bytes,
+        chunk_bytes,
+        num_chunks
+    );
+
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error("Failed to launch populateChunkArraysKernel");
+    }
+
+    err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess) {
+        throw std::runtime_error("Kernel execution failed");
+    }
+
+    return result;
+}
+
+// ============================================================================
 // Simple High-Level API Implementation
 // ============================================================================
 
@@ -704,17 +798,17 @@ uint8_t* byte_shuffle_simple(
     // This eliminates the host-to-device memcpy overhead from the old approach
     DeviceChunkArrays arrays;
     try {
-        arrays = createDeviceChunkArrays(device_input, device_output, total_bytes, chunk_bytes);
+        arrays = createDeviceChunkArrays(device_input, device_output, total_bytes, chunk_bytes, stream);
     } catch (const std::exception& e) {
         cudaFree(device_output);
         return nullptr;
     }
-    
+
     if (arrays.num_chunks == 0) {
         cudaFree(device_output);
         return nullptr;
     }
-    
+
     // Step 3: Launch shuffle kernel
     err = launch_byte_shuffle_optimized(
         const_cast<const uint8_t**>(arrays.d_input_ptrs),
@@ -766,17 +860,17 @@ uint8_t* byte_unshuffle_simple(
     // Step 2: Create device chunk arrays directly on GPU (OPTIMIZED!)
     DeviceChunkArrays arrays;
     try {
-        arrays = createDeviceChunkArrays(device_input, device_output, total_bytes, chunk_bytes);
+        arrays = createDeviceChunkArrays(device_input, device_output, total_bytes, chunk_bytes, stream);
     } catch (const std::exception& e) {
         cudaFree(device_output);
         return nullptr;
     }
-    
+
     if (arrays.num_chunks == 0) {
         cudaFree(device_output);
         return nullptr;
     }
-    
+
     // Step 3: Launch unshuffle kernel
     err = launch_byte_unshuffle_optimized(
         const_cast<const uint8_t**>(arrays.d_input_ptrs),
@@ -803,64 +897,32 @@ uint8_t* byte_unshuffle_simple(
 // ============================================================================
 
 /**
- * Helper: Check if pointer is aligned to boundary
- */
-__host__ inline bool is_aligned(const void* ptr, size_t alignment) {
-    return (reinterpret_cast<uintptr_t>(ptr) % alignment) == 0;
-}
-
-/**
  * Helper: Select optimal kernel based on data characteristics
  */
 __host__ ShuffleKernelType select_optimal_kernel(
-    const uint8_t** input_chunks,
-    uint8_t** output_chunks,
-    const size_t* chunk_sizes,
-    size_t num_chunks,
+    const uint8_t** /*input_chunks*/,
+    uint8_t** /*output_chunks*/,
+    const size_t* /*chunk_sizes*/,
+    size_t /*num_chunks*/,
     unsigned element_size
 ) {
-    // For very small element sizes, baseline is sufficient
-    if (element_size == 1) {
-        return ShuffleKernelType::BASELINE;
-    }
-    
-    // Check alignment for first chunk (heuristic)
-    bool first_chunk_aligned = false;
-    if (num_chunks > 0) {
-        // Note: This is a host-side check, pointers are device pointers
-        // In production, might want to maintain alignment metadata
-        first_chunk_aligned = is_aligned(input_chunks, 16) && 
-                              is_aligned(output_chunks, 16);
-    }
-    
-    // Selection strategy based on element size
+    // Selection strategy based on element size.
+    // Vectorized kernels have internal alignment checks with scalar fallback,
+    // so they are always safe to select regardless of data alignment.
     switch (element_size) {
+        case 1:
+            return ShuffleKernelType::BASELINE;
         case 2:
-            // Small elements: specialized template is best
             return ShuffleKernelType::SPECIALIZED;
-            
         case 4:
-            // 4-byte elements: vectorized if aligned, else specialized
-            if (first_chunk_aligned) {
-                return ShuffleKernelType::VECTORIZED_4B;
-            }
-            return ShuffleKernelType::SPECIALIZED;
-            
+            return ShuffleKernelType::VECTORIZED_4B;
         case 8:
-            // 8-byte elements: vectorized if aligned, else shared memory
-            if (first_chunk_aligned) {
-                return ShuffleKernelType::VECTORIZED_8B;
-            }
-            return ShuffleKernelType::SHARED_MEMORY;
-            
+            return ShuffleKernelType::VECTORIZED_8B;
         case 16:
         case 32:
         case 64:
-            // Large elements: shared memory staging is best
             return ShuffleKernelType::SHARED_MEMORY;
-            
         default:
-            // For other sizes, use specialized if small, shared memory if large
             if (element_size <= 8) {
                 return ShuffleKernelType::SPECIALIZED;
             } else {

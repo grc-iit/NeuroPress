@@ -49,6 +49,12 @@ herr_t H5Pget_gpucompress(
 /* Filter info */
 const void* H5Z_gpucompress_get_filter_info(void);
 
+/* Per-chunk algorithm tracking */
+void  H5Z_gpucompress_reset_chunk_tracking(void);
+int   H5Z_gpucompress_get_chunk_count(void);
+int   H5Z_gpucompress_get_chunk_algorithm(int chunk_idx);
+herr_t H5Z_gpucompress_write_chunk_attr(hid_t dset_id);
+
 #ifdef __cplusplus
 }
 #endif

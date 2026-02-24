@@ -14,7 +14,7 @@ An audit of every `cudaMemcpy`, `cudaMalloc`, and `cudaFree` across the compress
 
 ## Finding 1 (HIGH): Per-call cudaMalloc/cudaFree in NN inference
 
-**File:** `src/lib/nn_gpu.cu:574–640`
+**File:** `src/nn/nn_gpu.cu:574–640`
 
 Every call to `runNNInference()` allocates and frees 3 tiny device buffers:
 
@@ -36,7 +36,7 @@ That is **3 malloc + 3 free = 6 synchronization points** for 136 total bytes. Es
 
 ## Finding 2 (HIGH): Per-call cudaMalloc/cudaFree in stats pipeline
 
-**File:** `src/lib/stats_kernel.cu:438, 516` (duplicated at lines 550, 642 for Q-table path)
+**File:** `src/stats/stats_kernel.cu:438, 516` (duplicated at lines 550, 642 for Q-table path)
 
 Every call to `runStatsKernels()` allocates the workspace:
 
@@ -56,7 +56,7 @@ Same problem: malloc/free per call for a workspace that is always the same size.
 
 ## Finding 3 (HIGH when triggered): Active learning loop — sync memcpy + per-iteration malloc/free
 
-**File:** `src/lib/gpucompress_api.cpp:529–671`
+**File:** `src/api/gpucompress_api.cpp:529–671`
 
 The Level 2 exploration loop runs up to **K=31 iterations**, and each iteration does:
 
@@ -80,7 +80,7 @@ The `cudaMemcpy` at line 650 is **synchronous** (not Async), and there are up to
 
 ## Finding 4 (MEDIUM): Header round-trips host → GPU → host
 
-**File:** `src/lib/gpucompress_api.cpp:463, 466`
+**File:** `src/api/gpucompress_api.cpp:463, 466`
 
 The compression header is built entirely on the CPU (lines 437–460), then:
 
@@ -110,7 +110,7 @@ Savings: eliminates 1 H2D transfer, reduces D2H by `GPUCOMPRESS_HEADER_SIZE` byt
 
 ## Finding 5 (MEDIUM): Decompress copies header bytes to GPU unnecessarily
 
-**File:** `src/lib/gpucompress_api.cpp:734, 740`
+**File:** `src/api/gpucompress_api.cpp:734, 740`
 
 ```cpp
 cudaMalloc(&d_compressed, input_size);                              // allocates header+payload
@@ -157,7 +157,7 @@ Same pattern as NN inference. Only used in the fallback path (when NN isn't load
 
 ## Finding 7 (LOW): Stats results copied in 2 separate small transfers
 
-**File:** `src/lib/stats_kernel.cu:495–504`
+**File:** `src/stats/stats_kernel.cu:495–504`
 
 ```cpp
 cudaMemcpyAsync(&h_result.entropy, &d_stats->entropy, 8 bytes, D2H);

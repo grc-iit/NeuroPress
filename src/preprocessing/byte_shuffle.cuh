@@ -4,7 +4,7 @@
 #include <cuda_runtime.h>
 #include <cstddef>
 #include <cstdint>
-#include "core/util.h"
+#include "compression/util.h"
 
 /**
  * @file byte_shuffle.cuh

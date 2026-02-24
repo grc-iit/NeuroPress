@@ -381,7 +381,7 @@ The exporter runs a verification pass that reads back the binary, asserts every 
 
 ### 7.1 Stats Pipeline
 
-**File: `src/lib/stats_kernel.cu`**
+**File: `src/stats/stats_kernel.cu`**
 
 Before the NN runs, three data statistics are computed on GPU in multiple kernel passes:
 
@@ -406,7 +406,7 @@ Two pipeline variants exist:
 
 ### 7.2 NN Inference Kernel
 
-**File: `src/lib/nn_gpu.cu`**
+**File: `src/nn/nn_gpu.cu`**
 
 A single kernel launch with 32 threads evaluates all 32 configurations in parallel.
 
@@ -540,11 +540,11 @@ int runNNInference(
 
 ```
 gpucompress_compress(data, size, output, &out_size, &config, &stats)
-│                                                [src/lib/gpucompress_api.cpp]
+│                                                [src/api/gpucompress_api.cpp]
 │
 ├── 1. cudaMemcpy(d_input ← data)
 │
-├── 2. runAutoStatsNNPipeline(d_input, size, ...)       [src/lib/stats_kernel.cu]
+├── 2. runAutoStatsNNPipeline(d_input, size, ...)       [src/stats/stats_kernel.cu]
 │      │
 │      ├── 2a. statsPass1Kernel<<<N, 256>>>
 │      │        Per-block: sum, min, max, |x[i+1]-2*x[i]+x[i-1]|
@@ -561,13 +561,13 @@ gpucompress_compress(data, size, output, &out_size, &config, &stats)
 │      │
 │      ├── 2e. cudaMemcpy(host ← entropy, mad, deriv)
 │      │
-│      └── 2f. runNNInference(entropy, mad, deriv, ...) [src/lib/nn_gpu.cu]
+│      └── 2f. runNNInference(entropy, mad, deriv, ...) [src/nn/nn_gpu.cu]
 │              │
 │              └── nnInferenceKernel<<<1, 32>>>
 │                  ├── Each thread: build input → forward pass → predict metrics
 │                  └── Parallel reduction: pick best action (0-31)
 │
-├── 3. decodeAction(action)                             [src/lib/internal.hpp]
+├── 3. decodeAction(action)                             [src/api/internal.hpp]
 │      algo = action % 8
 │      quant = (action / 8) % 2
 │      shuffle = (action / 16) % 2
@@ -593,7 +593,7 @@ gpucompress_compress(data, size, output, &out_size, &config, &stats)
 
 ## 8. API Integration
 
-**File: `src/lib/gpucompress_api.cpp`**
+**File: `src/api/gpucompress_api.cpp`**
 
 ### Fallback chain
 
@@ -725,7 +725,7 @@ Level 2 (full, K=31):   32 total             31x extra
 
 ### 9.4 OOD Detection
 
-**File: `src/lib/nn_gpu.cu`**, function `isInputOOD()`
+**File: `src/nn/nn_gpu.cu`**, function `isInputOOD()`
 
 Before trusting the NN prediction, the system checks if the 5 continuous features (indices 10-14) fall within the training data range (with 10% margin):
 
@@ -749,7 +749,7 @@ If OOD is detected, Level 2 exploration uses K=31 (try everything).
 
 ### 9.5 Experience Buffer
 
-**Files: `src/lib/experience_buffer.h`, `src/lib/experience_buffer.cpp`**
+**Files: `src/nn/experience_buffer.h`, `src/nn/experience_buffer.cpp`**
 
 Thread-safe CSV writer with `std::mutex`:
 
@@ -919,12 +919,12 @@ Exact numbers depend on the training data and evaluation split. The NN reliably 
 
 | File | Purpose |
 |------|---------|
-| `src/lib/nn_gpu.cu` | `NNWeightsGPU` struct, `nnInferenceKernel`, `loadNNFromBinary()`, `isInputOOD()`, `runNNInference()` |
-| `src/lib/stats_kernel.cu` | GPU stats pipeline (entropy, MAD, derivative), `runAutoStatsNNPipeline()`, `runStatsOnlyPipeline()` |
-| `src/lib/internal.hpp` | Internal declarations for NN functions, `QTableAction` struct |
-| `src/lib/gpucompress_api.cpp` | Public API, ALGO_AUTO logic, `gpucompress_compute_stats()`, active learning integration |
-| `src/lib/experience_buffer.h` | `ExperienceSample` struct, experience buffer C API |
-| `src/lib/experience_buffer.cpp` | Thread-safe CSV writer |
+| `src/nn/nn_gpu.cu` | `NNWeightsGPU` struct, `nnInferenceKernel`, `loadNNFromBinary()`, `isInputOOD()`, `runNNInference()` |
+| `src/stats/stats_kernel.cu` | GPU stats pipeline (entropy, MAD, derivative), `runAutoStatsNNPipeline()`, `runStatsOnlyPipeline()` |
+| `src/api/internal.hpp` | Internal declarations for NN functions, `QTableAction` struct |
+| `src/api/gpucompress_api.cpp` | Public API, ALGO_AUTO logic, `gpucompress_compute_stats()`, active learning integration |
+| `src/nn/experience_buffer.h` | `ExperienceSample` struct, experience buffer C API |
+| `src/nn/experience_buffer.cpp` | Thread-safe CSV writer |
 | `include/gpucompress.h` | Public C API declarations (NN, active learning, stats, compression) |
 
 ### Weights

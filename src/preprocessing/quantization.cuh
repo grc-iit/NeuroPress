@@ -22,6 +22,7 @@
 #include <cuda_runtime.h>
 #include <cstddef>
 #include <cstdint>
+#include <cinttypes>
 #include <cstdio>
 #include <cfloat>
 #include <cctype>
@@ -166,8 +167,8 @@ struct QuantizationResult {
         printf("  Data range: [%.6e, %.6e]\n", data_min, data_max);
         printf("  Scale factor: %.6e\n", scale_factor);
         printf("  Precision: %d bits\n", actual_precision);
-        printf("  Original size: %lu bytes\n", num_elements * original_element_size);
-        printf("  Quantized size: %lu bytes\n", quantized_bytes);
+        printf("  Original size: %zu bytes\n", num_elements * original_element_size);
+        printf("  Quantized size: %zu bytes\n", quantized_bytes);
         printf("  Quantization ratio: %.2fx\n", getQuantizationRatio());
     }
 };

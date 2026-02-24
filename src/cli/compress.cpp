@@ -26,14 +26,14 @@
 #include "nvcomp/nvcompManagerFactory.hpp"
 
 // Compression factory for algorithm selection
-#include "core/compression_factory.hpp"
+#include "compression/compression_factory.hpp"
 
 // Byte shuffle for preprocessing
 #include "preprocessing/byte_shuffle.cuh"
-#include "core/util.h"
+#include "compression/util.h"
 
 // Compression header for metadata
-#include "core/compression_header.h"
+#include "compression/compression_header.h"
 
 // Quantization for lossy preprocessing
 #include "preprocessing/quantization.cuh"
@@ -46,8 +46,9 @@ using namespace nvcomp;
     cudaError_t rt = (func);                                                   \
     if (rt != cudaSuccess) {                                                   \
       std::cerr << "CUDA API call failure \"" #func "\" with " << rt          \
+                << " (" << cudaGetErrorString(rt) << ")"                       \
                 << " at " << __FILE__ << ":" << __LINE__ << std::endl;         \
-      throw;                                                                   \
+      exit(1);                                                                 \
     }                                                                          \
   } while (0)
 
@@ -611,8 +612,9 @@ int main(int argc, char* argv[]) {
     } else {
         // For lossless: verify exact match
         int* d_invalid;
-        CUDA_CHECK(cudaMallocHost(&d_invalid, sizeof(int)));
-        *d_invalid = 0;
+        CUDA_CHECK(cudaMalloc(&d_invalid, sizeof(int)));
+        int h_invalid = 0;
+        CUDA_CHECK(cudaMemsetAsync(d_invalid, 0, sizeof(int), stream));
 
         cudaDeviceProp deviceProp;
         CUDA_CHECK(cudaGetDeviceProperties(&deviceProp, 0));
@@ -621,9 +623,11 @@ int main(int argc, char* argv[]) {
         compare_buffers<<<2 * sm_count, 1024, 0, stream>>>(
             d_input, d_verify_data, d_invalid, file_size);
 
+        CUDA_CHECK(cudaMemcpyAsync(&h_invalid, d_invalid, sizeof(int),
+                                    cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
-        if (*d_invalid) {
+        if (h_invalid) {
             if (shuffle_element_size > 0) {
                 printf("FAILED: Shuffle -> Compress -> Decompress -> Unshuffle did NOT restore original data!\n");
             } else {
@@ -641,7 +645,7 @@ int main(int argc, char* argv[]) {
             verification_passed = true;
         }
 
-        CUDA_CHECK(cudaFreeHost(d_invalid));
+        CUDA_CHECK(cudaFree(d_invalid));
     }
     printf("[END] Step 7.8: Verify data integrity\n");
     printf("[END] Step 7.5: Verify compression with decompression\n");
@@ -732,7 +736,9 @@ int main(int argc, char* argv[]) {
     printf("✓ Wrote %ld bytes (header + compressed data) to %s via GDS\n", bytes_written, output_file);
     
     // Truncate file to actual size (header + compressed, remove padding)
-    ftruncate(fd_out, total_output_size);
+    if (ftruncate(fd_out, total_output_size) != 0) {
+        perror("Warning: ftruncate failed — output file may have trailing padding");
+    }
     printf("[END] Step 8: Open output file and write compressed data\n");
 
     // ========== Step 9: Cleanup ==========

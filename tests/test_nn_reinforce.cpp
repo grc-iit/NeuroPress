@@ -18,8 +18,8 @@
 #include <cstring>
 
 #include "gpucompress.h"
-#include "lib/nn_weights.h"
-#include "lib/nn_reinforce.h"
+#include "nn/nn_weights.h"
+#include "nn/nn_reinforce.h"
 
 /* ============================================================
  * External symbols from libgpucompress.so

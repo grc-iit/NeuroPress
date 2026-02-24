@@ -25,10 +25,10 @@
 #include "nvcomp/nvcompManagerFactory.hpp"
 
 // Compression factory for algorithm selection
-#include "core/compression_factory.hpp"
+#include "compression/compression_factory.hpp"
 
 // Compression header and byte shuffle
-#include "core/compression_header.h"
+#include "compression/compression_header.h"
 #include "preprocessing/byte_shuffle.cuh"
 
 // Quantization for lossy preprocessing
@@ -42,8 +42,9 @@ using namespace nvcomp;
     cudaError_t rt = (func);                                                   \
     if (rt != cudaSuccess) {                                                   \
       std::cerr << "CUDA API call failure \"" #func "\" with " << rt          \
+                << " (" << cudaGetErrorString(rt) << ")"                       \
                 << " at " << __FILE__ << ":" << __LINE__ << std::endl;         \
-      throw;                                                                   \
+      exit(1);                                                                 \
     }                                                                          \
   } while (0)
 
@@ -190,7 +191,21 @@ int main(int argc, char* argv[]) {
     printf("✓ Valid compression header detected\n");
     header.print();
     printf("\n");
-    
+
+    // Validate file_size can hold header + claimed compressed data
+    size_t header_size = sizeof(CompressionHeader);
+    if (file_size < header_size + header.compressed_size) {
+        printf("Error: File truncated — file is %lu bytes but header claims %lu + %lu = %lu bytes\n",
+               file_size, header_size, (size_t)header.compressed_size,
+               header_size + (size_t)header.compressed_size);
+        if (input_buf_registered) cuFileBufDeregister(d_compressed);
+        cuFileHandleDeregister(cf_handle_in);
+        cuFileDriverClose();
+        CUDA_CHECK(cudaFree(d_compressed));
+        close(fd_input);
+        return -1;
+    }
+
     // Get pointer to actual compressed data (after header)
     uint8_t* d_compressed_data = getCompressedDataPtr(d_compressed);
     
@@ -206,8 +221,9 @@ int main(int argc, char* argv[]) {
 
     size_t decompressed_size = decomp_config.decomp_data_size;
     
-    // Verify decompressed size matches header
-    if (header.hasShuffleApplied() && decompressed_size != header.original_size) {
+    // Verify decompressed size matches header (only when no quantization,
+    // since quantized data is expected to be smaller than original_size)
+    if (!header.hasQuantizationApplied() && decompressed_size != header.original_size) {
         printf("Warning: Decompressed size (%lu) doesn't match header original size (%lu)\n",
                decompressed_size, header.original_size);
     }
@@ -433,7 +449,9 @@ int main(int argc, char* argv[]) {
            output_file);
 
     // Truncate file to actual size (remove padding)
-    ftruncate(fd_out, final_output_size);
+    if (ftruncate(fd_out, final_output_size) != 0) {
+        perror("Warning: ftruncate failed — output file may have trailing padding");
+    }
 
     // ========== Step 9: Cleanup ==========
 

@@ -119,8 +119,8 @@ Make GPUCompress callable from any language (C, Python, Fortran, HDF5), not just
 | File | Purpose |
 |------|---------|
 | `include/gpucompress.h` | Public C header defining the entire API (~400 lines) |
-| `src/lib/gpucompress_api.cpp` | Implementation of that API (~835 lines) |
-| `src/lib/internal.hpp` | Internal C++ utilities, not exposed (~239 lines) |
+| `src/api/gpucompress_api.cpp` | Implementation of that API (~835 lines) |
+| `src/api/internal.hpp` | Internal C++ utilities, not exposed (~239 lines) |
 
 ### How It Works
 
@@ -440,7 +440,7 @@ USER APPLICATION
        v
 +============================================================================+
 |  C API: gpucompress_compress()                                             |
-|  File: src/lib/gpucompress_api.cpp:173                                     |
+|  File: src/api/gpucompress_api.cpp:173                                     |
 +============================================================================+
        |
        |  STAGE 1: HOST --> GPU TRANSFER
@@ -458,7 +458,7 @@ USER APPLICATION
        |
        |  STAGE 2: RL Q-TABLE ALGORITHM SELECTION  (ALGO_AUTO triggers this)
        |  ===================================================================
-       |  File: src/lib/gpucompress_api.cpp:225-259
+       |  File: src/api/gpucompress_api.cpp:225-259
        |
        |  cfg.algorithm == GPUCOMPRESS_ALGO_AUTO --> enter RL selection path
        |
@@ -768,7 +768,7 @@ USER APPLICATION
        v
 +============================================================================+
 |  C API: gpucompress_decompress()                                           |
-|  File: src/lib/gpucompress_api.cpp:442                                     |
+|  File: src/api/gpucompress_api.cpp:442                                     |
 +============================================================================+
        |
        |  STAGE 1: READ HEADER (CPU, from host buffer)
@@ -1602,7 +1602,7 @@ These files existed before this commit and form the foundation the new library w
 | `preprocessing/quantization_kernels.cu` | ~450 | **Quantization CUDA kernels.** Implements `quantize_simple()`: first computes data range via CUB block reduction (`compute_min_max_kernel`), determines precision, then applies `round(value / (2 * error_bound))` via the quantization kernel. Supports float32 and float64 input with int8/int16/int32 output. `dequantize_simple()` reverses: `value = quantized * (2 * error_bound)`. The `verify_error_bound()` function computes max absolute error across all elements to confirm the guarantee holds. |
 | `core/util.h` | 230 | **GPU chunk array utilities.** Defines `DeviceChunkArrays` (RAII wrapper for device-allocated pointer arrays) and `createDeviceChunkArrays()`. The key optimization: a GPU kernel (`populateChunkArraysKernel`) computes chunk offsets and sizes directly on device, avoiding host-side array construction and `cudaMemcpy`. Each thread computes metadata for one chunk. Used by the byte shuffle system to set up per-chunk pointers with zero CPU-GPU transfer overhead. Move-only semantics prevent accidental double-free of device pointers. |
 
-### `src/lib/` - Shared Library Source (NEW in This Commit)
+### `src/api/`, `src/nn/`, `src/stats/` - Shared Library Source (NEW in This Commit)
 
 These files implement `libgpucompress.so` and are the bridge between the public C API and the existing engine.
 
