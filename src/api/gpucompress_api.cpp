@@ -380,7 +380,6 @@ extern "C" gpucompress_error_t gpucompress_compress(
             compress_input_size,
             shuffle_size,
             gpucompress::SHUFFLE_CHUNK_SIZE,
-            ShuffleKernelType::AUTO,
             stream
         );
 
@@ -619,8 +618,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
                 if (alt_shuf_size > 0) {
                     uint8_t* shuf = byte_shuffle_simple(
                         d_alt_input, alt_compress_size, alt_shuf_size,
-                        gpucompress::SHUFFLE_CHUNK_SIZE,
-                        ShuffleKernelType::AUTO, stream);
+                        gpucompress::SHUFFLE_CHUNK_SIZE, stream);
                     if (shuf) {
                         d_alt_shuf = shuf;
                         d_alt_input = d_alt_shuf;
@@ -729,7 +727,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
                                                 d_rt_unshuf = byte_unshuffle_simple(
                                                     d_rt_decompressed, rt_decomp_size,
                                                     alt_shuf_size, gpucompress::SHUFFLE_CHUNK_SIZE,
-                                                    ShuffleKernelType::AUTO, stream);
+                                                    stream);
                                                 if (d_rt_unshuf) d_rt_result = d_rt_unshuf;
                                             }
 
@@ -1038,7 +1036,6 @@ extern "C" gpucompress_error_t gpucompress_decompress(
             decompressed_size,
             header.shuffle_element_size,
             gpucompress::SHUFFLE_CHUNK_SIZE,
-            ShuffleKernelType::AUTO,
             stream
         );
 

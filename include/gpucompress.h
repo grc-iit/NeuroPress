@@ -65,20 +65,16 @@ typedef enum {
  */
 typedef enum {
     GPUCOMPRESS_PREPROC_NONE       = 0x00,  /**< No preprocessing */
-    GPUCOMPRESS_PREPROC_SHUFFLE_2  = 0x01,  /**< 2-byte element shuffle */
-    GPUCOMPRESS_PREPROC_SHUFFLE_4  = 0x02,  /**< 4-byte element shuffle */
-    GPUCOMPRESS_PREPROC_SHUFFLE_8  = 0x04,  /**< 8-byte element shuffle */
+    GPUCOMPRESS_PREPROC_SHUFFLE_4  = 0x02,  /**< 4-byte element shuffle (float32) */
     GPUCOMPRESS_PREPROC_QUANTIZE   = 0x10   /**< Enable quantization (lossy) */
 } gpucompress_preproc_t;
 
 /**
  * Extract shuffle element size from preprocessing flags.
- * Returns 0, 2, 4, or 8.
+ * Returns 0 or 4.
  */
 #define GPUCOMPRESS_GET_SHUFFLE_SIZE(flags) \
-    (((flags) & GPUCOMPRESS_PREPROC_SHUFFLE_8) ? 8 : \
-     ((flags) & GPUCOMPRESS_PREPROC_SHUFFLE_4) ? 4 : \
-     ((flags) & GPUCOMPRESS_PREPROC_SHUFFLE_2) ? 2 : 0)
+    (((flags) & GPUCOMPRESS_PREPROC_SHUFFLE_4) ? 4 : 0)
 
 /* ============================================================
  * Error Codes

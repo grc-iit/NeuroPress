@@ -29,8 +29,6 @@ static const char* preproc_str(unsigned int p) {
     buf[0] = '\0';
     if (p & GPUCOMPRESS_PREPROC_QUANTIZE)  strcat(buf, "quant ");
     if (p & GPUCOMPRESS_PREPROC_SHUFFLE_4) strcat(buf, "shuf4 ");
-    if (p & GPUCOMPRESS_PREPROC_SHUFFLE_2) strcat(buf, "shuf2 ");
-    if (p & GPUCOMPRESS_PREPROC_SHUFFLE_8) strcat(buf, "shuf8 ");
     if (buf[0] == '\0') strcpy(buf, "none");
     return buf;
 }

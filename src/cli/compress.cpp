@@ -84,7 +84,7 @@ void usage(const char* prog) {
     printf("  cascaded  - High compression for floating-point\n");
     printf("  bitcomp   - Lossless for scientific data\n");
     printf("\nOptions:\n");
-    printf("  --shuffle <size>            Byte shuffle element size: 2, 4, 8 (default: 0 = disabled)\n");
+    printf("  --shuffle <size>            Byte shuffle element size: 4 (float32) (default: 0 = disabled)\n");
     printf("  --quant-type <type>         Quantization method: linear (default: none)\n");
     printf("  --error-bound <value>       Absolute error bound (required if quant-type set)\n");
     printf("\nQuantization:\n");
@@ -126,6 +126,10 @@ int main(int argc, char* argv[]) {
     while (arg_idx < argc) {
         if (strcmp(argv[arg_idx], "--shuffle") == 0 && arg_idx + 1 < argc) {
             shuffle_element_size = atoi(argv[arg_idx + 1]);
+            if (shuffle_element_size != 0 && shuffle_element_size != 4) {
+                printf("Error: Only 4-byte shuffle is supported (float32)\n");
+                return -1;
+            }
             arg_idx += 2;
         } else if (strcmp(argv[arg_idx], "--quant-type") == 0 && arg_idx + 1 < argc) {
             quant_type = parseQuantizationType(argv[arg_idx + 1]);
@@ -356,7 +360,6 @@ int main(int argc, char* argv[]) {
             data_size_for_compression,
             shuffle_element_size,
             SHUFFLE_CHUNK_SIZE,
-            ShuffleKernelType::AUTO,
             stream
         );
 
@@ -511,7 +514,6 @@ int main(int argc, char* argv[]) {
             verify_data_size,
             shuffle_element_size,
             SHUFFLE_CHUNK_SIZE,
-            ShuffleKernelType::AUTO,
             stream
         );
 

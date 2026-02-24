@@ -338,6 +338,55 @@ else()
 endif()
 
 # ============================================================
+# Executable: Shuffle Test Suite
+# ============================================================
+add_executable(test_shuffle tests/test_shuffle.cu)
+target_link_libraries(test_shuffle PRIVATE gpucompress CUDA::cudart)
+set_target_properties(test_shuffle PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+)
+
+# ============================================================
+# Executable: 128MB Experiment
+# ============================================================
+add_executable(experiment_128mb tests/experiment_128mb.cu)
+target_link_libraries(experiment_128mb PRIVATE gpucompress CUDA::cudart)
+set_target_properties(experiment_128mb PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+)
+
+# ============================================================
+# Executable: HDF5 128MB Experiment
+# ============================================================
+if(HDF5_FOUND)
+    add_executable(experiment_hdf5_128mb tests/experiment_hdf5_128mb.c)
+    target_include_directories(experiment_hdf5_128mb PRIVATE
+        ${HDF5_INCLUDE_DIRS}
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    target_link_libraries(experiment_hdf5_128mb PRIVATE
+        gpucompress
+        H5Zgpucompress
+        ${HDF5_C_LIBRARIES}
+        m
+    )
+
+    add_executable(experiment_hdf5_mixed tests/experiment_hdf5_mixed.c)
+    target_include_directories(experiment_hdf5_mixed PRIVATE
+        ${HDF5_INCLUDE_DIRS}
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    target_link_libraries(experiment_hdf5_mixed PRIVATE
+        gpucompress
+        H5Zgpucompress
+        ${HDF5_C_LIBRARIES}
+        m
+    )
+endif()
+
+# ============================================================
 # Installation
 # ============================================================
 include(GNUInstallDirs)

@@ -267,7 +267,6 @@ int main(int argc, char* argv[]) {
             decompressed_size,
             header.shuffle_element_size,
             SHUFFLE_CHUNK_SIZE,
-            ShuffleKernelType::AUTO,
             stream
         );
 

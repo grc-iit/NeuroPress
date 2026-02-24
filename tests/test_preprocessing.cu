@@ -86,40 +86,36 @@ static void test_shuffle_roundtrip_float() {
 }
 
 /* ============================================================
- * Test 2: Byte shuffle round-trip (8-byte double elements)
+ * Test 2: Byte shuffle round-trip (float32, random data)
  * ============================================================ */
-static void test_shuffle_roundtrip_double() {
-    TEST("Shuffle round-trip double (8-byte, AUTO kernel, 2M elements)");
+static void test_shuffle_roundtrip_float_random() {
+    TEST("Shuffle round-trip float32 (random data, 4M elements)");
 
-    const size_t N = 2 * 1024 * 1024;  // 2M doubles = 16 MB
-    const size_t bytes = N * sizeof(double);
+    const size_t N = 4 * 1024 * 1024;  // 4M floats = 16 MB
+    const size_t bytes = N * sizeof(float);
 
-    double* h_data = (double*)malloc(bytes);
+    float* h_data = (float*)malloc(bytes);
+    unsigned seed = 42;
     for (size_t i = 0; i < N; i++) {
-        h_data[i] = (double)i * 3.14159 - 1000.0;
+        seed = seed * 1664525u + 1013904223u;
+        h_data[i] = (float)(seed >> 8) / 16777216.0f * 2000.0f - 1000.0f;
     }
 
     void* d_data = nullptr;
     cudaMalloc(&d_data, bytes);
     cudaMemcpy(d_data, h_data, bytes, cudaMemcpyHostToDevice);
 
-    uint8_t* d_shuffled = byte_shuffle_simple(d_data, bytes, sizeof(double));
+    uint8_t* d_shuffled = byte_shuffle_simple(d_data, bytes, sizeof(float));
     ASSERT(d_shuffled != nullptr, "shuffle returned null");
 
-    uint8_t* d_restored = byte_unshuffle_simple(d_shuffled, bytes, sizeof(double));
+    uint8_t* d_restored = byte_unshuffle_simple(d_shuffled, bytes, sizeof(float));
     ASSERT(d_restored != nullptr, "unshuffle returned null");
 
     cudaDeviceSynchronize();
-    double* h_restored = (double*)malloc(bytes);
+    float* h_restored = (float*)malloc(bytes);
     cudaMemcpy(h_restored, d_restored, bytes, cudaMemcpyDeviceToHost);
 
-    bool match = true;
-    for (size_t i = 0; i < N; i++) {
-        if (h_data[i] != h_restored[i]) {
-            match = false;
-            break;
-        }
-    }
+    bool match = (memcmp(h_data, h_restored, bytes) == 0);
     ASSERT(match, "data mismatch after shuffle round-trip");
 
     free(h_data);
@@ -131,17 +127,17 @@ static void test_shuffle_roundtrip_double() {
 }
 
 /* ============================================================
- * Test 3: Byte shuffle round-trip (2-byte, SPECIALIZED kernel)
+ * Test 3: Byte shuffle round-trip (float32, large dataset)
  * ============================================================ */
-static void test_shuffle_roundtrip_int16() {
-    TEST("Shuffle round-trip int16 (2-byte, SPECIALIZED kernel, 8M elements)");
+static void test_shuffle_roundtrip_float_large() {
+    TEST("Shuffle round-trip float32 (4-byte, 16M elements = 64 MB)");
 
-    const size_t N = 8 * 1024 * 1024;  // 8M int16s = 16 MB
-    const size_t bytes = N * sizeof(int16_t);
+    const size_t N = 16 * 1024 * 1024;  // 16M floats = 64 MB
+    const size_t bytes = N * sizeof(float);
 
-    int16_t* h_data = (int16_t*)malloc(bytes);
+    float* h_data = (float*)malloc(bytes);
     for (size_t i = 0; i < N; i++) {
-        h_data[i] = (int16_t)(i % 65536 - 32768);
+        h_data[i] = sinf((float)i * 0.0001f) * 1000.0f;
     }
 
     void* d_data = nullptr;
@@ -149,15 +145,15 @@ static void test_shuffle_roundtrip_int16() {
     cudaMemcpy(d_data, h_data, bytes, cudaMemcpyHostToDevice);
 
     uint8_t* d_shuffled = byte_shuffle_simple(
-        d_data, bytes, 2, 256 * 1024, ShuffleKernelType::SPECIALIZED);
+        d_data, bytes, 4, 256 * 1024);
     ASSERT(d_shuffled != nullptr, "shuffle returned null");
 
     uint8_t* d_restored = byte_unshuffle_simple(
-        d_shuffled, bytes, 2, 256 * 1024, ShuffleKernelType::SPECIALIZED);
+        d_shuffled, bytes, 4, 256 * 1024);
     ASSERT(d_restored != nullptr, "unshuffle returned null");
 
     cudaDeviceSynchronize();
-    int16_t* h_restored = (int16_t*)malloc(bytes);
+    float* h_restored = (float*)malloc(bytes);
     cudaMemcpy(h_restored, d_restored, bytes, cudaMemcpyDeviceToHost);
 
     bool match = (memcmp(h_data, h_restored, bytes) == 0);
@@ -329,39 +325,54 @@ static void test_quantize_mixed_data() {
 }
 
 /* ============================================================
- * Test 8: Shuffle with SHARED_MEMORY kernel (16-byte elements)
+ * Test 8: Shuffle with different chunk sizes (float32)
  * ============================================================ */
-static void test_shuffle_smem_16byte() {
-    TEST("Shuffle round-trip (16-byte, SHARED_MEMORY kernel, 1M elements)");
+static void test_shuffle_chunk_sizes() {
+    TEST("Shuffle round-trip float32 with 64KB and 1MB chunk sizes");
 
-    // Use 16-byte elements (e.g., two doubles packed)
-    const size_t elem_size = 16;
-    const size_t N_elems = 1024 * 1024;  // 1M elements = 16 MB
-    const size_t bytes = N_elems * elem_size;
+    const size_t N = 4 * 1024 * 1024;  // 4M floats = 16 MB
+    const size_t bytes = N * sizeof(float);
 
-    uint8_t* h_data = (uint8_t*)malloc(bytes);
-    for (size_t i = 0; i < bytes; i++) {
-        h_data[i] = (uint8_t)((i * 7 + 13) & 0xFF);
+    float* h_data = (float*)malloc(bytes);
+    for (size_t i = 0; i < N; i++) {
+        h_data[i] = (float)(i * 7 + 13) * 0.001f;
     }
 
     void* d_data = nullptr;
     cudaMalloc(&d_data, bytes);
     cudaMemcpy(d_data, h_data, bytes, cudaMemcpyHostToDevice);
 
+    // Test with 64KB chunks
     uint8_t* d_shuffled = byte_shuffle_simple(
-        d_data, bytes, elem_size, 256 * 1024, ShuffleKernelType::SHARED_MEMORY);
-    ASSERT(d_shuffled != nullptr, "shuffle returned null");
+        d_data, bytes, 4, 64 * 1024);
+    ASSERT(d_shuffled != nullptr, "shuffle returned null (64KB chunks)");
 
     uint8_t* d_restored = byte_unshuffle_simple(
-        d_shuffled, bytes, elem_size, 256 * 1024, ShuffleKernelType::SHARED_MEMORY);
-    ASSERT(d_restored != nullptr, "unshuffle returned null");
+        d_shuffled, bytes, 4, 64 * 1024);
+    ASSERT(d_restored != nullptr, "unshuffle returned null (64KB chunks)");
 
     cudaDeviceSynchronize();
-    uint8_t* h_restored = (uint8_t*)malloc(bytes);
+    float* h_restored = (float*)malloc(bytes);
     cudaMemcpy(h_restored, d_restored, bytes, cudaMemcpyDeviceToHost);
 
     bool match = (memcmp(h_data, h_restored, bytes) == 0);
-    ASSERT(match, "data mismatch with SHARED_MEMORY kernel");
+    ASSERT(match, "data mismatch with 64KB chunks");
+
+    cudaFree(d_shuffled);
+    cudaFree(d_restored);
+
+    // Test with 1MB chunks
+    d_shuffled = byte_shuffle_simple(d_data, bytes, 4, 1024 * 1024);
+    ASSERT(d_shuffled != nullptr, "shuffle returned null (1MB chunks)");
+
+    d_restored = byte_unshuffle_simple(d_shuffled, bytes, 4, 1024 * 1024);
+    ASSERT(d_restored != nullptr, "unshuffle returned null (1MB chunks)");
+
+    cudaDeviceSynchronize();
+    cudaMemcpy(h_restored, d_restored, bytes, cudaMemcpyDeviceToHost);
+
+    match = (memcmp(h_data, h_restored, bytes) == 0);
+    ASSERT(match, "data mismatch with 1MB chunks");
 
     free(h_data);
     free(h_restored);
@@ -384,12 +395,12 @@ int main() {
         return 1;
     }
 
-    // Byte shuffle tests
+    // Byte shuffle tests (float32 only)
     test_shuffle_roundtrip_float();
-    test_shuffle_roundtrip_double();
-    test_shuffle_roundtrip_int16();
+    test_shuffle_roundtrip_float_random();
+    test_shuffle_roundtrip_float_large();
     test_shuffle_leftover_bytes();
-    test_shuffle_smem_16byte();
+    test_shuffle_chunk_sizes();
 
     // Quantization tests
     test_quantize_roundtrip_positive();
