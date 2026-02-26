@@ -17,8 +17,8 @@ os.makedirs(OUT_DIR, exist_ok=True)
 df = pd.read_csv(CSV_PATH)
 print(f"Loaded {len(df)} rows from {CSV_PATH}")
 
-PATTERNS = ['constant', 'sine', 'random', 'ramp', 'sparse', 'gaussian', 'step', 'hf_sine_noise']
-LABELS   = ['Constant', 'Sine', 'Random', 'Ramp', 'Sparse', 'Gaussian', 'Step', 'HF+Noise']
+PATTERNS = ['ramp', 'sparse']
+LABELS   = ['Ramp', 'Sparse']
 ALGOS    = ['lz4', 'snappy', 'deflate', 'gdeflate', 'zstd', 'ans', 'cascaded', 'bitcomp']
 ALGO_LBL = ['LZ4', 'Snappy', 'Deflate', 'Gdeflate', 'Zstd', 'ANS', 'Cascaded', 'Bitcomp']
 
@@ -159,9 +159,9 @@ plt.savefig(path, bbox_inches='tight'); plt.close()
 print(f"  [3/6] {path}")
 
 # ═══════════════════════════════════════════════════════════════
-# Fig 4 — Per-Pattern: 8 Algos vs NN (subplots)
+# Fig 4 — Per-Pattern: Algos vs NN (subplots)
 # ═══════════════════════════════════════════════════════════════
-fig, axes = plt.subplots(2, 4, figsize=(20, 9))
+fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 for idx, (pat, lbl) in enumerate(zip(PATTERNS, LABELS)):
     ax = axes.flat[idx]
     sub = static_df[static_df['pattern'] == pat]

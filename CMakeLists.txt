@@ -55,6 +55,7 @@ set(PREPROCESSING_SOURCES
 set(LIB_SOURCES
     src/api/gpucompress_api.cpp
     src/stats/entropy_kernel.cu
+    src/stats/stats_cpu.cpp
     src/nn/nn_gpu.cu
     src/nn/nn_reinforce.cpp
     src/stats/stats_kernel.cu
@@ -352,6 +353,15 @@ set_target_properties(test_nn_shuffle PROPERTIES
 add_executable(test_shuffle tests/test_shuffle.cu)
 target_link_libraries(test_shuffle PRIVATE gpucompress CUDA::cudart)
 set_target_properties(test_shuffle PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+)
+
+# ============================================================
+# Executable: CPU Stats Correctness Test
+# ============================================================
+add_executable(test_cpu_stats tests/test_cpu_stats.cu)
+target_link_libraries(test_cpu_stats PRIVATE gpucompress CUDA::cudart)
+set_target_properties(test_cpu_stats PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
 )
 

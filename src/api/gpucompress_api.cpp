@@ -22,6 +22,7 @@
 #include "preprocessing/byte_shuffle.cuh"
 #include "preprocessing/quantization.cuh"
 #include "nn/experience_buffer.h"
+#include "stats/stats_cpu.h"
 
 #include "nvcomp.hpp"
 #include "nvcomp/nvcompManagerFactory.hpp"
@@ -79,9 +80,11 @@ int g_cuda_device = 0;
 /** Version string */
 const char* VERSION_STRING = "1.0.0";
 
-/** Active learning state */
-bool g_active_learning_enabled = false;
-double g_exploration_threshold = 0.20;  // 20% MAPE
+/** Online learning state */
+bool g_online_learning_enabled = false;   // master switch
+bool g_exploration_enabled = false;       // OFF by default
+bool g_experience_logging_enabled = false; // OFF by default
+double g_exploration_threshold = 0.20;    // 20% MAPE
 char g_experience_path[512] = "";
 
 /** Last NN action and exploration state (for query after compress) */
@@ -90,8 +93,7 @@ int g_last_nn_original_action = -1;
 int g_last_exploration_triggered = 0;
 int g_last_sgd_fired = 0;
 
-/** Online reinforcement state */
-bool g_reinforce_enabled = false;
+/** Online reinforcement (SGD) state */
 float g_reinforce_lr = 1e-4f;
 float g_reinforce_mape_threshold = 0.20f;
 bool g_reinforce_initialized = false;
@@ -178,7 +180,9 @@ extern "C" void gpucompress_cleanup(void) {
         nn_reinforce_cleanup();
         g_reinforce_initialized = false;
         experience_buffer_cleanup();
-        g_active_learning_enabled = false;
+        g_online_learning_enabled = false;
+        g_exploration_enabled = false;
+        g_experience_logging_enabled = false;
         gpucompress_nn_cleanup_impl();
         if (g_default_stream != nullptr) {
             cudaStreamDestroy(g_default_stream);
@@ -306,22 +310,22 @@ extern "C" gpucompress_error_t gpucompress_compress(
         int rc = -1;
 
         if (num_elements > 0 && gpucompress_nn_is_loaded_impl()) {
-            // Neural Network inference (preferred)
-            // Always get stats when active learning is enabled
-            bool need_stats = (stats != nullptr) || g_active_learning_enabled;
-            float* p_ratio = (stats != nullptr || g_active_learning_enabled) ? &predicted_ratio : nullptr;
-            float* p_comp_time = p_ratio ? &predicted_comp_time : nullptr;
-            int* p_top = g_active_learning_enabled ? top_actions : nullptr;
+            // CPU stats from host pointer (avoids GPU stats pipeline entirely)
+            int stats_rc = gpucompress::computeStatsCPU(
+                input, input_size, &entropy, &mad, &second_derivative);
 
-            rc = gpucompress::runAutoStatsNNPipeline(
-                d_input, input_size, cfg.error_bound, stream,
-                &action,
-                need_stats ? &entropy : nullptr,
-                need_stats ? &mad : nullptr,
-                need_stats ? &second_derivative : nullptr,
-                p_ratio,
-                p_comp_time,
-                p_top);
+            if (stats_rc == 0) {
+                // NN inference directly using CPU-computed stats
+                float* p_ratio = (stats != nullptr || g_online_learning_enabled) ? &predicted_ratio : nullptr;
+                float* p_comp_time = p_ratio ? &predicted_comp_time : nullptr;
+                int* p_top = g_online_learning_enabled ? top_actions : nullptr;
+
+                action = gpucompress::runNNInference(
+                    entropy, mad, second_derivative,
+                    input_size, cfg.error_bound, stream,
+                    p_ratio, p_comp_time, p_top);
+                rc = (action >= 0) ? 0 : -1;
+            }
 
             if (rc == 0) {
                 nn_was_used = true;
@@ -330,7 +334,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
                 g_last_nn_action = action;
 
                 // Check OOD
-                if (g_active_learning_enabled) {
+                if (g_online_learning_enabled) {
                     is_ood = gpucompress::isInputOOD(
                         entropy, mad, second_derivative,
                         input_size, cfg.error_bound);
@@ -541,7 +545,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
 
     // Active learning: Level 1 passive collection + Level 2 exploration
     if (cfg.algorithm == GPUCOMPRESS_ALGO_AUTO && nn_was_used &&
-        g_active_learning_enabled) {
+        g_online_learning_enabled) {
         double actual_ratio = static_cast<double>(input_size) /
                               static_cast<double>(compressed_size);
 
@@ -557,7 +561,9 @@ extern "C" gpucompress_error_t gpucompress_compress(
         sample.actual_comp_time_ms = static_cast<double>(primary_comp_time_ms);
         sample.actual_decomp_time_ms = 0.0;
         sample.actual_psnr = 0.0;
-        experience_buffer_append(&sample);
+        if (g_experience_logging_enabled) {
+            experience_buffer_append(&sample);
+        }
 
         // Check prediction error (max of ratio MAPE and time MAPE)
         double pred_ratio_d = static_cast<double>(predicted_ratio);
@@ -577,7 +583,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
                                     static_cast<double>(primary_comp_time_ms),
                                     0.0, 0.0});
 
-        if (error_pct > g_exploration_threshold || is_ood) {
+        if (g_exploration_enabled && (error_pct > g_exploration_threshold || is_ood)) {
             exploration_triggered = true;
             // Level 2: Explore alternatives
             // Determine K (number of alternatives to try)
@@ -599,6 +605,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
                 if (alt_action == nn_action) continue;
 
                 gpucompress::DecodedAction alt = gpucompress::decodeAction(alt_action);
+                if (alt.use_quantization && cfg.error_bound <= 0.0) continue;
                 gpucompress_algorithm_t alt_algo =
                     static_cast<gpucompress_algorithm_t>(alt.algorithm + 1);
                 unsigned int alt_preproc = 0;
@@ -834,7 +841,9 @@ extern "C" gpucompress_error_t gpucompress_compress(
                             alt_sample.actual_comp_time_ms = static_cast<double>(alt_ct_ms);
                             alt_sample.actual_decomp_time_ms = alt_decomp_ms;
                             alt_sample.actual_psnr = alt_psnr;
-                            experience_buffer_append(&alt_sample);
+                            if (g_experience_logging_enabled) {
+                                experience_buffer_append(&alt_sample);
+                            }
 
                             // Track if this is better than current best
                             if (alt_ratio > best_ratio) {
@@ -901,7 +910,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
         }
 
         // Online reinforcement: fire SGD only when ratio MAPE exceeds threshold.
-        if (g_reinforce_enabled && error_pct > static_cast<double>(g_reinforce_mape_threshold)) {
+        if (error_pct > static_cast<double>(g_reinforce_mape_threshold)) {
             void* d_weights = gpucompress_nn_get_device_ptr_impl();
             if (d_weights) {
                 // Lazy-init: copy GPU weights to host on first trigger
@@ -1254,30 +1263,10 @@ extern "C" gpucompress_error_t gpucompress_compute_stats(
         return GPUCOMPRESS_ERROR_INVALID_INPUT;
     }
 
-    cudaStream_t stream = g_default_stream;
-    cudaError_t cuda_err;
-
-    // Allocate GPU buffer and copy data
-    uint8_t* d_data = nullptr;
-    cuda_err = cudaMalloc(&d_data, size);
-    if (cuda_err != cudaSuccess) {
-        return GPUCOMPRESS_ERROR_OUT_OF_MEMORY;
-    }
-
-    cuda_err = cudaMemcpyAsync(d_data, data, size, cudaMemcpyHostToDevice, stream);
-    if (cuda_err != cudaSuccess) {
-        cudaFree(d_data);
-        return GPUCOMPRESS_ERROR_CUDA_FAILED;
-    }
-
-    // Run stats-only pipeline on GPU
-    int rc = gpucompress::runStatsOnlyPipeline(
-        d_data, size, stream, entropy, mad, second_derivative);
-
-    cudaFree(d_data);
-
+    // Compute stats on CPU directly from host data (no GPU round-trip)
+    int rc = gpucompress::computeStatsCPU(data, size, entropy, mad, second_derivative);
     if (rc != 0) {
-        return GPUCOMPRESS_ERROR_CUDA_FAILED;
+        return GPUCOMPRESS_ERROR_INVALID_INPUT;
     }
 
     return GPUCOMPRESS_SUCCESS;
@@ -1358,37 +1347,73 @@ extern "C" const char* gpucompress_version(void) {
  * Active Learning API
  * ============================================================ */
 
-extern "C" gpucompress_error_t gpucompress_enable_active_learning(
-    const char* experience_path
-) {
-    if (experience_path == nullptr || experience_path[0] == '\0') {
+/* ============================================================
+ * Online Learning API (new granular controls)
+ * ============================================================ */
+
+extern "C" void gpucompress_enable_online_learning(void) {
+    g_online_learning_enabled = true;
+}
+
+extern "C" void gpucompress_disable_online_learning(void) {
+    g_online_learning_enabled = false;
+    g_exploration_enabled = false;
+    if (g_experience_logging_enabled) {
+        g_experience_logging_enabled = false;
+        experience_buffer_cleanup();
+        g_experience_path[0] = '\0';
+    }
+    if (g_reinforce_initialized) {
+        nn_reinforce_cleanup();
+        g_reinforce_initialized = false;
+    }
+}
+
+extern "C" int gpucompress_online_learning_enabled(void) {
+    return g_online_learning_enabled ? 1 : 0;
+}
+
+extern "C" void gpucompress_set_exploration(int enable) {
+    g_exploration_enabled = (enable != 0);
+}
+
+extern "C" gpucompress_error_t gpucompress_enable_experience_logging(const char* csv_path) {
+    if (csv_path == nullptr || csv_path[0] == '\0') {
         return GPUCOMPRESS_ERROR_INVALID_INPUT;
     }
-
-    std::lock_guard<std::mutex> lock(g_init_mutex);
-
-    // Initialize experience buffer
-    if (experience_buffer_init(experience_path) != 0) {
+    if (experience_buffer_init(csv_path) != 0) {
         return GPUCOMPRESS_ERROR_INVALID_INPUT;
     }
-
-    strncpy(g_experience_path, experience_path, sizeof(g_experience_path) - 1);
+    strncpy(g_experience_path, csv_path, sizeof(g_experience_path) - 1);
     g_experience_path[sizeof(g_experience_path) - 1] = '\0';
-    g_active_learning_enabled = true;
-
+    g_experience_logging_enabled = true;
     return GPUCOMPRESS_SUCCESS;
 }
 
-extern "C" void gpucompress_disable_active_learning(void) {
-    std::lock_guard<std::mutex> lock(g_init_mutex);
-
-    g_active_learning_enabled = false;
+extern "C" void gpucompress_disable_experience_logging(void) {
+    g_experience_logging_enabled = false;
     experience_buffer_cleanup();
     g_experience_path[0] = '\0';
 }
 
+/* ============================================================
+ * Backward-compatible Active Learning API
+ * ============================================================ */
+
+extern "C" gpucompress_error_t gpucompress_enable_active_learning(
+    const char* experience_path
+) {
+    gpucompress_enable_online_learning();
+    g_exploration_enabled = true;
+    return gpucompress_enable_experience_logging(experience_path);
+}
+
+extern "C" void gpucompress_disable_active_learning(void) {
+    gpucompress_disable_online_learning();
+}
+
 extern "C" int gpucompress_active_learning_enabled(void) {
-    return g_active_learning_enabled ? 1 : 0;
+    return g_online_learning_enabled ? 1 : 0;
 }
 
 extern "C" void gpucompress_set_exploration_threshold(double threshold) {
@@ -1397,17 +1422,11 @@ extern "C" void gpucompress_set_exploration_threshold(double threshold) {
     }
 }
 
-extern "C" void gpucompress_set_reinforcement(int enable, float learning_rate,
+extern "C" void gpucompress_set_reinforcement(int /*enable*/, float learning_rate,
                                                float mape_threshold,
                                                float /*ct_mape_threshold*/) {
-    g_reinforce_enabled = (enable != 0);
     if (learning_rate > 0.0f) g_reinforce_lr = learning_rate;
     if (mape_threshold > 0.0f) g_reinforce_mape_threshold = mape_threshold;
-
-    if (!g_reinforce_enabled) {
-        nn_reinforce_cleanup();
-        g_reinforce_initialized = false;
-    }
 }
 
 extern "C" void gpucompress_reinforce_last_stats(float* grad_norm,

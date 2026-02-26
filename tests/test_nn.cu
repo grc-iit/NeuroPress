@@ -470,6 +470,59 @@ static void test_full_pipeline() {
 }
 
 /* ============================================================
+ * Test 11: Quant actions masked in lossless mode (error_bound=0)
+ * ============================================================ */
+static void test_quant_masked_lossless() {
+    TEST("Quant actions masked when error_bound=0 (lossless)");
+
+    const char* path = "/tmp/test_nn_quant_mask.nnwt";
+    ASSERT(write_synthetic_nnwt(path), "failed to write synthetic nnwt");
+    ASSERT(gpucompress::loadNNFromBinary(path), "load should succeed");
+
+    // Run inference with error_bound=0.0 (lossless)
+    float ratio = 0.0f, comp_time = 0.0f;
+    int top[32];
+    int action = gpucompress::runNNInference(
+        5.0, 0.25, 0.15, 4 * 1024 * 1024, 0.0, 0,
+        &ratio, &comp_time, top);
+
+    // Winner must be non-quant (actions 0-7 or 16-23)
+    int winner_quant = (action / 8) % 2;
+    ASSERT(winner_quant == 0, "winner should be non-quant when error_bound=0");
+
+    // All top-16 actions should be non-quant; bottom 16 should be quant (masked)
+    bool top16_ok = true;
+    bool bot16_ok = true;
+    for (int i = 0; i < 16; i++) {
+        int q = (top[i] / 8) % 2;
+        if (q != 0) top16_ok = false;
+    }
+    for (int i = 16; i < 32; i++) {
+        int q = (top[i] / 8) % 2;
+        if (q != 1) bot16_ok = false;
+    }
+    ASSERT(top16_ok, "top-16 actions should all be non-quant in lossless mode");
+    ASSERT(bot16_ok, "bottom-16 actions should all be quant (masked) in lossless mode");
+
+    // With error_bound > 0, quant actions should appear in ranking
+    int top2[32];
+    gpucompress::runNNInference(
+        5.0, 0.25, 0.15, 4 * 1024 * 1024, 0.001, 0,
+        &ratio, &comp_time, top2);
+
+    bool has_quant = false;
+    for (int i = 0; i < 16; i++) {
+        int q = (top2[i] / 8) % 2;
+        if (q == 1) { has_quant = true; break; }
+    }
+    ASSERT(has_quant, "quant actions should appear in top-16 when error_bound>0");
+
+    gpucompress::cleanupNN();
+    remove(path);
+    PASS();
+}
+
+/* ============================================================
  * Main
  * ============================================================ */
 int main() {
@@ -492,6 +545,7 @@ int main() {
     test_experience_buffer_invalid_action();
     test_experience_buffer_null();
     test_full_pipeline();
+    test_quant_masked_lossless();
 
     printf("\nResults: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail > 0 ? 1 : 0;

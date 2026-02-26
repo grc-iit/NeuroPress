@@ -251,6 +251,12 @@ __global__ void nnInferenceKernel(
         rank_val = -rank_val;
     }
 
+    // Mask out quantization configs in lossless mode — their predicted
+    // ratios assume quant is applied, but it won't be (error_bound <= 0).
+    if (quant == 1 && error_bound <= 0.0) {
+        rank_val = -INFINITY;
+    }
+
     // ---- Store per-thread predicted ratio and comp_time for later retrieval ----
     __shared__ float s_ratios[NN_NUM_CONFIGS];
     __shared__ float s_comp_times[NN_NUM_CONFIGS];

@@ -381,18 +381,56 @@ gpucompress_error_t gpucompress_load_nn(const char* filepath);
 int gpucompress_nn_is_loaded(void);
 
 /* ============================================================
- * Active Learning API
+ * Online Learning API
+ * ============================================================ */
+
+/**
+ * Enable online learning (master switch). Activates SGD reinforcement.
+ * Exploration and experience logging are off by default — enable separately.
+ */
+void gpucompress_enable_online_learning(void);
+
+/**
+ * Disable online learning entirely. Stops SGD, exploration, and logging.
+ */
+void gpucompress_disable_online_learning(void);
+
+/**
+ * Check if online learning is enabled.
+ *
+ * @return 1 if enabled, 0 otherwise
+ */
+int gpucompress_online_learning_enabled(void);
+
+/**
+ * Enable/disable exploration. Only effective when online learning is on.
+ * Off by default.
+ *
+ * @param enable 1 to enable, 0 to disable
+ */
+void gpucompress_set_exploration(int enable);
+
+/**
+ * Enable experience CSV logging. Only effective when online learning is on.
+ * Off by default.
+ *
+ * @param csv_path Path to CSV file for storing experience samples
+ * @return GPUCOMPRESS_SUCCESS or error code
+ */
+gpucompress_error_t gpucompress_enable_experience_logging(const char* csv_path);
+
+/**
+ * Disable experience CSV logging and close the file.
+ */
+void gpucompress_disable_experience_logging(void);
+
+/* ============================================================
+ * Active Learning API (backward-compatible convenience)
  * ============================================================ */
 
 /**
  * Enable active learning with experience collection.
- *
- * When enabled, each ALGO_AUTO compression call will:
- *   - Store the (data_stats, config, actual_result) as a CSV row
- *   - Check if the NN prediction was accurate
- *   - If prediction error exceeds threshold, explore alternative configs
- *
- * Off by default. Call gpucompress_disable_active_learning() to stop.
+ * Convenience function: enables online learning, exploration, and CSV logging.
  *
  * @param experience_path Path to CSV file for storing experience samples
  * @return GPUCOMPRESS_SUCCESS or error code
@@ -401,12 +439,12 @@ gpucompress_error_t gpucompress_enable_active_learning(
     const char* experience_path);
 
 /**
- * Disable active learning and close the experience file.
+ * Disable active learning. Calls gpucompress_disable_online_learning().
  */
 void gpucompress_disable_active_learning(void);
 
 /**
- * Check if active learning is currently enabled.
+ * Check if online learning is currently enabled.
  *
  * @return 1 if enabled, 0 otherwise
  */
@@ -423,15 +461,13 @@ int gpucompress_active_learning_enabled(void);
 void gpucompress_set_exploration_threshold(double threshold);
 
 /**
- * Enable/disable online reinforcement learning.
- * When enabled and a prediction's MAPE exceeds the threshold,
- * the NN weights are updated via single-sample SGD on CPU
- * and copied back to GPU immediately.
+ * Set SGD reinforcement parameters.
+ * SGD is always active when online learning is on — the enable param is ignored.
  *
- * @param enable            1 to enable, 0 to disable
+ * @param enable            Ignored (kept for backward compatibility)
  * @param learning_rate     SGD step size (default 1e-4)
- * @param mape_threshold    Ratio MAPE threshold to trigger reinforcement (default 0.60)
- * @param ct_mape_threshold Comp time MAPE threshold to trigger reinforcement (0 = disabled)
+ * @param mape_threshold    Ratio MAPE threshold to trigger reinforcement (default 0.20)
+ * @param ct_mape_threshold Ignored (kept for backward compatibility)
  */
 void gpucompress_set_reinforcement(int enable, float learning_rate,
                                    float mape_threshold, float ct_mape_threshold);

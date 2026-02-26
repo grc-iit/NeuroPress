@@ -29,9 +29,11 @@
  * Constants
  * ============================================================ */
 
-#define N_PATTERNS     8
-#define CHUNK_FLOATS   (1024 * 1024)          /* 1M floats = 4 MB */
+#define N_PATTERNS     2
+#define CHUNK_FLOATS   (1024 * 1024)          /* 1M floats = 4 MB per chunk */
 #define CHUNK_BYTES    (CHUNK_FLOATS * sizeof(float))
+#define DATASET_FLOATS (4 * 1024 * 1024)      /* 4M floats = 16 MB dataset */
+#define DATASET_BYTES  (DATASET_FLOATS * sizeof(float))
 #define N_ALGOS        8
 #define N_STATIC       (N_ALGOS * 2)          /* 8 algos x 2 shuffle */
 #define MAX_RESULTS    256
@@ -67,42 +69,22 @@ static double time_ms(void) {
  * ============================================================ */
 
 static const char *pattern_names[N_PATTERNS] = {
-    "constant", "sine", "random", "ramp",
-    "sparse", "gaussian", "step", "hf_sine_noise"
+    "ramp", "sparse"
 };
 
 static const char *pattern_desc[N_PATTERNS] = {
-    "constant (42.0)",
-    "smooth sine wave",
-    "pure random (LCG)",
     "linear ramp",
-    "sparse (99%% zero)",
-    "gaussian noise",
-    "step function (8 levels)",
-    "high-freq sine + noise"
+    "sparse (99%% zero)"
 };
 
-static void fill_chunk(float *buf, int id) {
-    const size_t N = CHUNK_FLOATS;
+static void fill_dataset(float *buf, int id) {
+    const size_t N = DATASET_FLOATS;
     switch (id) {
-    case 0: /* constant */
-        for (size_t i = 0; i < N; i++)
-            buf[i] = 42.0f;
-        break;
-    case 1: /* smooth sine */
-        for (size_t i = 0; i < N; i++)
-            buf[i] = 1000.0f * sinf(2.0f * (float)M_PI * i / (float)N);
-        break;
-    case 2: /* pure random [-1000, 1000] */
-        lcg_seed(0xDEADBEEF);
-        for (size_t i = 0; i < N; i++)
-            buf[i] = lcg_float() * 2000.0f - 1000.0f;
-        break;
-    case 3: /* linear ramp 0..1 */
+    case 0: /* linear ramp 0..1 */
         for (size_t i = 0; i < N; i++)
             buf[i] = (float)i / (float)N;
         break;
-    case 4: /* sparse: 99% zero, 1% random spikes */
+    case 1: /* sparse: 99% zero, 1% random spikes */
         lcg_seed(0xCAFEBABE);
         for (size_t i = 0; i < N; i++) {
             if ((lcg_next() % 100) == 0)
@@ -110,27 +92,6 @@ static void fill_chunk(float *buf, int id) {
             else
                 buf[i] = 0.0f;
         }
-        break;
-    case 5: /* gaussian noise via Box-Muller */
-        lcg_seed(0x12345678);
-        for (size_t i = 0; i < N; i += 2) {
-            float u1 = lcg_float() * 0.9999f + 0.0001f;
-            float u2 = lcg_float();
-            float mag = sqrtf(-2.0f * logf(u1));
-            buf[i] = mag * cosf(2.0f * (float)M_PI * u2) * 500.0f;
-            if (i + 1 < N)
-                buf[i + 1] = mag * sinf(2.0f * (float)M_PI * u2) * 500.0f;
-        }
-        break;
-    case 6: /* step function: 8 discrete levels */
-        for (size_t i = 0; i < N; i++)
-            buf[i] = (float)(i / (N / 8)) * 100.0f;
-        break;
-    case 7: /* high-frequency sine + random noise */
-        lcg_seed(0xABCD1234);
-        for (size_t i = 0; i < N; i++)
-            buf[i] = 500.0f * sinf(2.0f * (float)M_PI * i * 0.3f)
-                   + (lcg_float() - 0.5f) * 1000.0f;
         break;
     }
 }
@@ -522,8 +483,10 @@ int main(int argc, char **argv) {
     printf("=== HDF5 Lossless Benchmark: No Compression vs Static vs NN ===\n\n");
     printf("Weights: %s\n", weights_path);
     printf("CSV:     %s\n", csv_path);
-    printf("Chunk:   %zu MB float32 (%zu floats)\n\n",
+    printf("Chunk:   %zu MB float32 (%zu floats)\n",
            CHUNK_BYTES / (1024 * 1024), (size_t)CHUNK_FLOATS);
+    printf("Dataset: %zu MB float32 (%zu floats)\n\n",
+           DATASET_BYTES / (1024 * 1024), (size_t)DATASET_FLOATS);
 
     /* Suppress HDF5 automatic error printing */
     H5Eset_auto2(H5E_DEFAULT, NULL, NULL);
@@ -546,25 +509,17 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Enable active learning + reinforcement */
-    rc = gpucompress_enable_active_learning(
-             "tests/benchmark_hdf5_results/experience.csv");
-    if (rc != GPUCOMPRESS_SUCCESS) {
-        fprintf(stderr, "WARNING: active learning init failed (%s)\n",
-                gpucompress_error_string(rc));
-    } else {
-        printf("Active learning enabled\n");
-    }
-    gpucompress_set_reinforcement(1, 1e-3f, 0.10f, 0.0f);
-    gpucompress_set_exploration_threshold(0.05);
-    printf("Reinforcement: lr=1e-3, SGD threshold=10%%, explore threshold=5%%\n\n");
+    /* SGD reinforcement only — no exploration, no CSV logging */
+    gpucompress_enable_online_learning();
+    gpucompress_set_reinforcement(1, 0.5f, 0.10f, 0.0f);
+    printf("Online learning: SGD only, lr=1e-3, threshold=10%%\n\n");
 
     /* Generate data patterns */
-    float *chunks[N_PATTERNS];
+    float *datasets[N_PATTERNS];
     for (int p = 0; p < N_PATTERNS; p++) {
-        chunks[p] = (float *)malloc(CHUNK_BYTES);
-        if (!chunks[p]) { perror("malloc"); return 1; }
-        fill_chunk(chunks[p], p);
+        datasets[p] = (float *)malloc(DATASET_BYTES);
+        if (!datasets[p]) { perror("malloc"); return 1; }
+        fill_dataset(datasets[p], p);
     }
 
     /* Build 16 lossless static configs */
@@ -580,10 +535,11 @@ int main(int argc, char **argv) {
 
     /* Run benchmarks */
     for (int p = 0; p < N_PATTERNS; p++) {
-        printf("Pattern %d/%d: %s (%zu MB)\n",
+        printf("Pattern %d/%d: %s (%zu MB, %zu MB chunks)\n",
                p + 1, N_PATTERNS, pattern_desc[p],
+               DATASET_BYTES / (1024 * 1024),
                CHUNK_BYTES / (1024 * 1024));
-        bench_dataset(pattern_names[p], chunks[p], CHUNK_FLOATS, cfgs, ncfg);
+        bench_dataset(pattern_names[p], datasets[p], DATASET_FLOATS, cfgs, ncfg);
         printf("\n");
     }
 
@@ -592,8 +548,7 @@ int main(int argc, char **argv) {
     print_summary();
 
     /* Cleanup */
-    gpucompress_disable_active_learning();
-    for (int p = 0; p < N_PATTERNS; p++) free(chunks[p]);
+    for (int p = 0; p < N_PATTERNS; p++) free(datasets[p]);
     gpucompress_cleanup();
 
     printf("\nDone. %d results recorded.\n", g_nresults);
