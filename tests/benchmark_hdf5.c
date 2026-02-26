@@ -30,9 +30,9 @@
  * ============================================================ */
 
 #define N_PATTERNS     2
-#define CHUNK_FLOATS   (1024 * 1024)          /* 1M floats = 4 MB per chunk */
+#define CHUNK_FLOATS   (2 * 1024 * 1024)      /* 2M floats = 8 MB per chunk */
 #define CHUNK_BYTES    (CHUNK_FLOATS * sizeof(float))
-#define DATASET_FLOATS (4 * 1024 * 1024)      /* 4M floats = 16 MB dataset */
+#define DATASET_FLOATS (16 * 1024 * 1024)     /* 16M floats = 64 MB dataset */
 #define DATASET_BYTES  (DATASET_FLOATS * sizeof(float))
 #define N_ALGOS        8
 #define N_STATIC       (N_ALGOS * 2)          /* 8 algos x 2 shuffle */
@@ -511,7 +511,7 @@ int main(int argc, char **argv) {
 
     /* SGD reinforcement only — no exploration, no CSV logging */
     gpucompress_enable_online_learning();
-    gpucompress_set_reinforcement(1, 0.5f, 0.10f, 0.0f);
+    gpucompress_set_reinforcement(1, 0.1f, 0.10f, 0.0f);
     printf("Online learning: SGD only, lr=1e-3, threshold=10%%\n\n");
 
     /* Generate data patterns */

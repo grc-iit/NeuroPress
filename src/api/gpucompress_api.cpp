@@ -310,12 +310,14 @@ extern "C" gpucompress_error_t gpucompress_compress(
         int rc = -1;
 
         if (num_elements > 0 && gpucompress_nn_is_loaded_impl()) {
-            // CPU stats from host pointer (avoids GPU stats pipeline entirely)
-            int stats_rc = gpucompress::computeStatsCPU(
-                input, input_size, &entropy, &mad, &second_derivative);
+            // GPU stats from device pointer (data already copied to d_input)
+            cudaStreamSynchronize(stream);
+            int stats_rc = gpucompress::runStatsOnlyPipeline(
+                d_input, input_size, stream,
+                &entropy, &mad, &second_derivative);
 
             if (stats_rc == 0) {
-                // NN inference directly using CPU-computed stats
+                // NN inference using GPU-computed stats
                 float* p_ratio = (stats != nullptr || g_online_learning_enabled) ? &predicted_ratio : nullptr;
                 float* p_comp_time = p_ratio ? &predicted_comp_time : nullptr;
                 int* p_top = g_online_learning_enabled ? top_actions : nullptr;

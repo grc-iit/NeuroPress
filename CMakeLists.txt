@@ -366,6 +366,15 @@ set_target_properties(test_cpu_stats PROPERTIES
 )
 
 # ============================================================
+# Executable: Stats Performance Benchmark (CPU vs GPU)
+# ============================================================
+add_executable(bench_stats tests/bench_stats.cu)
+target_link_libraries(bench_stats PRIVATE gpucompress CUDA::cudart)
+set_target_properties(bench_stats PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+)
+
+# ============================================================
 # Executable: 128MB Experiment
 # ============================================================
 add_executable(experiment_128mb tests/experiment_128mb.cu)
