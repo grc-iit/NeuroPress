@@ -464,7 +464,7 @@ static void test_algo_auto_roundtrip() {
  * Cross-check with direct computeStatsCPU call.
  * ============================================================ */
 static void test_public_api_compute_stats() {
-    TEST("gpucompress_compute_stats matches computeStatsCPU directly");
+    TEST("gpucompress_compute_stats (GPU) matches computeStatsCPU within tolerance");
 
     gpucompress_error_t rc = gpucompress_init(nullptr);
     ASSERT(rc == GPUCOMPRESS_SUCCESS, "gpucompress_init should succeed");
@@ -476,7 +476,7 @@ static void test_public_api_compute_stats() {
         h_data[i] = (float)(i % 1000) * 0.1f;
     }
 
-    // Via public API
+    // Via public API (GPU path)
     double api_ent, api_mad, api_deriv;
     rc = gpucompress_compute_stats(h_data, bytes, &api_ent, &api_mad, &api_deriv);
     ASSERT(rc == GPUCOMPRESS_SUCCESS, "gpucompress_compute_stats should succeed");
@@ -486,10 +486,11 @@ static void test_public_api_compute_stats() {
     int cpu_rc = gpucompress::computeStatsCPU(h_data, bytes, &cpu_ent, &cpu_mad, &cpu_deriv);
     ASSERT(cpu_rc == 0, "computeStatsCPU should succeed");
 
-    // Must be bitwise identical (same code path)
-    ASSERT(api_ent == cpu_ent, "entropy should be identical");
-    ASSERT(api_mad == cpu_mad, "MAD should be identical");
-    ASSERT(api_deriv == cpu_deriv, "deriv should be identical");
+    // GPU and CPU may differ slightly due to parallel reduction order
+    double tol = 1e-4;
+    ASSERT(fabs(api_ent - cpu_ent) < tol, "entropy mismatch beyond tolerance");
+    ASSERT(fabs(api_mad - cpu_mad) < tol, "MAD mismatch beyond tolerance");
+    ASSERT(fabs(api_deriv - cpu_deriv) < tol, "deriv mismatch beyond tolerance");
 
     printf("(entropy=%.4f mad=%.6f deriv=%.6f) ", api_ent, api_mad, api_deriv);
 

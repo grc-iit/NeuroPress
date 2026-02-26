@@ -1265,8 +1265,21 @@ extern "C" gpucompress_error_t gpucompress_compute_stats(
         return GPUCOMPRESS_ERROR_INVALID_INPUT;
     }
 
-    // Compute stats on CPU directly from host data (no GPU round-trip)
-    int rc = gpucompress::computeStatsCPU(data, size, entropy, mad, second_derivative);
+    // Upload to GPU and compute stats via GPU kernels
+    void* d_data = nullptr;
+    cudaError_t cuda_err = cudaMalloc(&d_data, size);
+    if (cuda_err != cudaSuccess) {
+        return GPUCOMPRESS_ERROR_OUT_OF_MEMORY;
+    }
+    cuda_err = cudaMemcpy(d_data, data, size, cudaMemcpyHostToDevice);
+    if (cuda_err != cudaSuccess) {
+        cudaFree(d_data);
+        return GPUCOMPRESS_ERROR_CUDA_FAILED;
+    }
+
+    int rc = gpucompress::runStatsOnlyPipeline(d_data, size, g_default_stream,
+                                                entropy, mad, second_derivative);
+    cudaFree(d_data);
     if (rc != 0) {
         return GPUCOMPRESS_ERROR_INVALID_INPUT;
     }
