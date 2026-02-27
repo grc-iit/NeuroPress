@@ -295,6 +295,16 @@ gpucompress_error_t gpucompress_decompress_gpu(
     void* stream
 );
 
+/**
+ * Check if a pointer is a CUDA device pointer.
+ *
+ * Uses cudaPointerGetAttributes internally.
+ *
+ * @param ptr  Pointer to test
+ * @return 1 if device pointer, 0 if host/unknown
+ */
+int gpucompress_is_device_ptr(const void* ptr);
+
 /* ============================================================
  * Entropy Analysis (GPU-accelerated)
  * ============================================================ */

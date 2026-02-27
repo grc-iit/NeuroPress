@@ -329,14 +329,18 @@ static int compute_data_range(
 
         float init_min = FLT_MAX;
         float init_max = -FLT_MAX;
+        fprintf(stderr, "[XFER H→D] quant float: init min=FLT_MAX (%zu B)\n", sizeof(float));
         cudaMemcpyAsync(d_min, &init_min, sizeof(float), cudaMemcpyHostToDevice, stream);
+        fprintf(stderr, "[XFER H→D] quant float: init max=-FLT_MAX (%zu B)\n", sizeof(float));
         cudaMemcpyAsync(d_max, &init_max, sizeof(float), cudaMemcpyHostToDevice, stream);
 
         compute_min_max_float_kernel<<<num_blocks, BLOCK_SIZE, 0, stream>>>(
             static_cast<float*>(d_input), num_elements, d_min, d_max);
 
         float h_min, h_max;
+        fprintf(stderr, "[XFER D→H] quant float: data_min (%zu B)\n", sizeof(float));
         cudaMemcpyAsync(&h_min, d_min, sizeof(float), cudaMemcpyDeviceToHost, stream);
+        fprintf(stderr, "[XFER D→H] quant float: data_max (%zu B)\n", sizeof(float));
         cudaMemcpyAsync(&h_max, d_max, sizeof(float), cudaMemcpyDeviceToHost, stream);
         cudaStreamSynchronize(stream);
 
@@ -349,13 +353,17 @@ static int compute_data_range(
 
         double init_min = DBL_MAX;
         double init_max = -DBL_MAX;
+        fprintf(stderr, "[XFER H→D] quant double: init min=DBL_MAX (%zu B)\n", sizeof(double));
         cudaMemcpyAsync(d_min_d, &init_min, sizeof(double), cudaMemcpyHostToDevice, stream);
+        fprintf(stderr, "[XFER H→D] quant double: init max=-DBL_MAX (%zu B)\n", sizeof(double));
         cudaMemcpyAsync(d_max_d, &init_max, sizeof(double), cudaMemcpyHostToDevice, stream);
 
         compute_min_max_double_kernel<<<num_blocks, BLOCK_SIZE, 0, stream>>>(
             static_cast<double*>(d_input), num_elements, d_min_d, d_max_d);
 
+        fprintf(stderr, "[XFER D→H] quant double: data_min (%zu B)\n", sizeof(double));
         cudaMemcpyAsync(&data_min, d_min_d, sizeof(double), cudaMemcpyDeviceToHost, stream);
+        fprintf(stderr, "[XFER D→H] quant double: data_max (%zu B)\n", sizeof(double));
         cudaMemcpyAsync(&data_max, d_max_d, sizeof(double), cudaMemcpyDeviceToHost, stream);
         cudaStreamSynchronize(stream);
     }
@@ -647,7 +655,9 @@ bool verify_error_bound(
 
     int zero = 0;
     double init_max = 0.0;
+    fprintf(stderr, "[XFER H→D] verify error bound: init violations=0 (%zu B)\n", sizeof(int));
     cudaMemcpyAsync(d_violations, &zero, sizeof(int), cudaMemcpyHostToDevice, stream);
+    fprintf(stderr, "[XFER H→D] verify error bound: init max_error=0 (%zu B)\n", sizeof(double));
     cudaMemcpyAsync(d_max_error, &init_max, sizeof(double), cudaMemcpyHostToDevice, stream);
 
     int num_blocks = min((int)((num_elements + BLOCK_SIZE - 1) / BLOCK_SIZE), 1024);
@@ -666,7 +676,9 @@ bool verify_error_bound(
 
     int h_violations;
     double h_max_error;
+    fprintf(stderr, "[XFER D→H] verify error bound: violation count (%zu B)\n", sizeof(int));
     cudaMemcpyAsync(&h_violations, d_violations, sizeof(int), cudaMemcpyDeviceToHost, stream);
+    fprintf(stderr, "[XFER D→H] verify error bound: max_error (%zu B)\n", sizeof(double));
     cudaMemcpyAsync(&h_max_error, d_max_error, sizeof(double), cudaMemcpyDeviceToHost, stream);
     cudaStreamSynchronize(stream);
 

@@ -264,6 +264,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
     }
 
     // Copy input to GPU
+    fprintf(stderr, "[XFER H→D] compress: input data (%zu B)\n", input_size);
     cuda_err = cudaMemcpyAsync(d_input, input, input_size, cudaMemcpyHostToDevice, stream);
     if (cuda_err != cudaSuccess) {
         cudaFree(d_input);
@@ -317,11 +318,14 @@ extern "C" gpucompress_error_t gpucompress_compress(
 
             // Conditional stats D→H only when user wants stats output or online learning needs them
             if (d_stats_ptr && (stats != nullptr || g_online_learning_enabled)) {
+                fprintf(stderr, "[XFER D→H] stats: entropy (%zu B)\n", sizeof(double));
                 cudaMemcpyAsync(&entropy, &d_stats_ptr->entropy, sizeof(double),
                                 cudaMemcpyDeviceToHost, stream);
                 // mad_normalized and deriv_normalized are contiguous
+                fprintf(stderr, "[XFER D→H] stats: mad_normalized (%zu B)\n", sizeof(double));
                 cudaMemcpyAsync(&mad, &d_stats_ptr->mad_normalized, sizeof(double),
                                 cudaMemcpyDeviceToHost, stream);
+                fprintf(stderr, "[XFER D→H] stats: deriv_normalized (%zu B)\n", sizeof(double));
                 cudaMemcpyAsync(&second_derivative, &d_stats_ptr->deriv_normalized, sizeof(double),
                                 cudaMemcpyDeviceToHost, stream);
                 cudaStreamSynchronize(stream);
@@ -508,6 +512,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
 
     // Copy only compressed payload from GPU to host (skip header region)
     uint8_t* host_payload = static_cast<uint8_t*>(output) + header_size;
+    fprintf(stderr, "[XFER D→H] compress: payload (%zu B)\n", compressed_size);
     cuda_err = cudaMemcpyAsync(host_payload, d_compressed, compressed_size,
                                cudaMemcpyDeviceToHost, stream);
     if (cuda_err != cudaSuccess) {
@@ -762,7 +767,9 @@ extern "C" gpucompress_error_t gpucompress_compress(
                                                 size_t num_floats = input_size / sizeof(float);
                                                 std::vector<float> h_orig(num_floats);
                                                 std::vector<float> h_dec(num_floats);
+                                                fprintf(stderr, "[XFER D→H] explore PSNR: original data (%zu B)\n", input_size);
                                                 cudaMemcpy(h_orig.data(), d_input, input_size, cudaMemcpyDeviceToHost);
+                                                fprintf(stderr, "[XFER D→H] explore PSNR: decompressed data (%zu B)\n", input_size);
                                                 cudaMemcpy(h_dec.data(), d_rt_result, input_size, cudaMemcpyDeviceToHost);
 
                                                 double mse = 0.0;
@@ -842,6 +849,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
 
                                     // Write header + compressed data to host output
                                     memcpy(output, &alt_hdr, sizeof(CompressionHeader));
+                                    fprintf(stderr, "[XFER D→H] explore winner: alt compressed payload (%zu B)\n", alt_comp_size);
                                     cudaMemcpy(
                                         static_cast<uint8_t*>(output) + header_sz,
                                         d_alt_out, alt_comp_size,
@@ -1004,6 +1012,7 @@ extern "C" gpucompress_error_t gpucompress_decompress(
 
     // Copy only the compressed payload to GPU (skip header)
     const uint8_t* host_payload = static_cast<const uint8_t*>(input) + header_size;
+    fprintf(stderr, "[XFER H→D] decompress: compressed payload (%zu B)\n", compressed_size);
     cuda_err = cudaMemcpyAsync(d_compressed_data, host_payload, compressed_size,
                                cudaMemcpyHostToDevice, stream);
     if (cuda_err != cudaSuccess) {
@@ -1095,6 +1104,7 @@ extern "C" gpucompress_error_t gpucompress_decompress(
     }
 
     // Copy result to host
+    fprintf(stderr, "[XFER D→H] decompress: result (%u B)\n", header.original_size);
     cuda_err = cudaMemcpyAsync(output, d_result, header.original_size,
                                cudaMemcpyDeviceToHost, stream);
     if (cuda_err != cudaSuccess) {
@@ -1172,6 +1182,7 @@ extern "C" gpucompress_error_t gpucompress_calculate_entropy(
     }
 
     // Copy to GPU
+    fprintf(stderr, "[XFER H→D] compute_stats: input data (%zu B)\n", size);
     cuda_err = cudaMemcpyAsync(d_data, data, size, cudaMemcpyHostToDevice, stream);
     if (cuda_err != cudaSuccess) {
         cudaFree(d_data);
@@ -1444,6 +1455,17 @@ extern "C" gpucompress_error_t gpucompress_reload_nn(const char* filepath) {
  * GPU Memory API (stubs for now)
  * ============================================================ */
 
+extern "C" int gpucompress_is_device_ptr(const void* ptr) {
+    if (!ptr) return 0;
+    struct cudaPointerAttributes attrs;
+    cudaError_t err = cudaPointerGetAttributes(&attrs, ptr);
+    if (err != cudaSuccess) {
+        cudaGetLastError(); /* clear error state */
+        return 0;
+    }
+    return (attrs.type == cudaMemoryTypeDevice) ? 1 : 0;
+}
+
 extern "C" gpucompress_error_t gpucompress_compress_gpu(
     const void* d_input,
     size_t input_size,
@@ -1451,17 +1473,145 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
     size_t* output_size,
     const gpucompress_config_t* config,
     gpucompress_stats_t* stats,
-    void* stream
+    void* stream_arg
 ) {
-    // TODO: Implement direct GPU-to-GPU compression
-    (void)d_input;
-    (void)input_size;
-    (void)d_output;
-    (void)output_size;
-    (void)config;
-    (void)stats;
-    (void)stream;
-    return GPUCOMPRESS_ERROR_INVALID_INPUT;
+    if (!g_initialized.load()) return GPUCOMPRESS_ERROR_NOT_INITIALIZED;
+    if (!d_input || !d_output || !output_size) return GPUCOMPRESS_ERROR_INVALID_INPUT;
+    if (input_size == 0) return GPUCOMPRESS_ERROR_INVALID_INPUT;
+
+    gpucompress_config_t cfg = config ? *config : gpucompress_default_config();
+    cudaStream_t stream = stream_arg ? static_cast<cudaStream_t>(stream_arg) : g_default_stream;
+
+    /* d_input is already on GPU — no H→D copy */
+    gpucompress_algorithm_t algo_to_use = cfg.algorithm;
+    unsigned int preproc_to_use = cfg.preprocessing;
+
+    /* AUTO not yet supported for GPU path (no stats kernel wiring); fall back to LZ4 */
+    if (algo_to_use == GPUCOMPRESS_ALGO_AUTO) {
+        algo_to_use = GPUCOMPRESS_ALGO_LZ4;
+    }
+
+    /* Apply preprocessing on GPU (same kernels as host path) */
+    const uint8_t* d_compress_input = static_cast<const uint8_t*>(d_input);
+    size_t compress_input_size = input_size;
+    uint8_t* d_quantized = nullptr;
+    uint8_t* d_shuffled  = nullptr;
+    QuantizationResult quant_result;
+
+    if ((preproc_to_use & GPUCOMPRESS_PREPROC_QUANTIZE) && cfg.error_bound > 0.0) {
+        size_t num_elements = input_size / sizeof(float);
+        if (num_elements > 0) {
+            QuantizationConfig quant_cfg(
+                QuantizationType::LINEAR, cfg.error_bound,
+                num_elements, sizeof(float));
+            quant_result = quantize_simple(
+                const_cast<uint8_t*>(d_compress_input), num_elements, sizeof(float), quant_cfg, stream);
+            if (quant_result.isValid()) {
+                d_quantized = static_cast<uint8_t*>(quant_result.d_quantized);
+                d_compress_input = d_quantized;
+                compress_input_size = quant_result.quantized_bytes;
+            }
+        }
+    }
+
+    unsigned int shuffle_size = GPUCOMPRESS_GET_SHUFFLE_SIZE(preproc_to_use);
+    if (shuffle_size > 0) {
+        d_shuffled = byte_shuffle_simple(
+            const_cast<uint8_t*>(d_compress_input), compress_input_size,
+            shuffle_size, gpucompress::SHUFFLE_CHUNK_SIZE, stream);
+        if (d_shuffled) d_compress_input = d_shuffled;
+    }
+
+    cudaError_t cuda_err = cudaStreamSynchronize(stream);
+    if (cuda_err != cudaSuccess) {
+        if (d_quantized) cudaFree(d_quantized);
+        if (d_shuffled)  cudaFree(d_shuffled);
+        return GPUCOMPRESS_ERROR_CUDA_FAILED;
+    }
+
+    /* Create nvcomp compression manager */
+    CompressionAlgorithm internal_algo = gpucompress::toInternalAlgorithm(algo_to_use);
+    auto compressor = createCompressionManager(
+        internal_algo, gpucompress::DEFAULT_CHUNK_SIZE, stream, d_compress_input);
+    if (!compressor) {
+        if (d_quantized) cudaFree(d_quantized);
+        if (d_shuffled)  cudaFree(d_shuffled);
+        return GPUCOMPRESS_ERROR_COMPRESSION;
+    }
+
+    CompressionConfig comp_config = compressor->configure_compression(compress_input_size);
+    size_t max_compressed_size = comp_config.max_compressed_buffer_size;
+    size_t header_size = GPUCOMPRESS_HEADER_SIZE;
+    size_t total_max_needed = header_size + max_compressed_size;
+
+    if (total_max_needed > *output_size) {
+        if (d_quantized) cudaFree(d_quantized);
+        if (d_shuffled)  cudaFree(d_shuffled);
+        *output_size = total_max_needed;
+        return GPUCOMPRESS_ERROR_BUFFER_TOO_SMALL;
+    }
+
+    /* Compress directly into caller's d_output (after header space) */
+    uint8_t* d_out        = static_cast<uint8_t*>(d_output);
+    uint8_t* d_compressed = d_out + header_size;
+
+    try {
+        compressor->compress(d_compress_input, d_compressed, comp_config);
+    } catch (...) {
+        if (d_quantized) cudaFree(d_quantized);
+        if (d_shuffled)  cudaFree(d_shuffled);
+        return GPUCOMPRESS_ERROR_COMPRESSION;
+    }
+
+    size_t compressed_size = compressor->get_compressed_output_size(d_compressed);
+    size_t total_size      = header_size + compressed_size;
+
+    /* Build header and write to d_output[0..63] via H→D */
+    CompressionHeader header;
+    header.magic               = COMPRESSION_MAGIC;
+    header.version             = COMPRESSION_HEADER_VERSION;
+    header.shuffle_element_size = shuffle_size;
+    header.original_size       = input_size;
+    header.compressed_size     = compressed_size;
+    if (d_quantized && quant_result.isValid()) {
+        header.setQuantizationFlags(
+            static_cast<uint32_t>(quant_result.type),
+            quant_result.actual_precision, true);
+        header.quant_error_bound = quant_result.error_bound;
+        header.quant_scale       = quant_result.scale_factor;
+        header.data_min          = quant_result.data_min;
+        header.data_max          = quant_result.data_max;
+    } else {
+        header.quant_flags       = 0;
+        header.quant_error_bound = 0.0;
+        header.quant_scale       = 0.0;
+        header.data_min          = 0.0;
+        header.data_max          = 0.0;
+    }
+
+    cuda_err = cudaMemcpyAsync(d_out, &header, sizeof(CompressionHeader),
+                               cudaMemcpyHostToDevice, stream);
+    if (cuda_err == cudaSuccess)
+        cuda_err = cudaStreamSynchronize(stream);
+
+    if (d_quantized) cudaFree(d_quantized);
+    if (d_shuffled)  cudaFree(d_shuffled);
+
+    if (cuda_err != cudaSuccess) return GPUCOMPRESS_ERROR_CUDA_FAILED;
+
+    *output_size = total_size;
+
+    if (stats) {
+        stats->original_size      = input_size;
+        stats->compressed_size    = total_size;
+        stats->compression_ratio  = (double)input_size / (total_size > 0 ? total_size : 1);
+        stats->algorithm_used     = algo_to_use;
+        stats->preprocessing_used = preproc_to_use;
+        stats->entropy_bits       = 0.0;
+        stats->throughput_mbps    = 0.0;
+    }
+
+    return GPUCOMPRESS_SUCCESS;
 }
 
 extern "C" gpucompress_error_t gpucompress_decompress_gpu(
@@ -1469,13 +1619,95 @@ extern "C" gpucompress_error_t gpucompress_decompress_gpu(
     size_t input_size,
     void* d_output,
     size_t* output_size,
-    void* stream
+    void* stream_arg
 ) {
-    // TODO: Implement direct GPU-to-GPU decompression
-    (void)d_input;
-    (void)input_size;
-    (void)d_output;
-    (void)output_size;
-    (void)stream;
-    return GPUCOMPRESS_ERROR_INVALID_INPUT;
+    if (!g_initialized.load()) return GPUCOMPRESS_ERROR_NOT_INITIALIZED;
+    if (!d_input || !d_output || !output_size) return GPUCOMPRESS_ERROR_INVALID_INPUT;
+    if (input_size < GPUCOMPRESS_HEADER_SIZE) return GPUCOMPRESS_ERROR_INVALID_HEADER;
+
+    cudaStream_t stream = stream_arg ? static_cast<cudaStream_t>(stream_arg) : g_default_stream;
+
+    /* Read header from GPU (64B D→H) */
+    CompressionHeader header;
+    cudaError_t cuda_err = readHeaderFromDevice(d_input, header, stream);
+    if (cuda_err != cudaSuccess) return GPUCOMPRESS_ERROR_CUDA_FAILED;
+    if (!header.isValid())       return GPUCOMPRESS_ERROR_INVALID_HEADER;
+
+    if (header.original_size > *output_size) {
+        *output_size = header.original_size;
+        return GPUCOMPRESS_ERROR_BUFFER_TOO_SMALL;
+    }
+
+    size_t compressed_size = header.compressed_size;
+    if (input_size < GPUCOMPRESS_HEADER_SIZE + compressed_size)
+        return GPUCOMPRESS_ERROR_INVALID_HEADER;
+
+    const uint8_t* d_compressed_data =
+        static_cast<const uint8_t*>(d_input) + GPUCOMPRESS_HEADER_SIZE;
+
+    /* nvcomp decompression */
+    auto decompressor = createDecompressionManager(d_compressed_data, stream);
+    if (!decompressor) return GPUCOMPRESS_ERROR_DECOMPRESSION;
+
+    DecompressionConfig decomp_config =
+        decompressor->configure_decompression(d_compressed_data);
+    size_t decompressed_size = decomp_config.decomp_data_size;
+
+    uint8_t* d_decompressed = nullptr;
+    if (cudaMalloc(&d_decompressed, decompressed_size) != cudaSuccess)
+        return GPUCOMPRESS_ERROR_OUT_OF_MEMORY;
+
+    try {
+        decompressor->decompress(d_decompressed, d_compressed_data, decomp_config);
+    } catch (...) {
+        cudaFree(d_decompressed);
+        return GPUCOMPRESS_ERROR_DECOMPRESSION;
+    }
+
+    /* Reverse preprocessing */
+    uint8_t* d_result    = d_decompressed;
+    uint8_t* d_unshuffled = nullptr;
+
+    if (header.hasShuffleApplied()) {
+        d_unshuffled = byte_unshuffle_simple(
+            d_decompressed, decompressed_size,
+            header.shuffle_element_size,
+            gpucompress::SHUFFLE_CHUNK_SIZE, stream);
+        if (d_unshuffled) d_result = d_unshuffled;
+    }
+
+    void* d_dequantized = nullptr;
+    if (header.hasQuantizationApplied()) {
+        QuantizationResult qr;
+        qr.scale_factor          = header.quant_scale;
+        qr.data_min              = header.data_min;
+        qr.data_max              = header.data_max;
+        qr.error_bound           = header.quant_error_bound;
+        qr.type                  = static_cast<QuantizationType>(header.getQuantizationType());
+        qr.actual_precision      = header.getQuantizationPrecision();
+        qr.num_elements          = header.original_size / sizeof(float);
+        qr.original_element_size = sizeof(float);
+        qr.d_quantized           = d_result;
+        qr.quantized_bytes       = decompressed_size;
+        d_dequantized = dequantize_simple(d_result, qr, stream);
+        if (d_dequantized) {
+            if (d_unshuffled) { cudaFree(d_unshuffled); d_unshuffled = nullptr; }
+            d_result = static_cast<uint8_t*>(d_dequantized);
+        }
+    }
+
+    /* D→D copy to caller's output buffer */
+    cuda_err = cudaMemcpyAsync(d_output, d_result, header.original_size,
+                               cudaMemcpyDeviceToDevice, stream);
+    if (cuda_err == cudaSuccess)
+        cuda_err = cudaStreamSynchronize(stream);
+
+    if (d_dequantized) cudaFree(d_dequantized);
+    if (d_unshuffled)  cudaFree(d_unshuffled);
+    cudaFree(d_decompressed);
+
+    if (cuda_err != cudaSuccess) return GPUCOMPRESS_ERROR_CUDA_FAILED;
+
+    *output_size = header.original_size;
+    return GPUCOMPRESS_SUCCESS;
 }

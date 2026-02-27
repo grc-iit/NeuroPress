@@ -423,6 +423,149 @@ if(HDF5_FOUND)
     #     m
     # )
 
+    # ============================================================
+    # HDF5 VOL Connector: libH5VLgpucompress.so
+    # Requires HDF5 >= 1.12 for public VOL API.
+    # Use HDF5 2.2.0 built at /tmp/hdf5-install if available.
+    # ============================================================
+    set(HDF5_VOL_INCLUDE /tmp/hdf5-install/include)
+    set(HDF5_VOL_LIB     /tmp/hdf5-install/lib/libhdf5.so)
+
+    if(EXISTS "${HDF5_VOL_LIB}")
+        add_library(H5VLgpucompress SHARED
+            src/hdf5/H5VLgpucompress.cu
+        )
+
+        set_source_files_properties(src/hdf5/H5VLgpucompress.cu PROPERTIES LANGUAGE CUDA)
+
+        target_include_directories(H5VLgpucompress
+            PRIVATE
+            ${HDF5_VOL_INCLUDE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/hdf5
+        )
+
+        target_link_libraries(H5VLgpucompress
+            PRIVATE
+            gpucompress
+            ${HDF5_VOL_LIB}
+            CUDA::cudart
+        )
+
+        set_target_properties(H5VLgpucompress PROPERTIES
+            CUDA_SEPARABLE_COMPILATION ON
+            POSITION_INDEPENDENT_CODE ON
+            VERSION 1.0.0
+            SOVERSION 1
+            OUTPUT_NAME H5VLgpucompress
+        )
+
+        # VOL GPU write/read test
+        add_executable(test_vol_gpu_write tests/test_vol_gpu_write.cu)
+
+        set_source_files_properties(tests/test_vol_gpu_write.cu PROPERTIES LANGUAGE CUDA)
+
+        target_include_directories(test_vol_gpu_write PRIVATE
+            ${HDF5_VOL_INCLUDE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+        )
+
+        target_link_libraries(test_vol_gpu_write PRIVATE
+            gpucompress
+            H5VLgpucompress
+            ${HDF5_VOL_LIB}
+            CUDA::cudart
+            m
+        )
+
+        set_target_properties(test_vol_gpu_write PROPERTIES
+            CUDA_SEPARABLE_COMPILATION ON
+        )
+
+        # Comprehensive VOL test suite
+        add_executable(test_vol_comprehensive tests/test_vol_comprehensive.cu)
+        set_source_files_properties(tests/test_vol_comprehensive.cu PROPERTIES LANGUAGE CUDA)
+        target_include_directories(test_vol_comprehensive PRIVATE
+            ${HDF5_VOL_INCLUDE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+        )
+        target_link_libraries(test_vol_comprehensive PRIVATE
+            gpucompress
+            H5VLgpucompress
+            ${HDF5_VOL_LIB}
+            CUDA::cudart
+            m
+        )
+        set_target_properties(test_vol_comprehensive PROPERTIES
+            CUDA_SEPARABLE_COMPILATION ON
+        )
+
+        # 8MB end-to-end VOL demo
+        add_executable(demo_vol_8mb tests/demo_vol_8mb.cu)
+        set_source_files_properties(tests/demo_vol_8mb.cu PROPERTIES LANGUAGE CUDA)
+        target_include_directories(demo_vol_8mb PRIVATE
+            ${HDF5_VOL_INCLUDE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+        )
+        target_link_libraries(demo_vol_8mb PRIVATE
+            gpucompress
+            H5VLgpucompress
+            ${HDF5_VOL_LIB}
+            CUDA::cudart
+            m
+        )
+        set_target_properties(demo_vol_8mb PROPERTIES
+            CUDA_SEPARABLE_COMPILATION ON
+        )
+
+        # GPU pipeline demo: full write→inspect→read→verify walkthrough
+        add_executable(demo_gpu_pipeline examples/demo_gpu_pipeline.cu)
+        set_source_files_properties(examples/demo_gpu_pipeline.cu PROPERTIES LANGUAGE CUDA)
+        target_include_directories(demo_gpu_pipeline PRIVATE
+            ${HDF5_VOL_INCLUDE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+        )
+        target_link_libraries(demo_gpu_pipeline PRIVATE
+            gpucompress H5VLgpucompress H5Zgpucompress ${HDF5_VOL_LIB} CUDA::cudart m
+        )
+        set_target_properties(demo_gpu_pipeline PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+        # GPU-native HDF5 write example
+        add_executable(gpu_hdf5_write examples/gpu_hdf5_write.cu)
+        set_source_files_properties(examples/gpu_hdf5_write.cu PROPERTIES LANGUAGE CUDA)
+        target_include_directories(gpu_hdf5_write PRIVATE
+            ${HDF5_VOL_INCLUDE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+        )
+        target_link_libraries(gpu_hdf5_write PRIVATE
+            gpucompress H5VLgpucompress ${HDF5_VOL_LIB} CUDA::cudart m
+        )
+        set_target_properties(gpu_hdf5_write PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+        # VOL 8MB round-trip test (mirrors test_h5z_8mb but uses GPU device pointers)
+        add_executable(test_vol_8mb tests/test_vol_8mb.cu)
+        set_source_files_properties(tests/test_vol_8mb.cu PROPERTIES LANGUAGE CUDA)
+        target_include_directories(test_vol_8mb PRIVATE
+            ${HDF5_VOL_INCLUDE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+        )
+        target_link_libraries(test_vol_8mb PRIVATE
+            gpucompress H5VLgpucompress H5Zgpucompress ${HDF5_VOL_LIB} CUDA::cudart m
+        )
+        set_target_properties(test_vol_8mb PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+        message(STATUS "HDF5 VOL connector: using ${HDF5_VOL_LIB}")
+    else()
+        message(STATUS "HDF5 VOL connector: skipped (HDF5 2.x not found at ${HDF5_VOL_LIB})")
+        message(STATUS "  Build HDF5 2.x: cmake -S /home/cc/hdf5 -B /tmp/hdf5-build ...")
+    endif()
+
     # HDF5 configuration validation test (all algos × preproc × patterns)
     add_executable(test_hdf5_configs tests/test_hdf5_configs.c)
     target_include_directories(test_hdf5_configs PRIVATE
@@ -449,6 +592,23 @@ if(HDF5_FOUND)
         ${HDF5_C_LIBRARIES}
         m
     )
+
+    # H5Z filter round-trip: GPU-generated 8 MB dataset, 4 MB chunks
+    add_executable(test_h5z_8mb tests/test_h5z_8mb.cu)
+    set_source_files_properties(tests/test_h5z_8mb.cu PROPERTIES LANGUAGE CUDA)
+    target_include_directories(test_h5z_8mb PRIVATE
+        ${HDF5_INCLUDE_DIRS}
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    target_link_libraries(test_h5z_8mb PRIVATE
+        gpucompress
+        H5Zgpucompress
+        ${HDF5_C_LIBRARIES}
+        CUDA::cudart
+        m
+    )
+    set_target_properties(test_h5z_8mb PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 endif()
 
 # ============================================================
@@ -474,10 +634,13 @@ install(TARGETS gpu_compress gpu_decompress
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 
-# Install HDF5 plugin to standard plugin directory
+# Install HDF5 plugin and VOL connector to standard plugin directory
 if(HDF5_FOUND)
     install(TARGETS H5Zgpucompress
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/hdf5/plugin
+    )
+    install(TARGETS H5VLgpucompress
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     )
 endif()
 
@@ -497,7 +660,9 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/neural_net/test_active_learning.cu")
     message(STATUS "  - test_active_learning (active learning integration test)")
 endif()
 if(HDF5_FOUND)
-    message(STATUS "  - libH5Zgpucompress.so (HDF5 filter plugin)")
+    message(STATUS "  - libH5Zgpucompress.so  (HDF5 filter plugin)")
+    message(STATUS "  - libH5VLgpucompress.so (HDF5 VOL connector)")
+    message(STATUS "  - test_vol_gpu_write    (VOL GPU write/read test)")
 endif()
 message(STATUS "")
 message(STATUS "Features:")

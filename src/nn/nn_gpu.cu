@@ -1016,6 +1016,7 @@ bool loadNNFromBinary(const char* filepath) {
         }
     }
 
+    fprintf(stderr, "[XFER H→D] NN weights load (%zu B)\n", sizeof(NNWeightsGPU));
     cudaError_t err = cudaMemcpy(d_nn_weights, &h_weights, sizeof(NNWeightsGPU),
                                   cudaMemcpyHostToDevice);
     if (err != cudaSuccess) {
@@ -1179,23 +1180,27 @@ int runNNInference(
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) return -1;
 
+    fprintf(stderr, "[XFER D→H] NN inference (old): action (%zu B)\n", sizeof(int));
     err = cudaMemcpyAsync(&h_action, d_infer_action, sizeof(int),
                            cudaMemcpyDeviceToHost, stream);
     if (err != cudaSuccess) return -1;
 
     if (out_predicted_ratio) {
+        fprintf(stderr, "[XFER D→H] NN inference (old): predicted_ratio (%zu B)\n", sizeof(float));
         err = cudaMemcpyAsync(out_predicted_ratio, d_infer_ratio, sizeof(float),
                                cudaMemcpyDeviceToHost, stream);
         if (err != cudaSuccess) return -1;
     }
 
     if (out_predicted_comp_time) {
+        fprintf(stderr, "[XFER D→H] NN inference (old): predicted_comp_time (%zu B)\n", sizeof(float));
         err = cudaMemcpyAsync(out_predicted_comp_time, d_infer_comp_time, sizeof(float),
                                cudaMemcpyDeviceToHost, stream);
         if (err != cudaSuccess) return -1;
     }
 
     if (out_top_actions) {
+        fprintf(stderr, "[XFER D→H] NN inference (old): top_actions (%zu B)\n", NN_NUM_CONFIGS * sizeof(int));
         err = cudaMemcpyAsync(out_top_actions, d_infer_top_actions,
                                NN_NUM_CONFIGS * sizeof(int),
                                cudaMemcpyDeviceToHost, stream);
@@ -1247,11 +1252,13 @@ int runNNFusedInference(
 
     // Single D→H of NNInferenceOutput (16B)
     NNInferenceOutput h_result;
+    fprintf(stderr, "[XFER D→H] NN fused inference: NNInferenceOutput (%zu B)\n", sizeof(NNInferenceOutput));
     err = cudaMemcpyAsync(&h_result, d_fused_infer_output, sizeof(NNInferenceOutput),
                            cudaMemcpyDeviceToHost, stream);
     if (err != cudaSuccess) return -1;
 
     if (out_top_actions) {
+        fprintf(stderr, "[XFER D→H] NN fused inference: top_actions (%zu B)\n", NN_NUM_CONFIGS * sizeof(int));
         err = cudaMemcpyAsync(out_top_actions, d_fused_top_actions,
                                NN_NUM_CONFIGS * sizeof(int),
                                cudaMemcpyDeviceToHost, stream);
@@ -1296,6 +1303,8 @@ int runNNSGD(
     }
 
     // H→D: copy samples (tiny: num_samples * 20B)
+    fprintf(stderr, "[XFER H→D] SGD samples (%d × %zu B = %zu B)\n",
+            num_samples, sizeof(SGDSample), (size_t)num_samples * sizeof(SGDSample));
     cudaError_t err = cudaMemcpyAsync(d_sgd_samples, samples,
                                        num_samples * sizeof(SGDSample),
                                        cudaMemcpyHostToDevice, stream);
@@ -1318,6 +1327,7 @@ int runNNSGD(
 
     // D→H: copy SGDOutput (12B)
     SGDOutput h_result;
+    fprintf(stderr, "[XFER D→H] SGD output: grad_norm + clipped + count (%zu B)\n", sizeof(SGDOutput));
     err = cudaMemcpyAsync(&h_result, d_sgd_output, sizeof(SGDOutput),
                            cudaMemcpyDeviceToHost, stream);
     if (err != cudaSuccess) return -1;
