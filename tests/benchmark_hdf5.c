@@ -47,6 +47,7 @@
 
 #define DEFAULT_CHUNK_MB   4
 #define DEFAULT_DATASET_MB 16384   /* 16 GB */
+#define DEFAULT_SWEEP_MB   128     /* small sweep dataset */
 
 #define TMP_HDF5       "/tmp/bm_hdf5_tmp.h5"
 #define DEFAULT_CSV    "tests/benchmark_hdf5_results/benchmark_hdf5_results.csv"
@@ -488,13 +489,316 @@ static void print_summary(const char *pat_name) {
 }
 
 /* ============================================================
- * Benchmark one dataset: none + static + NN
+ * Static config type
  * ============================================================ */
 
 typedef struct {
     gpucompress_algorithm_t algo;
     unsigned int            shuffle_sz;
 } static_cfg_t;
+
+/* ============================================================
+ * Sweep all 16 static configs (8 algos × 2 shuffle) on a small
+ * dataset, return the best config by compression ratio.
+ * ============================================================ */
+
+static static_cfg_t sweep_all_static(const float *data, size_t n_floats,
+                                     size_t sweep_bytes)
+{
+    static_cfg_t all_cfgs[N_ALGOS * 2];
+    int ncfg = 0;
+    for (int a = 1; a <= N_ALGOS; a++) {
+        all_cfgs[ncfg].algo = (gpucompress_algorithm_t)a;
+        all_cfgs[ncfg].shuffle_sz = 0;
+        ncfg++;
+        all_cfgs[ncfg].algo = (gpucompress_algorithm_t)a;
+        all_cfgs[ncfg].shuffle_sz = 4;
+        ncfg++;
+    }
+
+    printf("============================================================\n");
+    printf("  PHASE 1: Static Sweep (%d configs, %zu MB)\n", ncfg,
+           sweep_bytes / (1024 * 1024));
+    printf("============================================================\n\n");
+    printf("  %-12s | %4s | %8s | %10s | %10s\n",
+           "Algorithm", "Shuf", "Ratio", "Write MB/s", "Read MB/s");
+    printf("  -------------+------+----------+------------+------------\n");
+
+    double best_ratio = 0.0;
+    static_cfg_t best_cfg = { GPUCOMPRESS_ALGO_ZSTD, 4 };  /* fallback */
+
+    for (int c = 0; c < ncfg; c++) {
+        result_t r;
+        memset(&r, 0, sizeof(r));
+        if (run_test(data, n_floats, 1,
+                     all_cfgs[c].algo, all_cfgs[c].shuffle_sz, &r) == 0) {
+            const char *aname = gpucompress_algorithm_name(all_cfgs[c].algo);
+            printf("  %-12s | %4u | %8.2fx | %10.1f | %10.1f\n",
+                   aname, all_cfgs[c].shuffle_sz,
+                   r.ratio, r.write_mbps, r.read_mbps);
+            if (r.ratio > best_ratio) {
+                best_ratio = r.ratio;
+                best_cfg = all_cfgs[c];
+            }
+        } else {
+            const char *aname = gpucompress_algorithm_name(all_cfgs[c].algo);
+            printf("  %-12s | %4u | %8s | %10s | %10s\n",
+                   aname, all_cfgs[c].shuffle_sz, "FAIL", "-", "-");
+        }
+    }
+
+    printf("\n  Best: %.2fx (%s%s)\n\n", best_ratio,
+           gpucompress_algorithm_name(best_cfg.algo),
+           best_cfg.shuffle_sz ? "+shuf" : "");
+
+    return best_cfg;
+}
+
+/* ============================================================
+ * NN benchmark phase — standalone
+ * Writes entire dataset with ALGO_AUTO, captures diagnostics.
+ * ============================================================ */
+
+static void bench_nn(const char *pat_name, const float *data,
+                     size_t n_floats, const int *chunk_patterns)
+{
+    if (g_nresults >= MAX_RESULTS) return;
+
+    result_t *r;
+    remove(TMP_HDF5);
+
+    hid_t nn_file = H5Fcreate(TMP_HDF5, H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
+    if (nn_file < 0) { printf("  NN: FAILED (file create)\n"); return; }
+
+    hsize_t dims[1]       = { n_floats };
+    hsize_t chunk_dims[1] = { g_chunk_floats };
+    hid_t nn_dspace = H5Screate_simple(1, dims, NULL);
+    hid_t nn_dcpl   = H5Pcreate(H5P_DATASET_CREATE);
+    H5Pset_chunk(nn_dcpl, 1, chunk_dims);
+
+    if (H5Pset_gpucompress(nn_dcpl, GPUCOMPRESS_ALGO_AUTO, 0, 0, 0.0) < 0) {
+        H5Pclose(nn_dcpl); H5Sclose(nn_dspace); H5Fclose(nn_file);
+        remove(TMP_HDF5);
+        printf("  NN: FAILED (filter setup)\n");
+        return;
+    }
+
+    hid_t nn_dset = H5Dcreate2(nn_file, "data", H5T_NATIVE_FLOAT,
+                                 nn_dspace, H5P_DEFAULT, nn_dcpl, H5P_DEFAULT);
+    if (nn_dset < 0) {
+        H5Pclose(nn_dcpl); H5Sclose(nn_dspace); H5Fclose(nn_file);
+        remove(TMP_HDF5);
+        printf("  NN: FAILED (dataset create)\n");
+        return;
+    }
+
+    printf("\n  --- NN Adaptation (%zu x %zu MB chunks, single HDF5 file) ---\n",
+           g_n_chunks, g_chunk_bytes / (1024 * 1024));
+    printf("  %5s | %-14s | %-14s | %-14s | %3s %3s\n",
+           "Chunk", "Pattern", "NN Prediction", "Final Action", "Exp", "SGD");
+    printf("  ------+----------------+----------------+----------------+--------\n");
+
+    gpucompress_reset_chunk_history();
+    double t0 = time_ms();
+    herr_t hs = H5Dwrite(nn_dset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL,
+                          H5P_DEFAULT, data);
+
+    if (hs < 0) {
+        fprintf(stderr, "  FAILED: H5Dwrite\n");
+        H5Dclose(nn_dset); H5Pclose(nn_dcpl);
+        H5Sclose(nn_dspace); H5Fclose(nn_file);
+        remove(TMP_HDF5);
+        return;
+    }
+
+    H5Dclose(nn_dset);
+    H5Pclose(nn_dcpl);
+    H5Sclose(nn_dspace);
+    H5Fclose(nn_file);
+    double t1 = time_ms();
+    double total_write_ms = t1 - t0;
+
+    /* Retrieve per-chunk diagnostics from history buffer */
+    int n_hist = gpucompress_get_chunk_history_count();
+    chunk_diag_t *diags = (chunk_diag_t *)calloc(g_n_chunks, sizeof(chunk_diag_t));
+    int *win_explored = (int *)calloc(g_n_windows, sizeof(int));
+    int *win_sgd      = (int *)calloc(g_n_windows, sizeof(int));
+    int *win_changed  = (int *)calloc(g_n_windows, sizeof(int));
+    if (!diags || !win_explored || !win_sgd || !win_changed) {
+        fprintf(stderr, "  FAILED: alloc diags\n");
+        free(diags); free(win_explored); free(win_sgd); free(win_changed);
+        remove(TMP_HDF5);
+        return;
+    }
+
+    int total_explored = 0, total_sgd = 0, total_changed = 0;
+    int last_final_action = -1;
+
+    for (size_t i = 0; i < g_n_chunks; i++) {
+        chunk_diag_t *d = &diags[i];
+        gpucompress_chunk_diag_t hd;
+        if ((int)i < n_hist && gpucompress_get_chunk_diag((int)i, &hd) == 0) {
+            d->original_action = hd.nn_original_action;
+            d->final_action    = hd.nn_action;
+            d->explored        = hd.exploration_triggered;
+            d->sgd_fired       = hd.sgd_fired;
+        } else {
+            d->original_action = -1;
+            d->final_action    = -1;
+        }
+        d->write_ms = 0.0;
+
+        size_t w = i / WINDOW_SIZE;
+        if (w < g_n_windows) {
+            win_explored[w] += d->explored;
+            win_sgd[w]      += d->sgd_fired;
+            if (d->explored && d->original_action != d->final_action)
+                win_changed[w]++;
+        }
+
+        total_explored += d->explored;
+        total_sgd      += d->sgd_fired;
+        if (d->explored && d->original_action != d->final_action)
+            total_changed++;
+        last_final_action = d->final_action;
+
+        if (i < 32 || d->explored) {
+            char orig[32], final[32];
+            action_label(d->original_action, orig, sizeof(orig));
+            action_label(d->final_action, final, sizeof(final));
+            int chg = d->explored && d->original_action != d->final_action;
+            printf("  %5zu | %-14s | %-14s | %-14s | %s %s%s\n",
+                   i + 1,
+                   fill_pattern_names[chunk_patterns[i]],
+                   orig,
+                   chg ? final : "-",
+                   d->explored ? " E " : "   ",
+                   d->sgd_fired ? " S " : "   ",
+                   i >= 32 ? "  *" : "");
+        }
+    }
+
+    /* Reopen: get storage size, per-chunk sizes, and timed read-back */
+    size_t nn_orig_bytes = n_floats * sizeof(float);
+    size_t nn_storage = 0;
+    double read_ms = 0.0;
+    double *chunk_ratios = (double *)calloc(g_n_chunks, sizeof(double));
+
+    nn_file = H5Fopen(TMP_HDF5, H5F_ACC_RDONLY, H5P_DEFAULT);
+    if (nn_file >= 0) {
+        nn_dset = H5Dopen2(nn_file, "data", H5P_DEFAULT);
+        if (nn_dset >= 0) {
+            nn_storage = (size_t)H5Dget_storage_size(nn_dset);
+
+            hid_t cspace = H5Dget_space(nn_dset);
+            for (size_t i = 0; i < g_n_chunks; i++) {
+                hsize_t coff; unsigned fmask; haddr_t caddr; hsize_t csz = 0;
+                if (H5Dget_chunk_info(nn_dset, cspace, (hsize_t)i,
+                                      &coff, &fmask, &caddr, &csz) >= 0 && csz > 0) {
+                    chunk_ratios[i] = (double)g_chunk_bytes / (double)csz;
+                }
+            }
+            H5Sclose(cspace);
+
+            float *rbuf = (float *)malloc(nn_orig_bytes);
+            if (rbuf) {
+                double t2 = time_ms();
+                H5Dread(nn_dset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL,
+                        H5P_DEFAULT, rbuf);
+                double t3 = time_ms();
+                read_ms = t3 - t2;
+                free(rbuf);
+            }
+            H5Dclose(nn_dset);
+        }
+        H5Fclose(nn_file);
+    }
+    remove(TMP_HDF5);
+
+    double nn_ratio = (nn_storage > 0)
+                    ? (double)nn_orig_bytes / (double)nn_storage : 0.0;
+
+    /* Write per-chunk CSV */
+    if (g_chunk_csv) {
+        for (size_t i = 0; i < g_n_chunks; i++) {
+            chunk_diag_t *d = &diags[i];
+            char ol[32], fl[32];
+            action_label(d->original_action, ol, sizeof(ol));
+            action_label(d->final_action, fl, sizeof(fl));
+            fprintf(g_chunk_csv, "%s,%zu,%s,%d,%d,%d,%d,%s,%s,%.4f,%.2f\n",
+                    pat_name, i,
+                    fill_pattern_names[chunk_patterns[i]],
+                    d->explored, d->sgd_fired,
+                    d->original_action, d->final_action,
+                    ol, fl, chunk_ratios[i], d->write_ms);
+        }
+    }
+
+    /* Windowed summary */
+    printf("\n  --- Windowed summary (%d-chunk windows) ---\n\n", WINDOW_SIZE);
+    printf("  %-11s | %4s | %4s | %4s | %8s\n",
+           "Chunks", "Expl", "SGD", "Chgd", "Expl%");
+    printf("  -----------+------+------+------+----------\n");
+
+    for (size_t w = 0; w < g_n_windows; w++) {
+        printf("  %3zu - %3zu  | %2d/%d | %2d/%d | %2d/%d | %6.1f%%\n",
+               w * WINDOW_SIZE + 1, (w + 1) * WINDOW_SIZE,
+               win_explored[w], WINDOW_SIZE,
+               win_sgd[w], WINDOW_SIZE,
+               win_changed[w], WINDOW_SIZE,
+               100.0 * win_explored[w] / WINDOW_SIZE);
+    }
+
+    printf("  -----------+------+------+------+----------\n");
+    printf("  TOTAL      | %3d  | %3d  | %3d  | %6.1f%%\n",
+           total_explored, total_sgd, total_changed,
+           100.0 * total_explored / g_n_chunks);
+    printf("  out of %zu chunks\n", g_n_chunks);
+
+    if (total_explored == 0)
+        printf("\n  Model predicted accurately from the start.\n");
+    else if (g_n_windows > 0 && win_explored[g_n_windows - 1] == 0)
+        printf("\n  Model adapted: exploration dropped to 0%% by the end.\n");
+    else
+        printf("\n  Model still exploring at the end — may need more chunks or tuning.\n");
+
+    /* Record aggregate NN result */
+    r = &g_results[g_nresults];
+    snprintf(r->pattern, sizeof(r->pattern), "%s", pat_name);
+    snprintf(r->mode,    sizeof(r->mode),    "nn");
+    action_label(last_final_action, r->algorithm, sizeof(r->algorithm));
+    double total_mb       = (double)nn_orig_bytes / (1024.0 * 1024.0);
+    r->original_bytes     = nn_orig_bytes;
+    r->file_bytes         = nn_storage;
+    r->ratio              = nn_ratio;
+    r->write_ms           = total_write_ms;
+    r->read_ms            = read_ms;
+    r->write_mbps         = (total_write_ms > 0) ? total_mb / (total_write_ms / 1000.0) : 0.0;
+    r->read_mbps          = (read_ms > 0)        ? total_mb / (read_ms / 1000.0) : 0.0;
+    r->shuffle            = 0;
+    r->nn_original_action = -1;
+    r->nn_final_action    = last_final_action;
+    r->explored           = total_explored;
+    r->sgd_fired          = total_sgd;
+    g_nresults++;
+
+    printf("\n  NN: %.2fx (%s), %zu -> %zu bytes\n",
+           nn_ratio, r->algorithm, nn_orig_bytes, nn_storage);
+    printf("  Write: %.1f ms (%.1f MB/s), Read: %.1f ms (%.1f MB/s)\n",
+           total_write_ms, r->write_mbps, read_ms, r->read_mbps);
+    printf("  Explored %d/%zu, SGD %d/%zu, Changed %d/%zu\n",
+           total_explored, g_n_chunks, total_sgd, g_n_chunks, total_changed, g_n_chunks);
+
+    free(diags);
+    free(win_explored);
+    free(win_sgd);
+    free(win_changed);
+    free(chunk_ratios);
+}
+
+/* ============================================================
+ * Benchmark one dataset: none + static + NN
+ * ============================================================ */
 
 static void bench_dataset(const char *pat_name, const float *data,
                           size_t n_floats,
@@ -550,246 +854,8 @@ static void bench_dataset(const char *pat_name, const float *data,
     }
     if (fail > 0) printf("  Static: %d configs failed\n", fail);
 
-    /* 3. NN lossless — single HDF5 file, bulk H5Dwrite + history buffer */
-    if (g_nresults >= MAX_RESULTS) return;
-    {
-        remove(TMP_HDF5);
-
-        hid_t nn_file = H5Fcreate(TMP_HDF5, H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
-        if (nn_file < 0) { printf("  NN: FAILED (file create)\n"); return; }
-
-        hsize_t dims[1]       = { n_floats };
-        hsize_t chunk_dims[1] = { g_chunk_floats };
-        hid_t nn_dspace = H5Screate_simple(1, dims, NULL);
-        hid_t nn_dcpl   = H5Pcreate(H5P_DATASET_CREATE);
-        H5Pset_chunk(nn_dcpl, 1, chunk_dims);
-
-        if (H5Pset_gpucompress(nn_dcpl, GPUCOMPRESS_ALGO_AUTO, 0, 0, 0.0) < 0) {
-            H5Pclose(nn_dcpl); H5Sclose(nn_dspace); H5Fclose(nn_file);
-            remove(TMP_HDF5);
-            printf("  NN: FAILED (filter setup)\n");
-            return;
-        }
-
-        hid_t nn_dset = H5Dcreate2(nn_file, "data", H5T_NATIVE_FLOAT,
-                                     nn_dspace, H5P_DEFAULT, nn_dcpl, H5P_DEFAULT);
-        if (nn_dset < 0) {
-            H5Pclose(nn_dcpl); H5Sclose(nn_dspace); H5Fclose(nn_file);
-            remove(TMP_HDF5);
-            printf("  NN: FAILED (dataset create)\n");
-            return;
-        }
-
-        printf("\n  --- NN Adaptation (%zu x %zu MB chunks, single HDF5 file) ---\n",
-               g_n_chunks, g_chunk_bytes / (1024 * 1024));
-        printf("  %5s | %-14s | %-14s | %-14s | %3s %3s\n",
-               "Chunk", "Pattern", "NN Prediction", "Final Action", "Exp", "SGD");
-        printf("  ------+----------------+----------------+----------------+--------\n");
-
-        /* Single H5Dwrite — history buffer captures per-chunk diagnostics */
-        gpucompress_reset_chunk_history();
-        double t0 = time_ms();
-        herr_t hs = H5Dwrite(nn_dset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL,
-                              H5P_DEFAULT, data);
-
-        if (hs < 0) {
-            fprintf(stderr, "  FAILED: H5Dwrite\n");
-            H5Dclose(nn_dset);
-            H5Pclose(nn_dcpl);
-            H5Sclose(nn_dspace);
-            H5Fclose(nn_file);
-            remove(TMP_HDF5);
-            return;
-        }
-
-        /* Close flushes all compressed chunks — include in write time */
-        H5Dclose(nn_dset);
-        H5Pclose(nn_dcpl);
-        H5Sclose(nn_dspace);
-        H5Fclose(nn_file);
-        double t1 = time_ms();
-        double total_write_ms = t1 - t0;
-
-        /* Retrieve per-chunk diagnostics from history buffer */
-        int n_hist = gpucompress_get_chunk_history_count();
-        chunk_diag_t *diags = (chunk_diag_t *)calloc(g_n_chunks, sizeof(chunk_diag_t));
-        int *win_explored = (int *)calloc(g_n_windows, sizeof(int));
-        int *win_sgd      = (int *)calloc(g_n_windows, sizeof(int));
-        int *win_changed  = (int *)calloc(g_n_windows, sizeof(int));
-        if (!diags || !win_explored || !win_sgd || !win_changed) {
-            fprintf(stderr, "  FAILED: alloc diags\n");
-            free(diags); free(win_explored); free(win_sgd); free(win_changed);
-            remove(TMP_HDF5);
-            return;
-        }
-
-        int total_explored = 0, total_sgd = 0, total_changed = 0;
-        int last_final_action = -1;
-
-        for (size_t i = 0; i < g_n_chunks; i++) {
-            chunk_diag_t *d = &diags[i];
-            gpucompress_chunk_diag_t hd;
-            if ((int)i < n_hist && gpucompress_get_chunk_diag((int)i, &hd) == 0) {
-                d->original_action = hd.nn_original_action;
-                d->final_action    = hd.nn_action;
-                d->explored        = hd.exploration_triggered;
-                d->sgd_fired       = hd.sgd_fired;
-            } else {
-                d->original_action = -1;
-                d->final_action    = -1;
-            }
-            d->write_ms = 0.0; /* single bulk write; no per-chunk timing */
-
-            size_t w = i / WINDOW_SIZE;
-            if (w < g_n_windows) {
-                win_explored[w] += d->explored;
-                win_sgd[w]      += d->sgd_fired;
-                if (d->explored && d->original_action != d->final_action)
-                    win_changed[w]++;
-            }
-
-            total_explored += d->explored;
-            total_sgd      += d->sgd_fired;
-            if (d->explored && d->original_action != d->final_action)
-                total_changed++;
-            last_final_action = d->final_action;
-
-            /* Print first 32 chunks + any explored after that */
-            if (i < 32 || d->explored) {
-                char orig[32], final[32];
-                action_label(d->original_action, orig, sizeof(orig));
-                action_label(d->final_action, final, sizeof(final));
-                int chg = d->explored && d->original_action != d->final_action;
-                printf("  %5zu | %-14s | %-14s | %-14s | %s %s%s\n",
-                       i + 1,
-                       fill_pattern_names[chunk_patterns[i]],
-                       orig,
-                       chg ? final : "-",
-                       d->explored ? " E " : "   ",
-                       d->sgd_fired ? " S " : "   ",
-                       i >= 32 ? "  *" : "");
-            }
-        }
-
-        /* Reopen: get storage size, per-chunk sizes, and timed read-back */
-        size_t nn_orig_bytes = n_floats * sizeof(float);
-        size_t nn_storage = 0;
-        double read_ms = 0.0;
-        double *chunk_ratios = (double *)calloc(g_n_chunks, sizeof(double));
-
-        nn_file = H5Fopen(TMP_HDF5, H5F_ACC_RDONLY, H5P_DEFAULT);
-        if (nn_file >= 0) {
-            nn_dset = H5Dopen2(nn_file, "data", H5P_DEFAULT);
-            if (nn_dset >= 0) {
-                nn_storage = (size_t)H5Dget_storage_size(nn_dset);
-
-                /* Per-chunk compressed sizes via H5Dget_chunk_info */
-                hid_t cspace = H5Dget_space(nn_dset);
-                for (size_t i = 0; i < g_n_chunks; i++) {
-                    hsize_t coff; unsigned fmask; haddr_t caddr; hsize_t csz = 0;
-                    if (H5Dget_chunk_info(nn_dset, cspace, (hsize_t)i,
-                                          &coff, &fmask, &caddr, &csz) >= 0 && csz > 0) {
-                        chunk_ratios[i] = (double)g_chunk_bytes / (double)csz;
-                    }
-                }
-                H5Sclose(cspace);
-
-                /* Timed read-back */
-                float *rbuf = (float *)malloc(nn_orig_bytes);
-                if (rbuf) {
-                    double t2 = time_ms();
-                    H5Dread(nn_dset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL,
-                            H5P_DEFAULT, rbuf);
-                    double t3 = time_ms();
-                    read_ms = t3 - t2;
-                    free(rbuf);
-                }
-                H5Dclose(nn_dset);
-            }
-            H5Fclose(nn_file);
-        }
-        remove(TMP_HDF5);
-
-        double nn_ratio = (nn_storage > 0)
-                        ? (double)nn_orig_bytes / (double)nn_storage : 0.0;
-
-        /* Write per-chunk CSV (now with real ratios and chunk_pattern) */
-        if (g_chunk_csv) {
-            for (size_t i = 0; i < g_n_chunks; i++) {
-                chunk_diag_t *d = &diags[i];
-                char ol[32], fl[32];
-                action_label(d->original_action, ol, sizeof(ol));
-                action_label(d->final_action, fl, sizeof(fl));
-                fprintf(g_chunk_csv, "%s,%zu,%s,%d,%d,%d,%d,%s,%s,%.4f,%.2f\n",
-                        pat_name, i,
-                        fill_pattern_names[chunk_patterns[i]],
-                        d->explored, d->sgd_fired,
-                        d->original_action, d->final_action,
-                        ol, fl, chunk_ratios[i], d->write_ms);
-            }
-        }
-
-        /* Windowed summary */
-        printf("\n  --- Windowed summary (%d-chunk windows) ---\n\n", WINDOW_SIZE);
-        printf("  %-11s | %4s | %4s | %4s | %8s\n",
-               "Chunks", "Expl", "SGD", "Chgd", "Expl%");
-        printf("  -----------+------+------+------+----------\n");
-
-        for (size_t w = 0; w < g_n_windows; w++) {
-            printf("  %3zu - %3zu  | %2d/%d | %2d/%d | %2d/%d | %6.1f%%\n",
-                   w * WINDOW_SIZE + 1, (w + 1) * WINDOW_SIZE,
-                   win_explored[w], WINDOW_SIZE,
-                   win_sgd[w], WINDOW_SIZE,
-                   win_changed[w], WINDOW_SIZE,
-                   100.0 * win_explored[w] / WINDOW_SIZE);
-        }
-
-        printf("  -----------+------+------+------+----------\n");
-        printf("  TOTAL      | %3d  | %3d  | %3d  | %6.1f%%\n",
-               total_explored, total_sgd, total_changed,
-               100.0 * total_explored / g_n_chunks);
-        printf("  out of %zu chunks\n", g_n_chunks);
-
-        if (total_explored == 0)
-            printf("\n  Model predicted accurately from the start.\n");
-        else if (g_n_windows > 0 && win_explored[g_n_windows - 1] == 0)
-            printf("\n  Model adapted: exploration dropped to 0%% by the end.\n");
-        else
-            printf("\n  Model still exploring at the end — may need more chunks or tuning.\n");
-
-        /* Record aggregate NN result */
-        r = &g_results[g_nresults];
-        snprintf(r->pattern, sizeof(r->pattern), "%s", pat_name);
-        snprintf(r->mode,    sizeof(r->mode),    "nn");
-        action_label(last_final_action, r->algorithm, sizeof(r->algorithm));
-        double total_mb       = (double)nn_orig_bytes / (1024.0 * 1024.0);
-        r->original_bytes     = nn_orig_bytes;
-        r->file_bytes         = nn_storage;
-        r->ratio              = nn_ratio;
-        r->write_ms           = total_write_ms;
-        r->read_ms            = read_ms;
-        r->write_mbps         = (total_write_ms > 0) ? total_mb / (total_write_ms / 1000.0) : 0.0;
-        r->read_mbps          = (read_ms > 0)        ? total_mb / (read_ms / 1000.0) : 0.0;
-        r->shuffle            = 0;
-        r->nn_original_action = -1;
-        r->nn_final_action    = last_final_action;
-        r->explored           = total_explored;
-        r->sgd_fired          = total_sgd;
-        g_nresults++;
-
-        printf("\n  NN: %.2fx (%s), %zu -> %zu bytes\n",
-               nn_ratio, r->algorithm, nn_orig_bytes, nn_storage);
-        printf("  Write: %.1f ms (%.1f MB/s), Read: %.1f ms (%.1f MB/s)\n",
-               total_write_ms, r->write_mbps, read_ms, r->read_mbps);
-        printf("  Explored %d/%zu, SGD %d/%zu, Changed %d/%zu\n",
-               total_explored, g_n_chunks, total_sgd, g_n_chunks, total_changed, g_n_chunks);
-
-        free(diags);
-        free(win_explored);
-        free(win_sgd);
-        free(win_changed);
-        free(chunk_ratios);
-    }
+    /* 3. NN lossless */
+    bench_nn(pat_name, data, n_floats, chunk_patterns);
 }
 
 /* ============================================================
@@ -803,6 +869,10 @@ int main(int argc, char **argv) {
     int         fill_mode      = MODE_CONTIGUOUS; /* default: contiguous */
     int         dataset_mb     = DEFAULT_DATASET_MB;
     int         chunk_mb       = DEFAULT_CHUNK_MB;
+    int         sweep_mode     = 0;
+    int         sweep_mb       = DEFAULT_SWEEP_MB;
+    gpucompress_algorithm_t static_algo = GPUCOMPRESS_ALGO_ZSTD;
+    unsigned int static_shuffle = 4;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--output") == 0 && i + 1 < argc)
@@ -833,15 +903,54 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "ERROR: --chunk-mb must be >= 1\n");
                 return 1;
             }
+        } else if (strcmp(argv[i], "--static-algo") == 0 && i + 1 < argc) {
+            i++;
+            if (strcmp(argv[i], "lz4") == 0)
+                static_algo = GPUCOMPRESS_ALGO_LZ4;
+            else if (strcmp(argv[i], "snappy") == 0)
+                static_algo = GPUCOMPRESS_ALGO_SNAPPY;
+            else if (strcmp(argv[i], "deflate") == 0)
+                static_algo = GPUCOMPRESS_ALGO_DEFLATE;
+            else if (strcmp(argv[i], "gdeflate") == 0)
+                static_algo = GPUCOMPRESS_ALGO_GDEFLATE;
+            else if (strcmp(argv[i], "zstd") == 0)
+                static_algo = GPUCOMPRESS_ALGO_ZSTD;
+            else if (strcmp(argv[i], "ans") == 0)
+                static_algo = GPUCOMPRESS_ALGO_ANS;
+            else if (strcmp(argv[i], "cascaded") == 0)
+                static_algo = GPUCOMPRESS_ALGO_CASCADED;
+            else if (strcmp(argv[i], "bitcomp") == 0)
+                static_algo = GPUCOMPRESS_ALGO_BITCOMP;
+            else {
+                fprintf(stderr, "ERROR: unknown algo '%s' "
+                        "(use lz4, snappy, deflate, gdeflate, zstd, ans, cascaded, bitcomp)\n",
+                        argv[i]);
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--sweep") == 0) {
+            sweep_mode = 1;
+        } else if (strcmp(argv[i], "--sweep-mb") == 0 && i + 1 < argc) {
+            sweep_mb = atoi(argv[++i]);
+            if (sweep_mb < 1) {
+                fprintf(stderr, "ERROR: --sweep-mb must be >= 1\n");
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--no-shuffle") == 0) {
+            static_shuffle = 0;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("Usage: %s [weights.nnwt] [options]\n"
                    "  --mode uniform|contiguous|cycling  Fill mode (default: contiguous)\n"
                    "  --dataset-mb N                     Dataset size in MB (default: %d)\n"
                    "  --chunk-mb N                       Chunk size in MB (default: %d)\n"
+                   "  --sweep                            3-phase: sweep small -> best static -> NN\n"
+                   "  --sweep-mb N                       Sweep dataset size in MB (default: %d)\n"
+                   "  --static-algo ALGO                 Static baseline algorithm (default: zstd)\n"
+                   "       ALGO: lz4, snappy, deflate, gdeflate, zstd, ans, cascaded, bitcomp\n"
+                   "  --no-shuffle                       Disable shuffle for static baseline\n"
                    "  --output FILE                      Aggregate CSV path\n"
                    "  --chunk-csv FILE                   Per-chunk CSV path\n"
                    "  Or set GPUCOMPRESS_WEIGHTS env var\n",
-                   argv[0], DEFAULT_DATASET_MB, DEFAULT_CHUNK_MB);
+                   argv[0], DEFAULT_DATASET_MB, DEFAULT_CHUNK_MB, DEFAULT_SWEEP_MB);
             return 0;
         } else if (!weights_path)
             weights_path = argv[i];
@@ -886,6 +995,11 @@ int main(int argc, char **argv) {
 
     printf("=== HDF5 Lossless Benchmark: No Compression vs Static vs NN ===\n\n");
     printf("Weights:  %s\n", weights_path);
+    if (sweep_mode)
+        printf("Sweep:    %d MB (finding best static config)\n", sweep_mb);
+    else
+        printf("Static:   %s%s\n", gpucompress_algorithm_name(static_algo),
+               static_shuffle ? "+shuffle" : "");
     printf("Mode:     %s\n", mode_str);
     printf("CSV:      %s\n", csv_path);
     printf("ChunkCSV: %s\n", chunk_csv_path);
@@ -923,7 +1037,7 @@ int main(int argc, char **argv) {
     }
 
     gpucompress_enable_online_learning();
-    gpucompress_set_reinforcement(1, 0.3f, 0.2f, 0.0f);
+    gpucompress_set_reinforcement(1, 0.4f, 0.2f, 0.0f);
 
     /* Open per-chunk CSV */
     ensure_parent_dir(chunk_csv_path);
@@ -936,51 +1050,189 @@ int main(int argc, char **argv) {
         fprintf(stderr, "WARNING: cannot write chunk CSV %s\n", chunk_csv_path);
     }
 
-    /* Allocate buffer and fill chunk-by-chunk */
-    printf("Allocating %zu MB buffer...\n", g_dataset_bytes / (1024 * 1024));
-    float *data = (float *)malloc(g_dataset_bytes);
-    if (!data) { perror("malloc"); return 1; }
+    if (sweep_mode) {
+        /* ============================================================
+         * 3-Phase Sweep Workflow
+         * ============================================================ */
 
-    int *chunk_patterns = (int *)malloc(g_n_chunks * sizeof(int));
-    if (!chunk_patterns) { perror("malloc"); free(data); return 1; }
-
-    printf("Filling %zu chunks (%s mode)...\n", g_n_chunks, mode_str);
-    double fill_t0 = time_ms();
-    size_t chunks_per_pat = g_n_chunks / N_FILL_PATTERNS;
-    if (chunks_per_pat == 0) chunks_per_pat = 1;
-    for (size_t c = 0; c < g_n_chunks; c++) {
-        int pat_id;
-        switch (fill_mode) {
-        case MODE_CONTIGUOUS:
-            pat_id = (int)(c / chunks_per_pat);
-            if (pat_id >= N_FILL_PATTERNS) pat_id = N_FILL_PATTERNS - 1;
-            break;
-        case MODE_CYCLING:
-            pat_id = (int)(c % N_FILL_PATTERNS);
-            break;
-        default: /* MODE_UNIFORM */
-            pat_id = UNIFORM_PATTERN;
-            break;
+        /* --- Phase 1: Small sweep to find best static config --- */
+        size_t sweep_floats = (size_t)sweep_mb * 1024 * 1024 / sizeof(float);
+        size_t sweep_bytes  = sweep_floats * sizeof(float);
+        size_t sweep_chunks = sweep_floats / g_chunk_floats;
+        if (sweep_chunks == 0) {
+            fprintf(stderr, "ERROR: --sweep-mb (%d) too small for chunk size (%d MB)\n",
+                    sweep_mb, chunk_mb);
+            gpucompress_cleanup();
+            return 1;
         }
-        chunk_patterns[c] = pat_id;
-        fill_chunk(data + c * g_chunk_floats, pat_id, (int)c);
+        /* Round to whole chunks */
+        sweep_floats = sweep_chunks * g_chunk_floats;
+        sweep_bytes  = sweep_floats * sizeof(float);
+
+        printf("Phase 1: Allocating %zu MB sweep buffer...\n",
+               sweep_bytes / (1024 * 1024));
+        float *sweep_data = (float *)malloc(sweep_bytes);
+        if (!sweep_data) { perror("malloc sweep"); gpucompress_cleanup(); return 1; }
+
+        printf("Filling %zu sweep chunks (%s mode)...\n", sweep_chunks, mode_str);
+        double fill_t0 = time_ms();
+        size_t chunks_per_pat = sweep_chunks / N_FILL_PATTERNS;
+        if (chunks_per_pat == 0) chunks_per_pat = 1;
+        for (size_t c = 0; c < sweep_chunks; c++) {
+            int pat_id;
+            switch (fill_mode) {
+            case MODE_CONTIGUOUS:
+                pat_id = (int)(c / chunks_per_pat);
+                if (pat_id >= N_FILL_PATTERNS) pat_id = N_FILL_PATTERNS - 1;
+                break;
+            case MODE_CYCLING:
+                pat_id = (int)(c % N_FILL_PATTERNS);
+                break;
+            default:
+                pat_id = UNIFORM_PATTERN;
+                break;
+            }
+            fill_chunk(sweep_data + c * g_chunk_floats, pat_id, (int)c);
+        }
+        double fill_t1 = time_ms();
+        printf("Sweep fill complete: %.1f ms\n\n", fill_t1 - fill_t0);
+
+        static_cfg_t best_cfg = sweep_all_static(sweep_data, sweep_floats, sweep_bytes);
+        free(sweep_data);
+
+        /* --- Phase 2: Full-scale static benchmark (no-compress + best) --- */
+        printf("============================================================\n");
+        printf("  PHASE 2: Full Static (%d MB, %s%s)\n",
+               dataset_mb, gpucompress_algorithm_name(best_cfg.algo),
+               best_cfg.shuffle_sz ? "+shuf" : "");
+        printf("============================================================\n\n");
+
+        printf("Allocating %zu MB full buffer...\n", g_dataset_bytes / (1024 * 1024));
+        float *data = (float *)malloc(g_dataset_bytes);
+        if (!data) { perror("malloc full"); gpucompress_cleanup(); return 1; }
+
+        int *chunk_patterns = (int *)malloc(g_n_chunks * sizeof(int));
+        if (!chunk_patterns) { perror("malloc"); free(data); gpucompress_cleanup(); return 1; }
+
+        printf("Filling %zu chunks (%s mode)...\n", g_n_chunks, mode_str);
+        fill_t0 = time_ms();
+        chunks_per_pat = g_n_chunks / N_FILL_PATTERNS;
+        if (chunks_per_pat == 0) chunks_per_pat = 1;
+        for (size_t c = 0; c < g_n_chunks; c++) {
+            int pat_id;
+            switch (fill_mode) {
+            case MODE_CONTIGUOUS:
+                pat_id = (int)(c / chunks_per_pat);
+                if (pat_id >= N_FILL_PATTERNS) pat_id = N_FILL_PATTERNS - 1;
+                break;
+            case MODE_CYCLING:
+                pat_id = (int)(c % N_FILL_PATTERNS);
+                break;
+            default:
+                pat_id = UNIFORM_PATTERN;
+                break;
+            }
+            chunk_patterns[c] = pat_id;
+            fill_chunk(data + c * g_chunk_floats, pat_id, (int)c);
+        }
+        fill_t1 = time_ms();
+        printf("Fill complete: %.1f ms\n\n", fill_t1 - fill_t0);
+
+        /* No compression baseline */
+        result_t *r;
+        if (g_nresults < MAX_RESULTS) {
+            r = &g_results[g_nresults];
+            if (run_test(data, g_dataset_floats, 0, 0, 0, r) == 0) {
+                snprintf(r->pattern,   sizeof(r->pattern),   "%s", pat_name);
+                snprintf(r->mode,      sizeof(r->mode),      "none");
+                snprintf(r->algorithm, sizeof(r->algorithm), "none");
+                printf("  No compression: %.2fx, Write: %.1f ms (%.1f MB/s), Read: %.1f ms (%.1f MB/s)\n",
+                       r->ratio, r->write_ms, r->write_mbps, r->read_ms, r->read_mbps);
+                g_nresults++;
+            } else {
+                printf("  No compression: FAILED\n");
+            }
+        }
+
+        /* Best static config from sweep */
+        if (g_nresults < MAX_RESULTS) {
+            r = &g_results[g_nresults];
+            if (run_test(data, g_dataset_floats, 1,
+                         best_cfg.algo, best_cfg.shuffle_sz, r) == 0) {
+                snprintf(r->pattern,   sizeof(r->pattern),   "%s", pat_name);
+                snprintf(r->mode,      sizeof(r->mode),      "static");
+                snprintf(r->algorithm, sizeof(r->algorithm), "%s",
+                         gpucompress_algorithm_name(best_cfg.algo));
+                printf("  Static (%s%s): %.2fx, Write: %.1f ms (%.1f MB/s), Read: %.1f ms (%.1f MB/s)\n",
+                       r->algorithm, r->shuffle ? "+shuf" : "",
+                       r->ratio, r->write_ms, r->write_mbps, r->read_ms, r->read_mbps);
+                g_nresults++;
+            } else {
+                printf("  Static (%s%s): FAILED\n",
+                       gpucompress_algorithm_name(best_cfg.algo),
+                       best_cfg.shuffle_sz ? "+shuf" : "");
+            }
+        }
+
+        /* --- Phase 3: Full-scale NN benchmark --- */
+        printf("\n============================================================\n");
+        printf("  PHASE 3: Full NN (%d MB, ALGO_AUTO)\n", dataset_mb);
+        printf("============================================================\n");
+
+        bench_nn(pat_name, data, g_dataset_floats, chunk_patterns);
+
+        free(data);
+        free(chunk_patterns);
+
+    } else {
+        /* ============================================================
+         * Original single-config flow (no sweep)
+         * ============================================================ */
+
+        printf("Allocating %zu MB buffer...\n", g_dataset_bytes / (1024 * 1024));
+        float *data = (float *)malloc(g_dataset_bytes);
+        if (!data) { perror("malloc"); gpucompress_cleanup(); return 1; }
+
+        int *chunk_patterns = (int *)malloc(g_n_chunks * sizeof(int));
+        if (!chunk_patterns) { perror("malloc"); free(data); gpucompress_cleanup(); return 1; }
+
+        printf("Filling %zu chunks (%s mode)...\n", g_n_chunks, mode_str);
+        double fill_t0 = time_ms();
+        size_t chunks_per_pat = g_n_chunks / N_FILL_PATTERNS;
+        if (chunks_per_pat == 0) chunks_per_pat = 1;
+        for (size_t c = 0; c < g_n_chunks; c++) {
+            int pat_id;
+            switch (fill_mode) {
+            case MODE_CONTIGUOUS:
+                pat_id = (int)(c / chunks_per_pat);
+                if (pat_id >= N_FILL_PATTERNS) pat_id = N_FILL_PATTERNS - 1;
+                break;
+            case MODE_CYCLING:
+                pat_id = (int)(c % N_FILL_PATTERNS);
+                break;
+            default:
+                pat_id = UNIFORM_PATTERN;
+                break;
+            }
+            chunk_patterns[c] = pat_id;
+            fill_chunk(data + c * g_chunk_floats, pat_id, (int)c);
+        }
+        double fill_t1 = time_ms();
+        printf("Fill complete: %.1f ms\n\n", fill_t1 - fill_t0);
+
+        static_cfg_t cfgs[1];
+        cfgs[0].algo       = static_algo;
+        cfgs[0].shuffle_sz = static_shuffle;
+        int ncfg = 1;
+
+        printf("Dataset: %s (%zu MB, %zu x %zu MB chunks)\n",
+               pat_name, g_dataset_bytes / (1024 * 1024),
+               g_n_chunks, g_chunk_bytes / (1024 * 1024));
+
+        bench_dataset(pat_name, data, g_dataset_floats, cfgs, ncfg, chunk_patterns);
+        free(data);
+        free(chunk_patterns);
     }
-    double fill_t1 = time_ms();
-    printf("Fill complete: %.1f ms\n\n", fill_t1 - fill_t0);
-
-    /* Run benchmark — static baseline: zstd+shuffle (best from sweep) */
-    static_cfg_t cfgs[1];
-    cfgs[0].algo       = GPUCOMPRESS_ALGO_ZSTD;
-    cfgs[0].shuffle_sz = 4;
-    int ncfg = 1;
-
-    printf("Dataset: %s (%zu MB, %zu x %zu MB chunks)\n",
-           pat_name, g_dataset_bytes / (1024 * 1024),
-           g_n_chunks, g_chunk_bytes / (1024 * 1024));
-
-    bench_dataset(pat_name, data, g_dataset_floats, cfgs, ncfg, chunk_patterns);
-    free(data);
-    free(chunk_patterns);
 
     /* Output */
     write_csv(csv_path);

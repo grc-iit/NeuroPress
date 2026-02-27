@@ -139,33 +139,33 @@ if(HDF5_FOUND)
     # Define for plugin exports
     target_compile_definitions(H5Zgpucompress PRIVATE GPUCOMPRESS_BUILD_HDF5_PLUGIN)
 
-    # HDF5 filter integration test
-    add_executable(test_hdf5_filter tests/test_hdf5_filter.c)
-    target_include_directories(test_hdf5_filter PRIVATE
-        ${HDF5_INCLUDE_DIRS}
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-    )
-    target_link_libraries(test_hdf5_filter PRIVATE
-        gpucompress
-        H5Zgpucompress
-        ${HDF5_C_LIBRARIES}
-        m
-    )
+    # HDF5 filter integration test (source missing)
+    # add_executable(test_hdf5_filter tests/test_hdf5_filter.c)
+    # target_include_directories(test_hdf5_filter PRIVATE
+    #     ${HDF5_INCLUDE_DIRS}
+    #     ${CMAKE_CURRENT_SOURCE_DIR}/include
+    #     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    # )
+    # target_link_libraries(test_hdf5_filter PRIVATE
+    #     gpucompress
+    #     H5Zgpucompress
+    #     ${HDF5_C_LIBRARIES}
+    #     m
+    # )
 
-    # HDF5 plugin unit tests
-    add_executable(test_hdf5_plugin tests/test_hdf5_plugin.c)
-    target_include_directories(test_hdf5_plugin PRIVATE
-        ${HDF5_INCLUDE_DIRS}
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-    )
-    target_link_libraries(test_hdf5_plugin PRIVATE
-        gpucompress
-        H5Zgpucompress
-        ${HDF5_C_LIBRARIES}
-        m
-    )
+    # HDF5 plugin unit tests (source missing)
+    # add_executable(test_hdf5_plugin tests/test_hdf5_plugin.c)
+    # target_include_directories(test_hdf5_plugin PRIVATE
+    #     ${HDF5_INCLUDE_DIRS}
+    #     ${CMAKE_CURRENT_SOURCE_DIR}/include
+    #     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    # )
+    # target_link_libraries(test_hdf5_plugin PRIVATE
+    #     gpucompress
+    #     H5Zgpucompress
+    #     ${HDF5_C_LIBRARIES}
+    #     m
+    # )
 
 else()
     message(STATUS "HDF5 not found - skipping filter plugin libH5Zgpucompress.so")
@@ -217,20 +217,12 @@ set_target_properties(gpu_decompress PROPERTIES
 # ============================================================
 # Executable 3: Quantization Test Suite
 # ============================================================
-add_executable(test_quantization
-    tests/quantization/test_quantization_suite.cu
-    ${PREPROCESSING_SOURCES}
-)
-
-target_link_libraries(test_quantization
-    PRIVATE
-    CUDA::cudart
-    CUDA::curand
-)
-
-set_target_properties(test_quantization PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-)
+# add_executable(test_quantization  # source missing
+#     tests/quantization/test_quantization_suite.cu
+#     ${PREPROCESSING_SOURCES}
+# )
+# target_link_libraries(test_quantization PRIVATE CUDA::cudart CUDA::curand)
+# set_target_properties(test_quantization PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
 # ============================================================
 # Executable 4: Benchmark
@@ -241,75 +233,45 @@ target_link_libraries(benchmark PRIVATE gpucompress pthread)
 # ============================================================
 # Executable: Compression Core Test Suite
 # ============================================================
-add_executable(test_compression_core
-    tests/test_compression_core.cu
-    ${PREPROCESSING_SOURCES}
-)
-target_link_libraries(test_compression_core PRIVATE CUDA::cudart)
-set_target_properties(test_compression_core PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-)
+# add_executable(test_compression_core  # source missing
+#     tests/test_compression_core.cu
+#     ${PREPROCESSING_SOURCES}
+# )
+# target_link_libraries(test_compression_core PRIVATE CUDA::cudart)
+# set_target_properties(test_compression_core PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
-# ============================================================
-# Executable: Preprocessing Test Suite
-# ============================================================
-add_executable(test_preprocessing
-    tests/test_preprocessing.cu
-    ${PREPROCESSING_SOURCES}
-)
-target_link_libraries(test_preprocessing PRIVATE CUDA::cudart)
-set_target_properties(test_preprocessing PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-)
+# add_executable(test_preprocessing  # source missing
+#     tests/test_preprocessing.cu
+#     ${PREPROCESSING_SOURCES}
+# )
+# target_link_libraries(test_preprocessing PRIVATE CUDA::cudart)
+# set_target_properties(test_preprocessing PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
 # ============================================================
 # Executable: Stats Test Suite
 # ============================================================
-add_executable(test_stats tests/test_stats.cu)
-target_link_libraries(test_stats PRIVATE gpucompress CUDA::cudart)
-set_target_properties(test_stats PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-)
+# add_executable(test_stats tests/test_stats.cu)  # source missing
+# target_link_libraries(test_stats PRIVATE gpucompress CUDA::cudart)
+# set_target_properties(test_stats PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
-# ============================================================
-# Executable: CLI Test Suite
-# ============================================================
-add_executable(test_cli tests/test_cli.cu)
-target_link_libraries(test_cli PRIVATE gpucompress CUDA::cudart)
-set_target_properties(test_cli PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-)
+# add_executable(test_cli tests/test_cli.cu)  # source missing
+# target_link_libraries(test_cli PRIVATE gpucompress CUDA::cudart)
+# set_target_properties(test_cli PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
-# ============================================================
-# Executable: NN Test Suite (nn/ fixes)
-# ============================================================
-add_executable(test_nn tests/test_nn.cu)
-target_link_libraries(test_nn PRIVATE gpucompress CUDA::cudart)
-set_target_properties(test_nn PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-)
+# add_executable(test_nn tests/test_nn.cu)  # source missing
+# target_link_libraries(test_nn PRIVATE gpucompress CUDA::cudart)
+# set_target_properties(test_nn PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
-# ============================================================
-# Executable: API Test Suite
-# ============================================================
-add_executable(test_api tests/test_api.cu)
-target_link_libraries(test_api PRIVATE gpucompress CUDA::cudart)
-set_target_properties(test_api PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-)
+# add_executable(test_api tests/test_api.cu)  # source missing
+# target_link_libraries(test_api PRIVATE gpucompress CUDA::cudart)
+# set_target_properties(test_api PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
-# ============================================================
-# Executable 5: NN Reinforce Test Suite
-# ============================================================
-add_executable(test_nn_reinforce tests/test_nn_reinforce.cpp)
-set_source_files_properties(tests/test_nn_reinforce.cpp PROPERTIES LANGUAGE CUDA)
-target_link_libraries(test_nn_reinforce PRIVATE gpucompress CUDA::cudart pthread)
+# add_executable(test_nn_reinforce tests/test_nn_reinforce.cpp)  # source missing
+# set_source_files_properties(tests/test_nn_reinforce.cpp PROPERTIES LANGUAGE CUDA)
+# target_link_libraries(test_nn_reinforce PRIVATE gpucompress CUDA::cudart pthread)
 
-# ============================================================
-# Executable 6: NN Pipeline End-to-End Test
-# ============================================================
-add_executable(test_nn_pipeline tests/test_nn_pipeline.cpp)
-target_link_libraries(test_nn_pipeline PRIVATE gpucompress pthread)
+# add_executable(test_nn_pipeline tests/test_nn_pipeline.cpp)  # source missing
+# target_link_libraries(test_nn_pipeline PRIVATE gpucompress pthread)
 
 # ============================================================
 # Executable 7: Simulation Evaluation
@@ -341,77 +303,60 @@ endif()
 # ============================================================
 # Executable: NN Shuffle Selection Test
 # ============================================================
-add_executable(test_nn_shuffle tests/test_nn_shuffle.cu)
-target_link_libraries(test_nn_shuffle PRIVATE gpucompress CUDA::cudart)
-set_target_properties(test_nn_shuffle PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-)
+# add_executable(test_nn_shuffle tests/test_nn_shuffle.cu)  # source missing
+# target_link_libraries(test_nn_shuffle PRIVATE gpucompress CUDA::cudart)
+# set_target_properties(test_nn_shuffle PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
-# ============================================================
-# Executable: Shuffle Test Suite
-# ============================================================
-add_executable(test_shuffle tests/test_shuffle.cu)
-target_link_libraries(test_shuffle PRIVATE gpucompress CUDA::cudart)
-set_target_properties(test_shuffle PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-)
+# add_executable(test_shuffle tests/test_shuffle.cu)  # source missing
+# target_link_libraries(test_shuffle PRIVATE gpucompress CUDA::cudart)
+# set_target_properties(test_shuffle PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
-# ============================================================
-# Executable: CPU Stats Correctness Test
-# ============================================================
-add_executable(test_cpu_stats tests/test_cpu_stats.cu)
-target_link_libraries(test_cpu_stats PRIVATE gpucompress CUDA::cudart)
-set_target_properties(test_cpu_stats PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-)
+# add_executable(test_cpu_stats tests/test_cpu_stats.cu)  # source missing
+# target_link_libraries(test_cpu_stats PRIVATE gpucompress CUDA::cudart)
+# set_target_properties(test_cpu_stats PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
-# ============================================================
-# Executable: Stats Performance Benchmark (CPU vs GPU)
-# ============================================================
-add_executable(bench_stats tests/bench_stats.cu)
-target_link_libraries(bench_stats PRIVATE gpucompress CUDA::cudart)
-set_target_properties(bench_stats PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-)
+# add_executable(bench_stats tests/bench_stats.cu)  # source missing
+# target_link_libraries(bench_stats PRIVATE gpucompress CUDA::cudart)
+# set_target_properties(bench_stats PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
 # ============================================================
 # Executable: 128MB Experiment
 # ============================================================
-add_executable(experiment_128mb tests/experiment_128mb.cu)
-target_link_libraries(experiment_128mb PRIVATE gpucompress CUDA::cudart)
-set_target_properties(experiment_128mb PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-)
+# add_executable(experiment_128mb tests/experiment_128mb.cu)
+# target_link_libraries(experiment_128mb PRIVATE gpucompress CUDA::cudart)
+# set_target_properties(experiment_128mb PROPERTIES
+#     CUDA_SEPARABLE_COMPILATION ON
+# )
 
 # ============================================================
 # Executable: HDF5 128MB Experiment
 # ============================================================
 if(HDF5_FOUND)
-    add_executable(experiment_hdf5_128mb tests/experiment_hdf5_128mb.c)
-    target_include_directories(experiment_hdf5_128mb PRIVATE
-        ${HDF5_INCLUDE_DIRS}
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-    )
-    target_link_libraries(experiment_hdf5_128mb PRIVATE
-        gpucompress
-        H5Zgpucompress
-        ${HDF5_C_LIBRARIES}
-        m
-    )
+    # add_executable(experiment_hdf5_128mb tests/experiment_hdf5_128mb.c)
+    # target_include_directories(experiment_hdf5_128mb PRIVATE
+    #     ${HDF5_INCLUDE_DIRS}
+    #     ${CMAKE_CURRENT_SOURCE_DIR}/include
+    #     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    # )
+    # target_link_libraries(experiment_hdf5_128mb PRIVATE
+    #     gpucompress
+    #     H5Zgpucompress
+    #     ${HDF5_C_LIBRARIES}
+    #     m
+    # )
 
-    add_executable(experiment_hdf5_mixed tests/experiment_hdf5_mixed.c)
-    target_include_directories(experiment_hdf5_mixed PRIVATE
-        ${HDF5_INCLUDE_DIRS}
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-    )
-    target_link_libraries(experiment_hdf5_mixed PRIVATE
-        gpucompress
-        H5Zgpucompress
-        ${HDF5_C_LIBRARIES}
-        m
-    )
+    # add_executable(experiment_hdf5_mixed tests/experiment_hdf5_mixed.c)
+    # target_include_directories(experiment_hdf5_mixed PRIVATE
+    #     ${HDF5_INCLUDE_DIRS}
+    #     ${CMAKE_CURRENT_SOURCE_DIR}/include
+    #     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    # )
+    # target_link_libraries(experiment_hdf5_mixed PRIVATE
+    #     gpucompress
+    #     H5Zgpucompress
+    #     ${HDF5_C_LIBRARIES}
+    #     m
+    # )
 
     # HDF5 Benchmark: No Compression vs Static vs Dynamic (NN)
     add_executable(benchmark_hdf5 tests/benchmark_hdf5.c)
@@ -427,19 +372,19 @@ if(HDF5_FOUND)
         m
     )
 
-    # NN Adaptation Benchmark: per-chunk exploration tracking over 1GB streams
-    add_executable(bench_adaptation tests/bench_adaptation.c)
-    target_include_directories(bench_adaptation PRIVATE
-        ${HDF5_INCLUDE_DIRS}
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-    )
-    target_link_libraries(bench_adaptation PRIVATE
-        gpucompress
-        H5Zgpucompress
-        ${HDF5_C_LIBRARIES}
-        m
-    )
+    # NN Adaptation Benchmark (source not yet created)
+    # add_executable(bench_adaptation tests/bench_adaptation.c)
+    # target_include_directories(bench_adaptation PRIVATE
+    #     ${HDF5_INCLUDE_DIRS}
+    #     ${CMAKE_CURRENT_SOURCE_DIR}/include
+    #     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    # )
+    # target_link_libraries(bench_adaptation PRIVATE
+    #     gpucompress
+    #     H5Zgpucompress
+    #     ${HDF5_C_LIBRARIES}
+    #     m
+    # )
 
     # LR x MAPE sweep benchmark
     add_executable(bench_lr_sweep tests/bench_lr_sweep.c)
@@ -455,19 +400,19 @@ if(HDF5_FOUND)
         m
     )
 
-    # Mixed-algorithm lossless verification test
-    add_executable(test_mixed_algo_verify tests/test_mixed_algo_verify.c)
-    target_include_directories(test_mixed_algo_verify PRIVATE
-        ${HDF5_INCLUDE_DIRS}
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-    )
-    target_link_libraries(test_mixed_algo_verify PRIVATE
-        gpucompress
-        H5Zgpucompress
-        ${HDF5_C_LIBRARIES}
-        m
-    )
+    # Mixed-algorithm lossless verification test (source not yet created)
+    # add_executable(test_mixed_algo_verify tests/test_mixed_algo_verify.c)
+    # target_include_directories(test_mixed_algo_verify PRIVATE
+    #     ${HDF5_INCLUDE_DIRS}
+    #     ${CMAKE_CURRENT_SOURCE_DIR}/include
+    #     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    # )
+    # target_link_libraries(test_mixed_algo_verify PRIVATE
+    #     gpucompress
+    #     H5Zgpucompress
+    #     ${HDF5_C_LIBRARIES}
+    #     m
+    # )
 endif()
 
 # ============================================================
