@@ -989,7 +989,7 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
         size_t max_comp    = gpucompress_max_compressed_size(chunk_bytes);
 
         /* ---- 3-Stage concurrent pipeline: N_COMP_WORKERS + I/O thread ---- */
-#define N_COMP_WORKERS 4
+#define N_COMP_WORKERS 8
         struct WorkItem {
             const uint8_t* src;      /* source for compression */
             uint8_t*       d_owned;  /* non-NULL: worker cudaFrees after compression */

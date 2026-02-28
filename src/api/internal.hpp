@@ -22,7 +22,7 @@
  * ============================================================ */
 
 /** Number of concurrent compression slots. */
-static constexpr int N_COMP_CTX = 4;
+static constexpr int N_COMP_CTX = 8;
 
 /**
  * Per-slot GPU state for concurrent compression.
