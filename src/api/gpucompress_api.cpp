@@ -8,6 +8,7 @@
 
 #include <cuda_runtime.h>
 #include <atomic>
+#include <condition_variable>
 #include <mutex>
 #include <cstring>
 #include <cstdio>
@@ -60,6 +61,15 @@ extern "C" {
 }
 
 /* ============================================================
+ * SGD stream / event globals — extern-referenced from nn_gpu.cu
+ * Must be at file scope (external linkage, not anonymous namespace)
+ * ============================================================ */
+
+cudaStream_t g_sgd_stream    = nullptr;
+cudaEvent_t  g_sgd_done      = nullptr;
+bool         g_sgd_ever_fired = false;
+
+/* ============================================================
  * Global State
  * ============================================================ */
 
@@ -88,16 +98,28 @@ bool g_online_learning_enabled = false;   // master switch
 bool g_exploration_enabled = false;       // OFF by default
 double g_exploration_threshold = 0.20;    // 20% MAPE
 
-/** Last NN action and exploration state (for query after compress) */
-int g_last_nn_action = -1;
-int g_last_nn_original_action = -1;
-int g_last_exploration_triggered = 0;
-int g_last_sgd_fired = 0;
+/** Last NN action and exploration state (for query after compress).
+ *  Under concurrent use values are undefined per-call; per-call stats struct
+ *  carries the correct value. Atomic to prevent UB. */
+std::atomic<int> g_last_nn_action{-1};
+std::atomic<int> g_last_nn_original_action{-1};
+std::atomic<int> g_last_exploration_triggered{0};
+std::atomic<int> g_last_sgd_fired{0};
 
 /** Per-chunk diagnostic history */
 #define MAX_CHUNK_HISTORY 4096
 gpucompress_chunk_diag_t g_chunk_history[MAX_CHUNK_HISTORY];
-int g_chunk_history_count = 0;
+std::atomic<int> g_chunk_history_count{0};
+
+/* ---- CompContext pool ---- */
+static CompContext g_comp_pool[N_COMP_CTX];
+static bool g_pool_slot_free[N_COMP_CTX];
+static int  g_pool_free_count = 0;
+static std::mutex g_pool_mutex;
+static std::condition_variable g_pool_cv;
+
+/* ---- SGD serialization mutex (CPU-side) ---- */
+static std::mutex g_sgd_mutex;
 
 /** Pre-allocated CUDA timing events (reused across all timing sites) */
 cudaEvent_t g_t_start = nullptr;
@@ -137,6 +159,105 @@ const char* ERROR_MESSAGES[] = {
 } // anonymous namespace
 
 /* ============================================================
+ * CompContext pool implementation
+ * ============================================================ */
+
+namespace gpucompress {
+
+static constexpr size_t kPoolStatsWSZ =
+    sizeof(AutoStatsGPU) + 256 * sizeof(unsigned int);
+
+int initCompContextPool() {
+    std::lock_guard<std::mutex> lk(g_pool_mutex);
+    memset(g_comp_pool, 0, sizeof(g_comp_pool));
+    g_pool_free_count = 0;
+    for (int i = 0; i < N_COMP_CTX; i++) {
+        CompContext& ctx = g_comp_pool[i];
+        ctx.slot_id = i;
+        if (cudaStreamCreate(&ctx.stream)   != cudaSuccess) return -1;
+        if (cudaEventCreate (&ctx.t_start)  != cudaSuccess) return -1;
+        if (cudaEventCreate (&ctx.t_stop)   != cudaSuccess) return -1;
+
+        if (cudaMalloc(&ctx.d_stats_workspace, kPoolStatsWSZ) != cudaSuccess) return -1;
+        ctx.d_stats     = static_cast<AutoStatsGPU*>(ctx.d_stats_workspace);
+        ctx.d_histogram = reinterpret_cast<unsigned int*>(
+            static_cast<uint8_t*>(ctx.d_stats_workspace) + sizeof(AutoStatsGPU));
+
+        if (cudaMalloc(&ctx.d_fused_infer_output,
+                       sizeof(NNInferenceOutput)) != cudaSuccess) return -1;
+        if (cudaMalloc(&ctx.d_fused_top_actions,
+                       NN_NUM_CONFIGS * sizeof(int)) != cudaSuccess) return -1;
+
+        if (cudaMalloc(&ctx.d_sgd_grad_buffer,
+                       NN_SGD_GRAD_SIZE * sizeof(float)) != cudaSuccess) return -1;
+        if (cudaMalloc(&ctx.d_sgd_output, sizeof(SGDOutput)) != cudaSuccess) return -1;
+        if (cudaMalloc(&ctx.d_sgd_samples,
+                       NN_MAX_SGD_SAMPLES * sizeof(SGDSample)) != cudaSuccess) return -1;
+
+        g_pool_slot_free[i] = true;
+        g_pool_free_count++;
+    }
+    return 0;
+}
+
+void destroyCompContextPool() {
+    std::lock_guard<std::mutex> lk(g_pool_mutex);
+    for (int i = 0; i < N_COMP_CTX; i++) {
+        CompContext& ctx = g_comp_pool[i];
+        if (ctx.stream)              { cudaStreamDestroy(ctx.stream); ctx.stream = nullptr; }
+        if (ctx.t_start)             { cudaEventDestroy(ctx.t_start); ctx.t_start = nullptr; }
+        if (ctx.t_stop)              { cudaEventDestroy(ctx.t_stop);  ctx.t_stop  = nullptr; }
+        if (ctx.d_stats_workspace)   { cudaFree(ctx.d_stats_workspace);
+                                       ctx.d_stats_workspace = nullptr;
+                                       ctx.d_stats = nullptr; ctx.d_histogram = nullptr; }
+        if (ctx.d_fused_infer_output){ cudaFree(ctx.d_fused_infer_output);
+                                       ctx.d_fused_infer_output = nullptr; }
+        if (ctx.d_fused_top_actions) { cudaFree(ctx.d_fused_top_actions);
+                                       ctx.d_fused_top_actions = nullptr; }
+        if (ctx.d_sgd_grad_buffer)   { cudaFree(ctx.d_sgd_grad_buffer);
+                                       ctx.d_sgd_grad_buffer = nullptr; }
+        if (ctx.d_sgd_output)        { cudaFree(ctx.d_sgd_output); ctx.d_sgd_output = nullptr; }
+        if (ctx.d_sgd_samples)       { cudaFree(ctx.d_sgd_samples); ctx.d_sgd_samples = nullptr; }
+        g_pool_slot_free[i] = false;
+    }
+    g_pool_free_count = 0;
+}
+
+CompContext* acquireCompContext() {
+    std::unique_lock<std::mutex> lk(g_pool_mutex);
+    g_pool_cv.wait(lk, []{ return g_pool_free_count > 0; });
+    for (int i = 0; i < N_COMP_CTX; i++) {
+        if (g_pool_slot_free[i]) {
+            g_pool_slot_free[i] = false;
+            g_pool_free_count--;
+            return &g_comp_pool[i];
+        }
+    }
+    return nullptr; // unreachable
+}
+
+void releaseCompContext(CompContext* ctx) {
+    if (!ctx) return;
+    std::lock_guard<std::mutex> lk(g_pool_mutex);
+    g_pool_slot_free[ctx->slot_id] = true;
+    g_pool_free_count++;
+    g_pool_cv.notify_one();
+}
+
+} // namespace gpucompress
+
+/* RAII guard: releases CompContext on scope exit */
+namespace {
+struct ContextGuard {
+    CompContext* ctx;
+    explicit ContextGuard(CompContext* c) : ctx(c) {}
+    ~ContextGuard() { if (ctx) { gpucompress::releaseCompContext(ctx); ctx = nullptr; } }
+    ContextGuard(const ContextGuard&) = delete;
+    ContextGuard& operator=(const ContextGuard&) = delete;
+};
+} // anonymous namespace
+
+/* ============================================================
  * Initialization and Cleanup
  * ============================================================ */
 
@@ -169,6 +290,13 @@ extern "C" gpucompress_error_t gpucompress_init(const char* weights_path) {
     cudaEventCreate(&g_t_start);
     cudaEventCreate(&g_t_stop);
 
+    // SGD stream + event for GPU-level weight-update ordering
+    cudaStreamCreate(&g_sgd_stream);
+    cudaEventCreate(&g_sgd_done);
+
+    // Init CompContext pool
+    gpucompress::initCompContextPool();
+
     // Load NN weights if path provided
     if (weights_path != nullptr && weights_path[0] != '\0') {
         if (gpucompress_nn_load_impl(weights_path) != 0) {
@@ -195,6 +323,10 @@ extern "C" void gpucompress_cleanup(void) {
         g_exploration_enabled = false;
         gpucompress_nn_cleanup_impl();
         gpucompress_free_stats_workspace();
+        gpucompress::destroyCompContextPool();
+        if (g_sgd_stream) { cudaStreamDestroy(g_sgd_stream); g_sgd_stream = nullptr; }
+        if (g_sgd_done)   { cudaEventDestroy(g_sgd_done);   g_sgd_done   = nullptr; }
+        g_sgd_ever_fired = false;
         if (g_t_start) { cudaEventDestroy(g_t_start); g_t_start = nullptr; }
         if (g_t_stop)  { cudaEventDestroy(g_t_stop);  g_t_stop  = nullptr; }
         if (g_default_stream != nullptr) {
@@ -335,7 +467,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
                 nn_was_used = true;
                 nn_action = action;
                 nn_original_action = action;
-                g_last_nn_action = action;
+                g_last_nn_action.store(action);
             }
         }
 
@@ -818,7 +950,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
                             // Track if this is better than current best
                             if (alt_ratio > best_ratio) {
                                 best_ratio = alt_ratio;
-                                g_last_nn_action = alt_action;
+                                g_last_nn_action.store(alt_action);
 
                                 // Copy better result to output
                                 size_t header_sz = GPUCOMPRESS_HEADER_SIZE;
@@ -941,21 +1073,24 @@ extern "C" gpucompress_error_t gpucompress_compress(
         stats->sgd_fired = sgd_fired ? 1 : 0;
         stats->exploration_triggered = exploration_triggered ? 1 : 0;
         stats->nn_original_action = nn_original_action;
-        stats->nn_final_action = g_last_nn_action;
+        stats->nn_final_action = g_last_nn_action.load();
     }
 
     /* Update globals for query after HDF5 filter path */
-    g_last_nn_original_action = nn_original_action;
-    g_last_exploration_triggered = exploration_triggered ? 1 : 0;
-    g_last_sgd_fired = sgd_fired ? 1 : 0;
+    g_last_nn_original_action.store(nn_original_action);
+    g_last_exploration_triggered.store(exploration_triggered ? 1 : 0);
+    g_last_sgd_fired.store(sgd_fired ? 1 : 0);
 
     /* Append to per-chunk history */
-    if (g_chunk_history_count < MAX_CHUNK_HISTORY) {
-        gpucompress_chunk_diag_t *h = &g_chunk_history[g_chunk_history_count++];
-        h->nn_action             = g_last_nn_action;
-        h->nn_original_action    = nn_original_action;
-        h->exploration_triggered = exploration_triggered ? 1 : 0;
-        h->sgd_fired             = sgd_fired ? 1 : 0;
+    {
+        int idx = g_chunk_history_count.fetch_add(1);
+        if (idx < MAX_CHUNK_HISTORY) {
+            gpucompress_chunk_diag_t *h = &g_chunk_history[idx];
+            h->nn_action             = g_last_nn_action.load();
+            h->nn_original_action    = nn_original_action;
+            h->exploration_triggered = exploration_triggered ? 1 : 0;
+            h->sgd_fired             = sgd_fired ? 1 : 0;
+        }
     }
 
     return GPUCOMPRESS_SUCCESS;
@@ -1296,31 +1431,31 @@ extern "C" int gpucompress_nn_is_loaded(void) {
  * ============================================================ */
 
 extern "C" int gpucompress_get_last_nn_action(void) {
-    return g_last_nn_action;
+    return g_last_nn_action.load();
 }
 
 extern "C" int gpucompress_get_last_nn_original_action(void) {
-    return g_last_nn_original_action;
+    return g_last_nn_original_action.load();
 }
 
 extern "C" int gpucompress_get_last_exploration_triggered(void) {
-    return g_last_exploration_triggered;
+    return g_last_exploration_triggered.load();
 }
 
 extern "C" int gpucompress_get_last_sgd_fired(void) {
-    return g_last_sgd_fired;
+    return g_last_sgd_fired.load();
 }
 
 extern "C" void gpucompress_reset_chunk_history(void) {
-    g_chunk_history_count = 0;
+    g_chunk_history_count.store(0);
 }
 
 extern "C" int gpucompress_get_chunk_history_count(void) {
-    return g_chunk_history_count;
+    return g_chunk_history_count.load();
 }
 
 extern "C" int gpucompress_get_chunk_diag(int idx, gpucompress_chunk_diag_t *out) {
-    if (idx < 0 || idx >= g_chunk_history_count || out == NULL)
+    if (idx < 0 || idx >= g_chunk_history_count.load() || out == NULL)
         return -1;
     *out = g_chunk_history[idx];
     return 0;
@@ -1481,7 +1616,13 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
     if (input_size == 0) return GPUCOMPRESS_ERROR_INVALID_INPUT;
 
     gpucompress_config_t cfg = config ? *config : gpucompress_default_config();
-    cudaStream_t stream = stream_arg ? static_cast<cudaStream_t>(stream_arg) : g_default_stream;
+
+    /* Acquire a per-slot context (blocks until one is free) */
+    ContextGuard guard{gpucompress::acquireCompContext()};
+    if (!guard.ctx) return GPUCOMPRESS_ERROR_CUDA_FAILED;
+    CompContext* ctx = guard.ctx;
+    cudaStream_t stream = ctx->stream;
+    (void)stream_arg; /* ignored — each call uses its own ctx->stream */
 
     /* d_input is already on GPU — no H→D copy */
     gpucompress_algorithm_t algo_to_use = cfg.algorithm;
@@ -1502,8 +1643,8 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
         int rc = -1;
 
         if (num_elements > 0 && gpucompress_nn_is_loaded_impl()) {
-            /* d_input is already on GPU — no H→D copy needed */
-            d_stats_ptr = gpucompress::runStatsKernelsNoSync(d_input, input_size, stream);
+            /* d_input is already on GPU — use ctx-aware overload */
+            d_stats_ptr = gpucompress::runStatsKernelsNoSync(d_input, input_size, stream, ctx);
 
             if (d_stats_ptr) {
                 float* p_ratio = (stats != nullptr || g_online_learning_enabled) ? &predicted_ratio : nullptr;
@@ -1511,8 +1652,8 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
                 int* p_top = g_online_learning_enabled ? top_actions : nullptr;
                 int fused_ood = 0;
 
-                action = gpucompress::runNNFusedInference(
-                    d_stats_ptr, input_size, cfg.error_bound, stream,
+                action = gpucompress::runNNFusedInferenceCtx(
+                    d_stats_ptr, input_size, cfg.error_bound, stream, ctx,
                     &action, p_ratio, p_comp_time,
                     g_online_learning_enabled ? &fused_ood : nullptr, p_top);
                 rc = (action >= 0) ? 0 : -1;
@@ -1534,7 +1675,7 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
                 nn_was_used = true;
                 nn_action = action;
                 nn_original_action = action;
-                g_last_nn_action = action;
+                g_last_nn_action.store(action);
             }
         }
 
@@ -1582,7 +1723,12 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
         if (d_shuffled) d_compress_input = d_shuffled;
     }
 
-    cudaError_t cuda_err = cudaStreamSynchronize(stream);
+    /* Only sync when preprocessing actually ran (shuffle/quant allocated GPU buffers).
+     * Subsequent ops (createCompressionManager, configure, compress) are on the same
+     * stream so GPU ordering is already guaranteed by stream semantics. */
+    cudaError_t cuda_err = (d_quantized || d_shuffled)
+        ? cudaStreamSynchronize(stream)
+        : cudaSuccess;
     if (cuda_err != cudaSuccess) {
         if (d_quantized) cudaFree(d_quantized);
         if (d_shuffled)  cudaFree(d_shuffled);
@@ -1626,8 +1772,11 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
     }
 
     float primary_comp_time_ms = 0.0f;
-    bool timing_ok = (g_t_start != nullptr && g_t_stop != nullptr);
-    if (timing_ok) cudaEventRecord(g_t_start, stream);
+    bool timing_ok = (ctx->t_start != nullptr && ctx->t_stop != nullptr);
+    /* Only record/sync timing events when the result will actually be used
+     * (stats output requested or online learning enabled). */
+    bool need_timing = timing_ok && (stats != nullptr || g_online_learning_enabled);
+    if (need_timing) cudaEventRecord(ctx->t_start, stream);
 
     try {
         compressor->compress(d_compress_input, d_comp_target, comp_config);
@@ -1638,10 +1787,10 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
         return GPUCOMPRESS_ERROR_COMPRESSION;
     }
 
-    if (timing_ok) {
-        cudaEventRecord(g_t_stop, stream);
-        cudaEventSynchronize(g_t_stop);
-        cudaEventElapsedTime(&primary_comp_time_ms, g_t_start, g_t_stop);
+    if (need_timing) {
+        cudaEventRecord(ctx->t_stop, stream);
+        cudaEventSynchronize(ctx->t_stop);
+        cudaEventElapsedTime(&primary_comp_time_ms, ctx->t_start, ctx->t_stop);
     }
 
     size_t compressed_size = compressor->get_compressed_output_size(d_comp_target);
@@ -1805,14 +1954,14 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
                         size_t alt_max = alt_cc.max_compressed_buffer_size;
                         if (cudaMalloc(&d_alt_out, alt_max) == cudaSuccess) {
                             float alt_ct_ms = 0.0f;
-                            if (timing_ok) cudaEventRecord(g_t_start, stream);
+                            if (timing_ok) cudaEventRecord(ctx->t_start, stream);
 
                             alt_comp->compress(d_alt_input, d_alt_out, alt_cc);
 
                             if (timing_ok) {
-                                cudaEventRecord(g_t_stop, stream);
-                                cudaEventSynchronize(g_t_stop);
-                                cudaEventElapsedTime(&alt_ct_ms, g_t_start, g_t_stop);
+                                cudaEventRecord(ctx->t_stop, stream);
+                                cudaEventSynchronize(ctx->t_stop);
+                                cudaEventElapsedTime(&alt_ct_ms, ctx->t_start, ctx->t_stop);
                             }
 
                             alt_comp_size = alt_comp->get_compressed_output_size(d_alt_out);
@@ -1855,7 +2004,7 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
                                         size_t rt_decomp_size = rt_dc.decomp_data_size;
                                         uint8_t* d_rt_decompressed = nullptr;
                                         if (cudaMalloc(&d_rt_decompressed, rt_decomp_size) == cudaSuccess) {
-                                            if (timing_ok) cudaEventRecord(g_t_start, stream);
+                                            if (timing_ok) cudaEventRecord(ctx->t_start, stream);
 
                                             try {
                                                 rt_decomp->decompress(d_rt_decompressed, d_alt_out, rt_dc);
@@ -1893,10 +2042,10 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
                                             }
 
                                             if (timing_ok) {
-                                                cudaEventRecord(g_t_stop, stream);
-                                                cudaEventSynchronize(g_t_stop);
+                                                cudaEventRecord(ctx->t_stop, stream);
+                                                cudaEventSynchronize(ctx->t_stop);
                                                 float dt_ms = 0.0f;
-                                                cudaEventElapsedTime(&dt_ms, g_t_start, g_t_stop);
+                                                cudaEventElapsedTime(&dt_ms, ctx->t_start, ctx->t_stop);
                                                 alt_decomp_ms = static_cast<double>(dt_ms);
                                             }
 
@@ -1952,7 +2101,7 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
 
                             if (alt_ratio > best_ratio) {
                                 best_ratio = alt_ratio;
-                                g_last_nn_action = alt_action;
+                                g_last_nn_action.store(alt_action);
 
                                 size_t hdr_sz = GPUCOMPRESS_HEADER_SIZE;
                                 size_t alt_total = hdr_sz + alt_comp_size;
@@ -2026,14 +2175,20 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
 
             float sgd_grad_norm = 0.0f;
             int sgd_clipped = 0, sgd_count = 0;
-            if (gpucompress::runNNSGD(d_stats_ptr, sgd_samples,
-                    static_cast<int>(sgd_limit), input_size, cfg.error_bound,
-                    g_reinforce_lr, stream,
-                    &sgd_grad_norm, &sgd_clipped, &sgd_count) == 0) {
-                sgd_fired = true;
+            {
+                std::lock_guard<std::mutex> sgd_lk(g_sgd_mutex);
+                if (gpucompress::runNNSGDCtx(d_stats_ptr, sgd_samples,
+                        static_cast<int>(sgd_limit), input_size, cfg.error_bound,
+                        g_reinforce_lr, ctx,
+                        &sgd_grad_norm, &sgd_clipped, &sgd_count) == 0) {
+                    sgd_fired = true;
+                }
             }
         }
     }
+
+    /* Synchronize ctx->stream before releasing context — ensures d_output is fully written */
+    cudaStreamSynchronize(stream);
 
     /* Fill stats */
     if (stats != nullptr) {
@@ -2054,21 +2209,24 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
         stats->sgd_fired = sgd_fired ? 1 : 0;
         stats->exploration_triggered = exploration_triggered ? 1 : 0;
         stats->nn_original_action = nn_original_action;
-        stats->nn_final_action = g_last_nn_action;
+        stats->nn_final_action = g_last_nn_action.load();
     }
 
     /* Update globals for query after HDF5 filter path */
-    g_last_nn_original_action = nn_original_action;
-    g_last_exploration_triggered = exploration_triggered ? 1 : 0;
-    g_last_sgd_fired = sgd_fired ? 1 : 0;
+    g_last_nn_original_action.store(nn_original_action);
+    g_last_exploration_triggered.store(exploration_triggered ? 1 : 0);
+    g_last_sgd_fired.store(sgd_fired ? 1 : 0);
 
     /* Append to per-chunk history */
-    if (g_chunk_history_count < MAX_CHUNK_HISTORY) {
-        gpucompress_chunk_diag_t *h = &g_chunk_history[g_chunk_history_count++];
-        h->nn_action             = g_last_nn_action;
-        h->nn_original_action    = nn_original_action;
-        h->exploration_triggered = exploration_triggered ? 1 : 0;
-        h->sgd_fired             = sgd_fired ? 1 : 0;
+    {
+        int idx = g_chunk_history_count.fetch_add(1);
+        if (idx < MAX_CHUNK_HISTORY) {
+            gpucompress_chunk_diag_t *h = &g_chunk_history[idx];
+            h->nn_action             = g_last_nn_action.load();
+            h->nn_original_action    = nn_original_action;
+            h->exploration_triggered = exploration_triggered ? 1 : 0;
+            h->sgd_fired             = sgd_fired ? 1 : 0;
+        }
     }
 
     return GPUCOMPRESS_SUCCESS;

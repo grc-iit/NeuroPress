@@ -529,6 +529,19 @@ if(HDF5_FOUND)
         )
         set_target_properties(test_vol_8mb PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
+        # GPU-resident data benchmark: No Compression vs NN, single ramp pattern
+        add_executable(benchmark_gpu_resident tests/benchmark_gpu_resident.cu)
+        set_source_files_properties(tests/benchmark_gpu_resident.cu PROPERTIES LANGUAGE CUDA)
+        target_include_directories(benchmark_gpu_resident PRIVATE
+            ${HDF5_VOL_INCLUDE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+        )
+        target_link_libraries(benchmark_gpu_resident PRIVATE
+            gpucompress H5VLgpucompress ${HDF5_VOL_LIB} CUDA::cudart m
+        )
+        set_target_properties(benchmark_gpu_resident PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
         # NN VOL demo: 64 MB random data, ALGO_AUTO lossless, no online learning
         add_executable(nn_vol_demo examples/nn_vol_demo.cu)
         set_source_files_properties(examples/nn_vol_demo.cu PROPERTIES LANGUAGE CUDA)

@@ -1,0 +1,38 @@
+=== GPU-Resident HDF5 Benchmark: No Compression vs NN ===
+
+Weights:  neural_net/weights/model.nnwt
+Pattern:  ramp  (buf[i] = i / N, linear 0..1)
+Chunk:    4 MB  (1048576 floats)
+Dataset:  64 MB  (16777216 floats, 16 chunks)
+
+NN: Loaded 19076 parameters from neural_net/weights/model.nnwt (74.8 KB on GPU)
+--- Phase 1: No Compression ---
+    GPU ramp → D→H (timed) → VOL → native HDF5 chunked write
+
+  Generating 0.1 GB ramp on GPU...
+  Lossless verify: PASS (16777216 elements bit-exact)
+  Write: 101.6 ms  (660.6 MB/s)
+  Read:  44.0 ms  (1524.2 MB/s)
+  File:  1.00x ratio (uncompressed)
+
+--- Phase 2: NN Compression (ALGO_AUTO, lossless) ---
+    GPU ramp → VOL → GPU compress → D→H compressed bytes → disk
+
+  Generating 0.1 GB ramp on GPU...
+  VOL: write_calls=1  chunks_compressed=16
+  Lossless verify: PASS (16777216 elements bit-exact)
+  Write: 642.6 ms  (104.4 MB/s)
+  Read:  163.7 ms  (410.0 MB/s)
+  File:  1.73x compression ratio
+
+=== Summary: 64 MB, 4 MB chunks, ramp pattern ===
+
+  Mode                     | Write MB/s |  Read MB/s |    Ratio |  File MB
+  -------------------------+------------+------------+----------+---------
+  No comp (GPU→D→H→disk) |      660.6 |     1524.2 |     1.00x |       64
+  NN  (GPU→comp→disk)  |      104.4 |      410.0 |     1.73x |       36
+
+  Write speedup (NN vs no-comp):           0.16x
+  Space saving (NN):                       42.3%
+  Effective write BW (NN, uncomp-equiv):   180.8 MB/s
+

@@ -36,7 +36,7 @@
 #include "compression/compression_header.h"
 
 /* ---- Dataset geometry -------------------------------------------- */
-#define N_ELEM   16777216   /* 64 MB as float32: 16M × 4B          */
+#define N_ELEM   1073741824ULL   /* 4 GB as float32: 1G × 4B          */
 #define CHUNK     1048576   /*  4 MB per chunk:   1M × 4B          */
 #define N_CHUNK  (N_ELEM / CHUNK)  /* = 16 chunks               */
 

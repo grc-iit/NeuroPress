@@ -28,6 +28,12 @@
 
 #include "stats/auto_stats_gpu.h"
 #include "nn/nn_weights.h"
+#include "api/internal.hpp"
+
+/* SGD synchronization globals — defined in gpucompress_api.cpp at file scope */
+extern cudaStream_t g_sgd_stream;
+extern cudaEvent_t  g_sgd_done;
+extern bool         g_sgd_ever_fired;
 
 namespace gpucompress {
 
@@ -1341,6 +1347,136 @@ int runNNSGD(
 
     fprintf(stderr, "[SGD] GPU: %d samples, grad_norm=%.4f%s\n",
             h_result.sample_count, h_result.grad_norm,
+            h_result.was_clipped ? " (clipped)" : "");
+
+    return 0;
+}
+
+/**
+ * Context-aware fused NN inference.
+ * Uses ctx->d_fused_infer_output / d_fused_top_actions instead of globals.
+ * Inserts a GPU-level dependency on g_sgd_done so inference waits for
+ * any in-flight SGD on g_sgd_stream.
+ */
+int runNNFusedInferenceCtx(
+    const AutoStatsGPU* d_stats,
+    size_t data_size,
+    double error_bound,
+    cudaStream_t stream,
+    CompContext* ctx,
+    int* out_action,
+    float* out_ratio,
+    float* out_comp_time,
+    int* out_is_ood,
+    int* out_top_actions
+) {
+    if (!g_nn_loaded || d_nn_weights == nullptr || d_stats == nullptr || ctx == nullptr) {
+        return -1;
+    }
+
+    /* GPU-level barrier: wait for last SGD on g_sgd_stream before reading weights */
+    if (g_sgd_ever_fired)
+        cudaStreamWaitEvent(stream, g_sgd_done, 0);
+
+    nnFusedInferenceKernel<<<1, NN_NUM_CONFIGS, 0, stream>>>(
+        d_nn_weights,
+        d_stats,
+        data_size, error_bound,
+        static_cast<int>(g_rank_criterion),
+        ctx->d_fused_infer_output,
+        out_top_actions ? ctx->d_fused_top_actions : nullptr
+    );
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) return -1;
+
+    NNInferenceOutput h_result;
+    err = cudaMemcpyAsync(&h_result, ctx->d_fused_infer_output, sizeof(NNInferenceOutput),
+                           cudaMemcpyDeviceToHost, stream);
+    if (err != cudaSuccess) return -1;
+
+    if (out_top_actions) {
+        err = cudaMemcpyAsync(out_top_actions, ctx->d_fused_top_actions,
+                               NN_NUM_CONFIGS * sizeof(int),
+                               cudaMemcpyDeviceToHost, stream);
+        if (err != cudaSuccess) return -1;
+    }
+
+    err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess) return -1;
+
+    if (out_action)   *out_action   = h_result.action;
+    if (out_ratio)    *out_ratio    = h_result.predicted_ratio;
+    if (out_comp_time)*out_comp_time = h_result.predicted_comp_time;
+    if (out_is_ood)   *out_is_ood   = h_result.is_ood;
+
+    return h_result.action;
+}
+
+/**
+ * Context-aware GPU SGD.
+ * Launches nnSGDKernel on g_sgd_stream (not ctx->stream) so all SGD
+ * updates are serialized on one stream.  Uses ctx->d_sgd_* for workspace.
+ * Records g_sgd_done after kernel; sets g_sgd_ever_fired = true.
+ * Callers must hold g_sgd_mutex before calling this function.
+ */
+int runNNSGDCtx(
+    const AutoStatsGPU* d_stats,
+    const SGDSample* samples,
+    int num_samples,
+    size_t data_size,
+    double error_bound,
+    float learning_rate,
+    CompContext* ctx,
+    float* out_grad_norm,
+    int* out_clipped,
+    int* out_count
+) {
+    if (!g_nn_loaded || d_nn_weights == nullptr || d_stats == nullptr || ctx == nullptr) return -1;
+    if (samples == nullptr || num_samples <= 0) return -1;
+    if (num_samples > NN_MAX_SGD_SAMPLES) num_samples = NN_MAX_SGD_SAMPLES;
+
+    /* H→D: copy samples on g_sgd_stream */
+    cudaError_t err = cudaMemcpyAsync(ctx->d_sgd_samples, samples,
+                                       num_samples * sizeof(SGDSample),
+                                       cudaMemcpyHostToDevice, g_sgd_stream);
+    if (err != cudaSuccess) return -1;
+
+    /* Launch SGD kernel on dedicated g_sgd_stream */
+    nnSGDKernel<<<1, NN_HIDDEN_DIM, 0, g_sgd_stream>>>(
+        d_nn_weights,
+        d_stats,
+        ctx->d_sgd_samples,
+        num_samples,
+        data_size, error_bound,
+        learning_rate,
+        ctx->d_sgd_grad_buffer,
+        ctx->d_sgd_output
+    );
+
+    err = cudaGetLastError();
+    if (err != cudaSuccess) return -1;
+
+    /* Record completion event so future inference calls can wait */
+    cudaEventRecord(g_sgd_done, g_sgd_stream);
+
+    /* D→H: copy SGDOutput (12B) */
+    SGDOutput h_result;
+    err = cudaMemcpyAsync(&h_result, ctx->d_sgd_output, sizeof(SGDOutput),
+                           cudaMemcpyDeviceToHost, g_sgd_stream);
+    if (err != cudaSuccess) return -1;
+
+    err = cudaStreamSynchronize(g_sgd_stream);
+    if (err != cudaSuccess) return -1;
+
+    g_sgd_ever_fired = true;
+
+    if (out_grad_norm) *out_grad_norm = h_result.grad_norm;
+    if (out_clipped)   *out_clipped   = h_result.was_clipped;
+    if (out_count)     *out_count     = h_result.sample_count;
+
+    fprintf(stderr, "[SGD-CTX] slot=%d %d samples, grad_norm=%.4f%s\n",
+            ctx->slot_id, h_result.sample_count, h_result.grad_norm,
             h_result.was_clipped ? " (clipped)" : "");
 
     return 0;

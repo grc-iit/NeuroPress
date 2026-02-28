@@ -17,6 +17,37 @@
 #include "stats/auto_stats_gpu.h"
 #include "nn/nn_weights.h"
 
+/* ============================================================
+ * CompContext pool — per-compression-slot GPU state
+ * ============================================================ */
+
+/** Number of concurrent compression slots. */
+static constexpr int N_COMP_CTX = 4;
+
+/**
+ * Per-slot GPU state for concurrent compression.
+ * Eliminates sharing of global stats/NN/SGD buffers between concurrent calls.
+ */
+struct CompContext {
+    int           slot_id;
+    cudaStream_t  stream;
+    cudaEvent_t   t_start, t_stop;
+
+    /* Stats workspace (~1.1 KB) */
+    void*          d_stats_workspace;
+    AutoStatsGPU*  d_stats;
+    unsigned int*  d_histogram;
+
+    /* Fused inference buffers (144 B) */
+    NNInferenceOutput* d_fused_infer_output;
+    int*               d_fused_top_actions;
+
+    /* SGD buffers (~75 KB) */
+    float*      d_sgd_grad_buffer;
+    SGDOutput*  d_sgd_output;
+    SGDSample*  d_sgd_samples;
+};
+
 namespace gpucompress {
 
 /* ============================================================
@@ -238,6 +269,37 @@ AutoStatsGPU* runStatsKernelsNoSync(const void* d_input, size_t input_size, cuda
  * Get device pointer to pre-allocated stats buffer.
  */
 AutoStatsGPU* getStatsDevicePtr();
+
+/* ============================================================
+ * CompContext pool API
+ * ============================================================ */
+
+int          initCompContextPool();
+void         destroyCompContextPool();
+CompContext* acquireCompContext();   ///< blocks until a slot is free
+void         releaseCompContext(CompContext*);
+
+/* ============================================================
+ * Context-aware inference / SGD overloads (used by pool)
+ * ============================================================ */
+
+/** ctx overload: uses ctx->d_stats / d_histogram / d_stats_workspace */
+AutoStatsGPU* runStatsKernelsNoSync(const void* d_input, size_t input_size,
+    cudaStream_t stream, CompContext* ctx);
+
+/** ctx overload: uses ctx->d_fused_infer_output / d_fused_top_actions;
+ *  inserts cudaStreamWaitEvent on g_sgd_done if SGD has ever fired. */
+int runNNFusedInferenceCtx(const AutoStatsGPU* d_stats, size_t data_size,
+    double error_bound, cudaStream_t stream, CompContext* ctx,
+    int* out_action, float* out_ratio = nullptr, float* out_comp_time = nullptr,
+    int* out_is_ood = nullptr, int* out_top_actions = nullptr);
+
+/** ctx overload: launches nnSGDKernel on g_sgd_stream (not ctx->stream),
+ *  uses ctx->d_sgd_* buffers, records g_sgd_done, syncs g_sgd_stream. */
+int runNNSGDCtx(const AutoStatsGPU* d_stats, const SGDSample* samples,
+    int num_samples, size_t data_size, double error_bound, float learning_rate,
+    CompContext* ctx, float* out_grad_norm = nullptr,
+    int* out_clipped = nullptr, int* out_count = nullptr);
 
 /**
  * Fused NN inference: reads stats directly from device pointer.

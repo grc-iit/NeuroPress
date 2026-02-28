@@ -18,6 +18,7 @@
 #include <cmath>
 
 #include "stats/auto_stats_gpu.h"
+#include "api/internal.hpp"
 
 namespace gpucompress {
 
@@ -298,9 +299,9 @@ int runNNInference(
     size_t data_size,
     double error_bound,
     cudaStream_t stream,
-    float* out_predicted_ratio = nullptr,
-    float* out_predicted_comp_time = nullptr,
-    int* out_top_actions = nullptr
+    float* out_predicted_ratio,
+    float* out_predicted_comp_time,
+    int* out_top_actions
 );
 
 /* ============================================================
@@ -337,6 +338,55 @@ AutoStatsGPU* runStatsKernelsNoSync(
     h_init.error_level = 0;
 
     fprintf(stderr, "[XFER H→D] stats init: vmin/vmax/num_elements (%zu B)\n", sizeof(AutoStatsGPU));
+    err = cudaMemcpyAsync(d_stats, &h_init, sizeof(AutoStatsGPU),
+                          cudaMemcpyHostToDevice, stream);
+    if (err != cudaSuccess) return nullptr;
+
+    int num_blocks = static_cast<int>((num_elements + STATS_BLOCK_SIZE - 1) / STATS_BLOCK_SIZE);
+    if (num_blocks > STATS_MAX_BLOCKS) num_blocks = STATS_MAX_BLOCKS;
+
+    statsPass1Kernel<<<num_blocks, STATS_BLOCK_SIZE, 0, stream>>>(
+        static_cast<const float*>(d_input), num_elements, d_stats);
+
+    launchEntropyKernelsAsync(d_input, input_size, d_histogram,
+                              &d_stats->entropy, stream);
+
+    madPass2Kernel<<<num_blocks, STATS_BLOCK_SIZE, 0, stream>>>(
+        static_cast<const float*>(d_input), num_elements, d_stats);
+
+    finalizeStatsOnlyKernel<<<1, 1, 0, stream>>>(d_stats);
+
+    return d_stats;
+}
+
+/**
+ * Context-aware overload: uses ctx->d_stats/d_histogram/d_stats_workspace
+ * instead of the global singleton buffers.
+ */
+AutoStatsGPU* runStatsKernelsNoSync(
+    const void* d_input,
+    size_t input_size,
+    cudaStream_t stream,
+    CompContext* ctx
+) {
+    size_t num_elements = input_size / sizeof(float);
+    if (num_elements == 0 || d_input == nullptr || ctx == nullptr) {
+        return nullptr;
+    }
+
+    AutoStatsGPU* d_stats    = ctx->d_stats;
+    unsigned int* d_histogram = ctx->d_histogram;
+
+    cudaError_t err = cudaMemsetAsync(ctx->d_stats_workspace, 0, kStatsWorkspaceSize, stream);
+    if (err != cudaSuccess) return nullptr;
+
+    AutoStatsGPU h_init;
+    memset(&h_init, 0, sizeof(h_init));
+    h_init.vmin         = FLT_MAX;
+    h_init.vmax         = -FLT_MAX;
+    h_init.num_elements = num_elements;
+    h_init.error_level  = 0;
+
     err = cudaMemcpyAsync(d_stats, &h_init, sizeof(AutoStatsGPU),
                           cudaMemcpyHostToDevice, stream);
     if (err != cudaSuccess) return nullptr;

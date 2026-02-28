@@ -14,6 +14,12 @@ static constexpr int NN_OUTPUT_DIM = 4;
 static constexpr int NN_NUM_CONFIGS = 32;  // 8 algos x 2 quant x 2 shuffle
 static constexpr int NN_MAX_SGD_SAMPLES = 8;
 
+/** Total number of gradient floats for GPU SGD buffer. */
+static constexpr int NN_SGD_GRAD_SIZE =
+    NN_HIDDEN_DIM * NN_INPUT_DIM + NN_HIDDEN_DIM +   // w1 + b1: 1920 + 128
+    NN_HIDDEN_DIM * NN_HIDDEN_DIM + NN_HIDDEN_DIM +  // w2 + b2: 16384 + 128
+    NN_OUTPUT_DIM * NN_HIDDEN_DIM + NN_OUTPUT_DIM;   // w3 + b3: 512 + 4 = 19076
+
 /** Input sample for GPU SGD kernel. */
 struct SGDSample {
     int action;

@@ -19,6 +19,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <queue>
+#include <thread>
+#include <vector>
+
 #include <cuda_runtime.h>
 
 /* Public HDF5 headers */
@@ -976,196 +983,271 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
             goto done;
         }
 
-        /* ---- Allocate pinned host buffer for compressed output ---- */
         size_t chunk_elems = 1;
         for (int d = 0; d < ndims; d++) chunk_elems *= (size_t)chunk_dims[d];
         size_t chunk_bytes = chunk_elems * elem_size;
         size_t max_comp    = gpucompress_max_compressed_size(chunk_bytes);
 
-        void  *h_compressed = NULL;
-        if (cudaMallocHost(&h_compressed, max_comp) != cudaSuccess) goto done;
+        /* ---- 3-Stage concurrent pipeline: N_COMP_WORKERS + I/O thread ---- */
+#define N_COMP_WORKERS 4
+        struct WorkItem {
+            const uint8_t* src;      /* source for compression */
+            uint8_t*       d_owned;  /* non-NULL: worker cudaFrees after compression */
+            size_t         sz;
+            hsize_t        cs[32];
+            int            nd;
+            bool           valid;
+        };
 
-        /* Device buffer for one chunk (to gather into) + compressed output */
-        uint8_t *d_chunk      = NULL;
-        uint8_t *d_compressed = NULL;
-        if (cudaMalloc(&d_chunk,      chunk_bytes) != cudaSuccess) { cudaFreeHost(h_compressed); goto done; }
-        if (cudaMalloc(&d_compressed, max_comp)    != cudaSuccess) {
-            cudaFree(d_chunk); cudaFreeHost(h_compressed); goto done;
-        }
+        /* Per-worker device output and pinned host staging buffers */
+        uint8_t *d_comp_w[N_COMP_WORKERS] = {};
+        void    *h_comp_w[N_COMP_WORKERS] = {};
 
-        /* Device-side dimension arrays for the gather kernel */
+        /* Bounded work queue (capacity = N_COMP_WORKERS) */
+        std::mutex              wq_mtx;
+        std::condition_variable wq_full_cv, wq_ready_cv;
+        std::queue<WorkItem>    wq;
+
+        /* Error propagation from workers */
+        std::atomic<herr_t>     worker_err{0};
+
+        /* I/O writer thread (Stage 3) */
+        struct IOItem { void *data; size_t sz; hsize_t cs[32]; int nd; };
+        std::mutex              io_mtx;
+        std::condition_variable io_cv;
+        std::queue<IOItem>      io_q;
+        bool                    io_done_flag = false;
+        herr_t                  io_err       = 0;
+        bool                    io_started   = false;
+        std::thread             io_thr;
+
+        /* Stage-1 dimension arrays for gather kernel (reused across chunks) */
         hsize_t *d_dset_dims = NULL, *d_chunk_dims = NULL, *d_chunk_start = NULL;
 
-        /* ---- Iterate over all chunks ---- */
-        /* Compute number of chunks per dimension */
-        hsize_t num_chunks[32];
-        for (int d = 0; d < ndims; d++)
-            num_chunks[d] = (dset_dims[d] + chunk_dims[d] - 1) / chunk_dims[d];
+        /* ---- Allocate per-worker buffers ---- */
+        bool ok = true;
+        for (int w = 0; w < N_COMP_WORKERS && ok; w++) {
+            if (cudaMallocHost(&h_comp_w[w], max_comp) != cudaSuccess ||
+                cudaMalloc   (&d_comp_w[w], max_comp) != cudaSuccess)
+                ok = false;
+        }
+        if (!ok) goto done_write;
 
-        /* Total number of chunks */
-        size_t total_chunks = 1;
-        for (int d = 0; d < ndims; d++) total_chunks *= (size_t)num_chunks[d];
+        /* ---- Launch I/O writer thread (Stage 3) ---- */
+        io_thr = std::thread([&]() {
+            while (true) {
+                IOItem item;
+                { std::unique_lock<std::mutex> lk(io_mtx);
+                  io_cv.wait(lk, [&]{ return !io_q.empty() || io_done_flag; });
+                  if (io_q.empty()) break;
+                  item = io_q.front(); io_q.pop(); }
+                io_cv.notify_one();  /* wake worker blocked on io_q.size() < 8 */
+                herr_t r = write_chunk_to_native(o->under_object, o->under_vol_id,
+                                                  item.cs, item.data, item.sz, dxpl_id);
+                free(item.data);
+                if (r < 0) { std::lock_guard<std::mutex> lk(io_mtx); io_err = r; }
+            }
+        });
+        io_started = true;
 
-        ret = 0;   /* assume success until error */
-        s_gpu_writes++;
+        /* ---- Launch worker threads (Stage 2) + Stage 1 ---- */
+        {
+            std::vector<std::thread> workers;
+            workers.reserve(N_COMP_WORKERS);
+            for (int w = 0; w < N_COMP_WORKERS; w++) {
+                workers.emplace_back([&, w]() {
+                    while (true) {
+                        WorkItem wi;
+                        { std::unique_lock<std::mutex> lk(wq_mtx);
+                          wq_ready_cv.wait(lk, [&]{ return !wq.empty(); });
+                          wi = wq.front(); wq.pop(); }
+                        wq_full_cv.notify_one();
+                        if (!wi.valid) break;
 
-        for (size_t ci = 0; ci < total_chunks; ci++) {
-            /* Compute N-D chunk index */
-            hsize_t chunk_idx[32];
-            size_t  remaining = ci;
-            for (int d = ndims - 1; d >= 0; d--) {
-                chunk_idx[d] = (hsize_t)(remaining % (size_t)num_chunks[d]);
-                remaining   /= (size_t)num_chunks[d];
+                        size_t comp_sz = max_comp;
+                        gpucompress_error_t ce = gpucompress_compress_gpu(
+                            wi.src, wi.sz, d_comp_w[w], &comp_sz, &cfg, NULL, NULL);
+
+                        /* Free per-chunk owned buffer after compression completes */
+                        if (wi.d_owned) { cudaFree(wi.d_owned); wi.d_owned = NULL; }
+
+                        if (ce != GPUCOMPRESS_SUCCESS) {
+                            worker_err.store((herr_t)-1);
+                            continue;
+                        }
+
+                        /* D→H: safe — gpucompress_compress_gpu syncs ctx->stream */
+                        if (cudaMemcpy(h_comp_w[w], d_comp_w[w], comp_sz,
+                                       cudaMemcpyDeviceToHost) != cudaSuccess) {
+                            worker_err.store((herr_t)-1);
+                            continue;
+                        }
+
+                        /* Tight malloc copy for IOItem */
+                        void *dcopy = malloc(comp_sz);
+                        if (!dcopy) { worker_err.store((herr_t)-1); continue; }
+                        memcpy(dcopy, h_comp_w[w], comp_sz);
+
+                        IOItem item;
+                        item.data = dcopy;
+                        item.sz   = comp_sz;
+                        item.nd   = wi.nd;
+                        memcpy(item.cs, wi.cs, (size_t)wi.nd * sizeof(hsize_t));
+
+                        { std::unique_lock<std::mutex> lk(io_mtx);
+                          io_cv.wait(lk, [&]{ return io_q.size() < 8 || io_done_flag; });
+                          io_q.push(item); }
+                        io_cv.notify_one();
+                    }
+                });
             }
 
-            /* Chunk start coordinates in dataset elements */
-            hsize_t chunk_start[32];
-            for (int d = 0; d < ndims; d++)
-                chunk_start[d] = chunk_idx[d] * chunk_dims[d];
+            /* ---- Stage 1: iterate chunks, post WorkItems ---- */
+            {
+                hsize_t num_chunks[32];
+                for (int d = 0; d < ndims; d++)
+                    num_chunks[d] = (dset_dims[d] + chunk_dims[d] - 1) / chunk_dims[d];
+                size_t total_chunks = 1;
+                for (int d = 0; d < ndims; d++) total_chunks *= (size_t)num_chunks[d];
 
-            /* Actual size of this chunk (may be smaller at dataset boundary) */
-            hsize_t actual_chunk[32];
-            size_t  actual_elems = 1;
-            for (int d = 0; d < ndims; d++) {
-                actual_chunk[d] = chunk_dims[d];
-                if (chunk_start[d] + actual_chunk[d] > dset_dims[d])
-                    actual_chunk[d] = dset_dims[d] - chunk_start[d];
-                actual_elems *= (size_t)actual_chunk[d];
-            }
-            size_t actual_bytes = actual_elems * elem_size;
+                ret = 0;
+                s_gpu_writes++;
 
-            /* ---- Gather chunk from GPU buffer ---- */
-            bool contiguous = true;
-            /* A chunk is contiguous in C-order iff all trailing dimensions
-             * (1..ndims-1) span the full dataset extent.  Only the outermost
-             * dimension (d=0) is allowed to be smaller than the dataset. */
-            for (int d = 1; d < ndims; d++) {
-                if (chunk_dims[d] != dset_dims[d]) { contiguous = false; break; }
-            }
+                for (size_t ci = 0; ci < total_chunks && ret == 0; ci++) {
+                    /* ---- Compute N-D chunk coordinates ---- */
+                    hsize_t chunk_idx[32];
+                    size_t  remaining = ci;
+                    for (int d = ndims - 1; d >= 0; d--) {
+                        chunk_idx[d] = (hsize_t)(remaining % (size_t)num_chunks[d]);
+                        remaining   /= (size_t)num_chunks[d];
+                    }
+                    hsize_t chunk_start[32];
+                    for (int d = 0; d < ndims; d++)
+                        chunk_start[d] = chunk_idx[d] * chunk_dims[d];
 
-            VOL_TRACE("  chunk[%zu] off=%llu actual=%zuB  path=%s",
-                      ci, (unsigned long long)chunk_start[0], actual_bytes,
-                      contiguous ? "contiguous" : "gather-kernel");
+                    hsize_t actual_chunk[32];
+                    size_t  actual_elems = 1;
+                    for (int d = 0; d < ndims; d++) {
+                        actual_chunk[d] = chunk_dims[d];
+                        if (chunk_start[d] + actual_chunk[d] > dset_dims[d])
+                            actual_chunk[d] = dset_dims[d] - chunk_start[d];
+                        actual_elems *= (size_t)actual_chunk[d];
+                    }
+                    size_t actual_bytes = actual_elems * elem_size;
 
-            if (contiguous) {
-                /* Simple pointer offset: chunk is contiguous in C-order memory.
-                 * Compute the byte offset of the first element in d_buf. */
-                size_t off = 0;
-                size_t s   = elem_size;
-                for (int d = ndims - 1; d >= 0; d--) {
-                    off += (size_t)chunk_start[d] * s;
-                    s   *= (size_t)dset_dims[d];
-                }
-                /* If actual chunk == full chunk, just point into d_buf */
-                const uint8_t *src_ptr =
-                    static_cast<const uint8_t*>(d_buf) + off;
-
-                if (actual_bytes == chunk_bytes) {
-                    /* Whole chunk: compress directly from d_buf offset */
-                    size_t comp_size = max_comp;
-                    gpucompress_error_t ce = gpucompress_compress_gpu(
-                        src_ptr, actual_bytes, d_compressed,
-                        &comp_size, &cfg, NULL, NULL);
-                    if (ce != GPUCOMPRESS_SUCCESS) { ret = -1; break; }
-                    VOL_TRACE("    gpucompress_compress_gpu() → %zuB (%.2fx)",
-                              comp_size, (double)actual_bytes / comp_size);
-
-                    /* D→H: only the compressed bytes */
-                    VOL_TRACE("    cudaMemcpy D→H %zuB (compressed only, not %zuB raw)",
-                              comp_size, actual_bytes);
-                    if (vol_memcpy(h_compressed, d_compressed, comp_size,
-                                   cudaMemcpyDeviceToHost) != cudaSuccess) {
-                        ret = -1; break;
+                    /* ---- Check contiguity ---- */
+                    bool contiguous = true;
+                    for (int d = 1; d < ndims; d++) {
+                        if (chunk_dims[d] != dset_dims[d]) { contiguous = false; break; }
                     }
 
-                    if (write_chunk_to_native(o->under_object, o->under_vol_id,
-                                              chunk_start, h_compressed, comp_size,
-                                              dxpl_id) < 0) {
-                        ret = -1; break;
+                    WorkItem wi = {};
+                    wi.nd    = ndims;
+                    wi.valid = true;
+                    memcpy(wi.cs, chunk_start, (size_t)ndims * sizeof(hsize_t));
+
+                    VOL_TRACE("  chunk[%zu] off=%llu actual=%zuB  path=%s",
+                              ci, (unsigned long long)chunk_start[0], actual_bytes,
+                              contiguous ? "contiguous" : "gather-kernel");
+
+                    if (contiguous) {
+                        size_t off = 0, stride = elem_size;
+                        for (int d = ndims - 1; d >= 0; d--) {
+                            off    += (size_t)chunk_start[d] * stride;
+                            stride *= (size_t)dset_dims[d];
+                        }
+                        const uint8_t *raw = static_cast<const uint8_t*>(d_buf) + off;
+                        if (actual_bytes == chunk_bytes) {
+                            /* Full-size contiguous chunk: no copy needed */
+                            wi.src     = raw;
+                            wi.sz      = actual_bytes;
+                            wi.d_owned = NULL;
+                        } else {
+                            /* Partial boundary: pad with zeros into fresh device buffer */
+                            uint8_t *d_owned = NULL;
+                            if (cudaMalloc(&d_owned, chunk_bytes) != cudaSuccess)
+                                { ret = -1; break; }
+                            cudaMemset(d_owned, 0, chunk_bytes);
+                            vol_memcpy(d_owned, raw, actual_bytes, cudaMemcpyDeviceToDevice);
+                            cudaStreamSynchronize(cudaStreamDefault);
+                            wi.src     = d_owned;
+                            wi.sz      = chunk_bytes;
+                            wi.d_owned = d_owned;
+                        }
+                    } else {
+                        /* Non-contiguous: gather into fresh device buffer */
+                        uint8_t *d_owned = NULL;
+                        if (cudaMalloc(&d_owned, chunk_bytes) != cudaSuccess)
+                            { ret = -1; break; }
+                        if (!d_dset_dims) {
+                            if (alloc_dim_arrays(ndims, dset_dims, actual_chunk, chunk_start,
+                                                &d_dset_dims, &d_chunk_dims, &d_chunk_start) < 0)
+                                { cudaFree(d_owned); ret = -1; break; }
+                        } else {
+                            vol_memcpy(d_chunk_dims,  actual_chunk, (size_t)ndims * sizeof(hsize_t),
+                                       cudaMemcpyHostToDevice);
+                            vol_memcpy(d_chunk_start, chunk_start,  (size_t)ndims * sizeof(hsize_t),
+                                       cudaMemcpyHostToDevice);
+                        }
+                        int threads = 256;
+                        int blocks  = (int)((actual_elems + threads - 1) / threads);
+                        gather_chunk_kernel<<<blocks, threads>>>(
+                            static_cast<const uint8_t*>(d_buf), d_owned,
+                            ndims, elem_size, actual_elems,
+                            d_dset_dims, d_chunk_dims, d_chunk_start);
+                        if (cudaGetLastError() != cudaSuccess ||
+                            cudaStreamSynchronize(cudaStreamDefault) != cudaSuccess)
+                            { cudaFree(d_owned); ret = -1; break; }
+                        wi.src     = d_owned;
+                        wi.sz      = actual_bytes;
+                        wi.d_owned = d_owned;
                     }
+
+                    /* ---- Post WorkItem to bounded work queue ---- */
+                    { std::unique_lock<std::mutex> lk(wq_mtx);
+                      wq_full_cv.wait(lk, [&]{ return wq.size() < (size_t)N_COMP_WORKERS
+                                                      || ret != 0; });
+                      if (ret == 0)
+                          wq.push(wi);
+                      else if (wi.d_owned) { cudaFree(wi.d_owned); wi.d_owned = NULL; } }
+                    wq_ready_cv.notify_one();
+
                     s_chunks_comp++;
-                } else {
-                    /* Partial chunk at boundary: pad with zeros in d_chunk */
-                    cudaMemset(d_chunk, 0, chunk_bytes);
-                    vol_memcpy(d_chunk, src_ptr, actual_bytes,
-                               cudaMemcpyDeviceToDevice);
+                } /* chunk loop */
+            } /* Stage 1 scope */
 
-                    size_t comp_size = max_comp;
-                    gpucompress_error_t ce = gpucompress_compress_gpu(
-                        d_chunk, chunk_bytes, d_compressed,
-                        &comp_size, &cfg, NULL, NULL);
-                    if (ce != GPUCOMPRESS_SUCCESS) { ret = -1; break; }
-                    VOL_TRACE("    gpucompress_compress_gpu() [partial+padded] → %zuB (%.2fx)",
-                              comp_size, (double)chunk_bytes / comp_size);
-
-                    VOL_TRACE("    cudaMemcpy D→H %zuB", comp_size);
-                    if (vol_memcpy(h_compressed, d_compressed, comp_size,
-                                   cudaMemcpyDeviceToHost) != cudaSuccess) {
-                        ret = -1; break;
-                    }
-
-                    if (write_chunk_to_native(o->under_object, o->under_vol_id,
-                                              chunk_start, h_compressed, comp_size,
-                                              dxpl_id) < 0) {
-                        ret = -1; break;
-                    }
-                    s_chunks_comp++;
-                }
-            } else {
-                /* Non-contiguous: use gather kernel */
-                if (!d_dset_dims) {
-                    if (alloc_dim_arrays(ndims, dset_dims, actual_chunk,
-                                        chunk_start,
-                                        &d_dset_dims, &d_chunk_dims,
-                                        &d_chunk_start) < 0) {
-                        ret = -1; break;
-                    }
-                } else {
-                    /* Update chunk_start and actual_chunk on device */
-                    vol_memcpy(d_chunk_dims,  actual_chunk, (size_t)ndims * sizeof(hsize_t),
-                               cudaMemcpyHostToDevice);
-                    vol_memcpy(d_chunk_start, chunk_start,  (size_t)ndims * sizeof(hsize_t),
-                               cudaMemcpyHostToDevice);
-                }
-
-                int threads = 256;
-                int blocks  = (int)((actual_elems + threads - 1) / threads);
-                gather_chunk_kernel<<<blocks, threads>>>(
-                    static_cast<const uint8_t*>(d_buf),
-                    d_chunk, ndims, elem_size, actual_elems,
-                    d_dset_dims, d_chunk_dims, d_chunk_start);
-                if (cudaGetLastError() != cudaSuccess ||
-                    cudaDeviceSynchronize() != cudaSuccess) {
-                    ret = -1; break;
-                }
-
-                size_t comp_size = max_comp;
-                gpucompress_error_t ce = gpucompress_compress_gpu(
-                    d_chunk, actual_bytes, d_compressed,
-                    &comp_size, &cfg, NULL, NULL);
-                if (ce != GPUCOMPRESS_SUCCESS) { ret = -1; break; }
-                VOL_TRACE("    gpucompress_compress_gpu() [after gather] → %zuB (%.2fx)",
-                          comp_size, (double)actual_bytes / comp_size);
-
-                VOL_TRACE("    cudaMemcpy D→H %zuB", comp_size);
-                if (vol_memcpy(h_compressed, d_compressed, comp_size,
-                               cudaMemcpyDeviceToHost) != cudaSuccess) {
-                    ret = -1; break;
-                }
-
-                if (write_chunk_to_native(o->under_object, o->under_vol_id,
-                                          chunk_start, h_compressed, comp_size,
-                                          dxpl_id) < 0) {
-                    ret = -1; break;
-                }
-                s_chunks_comp++;
+            /* ---- Send sentinel WorkItems to stop all workers ---- */
+            for (int w = 0; w < N_COMP_WORKERS; w++) {
+                WorkItem sentinel = {};
+                sentinel.valid = false;
+                { std::unique_lock<std::mutex> lk(wq_mtx);
+                  wq_full_cv.wait(lk, [&]{ return wq.size() < (size_t)N_COMP_WORKERS; });
+                  wq.push(sentinel); }
+                wq_ready_cv.notify_one();
             }
-        } /* chunk loop */
 
+            /* ---- Join workers and propagate errors ---- */
+            for (auto &t : workers) t.join();
+            if (worker_err.load() != 0 && ret == 0) ret = (herr_t)-1;
+
+        } /* workers + Stage 1 scope */
+
+done_write:
+        /* ---- Signal I/O thread and join ---- */
+        if (io_started) {
+            { std::lock_guard<std::mutex> lk(io_mtx); io_done_flag = true; }
+            io_cv.notify_all();
+            io_thr.join();
+            if (io_err < 0 && ret == 0) ret = -1;
+        }
+
+        /* ---- Cleanup ---- */
         if (d_dset_dims) free_dim_arrays(d_dset_dims, d_chunk_dims, d_chunk_start);
-        cudaFree(d_compressed);
-        cudaFree(d_chunk);
-        cudaFreeHost(h_compressed);
+        for (int w = 0; w < N_COMP_WORKERS; w++) {
+            if (d_comp_w[w]) cudaFree(d_comp_w[w]);
+            if (h_comp_w[w]) cudaFreeHost(h_comp_w[w]);
+        }
+#undef N_COMP_WORKERS
     }
 
 done:
@@ -1220,78 +1302,115 @@ gpu_aware_chunked_read(H5VL_gpucompress_t *o,
         size_t chunk_bytes = chunk_elems * elem_size;
         size_t max_comp    = gpucompress_max_compressed_size(chunk_bytes);
 
-        /* Pinned host buffer for compressed input */
-        void *h_compressed = NULL;
-        if (cudaMallocHost(&h_compressed, max_comp) != cudaSuccess) goto done;
-
-        /* Device buffers */
-        uint8_t *d_compressed   = NULL;
-        uint8_t *d_decompressed = NULL;  /* lazy: only if non-contiguous chunk seen */
-        if (cudaMalloc(&d_compressed, max_comp) != cudaSuccess) {
-            cudaFreeHost(h_compressed); goto done;
-        }
-
+        /* ---- Prefetch pipeline: disk reader thread + GPU decompress main thread ---- */
+#define N_SLOTS_R 2
+        void    *h_comp_r[N_SLOTS_R] = {};   /* pinned host staging for compressed data */
+        uint8_t *d_compressed        = NULL;
+        uint8_t *d_decompressed      = NULL; /* lazy: only if non-contiguous chunk seen */
         hsize_t *d_dset_dims = NULL, *d_chunk_dims = NULL, *d_chunk_start = NULL;
 
         hsize_t num_chunks[32];
         for (int d = 0; d < ndims; d++)
             num_chunks[d] = (dset_dims[d] + chunk_dims[d] - 1) / chunk_dims[d];
-
         size_t total_chunks = 1;
         for (int d = 0; d < ndims; d++) total_chunks *= (size_t)num_chunks[d];
+
+        /* Semaphore (mutex+condvar): tracks free prefetch slots */
+        int                     free_slots_count = N_SLOTS_R;
+        std::mutex              free_mtx;
+        std::condition_variable free_cv;
+
+        /* Queue from prefetch thread to main thread */
+        struct PrefetchItem { int slot; size_t comp_sz; uint32_t filter_mask;
+                              hsize_t cs[32]; herr_t status; };
+        std::queue<PrefetchItem> ready_q;
+        std::mutex               ready_mtx;
+        std::condition_variable  ready_cv;
+
+        bool        pre_started = false;
+        std::thread pre_thr;
+
+        /* ---- Allocate resources ---- */
+        bool ok = true;
+        for (int s = 0; s < N_SLOTS_R && ok; s++) {
+            if (cudaMallocHost(&h_comp_r[s], max_comp) != cudaSuccess) ok = false;
+        }
+        if (ok && cudaMalloc(&d_compressed, max_comp) != cudaSuccess) ok = false;
+        if (!ok) goto done_read;
+
+        /* ---- Launch prefetch (disk reader) thread ---- */
+        pre_thr = std::thread([&]() {
+            for (size_t ci = 0; ci < total_chunks; ci++) {
+                /* Acquire a free slot */
+                { std::unique_lock<std::mutex> lk(free_mtx);
+                  free_cv.wait(lk, [&]{ return free_slots_count > 0; });
+                  free_slots_count--; }
+                int slot = (int)(ci % N_SLOTS_R);
+
+                /* Compute chunk_start for this ci */
+                hsize_t chunk_idx[32];
+                size_t  remaining = ci;
+                for (int d = ndims - 1; d >= 0; d--) {
+                    chunk_idx[d] = (hsize_t)(remaining % (size_t)num_chunks[d]);
+                    remaining   /= (size_t)num_chunks[d];
+                }
+                hsize_t chunk_start[32];
+                for (int d = 0; d < ndims; d++)
+                    chunk_start[d] = chunk_idx[d] * chunk_dims[d];
+
+                size_t   comp_sz     = max_comp;
+                uint32_t filter_mask = 0;
+                herr_t r = read_chunk_from_native(o->under_object, o->under_vol_id,
+                                                   chunk_start, h_comp_r[slot],
+                                                   &comp_sz, &filter_mask, dxpl_id);
+                PrefetchItem item;
+                item.slot        = slot;
+                item.comp_sz     = comp_sz;
+                item.filter_mask = filter_mask;
+                item.status      = r;
+                memcpy(item.cs, chunk_start, (size_t)ndims * sizeof(hsize_t));
+                { std::lock_guard<std::mutex> lk(ready_mtx); ready_q.push(item); }
+                ready_cv.notify_one();
+            }
+        });
+        pre_started = true;
 
         ret = 0;
         s_gpu_reads++;
 
         for (size_t ci = 0; ci < total_chunks; ci++) {
-            hsize_t chunk_idx[32];
-            size_t  remaining = ci;
-            for (int d = ndims - 1; d >= 0; d--) {
-                chunk_idx[d] = (hsize_t)(remaining % (size_t)num_chunks[d]);
-                remaining   /= (size_t)num_chunks[d];
-            }
+            /* Wait for the prefetch thread to deliver the next chunk */
+            PrefetchItem item;
+            { std::unique_lock<std::mutex> lk(ready_mtx);
+              ready_cv.wait(lk, [&]{ return !ready_q.empty(); });
+              item = ready_q.front(); ready_q.pop(); }
 
-            hsize_t chunk_start[32];
-            for (int d = 0; d < ndims; d++)
-                chunk_start[d] = chunk_idx[d] * chunk_dims[d];
+            if (item.status < 0) { ret = -1; break; }
 
-            hsize_t actual_chunk[32];
-            size_t  actual_elems = 1;
+            VOL_TRACE("  chunk[%zu] off=%llu → read %zuB compressed from file",
+                      ci, (unsigned long long)item.cs[0], item.comp_sz);
+
+            /* Recompute actual_chunk / actual_bytes from chunk_start */
+            hsize_t *chunk_start = item.cs;
+            hsize_t  actual_chunk[32];
+            size_t   actual_elems = 1;
             for (int d = 0; d < ndims; d++) {
                 actual_chunk[d] = chunk_dims[d];
                 if (chunk_start[d] + actual_chunk[d] > dset_dims[d])
                     actual_chunk[d] = dset_dims[d] - chunk_start[d];
                 actual_elems *= (size_t)actual_chunk[d];
             }
+            size_t actual_bytes = actual_elems * elem_size;
 
-            /* ---- Read compressed chunk from file ---- */
-            VOL_TRACE("  chunk[%zu] off=%llu", ci, (unsigned long long)chunk_start[0]);
-            size_t   comp_size   = max_comp;
-            uint32_t filter_mask = 0;
-            if (read_chunk_from_native(o->under_object, o->under_vol_id,
-                                       chunk_start, h_compressed,
-                                       &comp_size, &filter_mask, dxpl_id) < 0) {
-                ret = -1; break;
-            }
-            VOL_TRACE("    → read %zuB compressed from file", comp_size);
-
-            /* ---- Determine destination pointer before decompressing ---- */
-            /* Contiguous iff all trailing dims span the full dataset extent */
             bool contiguous = true;
             for (int d = 1; d < ndims; d++) {
                 if (chunk_dims[d] != dset_dims[d]) { contiguous = false; break; }
             }
 
-            size_t   actual_bytes = actual_elems * elem_size;
+            bool    direct_decomp = contiguous && (actual_bytes == chunk_bytes);
             uint8_t *dst_ptr;
 
-            /* Direct-decompress fast path: contiguous AND full (non-boundary) chunk.
-             * Boundary chunks are padded to chunk_bytes on write, so decompressing
-             * chunk_bytes directly into d_buf would overflow the user's buffer. */
-            bool direct_decomp = contiguous && (actual_bytes == chunk_bytes);
-
             if (direct_decomp) {
-                /* Decompress directly into the user's output buffer — no D→D copy */
                 size_t off = 0, s = elem_size;
                 for (int d = ndims - 1; d >= 0; d--) {
                     off += (size_t)chunk_start[d] * s;
@@ -1299,7 +1418,6 @@ gpu_aware_chunked_read(H5VL_gpucompress_t *o,
                 }
                 dst_ptr = static_cast<uint8_t*>(d_buf) + off;
             } else {
-                /* Boundary or non-contiguous: decompress into intermediate buffer */
                 if (!d_decompressed &&
                     cudaMalloc(&d_decompressed, chunk_bytes) != cudaSuccess) {
                     ret = -1; break;
@@ -1307,24 +1425,27 @@ gpu_aware_chunked_read(H5VL_gpucompress_t *o,
                 dst_ptr = d_decompressed;
             }
 
-            /* H→D: compressed bytes */
-            VOL_TRACE("    cudaMemcpy H→D %zuB (compressed)", comp_size);
-            if (vol_memcpy(d_compressed, h_compressed, comp_size,
+            /* H→D compressed bytes (synchronous — fast for compressed data) */
+            VOL_TRACE("    cudaMemcpy H→D %zuB (compressed)", item.comp_sz);
+            if (vol_memcpy(d_compressed, h_comp_r[item.slot], item.comp_sz,
                            cudaMemcpyHostToDevice) != cudaSuccess) {
                 ret = -1; break;
             }
 
-            /* Decompress into dst_ptr */
+            /* Release this prefetch slot now that H→D is done */
+            { std::lock_guard<std::mutex> lk(free_mtx); free_slots_count++; }
+            free_cv.notify_one();
+
+            /* Decompress on GPU */
             size_t decomp_size = chunk_bytes;
             gpucompress_error_t ce = gpucompress_decompress_gpu(
-                d_compressed, comp_size, dst_ptr, &decomp_size, NULL);
+                d_compressed, item.comp_sz, dst_ptr, &decomp_size, NULL);
             if (ce != GPUCOMPRESS_SUCCESS) { ret = -1; break; }
             VOL_TRACE("    gpucompress_decompress_gpu() → %zuB", decomp_size);
 
             if (direct_decomp) {
                 s_chunks_decomp++;
             } else if (contiguous) {
-                /* Boundary contiguous chunk: copy only the valid actual_bytes */
                 size_t off = 0, s = elem_size;
                 for (int d = ndims - 1; d >= 0; d--) {
                     off += (size_t)chunk_start[d] * s;
@@ -1338,10 +1459,8 @@ gpu_aware_chunked_read(H5VL_gpucompress_t *o,
                 s_chunks_decomp++;
             } else {
                 if (!d_dset_dims) {
-                    if (alloc_dim_arrays(ndims, dset_dims, actual_chunk,
-                                        chunk_start,
-                                        &d_dset_dims, &d_chunk_dims,
-                                        &d_chunk_start) < 0) {
+                    if (alloc_dim_arrays(ndims, dset_dims, actual_chunk, chunk_start,
+                                        &d_dset_dims, &d_chunk_dims, &d_chunk_start) < 0) {
                         ret = -1; break;
                     }
                 } else {
@@ -1350,26 +1469,36 @@ gpu_aware_chunked_read(H5VL_gpucompress_t *o,
                     vol_memcpy(d_chunk_start, chunk_start,  (size_t)ndims * sizeof(hsize_t),
                                cudaMemcpyHostToDevice);
                 }
-
                 int threads = 256;
                 int blocks  = (int)((actual_elems + threads - 1) / threads);
                 scatter_chunk_kernel<<<blocks, threads>>>(
-                    d_decompressed,
-                    static_cast<uint8_t*>(d_buf),
+                    d_decompressed, static_cast<uint8_t*>(d_buf),
                     ndims, elem_size, actual_elems,
                     d_dset_dims, d_chunk_dims, d_chunk_start);
                 if (cudaGetLastError() != cudaSuccess ||
-                    cudaDeviceSynchronize() != cudaSuccess) {
+                    cudaStreamSynchronize(cudaStreamDefault) != cudaSuccess) {
                     ret = -1; break;
                 }
                 s_chunks_decomp++;
             }
         } /* chunk loop */
 
+done_read:
+        /* Unblock prefetch thread (in case main exited early with ret==-1) */
+        if (pre_started) {
+            { std::lock_guard<std::mutex> lk(free_mtx);
+              free_slots_count = N_SLOTS_R; }
+            free_cv.notify_all();
+            pre_thr.join();
+        }
+
         if (d_dset_dims) free_dim_arrays(d_dset_dims, d_chunk_dims, d_chunk_start);
         cudaFree(d_decompressed);
         cudaFree(d_compressed);
-        cudaFreeHost(h_compressed);
+        for (int s = 0; s < N_SLOTS_R; s++) {
+            if (h_comp_r[s]) cudaFreeHost(h_comp_r[s]);
+        }
+#undef N_SLOTS_R
     }
 
 done:
