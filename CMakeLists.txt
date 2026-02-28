@@ -641,6 +641,19 @@ if(HDF5_FOUND)
         )
         set_target_properties(test_qw4_atomic_counters PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
+        # PERF-16 regression: gather/scatter kernel on dedicated non-default stream
+        add_executable(test_perf16_gather_stream tests/test_perf16_gather_stream.cu)
+        set_source_files_properties(tests/test_perf16_gather_stream.cu PROPERTIES LANGUAGE CUDA)
+        target_include_directories(test_perf16_gather_stream PRIVATE
+            ${HDF5_VOL_INCLUDE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+        )
+        target_link_libraries(test_perf16_gather_stream PRIVATE
+            gpucompress H5VLgpucompress ${HDF5_VOL_LIB} CUDA::cudart m pthread
+        )
+        set_target_properties(test_perf16_gather_stream PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
         # SGD parallel chunk demo: 128MB dataset, 16MB chunks, LR=0.4, MAPE=20%
         add_executable(demo_sgd_parallel_chunks tests/demo_sgd_parallel_chunks.cu)
         set_source_files_properties(tests/demo_sgd_parallel_chunks.cu PROPERTIES LANGUAGE CUDA)

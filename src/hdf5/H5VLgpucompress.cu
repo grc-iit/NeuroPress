@@ -1105,6 +1105,10 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
 
             /* ---- Stage 1: iterate chunks, post WorkItems ---- */
             {
+                /* Non-default stream for gather kernel: avoids null-stream serialization
+                 * against the 8 CompContext worker streams. */
+                cudaStream_t gather_stream = nullptr;
+                cudaStreamCreate(&gather_stream);
                 hsize_t num_chunks[32];
                 for (int d = 0; d < ndims; d++)
                     num_chunks[d] = (dset_dims[d] + chunk_dims[d] - 1) / chunk_dims[d];
@@ -1170,7 +1174,7 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                                 { ret = -1; break; }
                             cudaMemset(d_owned, 0, chunk_bytes);
                             vol_memcpy(d_owned, raw, actual_bytes, cudaMemcpyDeviceToDevice);
-                            cudaStreamSynchronize(cudaStreamDefault);
+                            /* cudaMemset/cudaMemcpy are synchronous — no extra sync needed */
                             wi.src     = d_owned;
                             wi.sz      = chunk_bytes;
                             wi.d_owned = d_owned;
@@ -1192,12 +1196,12 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                         }
                         int threads = 256;
                         int blocks  = (int)((actual_elems + threads - 1) / threads);
-                        gather_chunk_kernel<<<blocks, threads>>>(
+                        gather_chunk_kernel<<<blocks, threads, 0, gather_stream>>>(
                             static_cast<const uint8_t*>(d_buf), d_owned,
                             ndims, elem_size, actual_elems,
                             d_dset_dims, d_chunk_dims, d_chunk_start);
                         if (cudaGetLastError() != cudaSuccess ||
-                            cudaStreamSynchronize(cudaStreamDefault) != cudaSuccess)
+                            cudaStreamSynchronize(gather_stream) != cudaSuccess)
                             { cudaFree(d_owned); ret = -1; break; }
                         wi.src     = d_owned;
                         wi.sz      = actual_bytes;
@@ -1215,6 +1219,7 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
 
                     s_chunks_comp++;
                 } /* chunk loop */
+                cudaStreamDestroy(gather_stream);
             } /* Stage 1 scope */
 
             /* ---- Send sentinel WorkItems to stop all workers ---- */
@@ -1309,6 +1314,8 @@ gpu_aware_chunked_read(H5VL_gpucompress_t *o,
         uint8_t *d_compressed        = NULL;
         uint8_t *d_decompressed      = NULL; /* lazy: only if non-contiguous chunk seen */
         hsize_t *d_dset_dims = NULL, *d_chunk_dims = NULL, *d_chunk_start = NULL;
+        cudaStream_t scatter_stream = nullptr;
+        cudaStreamCreate(&scatter_stream);
 
         hsize_t num_chunks[32];
         for (int d = 0; d < ndims; d++)
@@ -1472,12 +1479,12 @@ gpu_aware_chunked_read(H5VL_gpucompress_t *o,
                 }
                 int threads = 256;
                 int blocks  = (int)((actual_elems + threads - 1) / threads);
-                scatter_chunk_kernel<<<blocks, threads>>>(
+                scatter_chunk_kernel<<<blocks, threads, 0, scatter_stream>>>(
                     d_decompressed, static_cast<uint8_t*>(d_buf),
                     ndims, elem_size, actual_elems,
                     d_dset_dims, d_chunk_dims, d_chunk_start);
                 if (cudaGetLastError() != cudaSuccess ||
-                    cudaStreamSynchronize(cudaStreamDefault) != cudaSuccess) {
+                    cudaStreamSynchronize(scatter_stream) != cudaSuccess) {
                     ret = -1; break;
                 }
                 s_chunks_decomp++;
@@ -1493,6 +1500,7 @@ done_read:
             pre_thr.join();
         }
 
+        if (scatter_stream) cudaStreamDestroy(scatter_stream);
         if (d_dset_dims) free_dim_arrays(d_dset_dims, d_chunk_dims, d_chunk_start);
         cudaFree(d_decompressed);
         cudaFree(d_compressed);

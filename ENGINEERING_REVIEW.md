@@ -515,7 +515,7 @@ These require minimal code changes and carry clear, verifiable benefits:
 | QW-1 | Set `CMAKE_CUDA_ARCHITECTURES=80` | CMakeLists.txt | 10-30% GPU kernel speedup | Low |
 | QW-2 | Add `-use_fast_math` to CUDA Release flags | CMakeLists.txt | 5-10% speedup | Low |
 | QW-3 | ~~Fix format string `%u` → `PRIu64`~~ | gpucompress_api.cpp:1243 | ✅ DONE — `#include <cinttypes>`, `PRIu64` + `(uint64_t)` cast. Verified by `test_bug4_format_string` (5/5). | — |
-| QW-4 | Make global stats atomics (`s_gpu_writes` etc.) | H5VLgpucompress.cu | Thread safety | Low |
+| QW-4 | ~~Make global stats atomics (`s_gpu_writes` etc.)~~ | H5VLgpucompress.cu | ✅ DONE — `static int` → `static std::atomic<int>` for `s_gpu_writes`, `s_gpu_reads`, `s_chunks_comp`, `s_chunks_decomp`; `.store(0)` in reset, `.load()` in get. Verified by `test_qw4_atomic_counters` (16/16). | — |
 | QW-5 | ~~Add `file.gcount()` checks in `loadNNFromBinary`~~ | nn_gpu.cu | ✅ DONE — `NN_READ` macro checks every array read; consolidated 6 header reads into 1. Verified by `test_bug5_truncated_nnwt` (7/7). | — |
 | QW-6 | Remove stderr spam (conditional on debug flag) | nn_gpu.cu, gpucompress_api.cpp | I/O overhead reduction | Low |
 | QW-7 | Batch 3 D→H copies in `runStatsKernels()` into 1 | stats_kernel.cu | PCIe efficiency | Low |
@@ -672,6 +672,7 @@ In the VOL write path, `d_comp_w[w]` is sized to `max_comp = gpucompress_max_out
 **Source:** [VOL-6] in CODE_REVIEW_FINDINGS.md
 **Verified:** YES. `H5VLgpucompress.cu:1194-1200` launches `gather_chunk_kernel` on `cudaStreamDefault` and synchronizes before posting the WorkItem. Every non-contiguous or N-D chunk causes Stage 1 to stall. For purely chunked, C-order layouts this never triggers; for HDF5 datasets with non-C-order access patterns, this serializes the entire pipeline.
 **My review:** mentioned this in the stream table ("VOL gather kernel: Default — Potential issue") but didn't flag it prominently.
+**Status:** ✅ FIXED — dedicated `gather_stream` (write) and `scatter_stream` (read) created per call; kernels use these non-default streams; sync changed to `cudaStreamSynchronize(gather_stream/scatter_stream)`. Null-stream implicit serialization against 8 CompContext worker streams eliminated. Verified by `test_perf16_gather_stream` (5/5).
 
 ---
 
@@ -704,7 +705,7 @@ In the VOL write path, `d_comp_w[w]` is sized to `max_comp = gpucompress_max_out
 | BUG-8 | `g_sgd_ever_fired` plain bool read/written without atomics | **MEDIUM** ✅ FIXED — `std::atomic<bool>` with `memory_order_release` write, `memory_order_acquire` read. Verified by `tests/test_bug8_sgd_concurrent` (16/16). | `gpucompress_api.cpp:70`, `nn_gpu.cu:1378,1472` |
 | PERF-14 | `atomicAddDouble` CAS should be native `atomicAdd` on sm_60+ | **MEDIUM** | `stats_kernel.cu:58-67` |
 | PERF-15 | Per-call `cudaMalloc` for CASCADED/ANS/BITCOMP temp buffer | **MEDIUM** | `gpucompress_api.cpp:1763-1768` |
-| PERF-16 | Gather kernel on default stream serializes Stage 1 (non-contiguous datasets) | **MEDIUM** | `H5VLgpucompress.cu:1194-1200` |
+| PERF-16 | ~~Gather kernel on default stream serializes Stage 1 (non-contiguous datasets)~~ | **MEDIUM** ✅ FIXED — dedicated `gather_stream`/`scatter_stream` per write/read call; redundant `cudaStreamSynchronize(cudaStreamDefault)` in partial-boundary path removed. Verified by `test_perf16_gather_stream` (5/5). | `H5VLgpucompress.cu:1194-1200` |
 | INVESTIGATE | CASCADED/BITCOMP `NVCOMP_TYPE_LONGLONG` assumption unverified | **LOW** | `compression_factory.cpp:116,123` |
 
 ---
