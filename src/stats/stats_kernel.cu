@@ -420,7 +420,8 @@ static int runStatsKernels(
     AutoStatsGPU* d_stats = runStatsKernelsNoSync(d_input, input_size, stream);
     if (d_stats == nullptr) return -1;
 
-    // Copy results back to host
+    // Single 24B D→H copy: entropy + mad_normalized + deriv_normalized are
+    // contiguous in AutoStatsGPU (see auto_stats_gpu.h comment).
     struct StatsResultBlock {
         double entropy;
         double mad_normalized;
@@ -428,15 +429,10 @@ static int runStatsKernels(
     };
     StatsResultBlock h_result;
 
-    GC_LOG("[XFER D→H] stats: entropy (%zu B)\n", sizeof(double));
-    cudaError_t err = cudaMemcpyAsync(&h_result.entropy, &d_stats->entropy, sizeof(double),
-                          cudaMemcpyDeviceToHost, stream);
-    if (err != cudaSuccess) return -1;
-
-    GC_LOG("[XFER D→H] stats: mad_normalized + deriv_normalized (%zu B)\n", 2 * sizeof(double));
-    err = cudaMemcpyAsync(&h_result.mad_normalized, &d_stats->mad_normalized,
-                          2 * sizeof(double),
-                          cudaMemcpyDeviceToHost, stream);
+    GC_LOG("[XFER D→H] stats: entropy+mad+deriv (24 B)\n");
+    cudaError_t err = cudaMemcpyAsync(&h_result, &d_stats->entropy,
+                                      sizeof(StatsResultBlock),
+                                      cudaMemcpyDeviceToHost, stream);
     if (err != cudaSuccess) return -1;
 
     err = cudaStreamSynchronize(stream);
