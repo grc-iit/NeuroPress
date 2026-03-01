@@ -500,6 +500,25 @@ if(HDF5_FOUND)
             CUDA_SEPARABLE_COMPILATION ON
         )
 
+        # VOL-2 regression test: GPU ptr on non-gpucompress dataset → D↔H fallback
+        add_executable(test_vol2_gpu_fallback tests/test_vol2_gpu_fallback.cu)
+        set_source_files_properties(tests/test_vol2_gpu_fallback.cu PROPERTIES LANGUAGE CUDA)
+        target_include_directories(test_vol2_gpu_fallback PRIVATE
+            ${HDF5_VOL_INCLUDE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+        )
+        target_link_libraries(test_vol2_gpu_fallback PRIVATE
+            gpucompress
+            H5VLgpucompress
+            ${HDF5_VOL_LIB}
+            CUDA::cudart
+            m
+        )
+        set_target_properties(test_vol2_gpu_fallback PROPERTIES
+            CUDA_SEPARABLE_COMPILATION ON
+        )
+
         # Comprehensive VOL test suite
         add_executable(test_vol_comprehensive tests/test_vol_comprehensive.cu)
         set_source_files_properties(tests/test_vol_comprehensive.cu PROPERTIES LANGUAGE CUDA)
@@ -518,6 +537,19 @@ if(HDF5_FOUND)
         set_target_properties(test_vol_comprehensive PROPERTIES
             CUDA_SEPARABLE_COMPILATION ON
         )
+
+        # Minimal lossless round-trip sample
+        add_executable(sample_gpu_compress_roundtrip examples/sample_gpu_compress_roundtrip.cu)
+        set_source_files_properties(examples/sample_gpu_compress_roundtrip.cu PROPERTIES LANGUAGE CUDA)
+        target_include_directories(sample_gpu_compress_roundtrip PRIVATE
+            ${HDF5_VOL_INCLUDE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+        )
+        target_link_libraries(sample_gpu_compress_roundtrip PRIVATE
+            gpucompress H5VLgpucompress ${HDF5_VOL_LIB} CUDA::cudart m
+        )
+        set_target_properties(sample_gpu_compress_roundtrip PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
         # GPU pipeline demo: full write→inspect→read→verify walkthrough
         add_executable(demo_gpu_pipeline examples/demo_gpu_pipeline.cu)
@@ -791,6 +823,19 @@ if(HDF5_FOUND)
             gpucompress H5VLgpucompress ${HDF5_VOL_LIB} CUDA::cudart m
         )
         set_target_properties(benchmark_vol_gpu PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+        # Algorithm sweep: all 8 algos × 2 preprocessing on 8 fill patterns
+        add_executable(benchmark_algo_sweep tests/benchmark_algo_sweep.cu)
+        set_source_files_properties(tests/benchmark_algo_sweep.cu PROPERTIES LANGUAGE CUDA)
+        target_include_directories(benchmark_algo_sweep PRIVATE
+            ${HDF5_VOL_INCLUDE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+        )
+        target_link_libraries(benchmark_algo_sweep PRIVATE
+            gpucompress H5VLgpucompress ${HDF5_VOL_LIB} CUDA::cudart m
+        )
+        set_target_properties(benchmark_algo_sweep PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
         # Chunking/header verification example
         add_executable(hdf5_chunk_verify examples/hdf5_chunk_verify.cu)

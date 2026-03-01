@@ -201,8 +201,13 @@ Verified by `tests/test_perf4_batched_dh.cu` (16/16):
 ### PERF-5: Three Separate D→H Copies in `runStatsKernels()`
 **File:** `src/stats/stats_kernel.cu`
 **Severity:** LOW-MEDIUM
+**Status:** ✅ ALREADY RESOLVED (non-issue)
 
-Copies entropy (8B), mad_normalized (8B), deriv_normalized (8B) in three separate transfers. Should be a single 24B copy from contiguous fields in `AutoStatsGPU`.
+Two reasons this is moot:
+1. `runStatsKernels()` (the `static` helper) already does a **single 24B `cudaMemcpyAsync`** — it packs `entropy + mad_normalized + deriv_normalized` into a local `StatsResultBlock` and copies in one transfer (`stats_kernel.cu:433`).
+2. The **primary compression path** (`gpucompress_compress_gpu`) never calls `runStatsKernels()` at all — it calls `runStatsKernelsNoSync()` which returns a raw `AutoStatsGPU*` device pointer. Stats never leave the GPU; `nnFusedInferenceKernel` reads `d_stats->entropy/mad/deriv` directly on-device.
+
+`runAutoStatsNNPipeline()` and `runStatsOnlyPipeline()` (the only callers of the D→H path) are declared but never called anywhere in the codebase.
 
 ---
 
@@ -225,10 +230,13 @@ Manual CAS loop emulates float `atomicMin`/`atomicMax`. On Ampere (sm_80), nativ
 ### PERF-8: Per-Chunk `malloc` in Workers
 **File:** `src/hdf5/H5VLgpucompress.cu` — Worker lambda
 **Severity:** MEDIUM
+**Status:** ✅ ALREADY DONE
 
-Each compressed chunk does `malloc(comp_sz)` + `memcpy` to create the `IOItem` payload, then `free(item.data)` in the I/O thread. For 1000 chunks, this is 1000 malloc/free cycles.
-
-**Fix:** Pre-allocate a pool of fixed-size buffers (size = `max_comp`) shared between all workers and the I/O thread via a free-list.
+Pre-allocated pinned buffer pool (`N_IO_BUFS=16` buffers × `max_comp` bytes, via `cudaMallocHost`) replaces any per-chunk malloc/free:
+- Workers call `pool_acquire()` → D→H directly into the pinned buffer
+- IO thread calls `pool_release(item.data)` after disk write → buffer reused
+- All 16 buffers allocated once at write start, freed once via `cudaFreeHost()` at cleanup
+- No `malloc`/`free` anywhere in the hot path
 
 ---
 
@@ -535,7 +543,7 @@ These require minimal code changes and carry clear, verifiable benefits:
 | QW-4 | ~~Make global stats atomics (`s_gpu_writes` etc.)~~ | H5VLgpucompress.cu | ✅ DONE — `static int` → `static std::atomic<int>` for `s_gpu_writes`, `s_gpu_reads`, `s_chunks_comp`, `s_chunks_decomp`; `.store(0)` in reset, `.load()` in get. Verified by `test_qw4_atomic_counters` (16/16). | — |
 | QW-5 | ~~Add `file.gcount()` checks in `loadNNFromBinary`~~ | nn_gpu.cu | ✅ DONE — `NN_READ` macro checks every array read; consolidated 6 header reads into 1. Verified by `test_bug5_truncated_nnwt` (7/7). | — |
 | QW-6 | Remove stderr spam (conditional on debug flag) | nn_gpu.cu, gpucompress_api.cpp | I/O overhead reduction | Low |
-| QW-7 | Batch 3 D→H copies in `runStatsKernels()` into 1 | stats_kernel.cu | PCIe efficiency | Low |
+| QW-7 | ~~Batch 3 D→H copies in `runStatsKernels()` into 1~~ | stats_kernel.cu | ✅ ALREADY DONE — `runStatsKernels()` already uses a single 24B copy; main path uses `runStatsKernelsNoSync()` (zero D→H). | — |
 | QW-8 | ~~Move insertion sort to CPU~~ — replaced with parallel bitonic sort instead | nn_gpu.cu | ✅ DONE — 32.9x speedup, commit `d704d71` | — |
 
 ---
@@ -642,19 +650,12 @@ This is a textbook C++ data race (concurrent read + unsynchronized write). The p
 
 ### VERIFIED NEW: `atomicAddDouble` CAS Contention — Native Atomic Available on sm_80+
 **Source:** [STATS-1] in CODE_REVIEW_FINDINGS.md
-**Verified:** YES (and my review only mentioned `atomicMinFloat`/`atomicMaxFloat`, not `atomicAddDouble`).
+**Status:** ✅ ALREADY DONE
 
-`stats_kernel.cu:58-67` implements `atomicAddDouble` via CAS loop. With `STATS_MAX_BLOCKS=1024`, one thread per block (the warp-0 lane-0 winner after shared-memory inter-warp reduction) calls this function — 1024 threads serializing on two global addresses (`stats->sum` and `stats->abs_diff_sum`).
+`atomicAddDouble` CAS loop already removed. `stats_kernel.cu:55-56` has the tombstone comment:
+> `atomicAdd(double*, double) is natively supported on sm_60+ (Pascal and newer). No CAS emulation needed — targeting sm_80 (Ampere).`
 
-On Ampere (sm_80+), CUDA natively supports `atomicAdd(double*, double)` since compute capability 6.0 (Pascal). The CAS emulation is both slower and generates unnecessary retry loops. A simple:
-```cpp
-// If targeting sm_60+:
-atomicAdd(address, val);  // native, no CAS loop
-```
-would eliminate all contention.
-
-**Severity:** MEDIUM (performance for large arrays on modern hardware).
-**My review:** partially mentioned (CAS for min/max) but missed the double-add variant.
+Native `atomicAdd(double*)` is called directly throughout the stats kernels. Correctness confirmed by `test_perf14_atomic_double` (5/5).
 
 ---
 
@@ -720,7 +721,7 @@ In the VOL write path, `d_comp_w[w]` is sized to `max_comp = gpucompress_max_out
 |----|-------|----------|-----------|
 | BUG-7 | `d_range_min`/`d_range_max` shared across concurrent quantize calls | **CRITICAL** ✅ FIXED | `quantization_kernels.cu` — per-CompContext buffers allocated in `initCompContextPool()` |
 | BUG-8 | `g_sgd_ever_fired` plain bool read/written without atomics | **MEDIUM** ✅ FIXED — `std::atomic<bool>` with `memory_order_release` write, `memory_order_acquire` read. Verified by `tests/test_bug8_sgd_concurrent` (16/16). | `gpucompress_api.cpp:70`, `nn_gpu.cu:1378,1472` |
-| PERF-14 | `atomicAddDouble` CAS should be native `atomicAdd` on sm_60+ | **MEDIUM** | `stats_kernel.cu:58-67` |
+| PERF-14 | ~~`atomicAddDouble` CAS should be native `atomicAdd` on sm_60+~~ | **MEDIUM** ✅ ALREADY DONE — CAS loop removed; comment at `stats_kernel.cu:55-56` confirms native `atomicAdd(double*)` used directly (sm_80 target). Correctness verified by `test_perf14_atomic_double` (5/5). | `stats_kernel.cu:55-56` |
 | PERF-15 | Per-call `cudaMalloc` for CASCADED/ANS/BITCOMP temp buffer | **MEDIUM** | `gpucompress_api.cpp:1763-1768` |
 | PERF-16 | ~~Gather kernel on default stream serializes Stage 1 (non-contiguous datasets)~~ | **MEDIUM** ✅ FIXED — dedicated `gather_stream`/`scatter_stream` per write/read call; redundant `cudaStreamSynchronize(cudaStreamDefault)` in partial-boundary path removed. Verified by `test_perf16_gather_stream` (5/5). | `H5VLgpucompress.cu:1194-1200` |
 | INVESTIGATE | CASCADED/BITCOMP `NVCOMP_TYPE_LONGLONG` assumption unverified | **LOW** | `compression_factory.cpp:116,123` |

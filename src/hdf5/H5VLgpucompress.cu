@@ -353,11 +353,10 @@ static const H5VL_class_t H5VL_gpucompress_g = {
  * Activity counters — queryable from tests / demos
  * ============================================================ */
 
-static std::atomic<int> s_gpu_writes    {0};  /* times gpu_aware_chunked_write was called */
-static std::atomic<int> s_gpu_reads     {0};  /* times gpu_aware_chunked_read was called  */
-static std::atomic<int> s_chunks_comp   {0};  /* chunks successfully compressed on GPU    */
-static std::atomic<int> s_chunks_decomp {0};  /* chunks successfully decompressed on GPU  */
-
+static std::atomic<int> s_gpu_writes      {0};  /* GPU compression path (gpu_aware_chunked_write) */
+static std::atomic<int> s_gpu_reads       {0};  /* GPU decompression path (gpu_aware_chunked_read)*/
+static std::atomic<int> s_chunks_comp     {0};  /* chunks successfully compressed on GPU          */
+static std::atomic<int> s_chunks_decomp   {0};  /* chunks successfully decompressed on GPU        */
 /* Transfer byte counters */
 static size_t s_h2d_bytes = 0;   /* total bytes copied host→device */
 static size_t s_d2h_bytes = 0;   /* total bytes copied device→host */
@@ -382,8 +381,8 @@ static inline cudaError_t vol_memcpy(void *dst, const void *src,
 extern "C" void
 H5VL_gpucompress_reset_stats(void)
 {
-    s_gpu_writes.store(0); s_gpu_reads.store(0);
-    s_chunks_comp.store(0); s_chunks_decomp.store(0);
+    s_gpu_writes.store(0);      s_gpu_reads.store(0);
+    s_chunks_comp.store(0);     s_chunks_decomp.store(0);
     s_h2d_bytes = s_d2h_bytes = s_d2d_bytes = 0;
     s_h2d_count = s_d2h_count = s_d2d_count = 0;
 }
@@ -978,9 +977,13 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
         if (elem_size == 0) goto done;
 
         /* ---- Get gpucompress config from DCPL ---- */
+        /* NOTE: caller (H5VL_gpucompress_dataset_write) already verified the
+         * filter is present and dispatches to gpu_fallback_dh_write() if not.
+         * This check is kept as a defensive safety net only. */
         gpucompress_config_t cfg;
         if (get_gpucompress_config_from_dcpl(o->dcpl_id, &cfg) != 0) {
-            /* No gpucompress filter found — fall through to host path */
+            fprintf(stderr, "gpucompress VOL [internal]: gpu_aware_chunked_write "
+                            "called without gpucompress filter — should not happen.\n");
             goto done;
         }
 
@@ -1279,6 +1282,159 @@ done_write:
 
 done:
     if (need_close_space) H5Sclose(actual_space_id);
+    return ret;
+}
+
+/* ============================================================
+ * gpu_fallback_dh_write
+ *
+ * Called when a GPU (device) pointer is passed to a dataset that has NO
+ * gpucompress filter in its DCPL.  Instead of failing, we:
+ *   1. Print a one-time warning so the caller can see what happened.
+ *   2. Allocate a pinned host buffer (falls back to regular malloc on OOM).
+ *   3. cudaMemcpy D→H.
+ *   4. Write the entire dataset via the underlying native VOL (one-shot,
+ *      no chunk-by-chunk loop — native HDF5 handles the chunked layout).
+ * ============================================================ */
+static herr_t
+gpu_fallback_dh_write(H5VL_gpucompress_t *o,
+                      hid_t mem_type_id, hid_t mem_space_id,
+                      hid_t file_space_id, hid_t dxpl_id,
+                      const void *d_buf, void **req)
+{
+    /* Resolve H5S_ALL → actual dataset space to compute total_bytes */
+    hid_t actual_space_id = H5I_INVALID_HID;
+    int   need_close = 0;
+    if (file_space_id == H5S_ALL) {
+        H5VL_dataset_get_args_t ga;
+        memset(&ga, 0, sizeof(ga));
+        ga.op_type                 = H5VL_DATASET_GET_SPACE;
+        ga.args.get_space.space_id = H5I_INVALID_HID;
+        if (H5VLdataset_get(o->under_object, o->under_vol_id,
+                            &ga, dxpl_id, NULL) < 0) {
+            fprintf(stderr, "gpucompress VOL fallback-write: failed to resolve "
+                            "dataset space (H5S_ALL)\n");
+            return -1;
+        }
+        actual_space_id = ga.args.get_space.space_id;
+        need_close = 1;
+    } else {
+        actual_space_id = file_space_id;
+    }
+
+    hsize_t n_elems  = (hsize_t)H5Sget_simple_extent_npoints(actual_space_id);
+    size_t  elem_sz  = H5Tget_size(mem_type_id);
+    if (need_close) H5Sclose(actual_space_id);
+
+    assert(n_elems  > 0 && "VOL fallback-write: dataset reports zero elements");
+    assert(elem_sz  > 0 && "VOL fallback-write: H5Tget_size returned zero");
+
+    size_t total_bytes = (size_t)n_elems * elem_sz;
+
+    fprintf(stderr, "gpucompress VOL: WARNING — GPU buffer passed to dataset "
+                    "without gpucompress filter; performing D->H copy "
+                    "(%zu MiB) and writing via native path (no compression).\n",
+                    total_bytes >> 20);
+
+    /* Allocate host staging buffer — prefer pinned for faster DMA */
+    void *h_tmp  = NULL;
+    int   pinned = (cudaMallocHost(&h_tmp, total_bytes) == cudaSuccess);
+    if (!pinned) {
+        h_tmp = malloc(total_bytes);
+        assert(h_tmp && "VOL fallback-write: host staging buffer allocation failed");
+        if (!h_tmp) return -1;
+    }
+
+    cudaError_t ce = cudaMemcpy(h_tmp, d_buf, total_bytes, cudaMemcpyDeviceToHost);
+    assert(ce == cudaSuccess && "VOL fallback-write: D->H cudaMemcpy failed");
+    if (ce != cudaSuccess) {
+        if (pinned) cudaFreeHost(h_tmp); else free(h_tmp);
+        return -1;
+    }
+
+    /* One-shot native write — HDF5 handles the chunked layout internally */
+    void       *under_obj = o->under_object;
+    const void *h_ptr     = h_tmp;
+    herr_t ret = H5VLdataset_write(1, &under_obj, o->under_vol_id,
+                                   &mem_type_id, &mem_space_id, &file_space_id,
+                                   dxpl_id, &h_ptr, req);
+    assert(ret >= 0 && "VOL fallback-write: H5VLdataset_write failed");
+
+    if (pinned) cudaFreeHost(h_tmp); else free(h_tmp);
+    return ret;
+}
+
+/* ============================================================
+ * gpu_fallback_hd_read
+ *
+ * Symmetric counterpart to gpu_fallback_dh_write for the read path.
+ * Called when a GPU buffer is passed to H5Dread on a dataset with no
+ * gpucompress filter.  Reads into a host buffer via native VOL, then
+ * H→D copies the result into the caller's GPU buffer.
+ * ============================================================ */
+static herr_t
+gpu_fallback_hd_read(H5VL_gpucompress_t *o,
+                     hid_t mem_type_id, hid_t mem_space_id,
+                     hid_t file_space_id, hid_t dxpl_id,
+                     void *d_buf, void **req)
+{
+    /* Resolve H5S_ALL → actual dataset space */
+    hid_t actual_space_id = H5I_INVALID_HID;
+    int   need_close = 0;
+    if (file_space_id == H5S_ALL) {
+        H5VL_dataset_get_args_t ga;
+        memset(&ga, 0, sizeof(ga));
+        ga.op_type                 = H5VL_DATASET_GET_SPACE;
+        ga.args.get_space.space_id = H5I_INVALID_HID;
+        if (H5VLdataset_get(o->under_object, o->under_vol_id,
+                            &ga, dxpl_id, NULL) < 0) {
+            fprintf(stderr, "gpucompress VOL fallback-read: failed to resolve "
+                            "dataset space (H5S_ALL)\n");
+            return -1;
+        }
+        actual_space_id = ga.args.get_space.space_id;
+        need_close = 1;
+    } else {
+        actual_space_id = file_space_id;
+    }
+
+    hsize_t n_elems  = (hsize_t)H5Sget_simple_extent_npoints(actual_space_id);
+    size_t  elem_sz  = H5Tget_size(mem_type_id);
+    if (need_close) H5Sclose(actual_space_id);
+
+    assert(n_elems  > 0 && "VOL fallback-read: dataset reports zero elements");
+    assert(elem_sz  > 0 && "VOL fallback-read: H5Tget_size returned zero");
+
+    size_t total_bytes = (size_t)n_elems * elem_sz;
+
+    fprintf(stderr, "gpucompress VOL: WARNING — GPU buffer passed to dataset "
+                    "without gpucompress filter; reading via native path then "
+                    "H->D copy (%zu MiB).\n",
+                    total_bytes >> 20);
+
+    /* Allocate host staging buffer */
+    void *h_tmp  = NULL;
+    int   pinned = (cudaMallocHost(&h_tmp, total_bytes) == cudaSuccess);
+    if (!pinned) {
+        h_tmp = malloc(total_bytes);
+        assert(h_tmp && "VOL fallback-read: host staging buffer allocation failed");
+        if (!h_tmp) return -1;
+    }
+
+    /* One-shot native read */
+    void  *under_obj = o->under_object;
+    herr_t ret = H5VLdataset_read(1, &under_obj, o->under_vol_id,
+                                  &mem_type_id, &mem_space_id, &file_space_id,
+                                  dxpl_id, &h_tmp, req);
+    assert(ret >= 0 && "VOL fallback-read: H5VLdataset_read failed");
+
+    if (ret >= 0) {
+        cudaError_t ce = cudaMemcpy(d_buf, h_tmp, total_bytes, cudaMemcpyHostToDevice);
+        assert(ce == cudaSuccess && "VOL fallback-read: H→D cudaMemcpy failed");
+        if (ce != cudaSuccess) ret = -1;
+    }
+
+    if (pinned) cudaFreeHost(h_tmp); else free(h_tmp);
     return ret;
 }
 
@@ -1601,11 +1757,20 @@ H5VL_gpucompress_dataset_read(size_t count, void *dset[],
         if (o->dcpl_id != H5I_INVALID_HID && buf[i] &&
             gpucompress_is_device_ptr(buf[i])) {
 
-            VOL_TRACE("dataset_read[%zu]: buf=%p → GPU path (device pointer)", i, buf[i]);
-            /* GPU path: read+decompress chunk by chunk */
-            ret = gpu_aware_chunked_read(o, mem_type_id[i],
-                                         file_space_id[i], plist_id,
-                                         buf[i]);
+            gpucompress_config_t cfg;
+            if (get_gpucompress_config_from_dcpl(o->dcpl_id, &cfg) == 0) {
+                VOL_TRACE("dataset_read[%zu]: buf=%p → GPU path (gpucompress filter)", i, buf[i]);
+                /* GPU path: read+decompress chunk by chunk */
+                ret = gpu_aware_chunked_read(o, mem_type_id[i],
+                                             file_space_id[i], plist_id,
+                                             buf[i]);
+            } else {
+                VOL_TRACE("dataset_read[%zu]: buf=%p → fallback native+H→D (no gpucompress filter)", i, buf[i]);
+                /* No gpucompress filter — native one-shot read then H→D copy */
+                ret = gpu_fallback_hd_read(o, mem_type_id[i], mem_space_id[i],
+                                           file_space_id[i], plist_id,
+                                           buf[i], req);
+            }
             if (ret < 0) return ret;
         } else {
             /* Host path: standard pass-through (one dataset at a time) */
@@ -1636,11 +1801,20 @@ H5VL_gpucompress_dataset_write(size_t count, void *dset[],
         if (o->dcpl_id != H5I_INVALID_HID && buf[i] &&
             gpucompress_is_device_ptr(buf[i])) {
 
-            VOL_TRACE("dataset_write[%zu]: buf=%p → GPU path (device pointer)", i, buf[i]);
-            /* GPU path: compress+write chunk by chunk */
-            ret = gpu_aware_chunked_write(o, mem_type_id[i],
-                                          file_space_id[i], plist_id,
-                                          buf[i]);
+            gpucompress_config_t cfg;
+            if (get_gpucompress_config_from_dcpl(o->dcpl_id, &cfg) == 0) {
+                VOL_TRACE("dataset_write[%zu]: buf=%p → GPU path (gpucompress filter)", i, buf[i]);
+                /* GPU path: compress+write chunk by chunk */
+                ret = gpu_aware_chunked_write(o, mem_type_id[i],
+                                              file_space_id[i], plist_id,
+                                              buf[i]);
+            } else {
+                VOL_TRACE("dataset_write[%zu]: buf=%p → fallback D→H (no gpucompress filter)", i, buf[i]);
+                /* No gpucompress filter — D→H copy then native one-shot write */
+                ret = gpu_fallback_dh_write(o, mem_type_id[i], mem_space_id[i],
+                                            file_space_id[i], plist_id,
+                                            buf[i], req);
+            }
             if (ret < 0) return ret;
         } else {
             /* Host path: standard pass-through */

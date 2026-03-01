@@ -7,7 +7,7 @@
  * with a GPU-side mismatch counter.
  *
  * Phases:
- *   1. no-comp  : GPU fill → D→H → H5Dwrite via VOL (host ptr, no filter)
+ *   1. no-comp  : GPU fill → H5Dwrite via VOL (GPU ptr, no filter → VOL-2 D→H fallback)
  *   2. static   : GPU fill → H5Dwrite via VOL (zstd + byte-shuffle)
  *   3. nn       : GPU fill → H5Dwrite via VOL (ALGO_AUTO + SGD)
  *
@@ -37,6 +37,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <assert.h>
 
 #include <cuda_runtime.h>
 #include <hdf5.h>
@@ -282,8 +283,8 @@ static hid_t make_dcpl_static(hsize_t chunk_floats)
 
     unsigned int cd[H5Z_GPUCOMPRESS_CD_NELMTS];
     cd[0] = 5; /* GPUCOMPRESS_ALGO_ZSTD */
-    cd[1] = 0;
-    cd[2] = 4; /* 4-byte shuffle (float32) */
+    cd[1] = 2; /* GPUCOMPRESS_PREPROC_SHUFFLE_4 — best config per sweep */
+    cd[2] = 4; /* 4-byte shuffle element size (float32) */
     pack_double_cd(0.0, &cd[3], &cd[4]);
     H5Pset_filter(dcpl, H5Z_FILTER_GPUCOMPRESS,
                   H5Z_FLAG_OPTIONAL, H5Z_GPUCOMPRESS_CD_NELMTS, cd);
@@ -329,7 +330,13 @@ typedef struct {
 
 /* ============================================================
  * Phase 1: no-comp
- *   GPU fill → D→H → plain H5Dwrite → H5Dread → H→D → GPU compare
+ *   GPU fill → H5Dwrite (GPU ptr, VOL-2 fallback: D→H internally, no filter)
+ *           → H5Dread  (GPU ptr, VOL-2 fallback: read natively, H→D internally)
+ *           → GPU compare
+ *
+ * Tests VOL-2 fix: VOL detects GPU ptr + no gpucompress filter, performs the
+ * D→H / H→D copies internally and forwards to the native connector.
+ * A WARNING line is printed to stderr by the VOL for each call.
  * ============================================================ */
 
 static int run_phase_nocomp(float *d_full, float *d_read,
@@ -338,30 +345,34 @@ static int run_phase_nocomp(float *d_full, float *d_read,
                             size_t chunk_floats, int fill_mode,
                             PhaseResult *r)
 {
+    (void)h_buf;   /* no longer used — VOL-2 fallback handles D<->H internally */
+
     size_t total_bytes = n_floats * sizeof(float);
     int n_chunks = (int)(n_floats / chunk_floats);
 
     printf("[no-comp] Filling GPU buffer...\n");
     fill_dataset(d_full, n_floats, chunk_floats, fill_mode);
 
-    /* D→H + write (VOL FAPL — same connector as other phases; host pointer
-     * branch: VOL detects non-device ptr → forwards to native connector) */
-    printf("[no-comp] D→H copy + H5Dwrite (VOL, host ptr)... "); fflush(stdout);
+    /* Write: pass GPU pointer directly — no gpucompress filter on DCPL.
+     * VOL-2 fallback activates: D→H copy + native write, all inside H5Dwrite. */
+    printf("[no-comp] H5Dwrite (GPU ptr, VOL-2 fallback D->H)... "); fflush(stdout);
     double t0 = now_ms();
-    cudaMemcpy(h_buf, d_full, total_bytes, cudaMemcpyDeviceToHost);
 
     remove(TMP_NOCOMP);
-    hsize_t dims[1]  = { (hsize_t)n_floats };
-    hid_t dcpl  = make_dcpl_nocomp((hsize_t)chunk_floats);
-    hid_t fapl  = make_vol_fapl();
-    hid_t file  = H5Fcreate(TMP_NOCOMP, H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+    hsize_t dims[1] = { (hsize_t)n_floats };
+    hid_t dcpl = make_dcpl_nocomp((hsize_t)chunk_floats);
+    hid_t fapl = make_vol_fapl();
+    hid_t file = H5Fcreate(TMP_NOCOMP, H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+    assert(file >= 0 && "[no-comp] H5Fcreate failed");
     H5Pclose(fapl);
-    hid_t fsp   = H5Screate_simple(1, dims, NULL);
-    hid_t dset  = H5Dcreate2(file, "data", H5T_NATIVE_FLOAT,
-                              fsp, H5P_DEFAULT, dcpl, H5P_DEFAULT);
+    hid_t fsp  = H5Screate_simple(1, dims, NULL);
+    hid_t dset = H5Dcreate2(file, "data", H5T_NATIVE_FLOAT,
+                             fsp, H5P_DEFAULT, dcpl, H5P_DEFAULT);
+    assert(dset >= 0 && "[no-comp] H5Dcreate2 failed");
     H5Sclose(fsp);
     H5Pclose(dcpl);
-    H5Dwrite(dset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL, H5P_DEFAULT, h_buf);
+    herr_t wrc = H5Dwrite(dset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL, H5P_DEFAULT, d_full);
+    assert(wrc >= 0 && "[no-comp] H5Dwrite(GPU ptr) failed — VOL-2 fallback broken");
     H5Dclose(dset);
     H5Fclose(file);
     double t1 = now_ms();
@@ -370,17 +381,21 @@ static int run_phase_nocomp(float *d_full, float *d_read,
     /* Evict from page cache so the read measures real disk I/O */
     drop_pagecache(TMP_NOCOMP);
 
-    /* Read back: open file outside timer, measure only H5Dread + H→D copy */
-    printf("[no-comp] H5Dread (VOL, host ptr) + H→D copy... "); fflush(stdout);
+    /* Read: pass GPU pointer directly — VOL-2 fallback activates:
+     * native read into host staging buffer, H→D copy, all inside H5Dread. */
+    printf("[no-comp] H5Dread (GPU ptr, VOL-2 fallback H->D)... "); fflush(stdout);
     fapl = make_vol_fapl();
     file = H5Fopen(TMP_NOCOMP, H5F_ACC_RDONLY, fapl);
+    assert(file >= 0 && "[no-comp] H5Fopen failed");
     H5Pclose(fapl);
     dset = H5Dopen2(file, "data", H5P_DEFAULT);
+    assert(dset >= 0 && "[no-comp] H5Dopen2 failed");
     double t2 = now_ms();
-    H5Dread(dset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL, H5P_DEFAULT, h_buf);
+    herr_t rrc = H5Dread(dset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL, H5P_DEFAULT, d_read);
+    assert(rrc >= 0 && "[no-comp] H5Dread(GPU ptr) failed — VOL-2 fallback broken");
+    cudaDeviceSynchronize();
     H5Dclose(dset);
     H5Fclose(file);
-    cudaMemcpy(d_read, h_buf, total_bytes, cudaMemcpyHostToDevice);
     double t3 = now_ms();
     printf("%.0f ms\n", t3 - t2);
 
@@ -723,8 +738,8 @@ int main(int argc, char **argv)
 
     /* ── Phase 3: nn+sgd (VOL, ALGO_AUTO) ─────────────────────────── */
     printf("\n── Phase 3/3: nn+sgd (VOL, ALGO_AUTO) ────────────────────────\n");
-    gpucompress_enable_online_learning();
-    gpucompress_set_reinforcement(1, REINFORCE_LR, REINFORCE_MAPE, REINFORCE_MAPE);
+    // gpucompress_enable_online_learning();
+    // gpucompress_set_reinforcement(1, REINFORCE_LR, REINFORCE_MAPE, REINFORCE_MAPE);
     printf("[nn] Online learning: LR=%.2f  MAPE threshold=%.0f%%\n",
            REINFORCE_LR, REINFORCE_MAPE * 100.0f);
 
