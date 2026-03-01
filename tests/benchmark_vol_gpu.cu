@@ -7,9 +7,11 @@
  * with a GPU-side mismatch counter.
  *
  * Phases:
- *   1. no-comp  : GPU fill → H5Dwrite via VOL (GPU ptr, no filter → VOL-2 D→H fallback)
- *   2. static   : GPU fill → H5Dwrite via VOL (zstd + byte-shuffle)
- *   3. nn       : GPU fill → H5Dwrite via VOL (ALGO_AUTO + SGD)
+ *   1. no-comp      : GPU fill → H5Dwrite via VOL (GPU ptr, no filter → VOL-2 D→H fallback)
+ *   2. static       : GPU fill → H5Dwrite via VOL (zstd + byte-shuffle)
+ *   3. nn           : GPU fill → H5Dwrite via VOL (ALGO_AUTO, inference-only, no RL)
+ *   4. nn-rl        : ALGO_AUTO + online SGD (MAPE≥20%, LR=0.4, no exploration)
+ *   5. nn-rl+exp50  : ALGO_AUTO + online SGD + Level-2 exploration (MAPE≥50%)
  *
  * GPU buffer is regenerated per phase to ensure a clean reference.
  *
@@ -56,9 +58,11 @@
 #define REINFORCE_LR        0.4f
 #define REINFORCE_MAPE      0.20f
 
-#define TMP_NOCOMP  "/tmp/bm_vol_nocomp.h5"
-#define TMP_STATIC  "/tmp/bm_vol_static.h5"
-#define TMP_NN      "/tmp/bm_vol_nn.h5"
+#define TMP_NOCOMP   "/tmp/bm_vol_nocomp.h5"
+#define TMP_STATIC   "/tmp/bm_vol_static.h5"
+#define TMP_NN       "/tmp/bm_vol_nn.h5"
+#define TMP_NN_RL    "/tmp/bm_vol_nn_rl.h5"
+#define TMP_NN_RLEXP "/tmp/bm_vol_nn_rlexp.h5"
 
 #define OUT_DIR     "tests/benchmark_vol_gpu_results"
 #define OUT_CSV     OUT_DIR "/benchmark_vol_gpu.csv"
@@ -274,7 +278,7 @@ static hid_t make_dcpl_auto(hsize_t chunk_floats)
     return dcpl;
 }
 
-/* DCPL for static: zstd + 4-byte shuffle */
+/* DCPL for static: lz4 + 4-byte shuffle */
 static hid_t make_dcpl_static(hsize_t chunk_floats)
 {
     hsize_t cdims[1] = { chunk_floats };
@@ -282,8 +286,8 @@ static hid_t make_dcpl_static(hsize_t chunk_floats)
     H5Pset_chunk(dcpl, 1, cdims);
 
     unsigned int cd[H5Z_GPUCOMPRESS_CD_NELMTS];
-    cd[0] = 5; /* GPUCOMPRESS_ALGO_ZSTD */
-    cd[1] = 2; /* GPUCOMPRESS_PREPROC_SHUFFLE_4 — best config per sweep */
+    cd[0] = 1; /* GPUCOMPRESS_ALGO_LZ4 */
+    cd[1] = 2; /* GPUCOMPRESS_PREPROC_SHUFFLE_4 */
     cd[2] = 4; /* 4-byte shuffle element size (float32) */
     pack_double_cd(0.0, &cd[3], &cd[4]);
     H5Pset_filter(dcpl, H5Z_FILTER_GPUCOMPRESS,
@@ -315,7 +319,7 @@ static hid_t make_vol_fapl(void)
  * ============================================================ */
 
 typedef struct {
-    char   phase[16];     /* "no-comp" / "static" / "nn" */
+    char   phase[20];     /* "no-comp" / "static" / "nn" / "nn-rl" / "nn-rl+exp50" */
     double write_ms;
     double read_ms;
     size_t file_bytes;
@@ -324,7 +328,8 @@ typedef struct {
     double write_mbps;
     double read_mbps;
     unsigned long long mismatches;
-    int    sgd_fires;     /* nn phase only */
+    int    sgd_fires;     /* nn phases with online learning */
+    int    explorations;  /* chunks where Level-2 exploration triggered */
     int    n_chunks;
 } PhaseResult;
 
@@ -495,31 +500,35 @@ static int run_phase_vol(float *d_full, float *d_read,
     unsigned long long mm = gpu_compare(d_full, d_read, n_floats, d_count);
 
     /* Collect per-chunk diagnostics */
-    int sgd_fires = 0;
-    int n_hist    = gpucompress_get_chunk_history_count();
+    int sgd_fires  = 0;
+    int explorations = 0;
+    int n_hist     = gpucompress_get_chunk_history_count();
     for (int i = 0; i < n_hist; i++) {
         gpucompress_chunk_diag_t d;
-        if (gpucompress_get_chunk_diag(i, &d) == 0)
-            sgd_fires += d.sgd_fired;
+        if (gpucompress_get_chunk_diag(i, &d) == 0) {
+            sgd_fires    += d.sgd_fired;
+            explorations += d.exploration_triggered;
+        }
     }
 
     size_t fbytes = file_size(tmp_file);
-    r->write_ms   = t1 - t0;
-    r->read_ms    = t3 - t2;
-    r->file_bytes = fbytes;
-    r->orig_bytes = total_bytes;
-    r->ratio      = (double)total_bytes / (double)(fbytes ? fbytes : 1);
-    r->write_mbps = (double)total_bytes / (1 << 20) / ((t1 - t0) / 1000.0);
-    r->read_mbps  = (double)total_bytes / (1 << 20) / ((t3 - t2) / 1000.0);
-    r->mismatches = mm;
-    r->sgd_fires  = sgd_fires;
-    r->n_chunks   = n_chunks;
+    r->write_ms    = t1 - t0;
+    r->read_ms     = t3 - t2;
+    r->file_bytes  = fbytes;
+    r->orig_bytes  = total_bytes;
+    r->ratio       = (double)total_bytes / (double)(fbytes ? fbytes : 1);
+    r->write_mbps  = (double)total_bytes / (1 << 20) / ((t1 - t0) / 1000.0);
+    r->read_mbps   = (double)total_bytes / (1 << 20) / ((t3 - t2) / 1000.0);
+    r->mismatches  = mm;
+    r->sgd_fires   = sgd_fires;
+    r->explorations = explorations;
+    r->n_chunks    = n_chunks;
     snprintf(r->phase, sizeof(r->phase), "%s", phase_name);
 
     printf("[%s] ratio=%.2fx  write=%.0f MB/s  read=%.0f MB/s  "
-           "file=%.0f MiB  sgd=%d/%d  mismatches=%llu\n",
+           "file=%.0f MiB  sgd=%d expl=%d/%d  mismatches=%llu\n",
            phase_name, r->ratio, r->write_mbps, r->read_mbps,
-           (double)fbytes / (1 << 20), sgd_fires, n_hist, mm);
+           (double)fbytes / (1 << 20), sgd_fires, explorations, n_hist, mm);
     return (mm == 0) ? 0 : 1;
 }
 
@@ -536,17 +545,17 @@ static void write_aggregate_csv(PhaseResult *res, int n_phases,
 
     fprintf(f, "phase,dataset_mb,chunk_mb,fill_mode,"
                "write_ms,read_ms,file_mb,ratio,"
-               "write_mbps,read_mbps,mismatches,sgd_fires,n_chunks\n");
+               "write_mbps,read_mbps,mismatches,sgd_fires,explorations,n_chunks\n");
     for (int i = 0; i < n_phases; i++) {
         PhaseResult *r = &res[i];
         fprintf(f, "%s,%d,%d,%s,"
                    "%.2f,%.2f,%.2f,%.4f,"
-                   "%.1f,%.1f,%llu,%d,%d\n",
+                   "%.1f,%.1f,%llu,%d,%d,%d\n",
                 r->phase, dataset_mb, chunk_mb, mode_name,
                 r->write_ms, r->read_ms,
                 (double)r->file_bytes / (1 << 20), r->ratio,
                 r->write_mbps, r->read_mbps,
-                r->mismatches, r->sgd_fires, r->n_chunks);
+                r->mismatches, r->sgd_fires, r->explorations, r->n_chunks);
     }
     fclose(f);
     printf("\nAggregate CSV written to: %s\n", OUT_CSV);
@@ -610,11 +619,14 @@ static void print_summary(PhaseResult *res, int n_phases,
     }
     printf("╚══════════════╩══════════╩══════════╩═══════╩══════════╩═════════════╝\n");
 
-    /* NN phase SGD summary if available */
+    /* NN phase SGD/exploration summary */
     for (int i = 0; i < n_phases; i++) {
-        if (strcmp(res[i].phase, "nn") == 0 && res[i].n_chunks > 0) {
-            printf("\n  NN phase: SGD fired on %d / %d chunks\n",
-                   res[i].sgd_fires, res[i].n_chunks);
+        if (strncmp(res[i].phase, "nn", 2) == 0 && res[i].n_chunks > 0) {
+            printf("\n  %-14s SGD fired: %d/%d chunks  Explorations: %d/%d chunks",
+                   res[i].phase,
+                   res[i].sgd_fires,   res[i].n_chunks,
+                   res[i].explorations, res[i].n_chunks);
+            printf("\n");
         }
     }
 }
@@ -713,20 +725,20 @@ int main(int argc, char **argv)
     }
     printf("[Alloc] Host buffer: %.0f MiB\n", (double)total_bytes / (1 << 20));
 
-    PhaseResult results[3];
+    PhaseResult results[5];
     int n_phases = 0;
     int any_fail = 0;
 
     /* ── Phase 1: no-comp ──────────────────────────────────────────── */
-    printf("\n── Phase 1/3: no-comp (GPU→Host→HDF5) ────────────────────────\n");
+    printf("\n── Phase 1/5: no-comp (GPU→Host→HDF5) ────────────────────────\n");
     int rc = run_phase_nocomp(d_full, d_read, d_count, h_buf,
                               n_floats, chunk_floats, fill_mode,
                               &results[n_phases]);
     if (rc) any_fail = 1;
     n_phases++;
 
-    /* ── Phase 2: static (VOL, zstd+shuffle) ──────────────────────── */
-    printf("\n── Phase 2/3: static (VOL, zstd+4B-shuffle) ──────────────────\n");
+    /* ── Phase 2: static (VOL, lz4+shuffle) ───────────────────────── */
+    printf("\n── Phase 2/5: static (VOL, lz4+4B-shuffle) ───────────────────\n");
     hid_t dcpl_static = make_dcpl_static((hsize_t)chunk_floats);
     rc = run_phase_vol(d_full, d_read, d_count, n_floats, chunk_floats,
                        fill_mode, "static", TMP_STATIC, dcpl_static,
@@ -736,13 +748,11 @@ int main(int argc, char **argv)
     write_chunk_csv("static", fill_mode, n_chunks);
     n_phases++;
 
-    /* ── Phase 3: nn+sgd (VOL, ALGO_AUTO) ─────────────────────────── */
-    printf("\n── Phase 3/3: nn+sgd (VOL, ALGO_AUTO) ────────────────────────\n");
-    // gpucompress_enable_online_learning();
-    // gpucompress_set_reinforcement(1, REINFORCE_LR, REINFORCE_MAPE, REINFORCE_MAPE);
-    printf("[nn] Online learning: LR=%.2f  MAPE threshold=%.0f%%\n",
-           REINFORCE_LR, REINFORCE_MAPE * 100.0f);
-
+    /* ── Phase 3: nn (VOL, ALGO_AUTO, no online learning) ─────────── */
+    printf("\n── Phase 3/5: nn (VOL, ALGO_AUTO, inference-only) ────────────\n");
+    /* Online learning is intentionally OFF here: pure NN routing, no SGD,
+     * no exploration. Establishes the baseline for per-chunk algorithm selection
+     * without any gradient updates to the model weights. */
     hid_t dcpl_nn = make_dcpl_auto((hsize_t)chunk_floats);
     rc = run_phase_vol(d_full, d_read, d_count, n_floats, chunk_floats,
                        fill_mode, "nn", TMP_NN, dcpl_nn,
@@ -750,6 +760,49 @@ int main(int argc, char **argv)
     H5Pclose(dcpl_nn);
     if (rc) any_fail = 1;
     write_chunk_csv("nn", fill_mode, n_chunks);
+    n_phases++;
+
+    /* ── Phase 4: nn-rl (ALGO_AUTO + SGD, no exploration) ─────────── */
+    /* Online learning ON, exploration OFF.
+     * SGD fires whenever ratio MAPE > 20% (REINFORCE_MAPE).
+     * Only the primary action's ratio is fed to the SGD kernel
+     * (explored_samples has exactly one entry).
+     * NOTE: model weights are updated in-place on GPU during this phase,
+     * so Phase 5 starts from Phase 4's final weights. */
+    printf("\n── Phase 4/5: nn-rl (ALGO_AUTO + SGD, MAPE≥20%%, LR=0.4) ────\n");
+    gpucompress_enable_online_learning();
+    gpucompress_set_reinforcement(1, REINFORCE_LR, REINFORCE_MAPE, REINFORCE_MAPE);
+    hid_t dcpl_rl = make_dcpl_auto((hsize_t)chunk_floats);
+    rc = run_phase_vol(d_full, d_read, d_count, n_floats, chunk_floats,
+                       fill_mode, "nn-rl", TMP_NN_RL, dcpl_rl,
+                       &results[n_phases]);
+    H5Pclose(dcpl_rl);
+    gpucompress_disable_online_learning();   /* stop SGD; reset exploration flag */
+    if (rc) any_fail = 1;
+    write_chunk_csv("nn-rl", fill_mode, n_chunks);
+    n_phases++;
+
+    /* ── Phase 5: nn-rl+exp50 (ALGO_AUTO + SGD + Level-2 exploration) */
+    /* Same SGD as Phase 4, plus Level-2 exploration when MAPE > 50%.
+     * When exploration triggers, up to K alternative configs are compressed
+     * and timed; the top 3 by ratio are fed to GPU SGD instead of just
+     * the primary action, giving richer gradient signal.
+     * Model weights carry over from Phase 4's updates.
+     * Exploration threshold 50% (vs SGD threshold 20%) means SGD fires broadly
+     * but exploration only kicks in for the worst-predicted chunks. */
+    printf("\n── Phase 5/5: nn-rl+exp50 (ALGO_AUTO + SGD + expl@MAPE≥50%%) ─\n");
+    gpucompress_enable_online_learning();
+    gpucompress_set_reinforcement(1, REINFORCE_LR, REINFORCE_MAPE, REINFORCE_MAPE);
+    gpucompress_set_exploration(1);
+    gpucompress_set_exploration_threshold(0.50);
+    hid_t dcpl_rlexp = make_dcpl_auto((hsize_t)chunk_floats);
+    rc = run_phase_vol(d_full, d_read, d_count, n_floats, chunk_floats,
+                       fill_mode, "nn-rl+exp50", TMP_NN_RLEXP, dcpl_rlexp,
+                       &results[n_phases]);
+    H5Pclose(dcpl_rlexp);
+    gpucompress_disable_online_learning();
+    if (rc) any_fail = 1;
+    write_chunk_csv("nn-rl+exp50", fill_mode, n_chunks);
     n_phases++;
 
     /* ── Summary ───────────────────────────────────────────────────── */
@@ -768,6 +821,8 @@ int main(int argc, char **argv)
     remove(TMP_NOCOMP);
     remove(TMP_STATIC);
     remove(TMP_NN);
+    remove(TMP_NN_RL);
+    remove(TMP_NN_RLEXP);
 
     printf("\n=== Benchmark %s ===\n", any_fail ? "FAILED" : "PASSED");
     return any_fail ? 1 : 0;
