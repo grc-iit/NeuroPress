@@ -69,6 +69,8 @@ set(LIB_SOURCES
     src/stats/stats_cpu.cpp
     src/nn/nn_gpu.cu
     src/stats/stats_kernel.cu
+    src/gray-scott/gray_scott_gpu.cu
+    src/gray-scott/gray_scott_sim.cu
 )
 
 # Set language property for .cpp files that use CUDA
@@ -288,6 +290,16 @@ target_link_libraries(test_nn_reinforce PRIVATE gpucompress CUDA::cudart pthread
 
 add_executable(test_nn_pipeline tests/functionalityTests/test_nn_pipeline.cpp)
 target_link_libraries(test_nn_pipeline PRIVATE gpucompress pthread)
+
+# Gray-Scott GPU simulation test (no HDF5 dependency)
+add_executable(test_grayscott_gpu tests/test_grayscott_gpu.cu)
+set_source_files_properties(tests/test_grayscott_gpu.cu PROPERTIES LANGUAGE CUDA)
+target_include_directories(test_grayscott_gpu PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_grayscott_gpu PRIVATE gpucompress CUDA::cudart m)
+set_target_properties(test_grayscott_gpu PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
 # ============================================================
 # Executable 7: Simulation Evaluation
@@ -806,6 +818,19 @@ if(HDF5_FOUND)
         )
         set_target_properties(nn_vol_demo PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
+        # Gray-Scott VOL demo: GPU simulation → NN compression → HDF5 → verify
+        add_executable(grayscott_vol_demo examples/grayscott_vol_demo.cu)
+        set_source_files_properties(examples/grayscott_vol_demo.cu PROPERTIES LANGUAGE CUDA)
+        target_include_directories(grayscott_vol_demo PRIVATE
+            ${HDF5_VOL_INCLUDE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+        )
+        target_link_libraries(grayscott_vol_demo PRIVATE
+            gpucompress H5VLgpucompress H5Zgpucompress ${HDF5_VOL_LIB} CUDA::cudart m
+        )
+        set_target_properties(grayscott_vol_demo PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
         # Quick algorithm × pattern sweep (no HDF5)
         add_executable(quick_algo_sweep tests/quick_algo_sweep.cu)
         set_source_files_properties(tests/quick_algo_sweep.cu PROPERTIES LANGUAGE CUDA)
@@ -934,9 +959,11 @@ if(HDF5_FOUND)
     install(TARGETS H5Zgpucompress
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/hdf5/plugin
     )
-    install(TARGETS H5VLgpucompress
-        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    )
+    if(TARGET H5VLgpucompress)
+        install(TARGETS H5VLgpucompress
+            LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        )
+    endif()
 endif()
 
 # ============================================================
