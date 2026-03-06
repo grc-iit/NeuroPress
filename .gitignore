@@ -1,17 +1,43 @@
-test_results/
-GPU_LZ4.cu
-*.bin
-*.o
+# Build
 build/
-cufile.log
-.venv
-venv/
-test_data/*.csv
-__pycache__/
-*.csv
+libs/
+*.o
+*.so
+*.a
+*.dylib
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# Data / model artifacts
+*.bin
 *.nnwt
 *.pt
 *.pkl
-plots/*.png
-eval/*.png
-neural_net/weights/*.png
+*.h5
+*.hdf5
+
+# Test / benchmark results
+test_results/
+*.csv
+test_data/*.csv
+
+# Plots / images (generated)
+*.png
+!assets/*.png
+
+# Logs
+*.log
+cufile.log
+output.txt
+
+# Python
+.venv/
+venv/
+__pycache__/
+
+# Legacy source (removed from tree)
+GPU_LZ4.cu

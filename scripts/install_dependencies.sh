@@ -19,6 +19,10 @@
 
 set -e  # Exit on error
 
+# Resolve project root early, before any cd changes the working directory.
+_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_PROJECT_DIR="$(dirname "${_SCRIPT_DIR}")"
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -225,10 +229,7 @@ fi
 
 echo_info "=== Step 3/3: Building GPUCompress ==="
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(dirname "${SCRIPT_DIR}")"
-
-cd "${PROJECT_DIR}"
+cd "${_PROJECT_DIR}"
 rm -rf build
 mkdir -p build
 cd build
