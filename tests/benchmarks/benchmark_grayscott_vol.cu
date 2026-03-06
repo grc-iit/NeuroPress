@@ -341,7 +341,7 @@ static int run_phase_nocomp(gpucompress_grayscott_t sim, int steps,
     r->n_chunks    = n_chunks;
     snprintf(r->phase, sizeof(r->phase), "no-comp");
 
-    printf("[no-comp] ratio=%.2fx  write=%.0f MB/s  read=%.0f MB/s  "
+    printf("[no-comp] ratio=%.2fx  write=%.0f MiB/s  read=%.0f MiB/s  "
            "file=%.0f MiB  mismatches=%llu\n",
            r->ratio, r->write_mbps, r->read_mbps,
            (double)fbytes / (1 << 20), mm);
@@ -445,7 +445,7 @@ static int run_phase_vol(gpucompress_grayscott_t sim, int steps,
     r->n_chunks    = n_chunks;
     snprintf(r->phase, sizeof(r->phase), "%s", phase_name);
 
-    printf("[%s] ratio=%.2fx  write=%.0f MB/s  read=%.0f MB/s  "
+    printf("[%s] ratio=%.2fx  write=%.0f MiB/s  read=%.0f MiB/s  "
            "file=%.0f MiB  sgd=%d expl=%d/%d  mismatches=%llu\n",
            phase_name, r->ratio, r->write_mbps, r->read_mbps,
            (double)fbytes / (1 << 20), sgd_fires, explorations, n_hist, mm);
@@ -464,8 +464,8 @@ static void write_aggregate_csv(PhaseResult *res, int n_phases,
     if (!f) { perror("fopen " OUT_CSV); return; }
 
     fprintf(f, "phase,L,steps,F,k,chunk_z,n_chunks,"
-               "sim_ms,write_ms,read_ms,file_mb,orig_mb,ratio,"
-               "write_mbps,read_mbps,mismatches,sgd_fires,explorations\n");
+               "sim_ms,write_ms,read_ms,file_mib,orig_mib,ratio,"
+               "write_mibps,read_mibps,mismatches,sgd_fires,explorations\n");
     for (int i = 0; i < n_phases; i++) {
         PhaseResult *r = &res[i];
         fprintf(f, "%s,%d,%d,%.4f,%.5f,%d,%d,"
@@ -532,7 +532,7 @@ static void print_summary(PhaseResult *res, int n_phases,
     printf("║  Pattern: F=%.4f  k=%.5f                                              \n", F, k);
     printf("╠══════════════╦══════════╦══════════╦═══════╦══════════╦══════╦═════════════╣\n");
     printf("║  Phase       ║  Sim     ║ Write    ║ Read  ║ Ratio   ║ File ║ Verify      ║\n");
-    printf("║              ║  (ms)    ║ (MB/s)   ║(MB/s) ║         ║ (MB) ║             ║\n");
+    printf("║              ║  (ms)    ║ (MiB/s)  ║(MiB/s)║         ║(MiB) ║             ║\n");
     printf("╠══════════════╬══════════╬══════════╬═══════╬═════════╬══════╬═════════════╣\n");
     for (int i = 0; i < n_phases; i++) {
         PhaseResult *r = &res[i];

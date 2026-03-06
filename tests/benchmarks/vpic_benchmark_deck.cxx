@@ -208,22 +208,29 @@ static hid_t make_dcpl_auto(hsize_t chunk_floats)
 }
 
 // ============================================================
-// Host-side bitwise comparison (copies GPU buffers to host)
+// GPU-side byte-exact comparison
 // ============================================================
-static unsigned long long gpu_compare(const float* d_a, const float* d_b,
-                                      size_t n, unsigned long long* /*unused*/)
+__global__ void count_mismatches_kernel(const float* __restrict__ a,
+                                        const float* __restrict__ b,
+                                        size_t n,
+                                        unsigned long long* count)
 {
-    size_t bytes = n * sizeof(float);
-    float* h_a = (float*)malloc(bytes);
-    float* h_b = (float*)malloc(bytes);
-    cudaMemcpy(h_a, d_a, bytes, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_b, d_b, bytes, cudaMemcpyDeviceToHost);
-    unsigned long long count = 0;
-    for (size_t i = 0; i < n; i++)
-        if (h_a[i] != h_b[i]) count++;
-    free(h_a);
-    free(h_b);
-    return count;
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long long local = 0;
+    for (; i < n; i += (size_t)gridDim.x * blockDim.x)
+        if (a[i] != b[i]) local++;
+    atomicAdd(count, local);
+}
+
+static unsigned long long gpu_compare(const float* d_a, const float* d_b,
+                                      size_t n, unsigned long long* d_count)
+{
+    cudaMemset(d_count, 0, sizeof(unsigned long long));
+    count_mismatches_kernel<<<512, 256>>>(d_a, d_b, n, d_count);
+    cudaDeviceSynchronize();
+    unsigned long long h_count = 0;
+    cudaMemcpy(&h_count, d_count, sizeof(h_count), cudaMemcpyDeviceToHost);
+    return h_count;
 }
 
 // ============================================================
@@ -232,7 +239,7 @@ static unsigned long long gpu_compare(const float* d_a, const float* d_b,
 static int run_phase(const char* phase_name, const char* tmp_file,
                      float* d_data, float* d_read,
                      unsigned long long* d_count,
-                     size_t n_floats, hid_t dcpl,
+                     size_t n_floats, int n_chunks, hid_t dcpl,
                      PhaseResult* r)
 {
     size_t total_bytes = n_floats * sizeof(float);
@@ -301,11 +308,6 @@ static int run_phase(const char* phase_name, const char* tmp_file,
     }
 
     size_t fbytes = get_file_size(tmp_file);
-    // Extract chunk count from file size and total size
-    int n_chunks = (fbytes > 0 && total_bytes > 0)
-                 ? (int)((total_bytes + fbytes - 1) / fbytes) : 0;
-    // Better: use history count as proxy for n_chunks
-    if (n_hist > 0) n_chunks = n_hist;
 
     r->write_ms     = t1 - t0;
     r->read_ms      = t3 - t2;
@@ -320,7 +322,7 @@ static int run_phase(const char* phase_name, const char* tmp_file,
     r->n_chunks     = n_chunks;
     snprintf(r->phase, sizeof(r->phase), "%s", phase_name);
 
-    printf("  [%s] ratio=%.2fx  write=%.0f MB/s  read=%.0f MB/s  "
+    printf("  [%s] ratio=%.2fx  write=%.0f MiB/s  read=%.0f MiB/s  "
            "file=%.0f MiB  sgd=%d expl=%d/%d  mismatches=%llu\n",
            phase_name, r->ratio, r->write_mbps, r->read_mbps,
            (double)fbytes / (1 << 20), sgd_fires, explorations, n_hist, mm);
@@ -543,7 +545,7 @@ begin_diagnostics {
         hid_t dcpl = make_dcpl_nocomp((hsize_t)chunk_floats);
         int rc = run_phase("no-comp", TMP_NOCOMP,
                            d_fields, global->d_read, global->d_count,
-                           n_floats, dcpl, &results[n_phases]);
+                           n_floats, n_chunks, dcpl, &results[n_phases]);
         H5Pclose(dcpl);
         if (rc) any_fail = 1;
         n_phases++;
@@ -555,7 +557,7 @@ begin_diagnostics {
         hid_t dcpl = make_dcpl_static((hsize_t)chunk_floats);
         int rc = run_phase("static", TMP_STATIC,
                            d_fields, global->d_read, global->d_count,
-                           n_floats, dcpl, &results[n_phases]);
+                           n_floats, n_chunks, dcpl, &results[n_phases]);
         H5Pclose(dcpl);
         if (rc) any_fail = 1;
         n_phases++;
@@ -569,7 +571,7 @@ begin_diagnostics {
         hid_t dcpl = make_dcpl_auto((hsize_t)chunk_floats);
         int rc = run_phase("nn", TMP_NN,
                            d_fields, global->d_read, global->d_count,
-                           n_floats, dcpl, &results[n_phases]);
+                           n_floats, n_chunks, dcpl, &results[n_phases]);
         H5Pclose(dcpl);
         if (rc) any_fail = 1;
         n_phases++;
@@ -584,7 +586,7 @@ begin_diagnostics {
         hid_t dcpl = make_dcpl_auto((hsize_t)chunk_floats);
         int rc = run_phase("nn-rl", TMP_NN_RL,
                            d_fields, global->d_read, global->d_count,
-                           n_floats, dcpl, &results[n_phases]);
+                           n_floats, n_chunks, dcpl, &results[n_phases]);
         H5Pclose(dcpl);
         gpucompress_disable_online_learning();
         if (rc) any_fail = 1;
@@ -601,7 +603,7 @@ begin_diagnostics {
         hid_t dcpl = make_dcpl_auto((hsize_t)chunk_floats);
         int rc = run_phase("nn-rl+exp50", TMP_NN_RLEXP,
                            d_fields, global->d_read, global->d_count,
-                           n_floats, dcpl, &results[n_phases]);
+                           n_floats, n_chunks, dcpl, &results[n_phases]);
         H5Pclose(dcpl);
         gpucompress_disable_online_learning();
         if (rc) any_fail = 1;
@@ -611,8 +613,8 @@ begin_diagnostics {
     // ── Summary table ─────────────────────────────────────────────
     sim_log("");
     printf("\n╔══════════════╦══════════╦══════════╦═══════╦══════════╦═════════════╗\n");
-    printf("║  Phase       ║ Write    ║ Read     ║ Ratio ║ File MB  ║ Verify      ║\n");
-    printf("║              ║ (MB/s)   ║ (MB/s)   ║       ║          ║             ║\n");
+    printf("║  Phase       ║ Write    ║ Read     ║ Ratio ║ File MiB ║ Verify      ║\n");
+    printf("║              ║ (MiB/s)  ║ (MiB/s)  ║       ║          ║             ║\n");
     printf("╠══════════════╬══════════╬══════════╬═══════╬══════════╬═════════════╣\n");
     for (int i = 0; i < n_phases; i++) {
         PhaseResult* r = &results[i];
@@ -642,8 +644,8 @@ begin_diagnostics {
         mkdir(csv_dir, 0755);
         FILE* csv = fopen(csv_path, "w");
         if (csv) {
-            fprintf(csv, "source,phase,write_ms,read_ms,file_mb,orig_mb,ratio,"
-                         "write_mbps,read_mbps,mismatches,sgd_fires,explorations,n_chunks\n");
+            fprintf(csv, "source,phase,write_ms,read_ms,file_mib,orig_mib,ratio,"
+                         "write_mibps,read_mibps,mismatches,sgd_fires,explorations,n_chunks\n");
             for (int i = 0; i < n_phases; i++) {
                 PhaseResult* r = &results[i];
                 fprintf(csv, "vpic,%s,%.2f,%.2f,%.2f,%.2f,%.4f,"
