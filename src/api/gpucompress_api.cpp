@@ -462,8 +462,8 @@ extern "C" gpucompress_error_t gpucompress_compress(
             d_stats_ptr = gpucompress::runStatsKernelsNoSync(d_input, input_size, stream);
 
             if (d_stats_ptr) {
-                float* p_ratio = (stats != nullptr || g_online_learning_enabled) ? &predicted_ratio : nullptr;
-                float* p_comp_time = p_ratio ? &predicted_comp_time : nullptr;
+                float* p_ratio = &predicted_ratio;  // always capture — no extra cost
+                float* p_comp_time = &predicted_comp_time;
                 int* p_top = g_online_learning_enabled ? top_actions : nullptr;
                 int fused_ood = 0;
 
@@ -1134,8 +1134,8 @@ extern "C" gpucompress_error_t gpucompress_compress(
             h->compression_ms        = diag_compression_ms;
             h->exploration_ms        = diag_exploration_ms;
             h->sgd_update_ms         = diag_sgd_ms;
-            h->actual_ratio          = (compressed_size > 0)
-                ? static_cast<float>(input_size) / static_cast<float>(compressed_size)
+            h->actual_ratio          = (total_size > 0)
+                ? static_cast<float>(input_size) / static_cast<float>(total_size)
                 : 0.0f;
             h->predicted_ratio       = predicted_ratio;
         }
@@ -1699,8 +1699,8 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
             d_stats_ptr = gpucompress::runStatsKernelsNoSync(d_input, input_size, stream, ctx);
 
             if (d_stats_ptr) {
-                float* p_ratio = (stats != nullptr || g_online_learning_enabled) ? &predicted_ratio : nullptr;
-                float* p_comp_time = p_ratio ? &predicted_comp_time : nullptr;
+                float* p_ratio = &predicted_ratio;  // always capture — no extra cost
+                float* p_comp_time = &predicted_comp_time;
                 int* p_top = g_online_learning_enabled ? top_actions : nullptr;
                 int fused_ood = 0;
 
@@ -2300,8 +2300,8 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
             h->compression_ms        = diag_compression_ms;
             h->exploration_ms        = diag_exploration_ms;
             h->sgd_update_ms         = diag_sgd_ms;
-            h->actual_ratio          = (compressed_size > 0)
-                ? static_cast<float>(input_size) / static_cast<float>(compressed_size)
+            h->actual_ratio          = (total_size > 0)
+                ? static_cast<float>(input_size) / static_cast<float>(total_size)
                 : 0.0f;
             h->predicted_ratio       = predicted_ratio;
         }

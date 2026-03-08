@@ -166,6 +166,12 @@ __device__ static void nnForwardPass(
     ratio       = expm1f(ratio       * weights->y_stds[2] + weights->y_means[2]);
     psnr        =        psnr        * weights->y_stds[3] + weights->y_means[3];
 
+    /* Clamp expm1f outputs to sane ranges — prevents SGD weight drift
+       from producing INF/NaN that corrupt action selection and MAPE. */
+    comp_time   = fmaxf(1e-6f, fminf(comp_time,   1e6f));
+    decomp_time = fmaxf(1e-6f, fminf(decomp_time, 1e6f));
+    ratio       = fmaxf(0.1f,  fminf(ratio,        1e5f));
+
     float rank_val;
     bool higher_is_better;
     switch (criterion) {

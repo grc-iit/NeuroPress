@@ -55,11 +55,11 @@ def g(row, *keys, default=0.0):
 
 # ── Constants ──────────────────────────────────────────────────────────
 
-PHASE_ORDER = ["no-comp", "static", "nn", "nn-rl", "nn-rl+exp50"]
+PHASE_ORDER = ["no-comp", "oracle", "nn", "nn-rl", "nn-rl+exp50"]
 
 PHASE_COLORS = {
     "no-comp":     "#95a5a6",
-    "static":      "#3498db",
+    "oracle":      "#8e44ad",
     "nn":          "#2ecc71",
     "nn-rl":       "#e67e22",
     "nn-rl+exp50": "#e74c3c",
@@ -67,18 +67,24 @@ PHASE_COLORS = {
 
 PHASE_LABELS = {
     "no-comp":     "No Comp",
-    "static":      "Static\n(LZ4+Shuf)",
+    "oracle":      "Oracle\n(Exhaustive)",
     "nn":          "NN\n(Inference)",
     "nn-rl":       "NN+SGD",
     "nn-rl+exp50": "NN+SGD\n+Explore",
 }
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)  # benchmarks/ -> GPUCompress/
+
 DEFAULT_GS_PATHS = [
-    "benchmarks/grayscott/benchmark_grayscott_vol.csv",
+    os.path.join(PROJECT_ROOT, "tests/benchmark_grayscott_vol_results/benchmark_grayscott_vol.csv"),
+    os.path.join(PROJECT_ROOT, "benchmarks/grayscott/benchmark_grayscott_vol.csv"),
 ]
 
 DEFAULT_VPIC_PATHS = [
-    "benchmarks/vpic/benchmark_vpic_deck.csv",
+    os.path.join(PROJECT_ROOT, "benchmarks/vpic-kokkos/benchmark_vpic_deck_results/benchmark_vpic_deck.csv"),
+    os.path.join(PROJECT_ROOT, "benchmarks/vpic-kokkos/benchmark_vpic_deck.csv"),
+    os.path.join(PROJECT_ROOT, "benchmarks/vpic/benchmark_vpic_deck.csv"),
 ]
 
 
@@ -406,7 +412,7 @@ def main():
         print(f"Loading VPIC: {vpic_path}")
         rows = parse_csv(vpic_path)
         r0 = rows[0] if rows else {}
-        orig = g(r0, "orig_mb", "orig_mib")
+        orig = g(r0, "orig_mib", "orig_mb")
         n_ch = int(g(r0, "n_chunks"))
         meta = (f"Dataset: {orig:.0f} MB | "
                 f"Chunks: {n_ch} | "
