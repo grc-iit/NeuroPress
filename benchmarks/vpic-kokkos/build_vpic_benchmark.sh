@@ -12,10 +12,6 @@ export NVCC_WRAPPER_DEFAULT_COMPILER=${CXX:-g++}
 
 DECK_PATH="${GPU_DIR}/benchmarks/vpic-kokkos/vpic_benchmark_deck.cxx"
 
-# Compile GPU comparison kernel separately (avoids VPIC deck preprocessor)
-echo "Compiling gpu_compare.cu ..."
-nvcc -c "${SCRIPT_DIR}/gpu_compare.cu" -o /tmp/gpu_compare.o -arch=sm_80
-
 # Compile and link the deck
 echo "Compiling vpic_benchmark_deck ..."
 "${VPIC_DIR}/kokkos/bin/nvcc_wrapper" \
@@ -37,7 +33,6 @@ echo "Compiling vpic_benchmark_deck ..."
   -DUSE_LEGACY_PARTICLE_ARRAY -DVPIC_ENABLE_AUTO_TUNING \
   "${VPIC_DIR}/deck/main.cc" \
   "${VPIC_DIR}/deck/wrapper.cc" \
-  /tmp/gpu_compare.o \
   -o vpic_benchmark_deck.Linux \
   -Wl,-rpath,"${VPIC_BUILD}" \
   -L"${VPIC_BUILD}" -lvpic \

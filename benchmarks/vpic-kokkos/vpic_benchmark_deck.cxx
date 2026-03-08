@@ -78,9 +78,11 @@ begin_globals {
     int                gpucompress_ready; // 1 if init succeeded
     int                benchmark_done;    // 1 after benchmark has run
 
-    // GPU buffers for benchmark
-    float*             d_read;            // Read-back buffer
-    unsigned long long* d_count;          // Mismatch counter
+    // Buffers for benchmark
+    float*             d_read;            // GPU read-back buffer
+    float*             h_orig;            // Host copy of original data
+    float*             h_read;            // Host copy of read-back data
+    size_t             h_buf_size;        // Size of host buffers in bytes
 };
 
 // ============================================================
@@ -183,10 +185,19 @@ static hid_t make_dcpl_auto(hsize_t chunk_floats)
 }
 
 // ============================================================
-// GPU-side byte-exact comparison (in gpu_compare.cu, avoids preprocessor)
+// CPU-side bitwise comparison (no separate .cu file needed)
 // ============================================================
-extern "C" unsigned long long gpu_compare(const float* d_a, const float* d_b,
-                                          size_t n, unsigned long long* d_count);
+static unsigned long long cpu_compare(const float* a, const float* b, size_t n)
+{
+    unsigned long long mm = 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned int ua, ub;
+        memcpy(&ua, &a[i], sizeof(unsigned int));
+        memcpy(&ub, &b[i], sizeof(unsigned int));
+        if (ua != ub) mm++;
+    }
+    return mm;
+}
 
 // ============================================================
 // Oracle: exhaustive best-config per chunk (1D flat data)
@@ -325,7 +336,7 @@ static int run_oracle_pass(const float* d_data, size_t n_floats,
 // ============================================================
 static int run_phase(const char* phase_name, const char* tmp_file,
                      float* d_data, float* d_read,
-                     unsigned long long* d_count,
+                     float* h_orig, float* h_read,
                      size_t n_floats, int n_chunks, hid_t dcpl,
                      PhaseResult* r)
 {
@@ -379,8 +390,10 @@ static int run_phase(const char* phase_name, const char* tmp_file,
 
     if (rret < 0) { fprintf(stderr, "  [%s] H5Dread failed\n", phase_name); return 1; }
 
-    // GPU bitwise verify
-    unsigned long long mm = gpu_compare(d_data, d_read, n_floats, d_count);
+    // CPU bitwise verify (copy GPU buffers to host AFTER timing stops)
+    cudaMemcpy(h_orig, d_data, n_floats * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_read, d_read, n_floats * sizeof(float), cudaMemcpyDeviceToHost);
+    unsigned long long mm = cpu_compare(h_orig, h_read, n_floats);
 
     // Collect per-chunk diagnostics
     int sgd_fires    = 0;
@@ -434,15 +447,19 @@ begin_initialization {
     double Ti_Te   = 1;
     double wpe_wce = 3;
 
-    // Grid: 320x320x320 cells, 2 particles/cell
-    // 320^3 + ghost = 322^3 voxels × 16 vars × 4B ≈ 2.03 GB field data
-    // Total GPU memory ~8 GB (fields + grid neighbor + particles)
+    // Grid size configurable via VPIC_NX env var (default 128)
+    // Field data = (nx+2)^3 * 16 * 4 bytes
+    //   128 → ~134 MB    256 → ~1.1 GB    404 → ~4.0 GB    512 → ~8.6 GB
+    const char* env_nx = getenv("VPIC_NX");
+    int grid_n = env_nx ? atoi(env_nx) : 128;
+    if (grid_n < 16) grid_n = 16;
+
     double Lx   = 80*L;
     double Ly   = 80*L;
     double Lz   = 80*L;
-    double nx   = 128;
-    double ny   = 128;
-    double nz   = 128;
+    double nx   = grid_n;
+    double ny   = grid_n;
+    double nz   = grid_n;
     double nppc = 2;
 
     double damp      = 0.001;
@@ -478,14 +495,23 @@ begin_initialization {
     double dt = cfl_req*dg/c;
     if (wpe*dt > wpedt_max) dt = wpedt_max/wpe;
 
-    // Run 100 steps to develop physics, then benchmark on step 100
-    num_step        = 101;   // 100 warmup + 1 diagnostic trigger
+    // Warmup steps and chunk size configurable via environment
+    const char* env_steps = getenv("VPIC_WARMUP_STEPS");
+    int warmup = env_steps ? atoi(env_steps) : 100;
+    if (warmup < 1) warmup = 1;
+
+    const char* env_chunk = getenv("VPIC_CHUNK_MB");
+    int chunk_mb = env_chunk ? atoi(env_chunk) : 2;
+    if (chunk_mb < 1) chunk_mb = 1;
+
+    // Run warmup steps to develop physics, then benchmark
+    num_step        = warmup + 1;
     status_interval = 50;
     clean_div_e_interval = 10;
     clean_div_b_interval = 10;
 
-    global->sim_steps     = 100;   // Step at which benchmark triggers
-    global->chunk_bytes   = 2 * 1024 * 1024;  // 2 MB chunks
+    global->sim_steps     = warmup;
+    global->chunk_bytes   = (size_t)chunk_mb * 1024 * 1024;
     global->benchmark_done = 0;
 
     // Grid setup
@@ -540,8 +566,10 @@ begin_initialization {
 
     // ---- GPUCompress + HDF5 VOL initialization ----
     global->gpucompress_ready = 0;
-    global->d_read  = NULL;
-    global->d_count = NULL;
+    global->d_read    = NULL;
+    global->h_orig    = NULL;
+    global->h_read    = NULL;
+    global->h_buf_size = 0;
 
     const char* weights_path = getenv("GPUCOMPRESS_WEIGHTS");
     gpucompress_error_t gerr = gpucompress_init(weights_path);
@@ -581,12 +609,16 @@ begin_initialization {
     sim_log("  Chunks   : " << global->chunk_bytes / (1024*1024) << " MB each");
     sim_log("  Particles: " << nppc << " per cell");
     sim_log("  Warmup   : " << global->sim_steps << " steps");
+    sim_log("  Env vars : VPIC_NX=" << grid_n << " VPIC_CHUNK_MB=" << chunk_mb
+            << " VPIC_WARMUP_STEPS=" << warmup);
     sim_log("  Weights  : " << (weights_path ? weights_path : "(none, fallback to LZ4)"));
     sim_log("  NN loaded: " << (gpucompress_nn_is_loaded() ? "yes" : "no"));
 
-    // Allocate GPU buffers for read-back and mismatch counter
-    cudaMalloc(&global->d_read,  field_bytes);
-    cudaMalloc(&global->d_count, sizeof(unsigned long long));
+    // Allocate GPU read-back buffer and host verification buffers
+    cudaMalloc(&global->d_read, field_bytes);
+    global->h_orig    = (float*)malloc(field_bytes);
+    global->h_read    = (float*)malloc(field_bytes);
+    global->h_buf_size = field_bytes;
 };
 
 // ============================================================
@@ -631,7 +663,7 @@ begin_diagnostics {
     {
         hid_t dcpl = make_dcpl_nocomp((hsize_t)chunk_floats);
         int rc = run_phase("no-comp", TMP_NOCOMP,
-                           d_fields, global->d_read, global->d_count,
+                           d_fields, global->d_read, global->h_orig, global->h_read,
                            n_floats, n_chunks, dcpl, &results[n_phases]);
         H5Pclose(dcpl);
         if (rc) any_fail = 1;
@@ -654,7 +686,7 @@ begin_diagnostics {
     {
         hid_t dcpl = make_dcpl_auto((hsize_t)chunk_floats);
         int rc = run_phase("nn", TMP_NN,
-                           d_fields, global->d_read, global->d_count,
+                           d_fields, global->d_read, global->h_orig, global->h_read,
                            n_floats, n_chunks, dcpl, &results[n_phases]);
         H5Pclose(dcpl);
         if (rc) any_fail = 1;
@@ -669,7 +701,7 @@ begin_diagnostics {
     {
         hid_t dcpl = make_dcpl_auto((hsize_t)chunk_floats);
         int rc = run_phase("nn-rl", TMP_NN_RL,
-                           d_fields, global->d_read, global->d_count,
+                           d_fields, global->d_read, global->h_orig, global->h_read,
                            n_floats, n_chunks, dcpl, &results[n_phases]);
         H5Pclose(dcpl);
         gpucompress_disable_online_learning();
@@ -686,7 +718,7 @@ begin_diagnostics {
     {
         hid_t dcpl = make_dcpl_auto((hsize_t)chunk_floats);
         int rc = run_phase("nn-rl+exp50", TMP_NN_RLEXP,
-                           d_fields, global->d_read, global->d_count,
+                           d_fields, global->d_read, global->h_orig, global->h_read,
                            n_floats, n_chunks, dcpl, &results[n_phases]);
         H5Pclose(dcpl);
         gpucompress_disable_online_learning();
@@ -745,11 +777,13 @@ begin_diagnostics {
         }
     }
 
-    // Cleanup GPU benchmark buffers
+    // Cleanup benchmark buffers
     cudaFree(global->d_read);
-    cudaFree(global->d_count);
+    free(global->h_orig);
+    free(global->h_read);
     global->d_read  = NULL;
-    global->d_count = NULL;
+    global->h_orig  = NULL;
+    global->h_read  = NULL;
 
     gpucompress_vpic_destroy(global->vpic_fields_h);
     H5Pclose(global->vol_fapl);

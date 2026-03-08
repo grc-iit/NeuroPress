@@ -744,12 +744,8 @@ extern "C" gpucompress_error_t gpucompress_compress(
             int K;
             if (g_exploration_k_override > 0) {
                 K = g_exploration_k_override;
-            } else if (is_ood) {
-                K = 31;  // OOD: try all 32 configs (minus original)
-            } else if (error_pct > 0.50) {
-                K = 9;
             } else {
-                K = 4;
+                K = 5;  // Top-5 alternatives (safe for GPU memory budget)
             }
 
             gpucompress::DecodedAction primary_dec = gpucompress::decodeAction(nn_action);
@@ -1938,12 +1934,8 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
             int K;
             if (g_exploration_k_override > 0) {
                 K = g_exploration_k_override;
-            } else if (is_ood) {
-                K = 31;
-            } else if (error_pct > 0.50) {
-                K = 9;
             } else {
-                K = 4;
+                K = 5;  // Top-5 alternatives (safe for GPU memory budget)
             }
 
             gpucompress::DecodedAction primary_dec = gpucompress::decodeAction(nn_action);

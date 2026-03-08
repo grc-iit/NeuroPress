@@ -304,18 +304,21 @@ def plot_verification(ax, phases, rows):
 # ── Figure assembly ────────────────────────────────────────────────────
 
 def make_figure(source_name, rows, output_path, meta_text=""):
-    """Build an 8-panel figure for one benchmark source."""
+    """Build a 6-panel figure for one benchmark source."""
     phases, ordered = _ordered(rows)
     if not phases:
         print(f"  {source_name}: no valid phases found, skipping.")
         return
 
-    fig = plt.figure(figsize=(16, 18))
+    fig = plt.figure(figsize=(16, 14))
     fig.suptitle(f"GPUCompress Benchmark: {source_name}",
                  fontsize=14, fontweight="bold", y=0.98)
+    if meta_text:
+        fig.text(0.5, 0.96, meta_text, ha="center", fontsize=10,
+                 color="#555", style="italic")
 
-    gs = gridspec.GridSpec(4, 2, hspace=0.50, wspace=0.30,
-                           top=0.94, bottom=0.04, left=0.08, right=0.96)
+    gs = gridspec.GridSpec(3, 2, hspace=0.50, wspace=0.30,
+                           top=0.93, bottom=0.04, left=0.08, right=0.96)
 
     # Row 1
     ax1 = fig.add_subplot(gs[0, 0])
@@ -340,21 +343,10 @@ def make_figure(source_name, rows, output_path, meta_text=""):
 
     # Row 3
     ax5 = fig.add_subplot(gs[2, 0])
-    plot_timing_breakdown(ax5, phases, ordered)
+    plot_nn_stats(ax5, phases, ordered)
 
     ax6 = fig.add_subplot(gs[2, 1])
-    plot_ratio_distribution(ax6, phases, ordered)
-
-    # Row 4
-    ax7 = fig.add_subplot(gs[3, 0])
-    plot_nn_stats(ax7, phases, ordered)
-
-    ax8 = fig.add_subplot(gs[3, 1])
-    plot_verification(ax8, phases, ordered)
-
-    if meta_text:
-        fig.text(0.5, 0.01, meta_text, ha="center", fontsize=9,
-                 style="italic", color="gray")
+    plot_verification(ax6, phases, ordered)
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
@@ -414,8 +406,9 @@ def main():
         r0 = rows[0] if rows else {}
         orig = g(r0, "orig_mib", "orig_mb")
         n_ch = int(g(r0, "n_chunks"))
+        chunk_mb = orig / max(n_ch, 1)
         meta = (f"Dataset: {orig:.0f} MB | "
-                f"Chunks: {n_ch} | "
+                f"Chunks: {n_ch} x {chunk_mb:.0f} MB | "
                 f"Source: Real VPIC Harris Sheet Simulation")
 
         out_dir = os.path.join(args.output_dir or script_dir, "vpic")

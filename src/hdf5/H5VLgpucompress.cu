@@ -1104,6 +1104,8 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                         if (wi.d_owned) { cudaFree(wi.d_owned); wi.d_owned = NULL; }
 
                         if (ce != GPUCOMPRESS_SUCCESS) {
+                            fprintf(stderr, "gpucompress VOL: worker %d compress failed "
+                                    "(err=%d, chunk_sz=%zu)\n", w, (int)ce, wi.sz);
                             worker_err.store((herr_t)-1);
                             continue;
                         }
