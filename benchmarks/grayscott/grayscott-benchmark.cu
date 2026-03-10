@@ -323,6 +323,12 @@ typedef struct {
     int    explorations;
     int    n_chunks;
     double mape_pct;
+    /* Per-component GPU-time (cumulative across chunks) */
+    double nn_ms;
+    double preproc_ms;
+    double comp_ms;
+    double explore_ms;
+    double sgd_ms;
 } PhaseResult;
 
 /* ============================================================
@@ -478,101 +484,102 @@ static int run_oracle_pass(const float *d_data, int L, int chunk_z,
     double oracle_ratio = (total_best_compressed > 0)
         ? (double)total_bytes / (double)total_best_compressed : 1.0;
 
-    /* ── Stage 2: End-to-end write — compress per-chunk best + disk ── */
-    printf("[exhaustive] E2E write (per-chunk best → D2H → disk)... "); fflush(stdout);
+    /* Find the most frequently winning algo+shuffle config */
+    int algo_votes[9][2] = {};  /* [algo_enum][shuffle] */
+    for (int c = 0; c < n_chunks; c++)
+        algo_votes[best_algos[c]][best_shuffles[c]]++;
+    int vol_algo = 1, vol_shuffle = 0, max_votes = 0;
+    for (int a = 1; a <= 8; a++)
+        for (int s = 0; s <= 1; s++)
+            if (algo_votes[a][s] > max_votes) {
+                max_votes = algo_votes[a][s];
+                vol_algo = a; vol_shuffle = s;
+            }
+    printf("[exhaustive] VOL E2E using best config: %s%s (%d/%d chunks)\n",
+           ALGO_NAMES[vol_algo], vol_shuffle ? "+shuf" : "", max_votes, n_chunks);
+
+    /* ── Stage 2: E2E write via HDF5 VOL ── */
+    printf("[exhaustive] E2E write (GPU ptr → VOL → HDF5)... "); fflush(stdout);
     remove(tmp_file);
-    int fd = open(tmp_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) { perror("open"); free(best_algos); free(best_shuffles);
-                   free(h_comp_buf); cudaFree(d_chunk_buf); cudaFree(d_comp_buf); return 1; }
+    {
+        hid_t dcpl_ex = make_dcpl_fixed(L, chunk_z, vol_algo, vol_shuffle);
+        hid_t fapl = make_vol_fapl();
+        hid_t file = H5Fcreate(tmp_file, H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+        H5Pclose(fapl);
+        if (file < 0) { free(best_algos); free(best_shuffles);
+                         free(h_comp_buf); cudaFree(d_chunk_buf); cudaFree(d_comp_buf);
+                         H5Pclose(dcpl_ex); return 1; }
 
-    size_t total_file_bytes = 0;
-    double t_write_start = now_ms();
-    for (int c = 0; c < n_chunks; c++) {
-        int actual_cz = chunk_z;
-        if (c * chunk_z + actual_cz > L) actual_cz = L - c * chunk_z;
-        size_t chunk_bytes = (size_t)L * L * actual_cz * sizeof(float);
+        hsize_t dims[3] = { (hsize_t)L, (hsize_t)L, (hsize_t)L };
+        hid_t fsp  = H5Screate_simple(3, dims, NULL);
+        hid_t dset = H5Dcreate2(file, "V", H5T_NATIVE_FLOAT,
+                                 fsp, H5P_DEFAULT, dcpl_ex, H5P_DEFAULT);
+        H5Sclose(fsp);
 
-        gather_chunk(d_chunk_buf, d_data, L, chunk_z, actual_cz, c);
-        cudaDeviceSynchronize();
+        double t_write_start = now_ms();
+        herr_t wret = H5Dwrite(dset, H5T_NATIVE_FLOAT,
+                               H5S_ALL, H5S_ALL, H5P_DEFAULT, d_data);
+        H5Dclose(dset);
+        H5Fclose(file);
+        H5Pclose(dcpl_ex);
+        double write_ms = now_ms() - t_write_start;
+        printf("%.0f ms\n", write_ms);
 
-        gpucompress_config_t cfg = gpucompress_default_config();
-        cfg.algorithm = (gpucompress_algorithm_t)best_algos[c];
-        cfg.preprocessing = 0;
-        if (best_shuffles[c]) cfg.preprocessing |= GPUCOMPRESS_PREPROC_SHUFFLE_4;
-        cfg.error_bound = 0.0;
+        if (wret < 0) { fprintf(stderr, "[exhaustive] H5Dwrite failed\n");
+                         free(best_algos); free(best_shuffles);
+                         free(h_comp_buf); cudaFree(d_chunk_buf); cudaFree(d_comp_buf); return 1; }
 
-        size_t comp_size = out_buf_size;
-        gpucompress_stats_t stats;
-        gpucompress_compress_gpu(d_chunk_buf, chunk_bytes,
-                                d_comp_buf, &comp_size, &cfg, &stats, NULL);
-
-        /* D→H + write to disk */
-        cudaMemcpy(h_comp_buf, d_comp_buf, comp_size, cudaMemcpyDeviceToHost);
-        write(fd, &comp_size, sizeof(comp_size));
-        write(fd, h_comp_buf, comp_size);
-        total_file_bytes += sizeof(comp_size) + comp_size;
+        r->write_ms   = write_ms;
+        r->write_mbps = (double)total_bytes / (1 << 20) / (write_ms / 1000.0);
     }
-    fdatasync(fd);
-    close(fd);
-    double write_ms = now_ms() - t_write_start;
-    printf("%.0f ms\n", write_ms);
 
     drop_pagecache(tmp_file);
 
-    /* ── Stage 3: End-to-end read — disk → H2D → decompress → verify ─ */
-    printf("[exhaustive] E2E read  (disk → H2D → decompress)... "); fflush(stdout);
-    fd = open(tmp_file, O_RDONLY);
-    if (fd < 0) { perror("open"); free(best_algos); free(best_shuffles);
-                   free(h_comp_buf); cudaFree(d_chunk_buf); cudaFree(d_comp_buf); return 1; }
+    /* ── Stage 3: E2E read via HDF5 VOL ── */
+    printf("[exhaustive] E2E read  (HDF5 → VOL → GPU ptr)... "); fflush(stdout);
+    {
+        hid_t fapl = make_vol_fapl();
+        hid_t file = H5Fopen(tmp_file, H5F_ACC_RDONLY, fapl);
+        H5Pclose(fapl);
+        hid_t dset = H5Dopen2(file, "V", H5P_DEFAULT);
 
-    /* Use d_decomp_field to scatter decompressed chunks back to full-field layout
-       for verification.  We decompress into d_chunk_buf then scatter. */
-    double t_read_start = now_ms();
-    for (int c = 0; c < n_chunks; c++) {
-        int actual_cz = chunk_z;
-        if (c * chunk_z + actual_cz > L) actual_cz = L - c * chunk_z;
-        size_t chunk_bytes = (size_t)L * L * actual_cz * sizeof(float);
-
-        size_t comp_size = 0;
-        read(fd, &comp_size, sizeof(comp_size));
-        read(fd, h_comp_buf, comp_size);
-
-        /* H→D + decompress */
-        cudaMemcpy(d_comp_buf, h_comp_buf, comp_size, cudaMemcpyHostToDevice);
-        size_t decomp_size = max_chunk_bytes;
-        gpucompress_decompress_gpu(d_comp_buf, comp_size,
-                                   d_chunk_buf, &decomp_size, NULL);
+        double t_read_start = now_ms();
+        herr_t rret = H5Dread(dset, H5T_NATIVE_FLOAT,
+                              H5S_ALL, H5S_ALL, H5P_DEFAULT, d_decomp_field);
         cudaDeviceSynchronize();
+        H5Dclose(dset);
+        H5Fclose(file);
+        double read_ms = now_ms() - t_read_start;
+        printf("%.0f ms\n", read_ms);
 
-        /* Scatter decompressed chunk back to 3D field layout */
-        scatter_chunk(d_decomp_field, d_chunk_buf, L, chunk_z, actual_cz, c);
+        if (rret < 0) { fprintf(stderr, "[exhaustive] H5Dread failed\n");
+                         free(best_algos); free(best_shuffles);
+                         free(h_comp_buf); cudaFree(d_chunk_buf); cudaFree(d_comp_buf); return 1; }
+
+        r->read_ms   = read_ms;
+        r->read_mbps = (double)total_bytes / (1 << 20) / (read_ms / 1000.0);
     }
-    cudaDeviceSynchronize();
-    close(fd);
-    double read_ms = now_ms() - t_read_start;
-    printf("%.0f ms\n", read_ms);
 
     /* Bitwise verification */
     unsigned long long mm = gpu_compare(d_data, d_decomp_field, n_floats, d_count);
 
-    /* Fill result */
-    memset(r, 0, sizeof(*r));
+    /* Fill result — write_ms/read_ms/write_mbps/read_mbps already set above */
+    size_t fbytes = file_size(tmp_file);
     snprintf(r->phase, sizeof(r->phase), "exhaustive");
     r->sim_ms      = 0;  /* set by caller */
-    r->write_ms    = write_ms;
-    r->read_ms     = read_ms;
-    r->file_bytes  = total_file_bytes;
+    r->file_bytes  = fbytes;
     r->orig_bytes  = total_bytes;
-    r->ratio       = oracle_ratio;
-    r->write_mbps  = (double)total_bytes / (1 << 20) / (write_ms / 1000.0);
-    r->read_mbps   = (double)total_bytes / (1 << 20) / (read_ms / 1000.0);
+    r->ratio       = (fbytes > 0) ? (double)total_bytes / (double)fbytes : 1.0;
     r->mismatches  = mm;
     r->n_chunks    = n_chunks;
+    r->sgd_fires   = 0;
+    r->explorations = 0;
+    r->mape_pct    = 0.0;
 
     printf("[exhaustive] ratio=%.2fx  write=%.0f MiB/s  read=%.0f MiB/s  "
            "file=%.0f MiB  mismatches=%llu\n",
            r->ratio, r->write_mbps, r->read_mbps,
-           (double)total_file_bytes / (1 << 20), mm);
+           (double)fbytes / (1 << 20), mm);
 
     free(best_algos);
     free(best_shuffles);
@@ -735,12 +742,22 @@ static int run_phase_vol(float *d_v, float *d_read,
     int explorations = 0;
     double ape_sum = 0.0;
     int    ape_cnt = 0;
+    double total_nn_ms     = 0.0;
+    double total_preproc_ms = 0.0;
+    double total_comp_ms   = 0.0;
+    double total_explore_ms = 0.0;
+    double total_sgd_ms    = 0.0;
     int n_hist     = gpucompress_get_chunk_history_count();
     for (int i = 0; i < n_hist; i++) {
         gpucompress_chunk_diag_t d;
         if (gpucompress_get_chunk_diag(i, &d) == 0) {
             sgd_fires    += d.sgd_fired;
             explorations += d.exploration_triggered;
+            total_nn_ms      += d.nn_inference_ms;
+            total_preproc_ms += d.preprocessing_ms;
+            total_comp_ms    += d.compression_ms;
+            total_explore_ms += d.exploration_ms;
+            total_sgd_ms     += d.sgd_update_ms;
             if (d.predicted_ratio > 0 && d.actual_ratio > 0) {
                 ape_sum += fabs(d.predicted_ratio - d.actual_ratio)
                            / d.actual_ratio;
@@ -760,26 +777,53 @@ static int run_phase_vol(float *d_v, float *d_read,
         }
     }
 
+    double write_ms = t1 - t0;
     size_t fbytes = file_size(tmp_file);
     r->sim_ms      = 0;  /* set by caller */
-    r->write_ms    = t1 - t0;
+    r->write_ms    = write_ms;
     r->read_ms     = t3 - t2;
     r->file_bytes  = fbytes;
     r->orig_bytes  = total_bytes;
     r->ratio       = (double)total_bytes / (double)(fbytes ? fbytes : 1);
-    r->write_mbps  = (double)total_bytes / (1 << 20) / ((t1 - t0) / 1000.0);
+    r->write_mbps  = (double)total_bytes / (1 << 20) / (write_ms / 1000.0);
     r->read_mbps   = (double)total_bytes / (1 << 20) / ((t3 - t2) / 1000.0);
     r->mismatches  = mm;
     r->sgd_fires   = sgd_fires;
     r->explorations = explorations;
     r->n_chunks    = n_chunks;
     r->mape_pct    = (ape_cnt > 0) ? 100.0 * ape_sum / ape_cnt : 0.0;
+    r->nn_ms       = total_nn_ms;
+    r->preproc_ms  = total_preproc_ms;
+    r->comp_ms     = total_comp_ms;
+    r->explore_ms  = total_explore_ms;
+    r->sgd_ms      = total_sgd_ms;
     snprintf(r->phase, sizeof(r->phase), "%s", phase_name);
 
     printf("[%s] ratio=%.2fx  write=%.0f MiB/s  read=%.0f MiB/s  "
            "file=%.0f MiB  sgd=%d expl=%d/%d  mismatches=%llu\n",
            phase_name, r->ratio, r->write_mbps, r->read_mbps,
            (double)fbytes / (1 << 20), sgd_fires, explorations, n_hist, mm);
+
+    /* Per-component overhead breakdown.
+     * Per-chunk timings are cumulative (sum across all chunks).  With 8
+     * concurrent VOL workers, the wall-clock time is less than the sum.
+     * Report both the cumulative GPU-time and the share of total GPU-time,
+     * so users can see which component dominates the pipeline. */
+    double total_tracked = total_nn_ms + total_preproc_ms + total_comp_ms
+                         + total_explore_ms + total_sgd_ms;
+    printf("[%s] Overhead breakdown (%d chunks, write=%.1f ms, total GPU-time=%.1f ms):\n",
+           phase_name, n_hist, write_ms, total_tracked);
+    printf("  NN inference : %8.1f ms  (%4.1f%% of GPU-time)\n",
+           total_nn_ms, total_tracked > 0 ? 100.0 * total_nn_ms / total_tracked : 0.0);
+    printf("  Preprocessing: %8.1f ms  (%4.1f%% of GPU-time)\n",
+           total_preproc_ms, total_tracked > 0 ? 100.0 * total_preproc_ms / total_tracked : 0.0);
+    printf("  Compression  : %8.1f ms  (%4.1f%% of GPU-time)\n",
+           total_comp_ms, total_tracked > 0 ? 100.0 * total_comp_ms / total_tracked : 0.0);
+    printf("  Exploration  : %8.1f ms  (%4.1f%% of GPU-time)\n",
+           total_explore_ms, total_tracked > 0 ? 100.0 * total_explore_ms / total_tracked : 0.0);
+    printf("  SGD update   : %8.1f ms  (%4.1f%% of GPU-time)\n",
+           total_sgd_ms, total_tracked > 0 ? 100.0 * total_sgd_ms / total_tracked : 0.0);
+
     return (mm == 0) ? 0 : 1;
 }
 
@@ -891,6 +935,46 @@ static void print_summary(PhaseResult *res, int n_phases,
                    res[i].mape_pct);
             printf("\n");
         }
+    }
+
+    /* GPU-time overhead breakdown for NN phases */
+    bool has_nn = false;
+    for (int i = 0; i < n_phases; i++)
+        if (strncmp(res[i].phase, "nn", 2) == 0) { has_nn = true; break; }
+
+    if (has_nn) {
+        printf("\n╔══════════════════════════════════════════════════════════════════════════════════════╗\n");
+        printf("║  GPU-Time Overhead Breakdown (cumulative across chunks, 8 concurrent workers)       ║\n");
+        printf("╠══════════════╦══════════╦══════════╦══════════╦══════════╦══════════╦════════════════╣\n");
+        printf("║  Phase       ║ NN Infer ║ Preproc  ║ Compress ║ Explore  ║ SGD      ║ Total GPU-time ║\n");
+        printf("╠══════════════╬══════════╬══════════╬══════════╬══════════╬══════════╬════════════════╣\n");
+        for (int i = 0; i < n_phases; i++) {
+            if (strncmp(res[i].phase, "nn", 2) != 0) continue;
+            PhaseResult *r = &res[i];
+            double total_gpu = r->nn_ms + r->preproc_ms + r->comp_ms
+                             + r->explore_ms + r->sgd_ms;
+            printf("║  %-12s║ %5.0f ms ║ %5.0f ms ║ %5.0f ms ║ %5.0f ms ║ %5.0f ms ║   %7.0f ms   ║\n",
+                   r->phase, r->nn_ms, r->preproc_ms, r->comp_ms,
+                   r->explore_ms, r->sgd_ms, total_gpu);
+        }
+        printf("╠══════════════╬══════════╬══════════╬══════════╬══════════╬══════════╬════════════════╣\n");
+        printf("║  (%% of GPU)  ║          ║          ║          ║          ║          ║                ║\n");
+        for (int i = 0; i < n_phases; i++) {
+            if (strncmp(res[i].phase, "nn", 2) != 0) continue;
+            PhaseResult *r = &res[i];
+            double total_gpu = r->nn_ms + r->preproc_ms + r->comp_ms
+                             + r->explore_ms + r->sgd_ms;
+            if (total_gpu <= 0) total_gpu = 1.0;
+            printf("║  %-12s║ %5.1f%%   ║ %5.1f%%   ║ %5.1f%%   ║ %5.1f%%   ║ %5.1f%%   ║   wall: %4.0f ms ║\n",
+                   r->phase,
+                   100.0 * r->nn_ms / total_gpu,
+                   100.0 * r->preproc_ms / total_gpu,
+                   100.0 * r->comp_ms / total_gpu,
+                   100.0 * r->explore_ms / total_gpu,
+                   100.0 * r->sgd_ms / total_gpu,
+                   r->write_ms);
+        }
+        printf("╚══════════════╩══════════╩══════════╩══════════╩══════════╩══════════╩════════════════╝\n");
     }
 }
 

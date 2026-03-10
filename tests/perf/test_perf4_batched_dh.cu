@@ -174,9 +174,10 @@ int main(void)
 {
     printf("=== PERF-4: batched D→H copy in runNNInference() ===\n\n");
 
-    if (gpucompress_load_nn("neural_net/weights/model.nnwt") != GPUCOMPRESS_SUCCESS) {
-        fprintf(stderr, "FATAL: failed to load NN weights from "
-                        "neural_net/weights/model.nnwt\n");
+    const char* wpath = "neural_net/weights/model.nnwt";
+    { FILE* f = fopen(wpath, "rb"); if (f) fclose(f); else wpath = "../neural_net/weights/model.nnwt"; }
+    if (gpucompress_load_nn(wpath) != GPUCOMPRESS_SUCCESS) {
+        fprintf(stderr, "FATAL: failed to load NN weights from %s\n", wpath);
         return 1;
     }
 

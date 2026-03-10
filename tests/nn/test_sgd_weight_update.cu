@@ -33,6 +33,7 @@ __global__ static void fill_ramp(float* d, size_t n) {
 int main(int argc, char** argv)
 {
     const char* nnwt = (argc > 1) ? argv[1] : "neural_net/weights/model.nnwt";
+    if (argc <= 1) { FILE* f = fopen(nnwt, "rb"); if (f) fclose(f); else nnwt = "../neural_net/weights/model.nnwt"; }
 
     printf("=== SGD Convergence Verification ===\n");
     printf("Data: %d MB ramp, lossless, no exploration\n", DATA_MB);

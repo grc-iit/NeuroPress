@@ -794,25 +794,29 @@ static float* d_sgd_grad_buffer = nullptr;
 static SGDOutput* d_sgd_output = nullptr;
 static SGDSample* d_sgd_samples = nullptr;
 
-static void allocSGDBuffers() {
+static bool allocSGDBuffers() {
     if (d_sgd_grad_buffer == nullptr) {
         if (cudaMalloc(&d_sgd_grad_buffer, SGD_GRAD_SIZE * sizeof(float)) != cudaSuccess) {
             fprintf(stderr, "NN: cudaMalloc failed for SGD gradient buffer\n");
             d_sgd_grad_buffer = nullptr;
+            return false;
         }
     }
     if (d_sgd_output == nullptr) {
         if (cudaMalloc(&d_sgd_output, sizeof(SGDOutput)) != cudaSuccess) {
             fprintf(stderr, "NN: cudaMalloc failed for SGD output\n");
             d_sgd_output = nullptr;
+            return false;
         }
     }
     if (d_sgd_samples == nullptr) {
         if (cudaMalloc(&d_sgd_samples, NN_MAX_SGD_SAMPLES * sizeof(SGDSample)) != cudaSuccess) {
             fprintf(stderr, "NN: cudaMalloc failed for SGD samples\n");
             d_sgd_samples = nullptr;
+            return false;
         }
     }
+    return true;
 }
 
 static void freeSGDBuffers() {

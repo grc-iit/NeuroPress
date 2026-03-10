@@ -417,6 +417,9 @@ int main(int argc, char** argv) {
         if (f) {
             fclose(f);
             nnwt_path = "neural_net/weights/model.nnwt";
+        } else {
+            f = fopen("../neural_net/weights/model.nnwt", "rb");
+            if (f) { fclose(f); nnwt_path = "../neural_net/weights/model.nnwt"; }
         }
     }
 

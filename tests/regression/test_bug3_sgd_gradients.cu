@@ -214,7 +214,9 @@ int main(void)
 
     /* 2. Init library */
     printf("[2/3] Initializing library...\n");
-    gpucompress_error_t init_err = gpucompress_init("neural_net/weights/model.nnwt");
+    const char* wpath = "neural_net/weights/model.nnwt";
+    { FILE* f = fopen(wpath, "rb"); if (f) fclose(f); else wpath = "../neural_net/weights/model.nnwt"; }
+    gpucompress_error_t init_err = gpucompress_init(wpath);
     if (init_err != GPUCOMPRESS_SUCCESS) {
         fprintf(stderr, "gpucompress_init failed: %d\n", (int)init_err);
         return 1;

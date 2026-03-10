@@ -1044,7 +1044,7 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
         std::mutex              io_mtx;
         std::condition_variable io_cv;
         std::queue<IOItem>      io_q;
-        bool                    io_done_flag = false;
+        std::atomic<bool>       io_done_flag{false};
         herr_t                  io_err       = 0;
         bool                    io_started   = false;
         std::thread             io_thr;

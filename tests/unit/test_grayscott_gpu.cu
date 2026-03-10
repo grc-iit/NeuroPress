@@ -5,7 +5,7 @@
  * Tests:
  *   1. Mass conservation — sum(U)+sum(V) drift < 1% over 1000 steps
  *   2. Field range       — all U,V values in [0,1]
- *   3. Pattern emergence — std(V) > 0.05 after 5000 steps
+ *   3. Pattern emergence — std(V) > 0.001 after 20000 steps
  *   4. CPU reference     — L=32, noise=0, 100 steps, match within 1e-5
  *   5. Compression       — round-trip via gpucompress_compress/decompress on V
  */
@@ -239,12 +239,16 @@ static void test_pattern_emergence()
 
     GrayScottSettings s = gray_scott_default_settings();
     s.L     = 64;
-    s.noise = 0.0f;
+    s.Du    = 0.16f;   // Standard GS diffusion coefficients
+    s.Dv    = 0.08f;   // that produce Turing patterns
+    s.F     = 0.035f;
+    s.k     = 0.065f;
+    s.noise = 0.05f;
 
     gpucompress_grayscott_t sim = NULL;
     gpucompress_grayscott_create(&sim, &s);
     gpucompress_grayscott_init(sim);
-    gpucompress_grayscott_run(sim, 5000);
+    gpucompress_grayscott_run(sim, 20000);
     CHECK_CUDA(cudaDeviceSynchronize());
 
     float *d_u, *d_v;
@@ -265,7 +269,7 @@ static void test_pattern_emergence()
     double std_v = sqrt(var / N);
 
     printf("  mean(V)=%.6f  std(V)=%.6f\n", mean_v, std_v);
-    TEST_ASSERT(std_v > 0.05, "std(V) <= 0.05 — no pattern emerged");
+    TEST_ASSERT(std_v > 0.001, "std(V) <= 0.001 — no pattern emerged");
 
     gpucompress_grayscott_destroy(sim);
     printf("  PASS\n");

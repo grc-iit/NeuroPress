@@ -185,7 +185,9 @@ int main(void)
     printf("=== BUG-8: g_sgd_ever_fired Atomic Visibility Test ===\n");
     printf("Fix: std::atomic<bool> with memory_order_release/acquire.\n\n");
 
-    if (gpucompress_init("neural_net/weights/model.nnwt") != GPUCOMPRESS_SUCCESS) {
+    const char* wpath = "neural_net/weights/model.nnwt";
+    { FILE* f = fopen(wpath, "rb"); if (f) fclose(f); else wpath = "../neural_net/weights/model.nnwt"; }
+    if (gpucompress_init(wpath) != GPUCOMPRESS_SUCCESS) {
         fprintf(stderr, "gpucompress_init failed — weights file required\n");
         return 1;
     }

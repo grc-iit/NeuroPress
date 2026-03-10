@@ -32,7 +32,6 @@ set_target_properties(test_vpic_adapter PROPERTIES CUDA_SEPARABLE_COMPILATION ON
 # Compression core test suite
 add_executable(test_compression_core
     tests/unit/test_compression_core.cu
-    ${PREPROCESSING_SOURCES}
 )
 target_include_directories(test_compression_core PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -44,7 +43,6 @@ set_target_properties(test_compression_core PROPERTIES CUDA_SEPARABLE_COMPILATIO
 # Preprocessing test
 add_executable(test_preprocessing
     tests/unit/test_preprocessing.cu
-    ${PREPROCESSING_SOURCES}
 )
 target_include_directories(test_preprocessing PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -102,7 +100,6 @@ set_target_properties(test_shuffle PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 # Quantization suite
 add_executable(test_quantization
     tests/unit/quantization/test_quantization_suite.cu
-    ${PREPROCESSING_SOURCES}
 )
 target_include_directories(test_quantization PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include

@@ -438,7 +438,8 @@ int main() {
     test_large_multiblock();
     test_repeated_calls();
 
-    // Transfer tracker tests
+    // Transfer tracker tests (must enable tracker before counting)
+    xfer_tracker_enable(1);
     test_no_h2d_for_stats_init();
 
     // GPU round-trip test

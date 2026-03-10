@@ -865,6 +865,7 @@ static void test_direct_api_stats(void) {
 /* ================================================================== */
 int main(int argc, char** argv) {
     const char* weights = (argc > 1) ? argv[1] : "neural_net/weights/model.nnwt";
+    if (argc <= 1) { FILE* f = fopen(weights, "rb"); if (f) fclose(f); else weights = "../neural_net/weights/model.nnwt"; }
 
     printf("======================================================\n");
     printf(" GPUCompress VOL Pipeline — Comprehensive Test Suite\n");

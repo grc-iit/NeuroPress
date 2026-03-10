@@ -32,7 +32,11 @@ int main() {
 
     /* ---- Init library with NN weights ---- */
     const char* weights = getenv("GPUCOMPRESS_WEIGHTS");
-    if (!weights) weights = "neural_net/weights/model.nnwt";
+    if (!weights) {
+        FILE* f = fopen("neural_net/weights/model.nnwt", "rb");
+        if (f) { fclose(f); weights = "neural_net/weights/model.nnwt"; }
+        else weights = "../neural_net/weights/model.nnwt";
+    }
     gpucompress_error_t err = gpucompress_init(weights);
     if (err != GPUCOMPRESS_SUCCESS) {
         printf("gpucompress_init failed: %s\n", gpucompress_error_string(err));

@@ -474,7 +474,7 @@ QuantizationResult quantize_simple(
     result.data_min = data_min;
     result.data_max = data_max;
     result.scale_factor = scale;
-    result.error_bound = config.error_bound;
+    result.error_bound = effective_eb;
     result.type = config.type;
     result.num_elements = num_elements;
     result.original_element_size = element_size;

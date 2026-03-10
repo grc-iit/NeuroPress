@@ -537,6 +537,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
             fprintf(stderr, "gpucompress ERROR: ALGO_AUTO requested but NN inference failed "
                     "(weights not loaded or inference error). Load weights via gpucompress_init() "
                     "or use an explicit algorithm.\n");
+            cudaFree(d_input);
             return GPUCOMPRESS_ERROR_NN_NOT_LOADED;
         }
     }
@@ -1565,10 +1566,11 @@ extern "C" int gpucompress_get_chunk_history_count(void) {
 }
 
 extern "C" int gpucompress_get_chunk_diag(int idx, gpucompress_chunk_diag_t *out) {
-    if (idx < 0 || idx >= g_chunk_history_count.load() || out == NULL)
+    if (idx < 0 || out == NULL)
         return -1;
     std::lock_guard<std::mutex> lk(g_chunk_history_mutex);
-    if (idx >= g_chunk_history_cap) return -1;
+    if (idx >= g_chunk_history_count.load() || idx >= g_chunk_history_cap)
+        return -1;
     *out = g_chunk_history[idx];
     return 0;
 }

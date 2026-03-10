@@ -111,6 +111,7 @@ static hid_t open_vol_file(const char* path, unsigned flags) {
 /* ------------------------------------------------------------------ */
 int main(int argc, char** argv) {
     const char* weights = (argc > 1) ? argv[1] : "neural_net/weights/model.nnwt";
+    if (argc <= 1) { FILE* f = fopen(weights, "rb"); if (f) fclose(f); else weights = "../neural_net/weights/model.nnwt"; }
 
     printf("==============================================\n");
     printf(" GPUCompress VOL Transfer Audit\n");

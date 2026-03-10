@@ -323,7 +323,9 @@ static int test_nn_reload(int& failures) {
     CHECK(gpucompress_nn_is_loaded() == 1, "NN is loaded before reload");
 
     // Reload the same weights
-    gpucompress_error_t rc = gpucompress_reload_nn("neural_net/weights/model.nnwt");
+    const char* reload_path = "neural_net/weights/model.nnwt";
+    { FILE* f = fopen(reload_path, "rb"); if (f) fclose(f); else reload_path = "../neural_net/weights/model.nnwt"; }
+    gpucompress_error_t rc = gpucompress_reload_nn(reload_path);
     CHECK(rc == GPUCOMPRESS_SUCCESS, "Hot-reload succeeded");
     CHECK(gpucompress_nn_is_loaded() == 1, "NN still loaded after reload");
 
@@ -370,6 +372,7 @@ int main(int argc, char** argv) {
 
     // Initialize with NN weights
     const char* weights = "neural_net/weights/model.nnwt";
+    { FILE* f = fopen(weights, "rb"); if (f) fclose(f); else weights = "../neural_net/weights/model.nnwt"; }
     fprintf(stderr, "\nInitializing with weights: %s\n", weights);
 
     gpucompress_error_t rc = gpucompress_init(weights);

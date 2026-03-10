@@ -177,7 +177,6 @@ if [ "$RUN_GPU" = true ]; then
         "$BUILD_DIR/test_shuffle"
         "$BUILD_DIR/test_api"
         "$BUILD_DIR/test_cli"
-        "$BUILD_DIR/test_cpu_stats"
         "$BUILD_DIR/test_vpic_adapter"
         "$BUILD_DIR/test_grayscott_gpu"
         "$BUILD_DIR/test_nn"
