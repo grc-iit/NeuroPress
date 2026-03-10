@@ -44,7 +44,7 @@ def prepare_fold(df_train, df_val):
         sub_df['comp_time_log'] = np.log1p(sub_df['compression_time_ms'].clip(lower=0)).astype(np.float32)
         sub_df['decomp_time_log'] = np.log1p(sub_df['decompression_time_ms'].clip(lower=0)).astype(np.float32)
         sub_df['ratio_log'] = np.log1p(sub_df['compression_ratio'].clip(lower=0)).astype(np.float32)
-        sub_df['psnr_clamped'] = sub_df['psnr_db'].replace([np.inf, -np.inf], 120.0).clip(upper=120.0).astype(np.float32)
+        sub_df['psnr_clamped'] = sub_df['psnr_db'].replace([np.inf, -np.inf], 120.0).fillna(120.0).clip(upper=120.0).astype(np.float32)
 
     algo_cols = [f'alg_{a}' for a in ALGORITHM_NAMES]
     feature_cols = algo_cols + ['quant_enc', 'shuffle_enc',

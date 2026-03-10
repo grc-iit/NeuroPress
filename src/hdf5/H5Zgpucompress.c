@@ -138,16 +138,18 @@ static double unpack_double(unsigned int lo, unsigned int hi) {
  * When set, ALGO_AUTO will use the neural network for per-chunk algorithm
  * selection. Without it, ALGO_AUTO falls back to LZ4.
  */
-static int ensure_initialized(void) {
-    if (!g_gpucompress_initialized) {
-        const char* weights = getenv("GPUCOMPRESS_WEIGHTS");
-        gpucompress_error_t err = gpucompress_init(weights);
-        if (err != GPUCOMPRESS_SUCCESS) {
-            return -1;
-        }
+static pthread_once_t g_init_once = PTHREAD_ONCE_INIT;
+static int g_init_result = -1;
+static void do_initialize(void) {
+    const char* weights = getenv("GPUCOMPRESS_WEIGHTS");
+    if (gpucompress_init(weights) == GPUCOMPRESS_SUCCESS) {
         g_gpucompress_initialized = 1;
+        g_init_result = 0;
     }
-    return 0;
+}
+static int ensure_initialized(void) {
+    pthread_once(&g_init_once, do_initialize);
+    return g_init_result;
 }
 
 /* ============================================================
@@ -245,8 +247,13 @@ static size_t H5Z_filter_gpucompress(
     if (cd_nelmts >= 2) {
         config.preprocessing = cd_values[1];
     }
-    if (cd_nelmts >= 3 && cd_values[2] == 4) {
-        config.preprocessing |= GPUCOMPRESS_PREPROC_SHUFFLE_4;
+    if (cd_nelmts >= 3) {
+        if (cd_values[2] == 4) {
+            config.preprocessing |= GPUCOMPRESS_PREPROC_SHUFFLE_4;
+        } else if (cd_values[2] != 0) {
+            fprintf(stderr, "gpucompress HDF5 filter: shuffle element_size=%u not supported "
+                    "(only 0 and 4 are supported), ignoring shuffle\n", cd_values[2]);
+        }
     }
     if (cd_nelmts >= 5) {
         config.error_bound = unpack_double(cd_values[3], cd_values[4]);

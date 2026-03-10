@@ -177,8 +177,10 @@ def verify_export(path: str, model, x_means, x_stds, y_means, y_stds,
 
     # Numerical test: manual forward pass with exported weights vs PyTorch reference output
     test_input = torch.randn(1, 15)
+    test_input_norm = (test_input - torch.from_numpy(xm)) / torch.from_numpy(np.clip(xs, 1e-8, None).astype(np.float32))
     with torch.no_grad():
-        expected_output = model(test_input).numpy()[0]
+        expected_output_norm = model(test_input_norm).numpy()[0]
+    expected_output = expected_output_norm * ys + ym
 
     # Manual forward pass using exported numpy weights to verify correctness
     x = (test_input.numpy()[0] - xm) / np.clip(xs, 1e-8, None)

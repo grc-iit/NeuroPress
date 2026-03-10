@@ -11,6 +11,7 @@
 #include <cuda_runtime.h>
 #include <cub/cub.cuh>
 #include <cfloat>
+#include <climits>
 #include <cstdio>
 
 extern bool g_gc_verbose;
@@ -73,6 +74,8 @@ __global__ void quantize_linear_kernel(
             quantized = fmax(-128.0, fmin(127.0, quantized));
         } else if (sizeof(OutputT) == 2) {
             quantized = fmax(-32768.0, fmin(32767.0, quantized));
+        } else if (sizeof(OutputT) == 4) {
+            quantized = fmax(-2147483648.0, fmin(2147483647.0, quantized));
         }
 
         output[i] = static_cast<OutputT>(quantized);
@@ -192,6 +195,12 @@ static int compute_data_range_typed(
     T* d_buf_max,
     cudaStream_t stream
 ) {
+    // Guard against int overflow: CUB DeviceReduce takes int count
+    if (num_elements > (size_t)INT_MAX) {
+        fprintf(stderr, "compute_data_range: num_elements %zu exceeds INT_MAX\n", num_elements);
+        return -1;
+    }
+
     // Query temp storage size (same for min and max)
     size_t temp_bytes = 0;
     cudaError_t err = cub::DeviceReduce::Min(nullptr, temp_bytes, d_input, d_buf_min,
@@ -396,6 +405,14 @@ QuantizationResult quantize_simple(
         }
     }
 
+    // Warn if forced INT8 cannot represent the data range
+    if (precision == 8 && data_range > 0) {
+        double max_quant = data_range / (2.0 * config.error_bound);
+        if (max_quant > 127.0)
+            fprintf(stderr, "gpucompress WARNING: forced INT8 cannot represent data range "
+                    "(need %.0f levels, int8 max=127). Error bound may be violated.\n", max_quant);
+    }
+
     // Compute quantization scale from effective error bound
     double scale = 1.0 / (2.0 * effective_eb);
 
@@ -441,7 +458,14 @@ QuantizationResult quantize_simple(
         }
     }
 
-    // No sync needed — quantize kernel is on same stream as subsequent compression
+    // Check kernel launch error
+    cudaError_t launch_err = cudaGetLastError();
+    if (launch_err != cudaSuccess) {
+        fprintf(stderr, "gpucompress ERROR: quantization kernel launch failed: %s\n",
+                cudaGetErrorString(launch_err));
+        cudaFree(d_output);
+        return result;  // returns invalid result
+    }
 
     // Fill result
     result.d_quantized = d_output;
@@ -528,6 +552,14 @@ QuantizationResult quantize_simple(
             case QuantizationPrecision::INT32: precision = 32; break;
             default: precision = 32;
         }
+    }
+
+    // Warn if forced INT8 cannot represent the data range
+    if (precision == 8 && data_range > 0) {
+        double max_quant = data_range / (2.0 * config.error_bound);
+        if (max_quant > 127.0)
+            fprintf(stderr, "gpucompress WARNING: forced INT8 cannot represent data range "
+                    "(need %.0f levels, int8 max=127). Error bound may be violated.\n", max_quant);
     }
 
     double scale = 1.0 / (2.0 * effective_eb);
@@ -634,6 +666,14 @@ void* dequantize_simple(
                 static_cast<int32_t*>(d_quantized), static_cast<double*>(d_output),
                 metadata.num_elements, inv_scale, metadata.data_min, stream);
         }
+    }
+
+    cudaError_t launch_err = cudaGetLastError();
+    if (launch_err != cudaSuccess) {
+        fprintf(stderr, "gpucompress ERROR: dequantization kernel launch failed: %s\n",
+                cudaGetErrorString(launch_err));
+        cudaFree(d_output);
+        return nullptr;
     }
 
     cudaStreamSynchronize(stream);

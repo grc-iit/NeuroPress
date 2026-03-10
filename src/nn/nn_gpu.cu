@@ -59,8 +59,8 @@ enum NNRankCriterion {
  * ============================================================ */
 
 static NNWeightsGPU* d_nn_weights = nullptr;
-static bool g_nn_loaded = false;
-static NNRankCriterion g_rank_criterion = NN_RANK_BY_RATIO;
+static std::atomic<bool> g_nn_loaded{false};
+static std::atomic<int> g_rank_criterion{NN_RANK_BY_RATIO};
 
 /** Pre-allocated inference output buffers (avoids per-call cudaMalloc) */
 static NNInferenceOutput* d_infer_output = nullptr;   // batched: action+ratio+comp_time+is_ood (16B)
@@ -458,10 +458,18 @@ static NNInferenceOutput* d_fused_infer_output = nullptr;
 static int* d_fused_top_actions = nullptr;
 
 static void allocFusedInferenceBuffers() {
-    if (d_fused_infer_output == nullptr)
-        cudaMalloc(&d_fused_infer_output, sizeof(NNInferenceOutput));
-    if (d_fused_top_actions == nullptr)
-        cudaMalloc(&d_fused_top_actions, NN_NUM_CONFIGS * sizeof(int));
+    if (d_fused_infer_output == nullptr) {
+        if (cudaMalloc(&d_fused_infer_output, sizeof(NNInferenceOutput)) != cudaSuccess) {
+            fprintf(stderr, "NN: cudaMalloc failed for fused inference output\n");
+            d_fused_infer_output = nullptr;
+        }
+    }
+    if (d_fused_top_actions == nullptr) {
+        if (cudaMalloc(&d_fused_top_actions, NN_NUM_CONFIGS * sizeof(int)) != cudaSuccess) {
+            fprintf(stderr, "NN: cudaMalloc failed for fused top actions\n");
+            d_fused_top_actions = nullptr;
+        }
+    }
 }
 
 static void freeFusedInferenceBuffers() {
@@ -634,14 +642,13 @@ __global__ void nnSGDKernel(
                 s_d3[1] = 0.0f;
             }
 
-            // PSNR (output 3)
-            if (sample.actual_psnr > 0.0f) {
-                float clamped = fminf(sample.actual_psnr, 120.0f);
+            // PSNR (output 3) — treat psnr<=0 as 120 dB (lossless = perfect reconstruction)
+            {
+                float psnr_val = (sample.actual_psnr <= 0.0f) ? 120.0f : sample.actual_psnr;
+                float clamped = fminf(psnr_val, 120.0f);
                 float y_std3 = weights->y_stds[3];
                 if (y_std3 < 1e-8f) y_std3 = 1e-8f;
                 s_d3[3] = s_y[3] - (clamped - weights->y_means[3]) / y_std3;
-            } else {
-                s_d3[3] = 0.0f;
             }
         }
         __syncthreads();
@@ -788,12 +795,24 @@ static SGDOutput* d_sgd_output = nullptr;
 static SGDSample* d_sgd_samples = nullptr;
 
 static void allocSGDBuffers() {
-    if (d_sgd_grad_buffer == nullptr)
-        cudaMalloc(&d_sgd_grad_buffer, SGD_GRAD_SIZE * sizeof(float));
-    if (d_sgd_output == nullptr)
-        cudaMalloc(&d_sgd_output, sizeof(SGDOutput));
-    if (d_sgd_samples == nullptr)
-        cudaMalloc(&d_sgd_samples, NN_MAX_SGD_SAMPLES * sizeof(SGDSample));
+    if (d_sgd_grad_buffer == nullptr) {
+        if (cudaMalloc(&d_sgd_grad_buffer, SGD_GRAD_SIZE * sizeof(float)) != cudaSuccess) {
+            fprintf(stderr, "NN: cudaMalloc failed for SGD gradient buffer\n");
+            d_sgd_grad_buffer = nullptr;
+        }
+    }
+    if (d_sgd_output == nullptr) {
+        if (cudaMalloc(&d_sgd_output, sizeof(SGDOutput)) != cudaSuccess) {
+            fprintf(stderr, "NN: cudaMalloc failed for SGD output\n");
+            d_sgd_output = nullptr;
+        }
+    }
+    if (d_sgd_samples == nullptr) {
+        if (cudaMalloc(&d_sgd_samples, NN_MAX_SGD_SAMPLES * sizeof(SGDSample)) != cudaSuccess) {
+            fprintf(stderr, "NN: cudaMalloc failed for SGD samples\n");
+            d_sgd_samples = nullptr;
+        }
+    }
 }
 
 static void freeSGDBuffers() {
@@ -817,7 +836,7 @@ bool loadNNFromBinary(const char* filepath) {
 
     // Immediately mark as not loaded — prevents using stale/corrupted weights
     // if any step below fails during a reload attempt
-    g_nn_loaded = false;
+    g_nn_loaded.store(false);
 
     std::ifstream file(filepath, std::ios::binary);
     if (!file.is_open()) {
@@ -939,7 +958,7 @@ bool loadNNFromBinary(const char* filepath) {
         return false;
     }
 
-    g_nn_loaded = true;
+    g_nn_loaded.store(true);
 
     // Pre-allocate inference output buffers
     allocInferenceBuffers();
@@ -1009,7 +1028,7 @@ void cleanupNN() {
     freeInferenceBuffers();
     freeFusedInferenceBuffers();
     freeSGDBuffers();
-    g_nn_loaded = false;
+    g_nn_loaded.store(false);
     g_has_bounds = false;
 }
 
@@ -1017,7 +1036,7 @@ void cleanupNN() {
  * Check if neural network is loaded.
  */
 bool isNNLoaded() {
-    return g_nn_loaded;
+    return g_nn_loaded.load();
 }
 
 /**
@@ -1031,7 +1050,7 @@ const NNWeightsGPU* getNNWeightsDevicePtr() {
  * Set the ranking criterion for neural network inference.
  */
 void setNNRankCriterion(NNRankCriterion criterion) {
-    g_rank_criterion = criterion;
+    g_rank_criterion.store(static_cast<int>(criterion));
 }
 
 /**
@@ -1061,7 +1080,7 @@ int runNNInference(
     float* out_predicted_comp_time,
     int* out_top_actions
 ) {
-    if (!g_nn_loaded || d_nn_weights == nullptr) {
+    if (!g_nn_loaded.load() || d_nn_weights == nullptr) {
         return -1;  // Error: NN not loaded
     }
 
@@ -1071,11 +1090,15 @@ int runNNInference(
         if (d_infer_output == nullptr) return -1;
     }
 
+    /* GPU-level barrier: wait for last SGD before reading weights */
+    if (g_sgd_ever_fired.load(std::memory_order_acquire))
+        cudaStreamWaitEvent(stream, g_sgd_done, 0);
+
     nnInferenceKernel<<<1, NN_NUM_CONFIGS, 0, stream>>>(
         d_nn_weights,
         entropy, mad_norm, deriv_norm,
         data_size, error_bound,
-        static_cast<int>(g_rank_criterion),
+        g_rank_criterion.load(),
         d_infer_output,
         out_top_actions ? d_infer_top_actions : nullptr
     );
@@ -1124,7 +1147,7 @@ int runNNFusedInference(
     int* out_is_ood,
     int* out_top_actions
 ) {
-    if (!g_nn_loaded || d_nn_weights == nullptr || d_stats == nullptr) {
+    if (!g_nn_loaded.load() || d_nn_weights == nullptr || d_stats == nullptr) {
         return -1;
     }
 
@@ -1134,11 +1157,15 @@ int runNNFusedInference(
         if (d_fused_infer_output == nullptr) return -1;
     }
 
+    /* GPU-level barrier: wait for last SGD before reading weights */
+    if (g_sgd_ever_fired.load(std::memory_order_acquire))
+        cudaStreamWaitEvent(stream, g_sgd_done, 0);
+
     nnFusedInferenceKernel<<<1, NN_NUM_CONFIGS, 0, stream>>>(
         d_nn_weights,
         d_stats,
         data_size, error_bound,
-        static_cast<int>(g_rank_criterion),
+        g_rank_criterion.load(),
         d_fused_infer_output,
         out_top_actions ? d_fused_top_actions : nullptr
     );
@@ -1190,7 +1217,7 @@ int runNNSGD(
     int* out_clipped,
     int* out_count
 ) {
-    if (!g_nn_loaded || d_nn_weights == nullptr || d_stats == nullptr) return -1;
+    if (!g_nn_loaded.load() || d_nn_weights == nullptr || d_stats == nullptr) return -1;
     if (samples == nullptr || num_samples <= 0) return -1;
     if (num_samples > NN_MAX_SGD_SAMPLES) num_samples = NN_MAX_SGD_SAMPLES;
 
@@ -1223,6 +1250,10 @@ int runNNSGD(
 
     err = cudaGetLastError();
     if (err != cudaSuccess) return -1;
+
+    /* Record completion so future inference waits for this SGD */
+    cudaEventRecord(g_sgd_done, stream);
+    g_sgd_ever_fired.store(true, std::memory_order_release);
 
     // D→H: copy SGDOutput (12B)
     SGDOutput h_result;
@@ -1264,7 +1295,7 @@ int runNNFusedInferenceCtx(
     int* out_is_ood,
     int* out_top_actions
 ) {
-    if (!g_nn_loaded || d_nn_weights == nullptr || d_stats == nullptr || ctx == nullptr) {
+    if (!g_nn_loaded.load() || d_nn_weights == nullptr || d_stats == nullptr || ctx == nullptr) {
         return -1;
     }
 
@@ -1276,7 +1307,7 @@ int runNNFusedInferenceCtx(
         d_nn_weights,
         d_stats,
         data_size, error_bound,
-        static_cast<int>(g_rank_criterion),
+        g_rank_criterion.load(),
         ctx->d_fused_infer_output,
         out_top_actions ? ctx->d_fused_top_actions : nullptr
     );
@@ -1328,7 +1359,7 @@ int runNNSGDCtx(
     int* out_clipped,
     int* out_count
 ) {
-    if (!g_nn_loaded || d_nn_weights == nullptr || d_stats == nullptr || ctx == nullptr) return -1;
+    if (!g_nn_loaded.load() || d_nn_weights == nullptr || d_stats == nullptr || ctx == nullptr) return -1;
     if (samples == nullptr || num_samples <= 0) return -1;
     if (num_samples > NN_MAX_SGD_SAMPLES) num_samples = NN_MAX_SGD_SAMPLES;
 

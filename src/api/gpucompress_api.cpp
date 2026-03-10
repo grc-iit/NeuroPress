@@ -121,9 +121,20 @@ static std::condition_variable g_pool_cv;
 /* ---- SGD serialization mutex (CPU-side) ---- */
 static std::mutex g_sgd_mutex;
 
-/** Pre-allocated CUDA timing events (reused across all timing sites) */
-cudaEvent_t g_t_start = nullptr;
-cudaEvent_t g_t_stop  = nullptr;
+/* ---- Host-path ALGO_AUTO mutex: protects global stats + inference buffers ---- */
+static std::mutex g_auto_mutex;
+
+/** Thread-local CUDA timing events — each thread gets its own pair,
+ *  lazy-initialized on first use. Avoids the race on global events
+ *  while keeping the zero-contention benefit of per-thread storage.
+ *  Cleanup handled by CUDA context teardown (single GPU node). */
+static thread_local cudaEvent_t tl_t_start = nullptr;
+static thread_local cudaEvent_t tl_t_stop  = nullptr;
+
+static inline void ensure_timing_events() {
+    if (!tl_t_start) cudaEventCreate(&tl_t_start);
+    if (!tl_t_stop)  cudaEventCreate(&tl_t_stop);
+}
 
 /** Online reinforcement (SGD) state */
 float g_reinforce_lr = 0.01f;
@@ -240,6 +251,7 @@ CompContext* acquireCompContext() {
             return &g_comp_pool[i];
         }
     }
+    return nullptr;
 }
 
 void releaseCompContext(CompContext* ctx) {
@@ -292,9 +304,7 @@ extern "C" gpucompress_error_t gpucompress_init(const char* weights_path) {
         return GPUCOMPRESS_ERROR_CUDA_FAILED;
     }
 
-    // Pre-allocate timing events
-    cudaEventCreate(&g_t_start);
-    cudaEventCreate(&g_t_stop);
+    // Timing events are now thread_local — no global creation needed
 
     // SGD stream + event for GPU-level weight-update ordering
     cudaStreamCreate(&g_sgd_stream);
@@ -336,8 +346,7 @@ extern "C" void gpucompress_cleanup(void) {
         if (g_sgd_stream) { cudaStreamDestroy(g_sgd_stream); g_sgd_stream = nullptr; }
         if (g_sgd_done)   { cudaEventDestroy(g_sgd_done);   g_sgd_done   = nullptr; }
         g_sgd_ever_fired.store(false, std::memory_order_relaxed);
-        if (g_t_start) { cudaEventDestroy(g_t_start); g_t_start = nullptr; }
-        if (g_t_stop)  { cudaEventDestroy(g_t_stop);  g_t_stop  = nullptr; }
+        // Timing events are thread_local — cleaned up by CUDA context teardown
         if (g_default_stream != nullptr) {
             cudaStreamDestroy(g_default_stream);
             g_default_stream = nullptr;
@@ -456,43 +465,48 @@ extern "C" gpucompress_error_t gpucompress_compress(
 
         if (num_elements > 0 && gpucompress_nn_is_loaded_impl()) {
             auto t_nn_start = std::chrono::steady_clock::now();
-            // Fused stats→NN: run stats kernels (no D→H, no sync)
-            d_stats_ptr = gpucompress::runStatsKernelsNoSync(d_input, input_size, stream);
+            {
+                // Lock protects global stats + inference GPU buffers.
+                std::lock_guard<std::mutex> auto_lk(g_auto_mutex);
 
-            if (d_stats_ptr) {
-                float* p_ratio = &predicted_ratio;  // always capture — no extra cost
-                float* p_comp_time = &predicted_comp_time;
-                int* p_top = g_online_learning_enabled ? top_actions : nullptr;
-                int fused_ood = 0;
+                // Fused stats→NN: run stats kernels (no D→H, no sync)
+                d_stats_ptr = gpucompress::runStatsKernelsNoSync(d_input, input_size, stream);
 
-                action = gpucompress::runNNFusedInference(
-                    d_stats_ptr, input_size, cfg.error_bound, stream,
-                    &action, p_ratio, p_comp_time,
-                    g_online_learning_enabled ? &fused_ood : nullptr, p_top);
-                rc = (action >= 0) ? 0 : -1;
+                if (d_stats_ptr) {
+                    float* p_ratio = &predicted_ratio;  // always capture — no extra cost
+                    float* p_comp_time = &predicted_comp_time;
+                    int* p_top = g_online_learning_enabled ? top_actions : nullptr;
+                    int fused_ood = 0;
 
-                if (rc == 0) {
-                    is_ood = (fused_ood != 0);
+                    action = gpucompress::runNNFusedInference(
+                        d_stats_ptr, input_size, cfg.error_bound, stream,
+                        &action, p_ratio, p_comp_time,
+                        g_online_learning_enabled ? &fused_ood : nullptr, p_top);
+                    rc = (action >= 0) ? 0 : -1;
+
+                    if (rc == 0) {
+                        is_ood = (fused_ood != 0);
+                    }
                 }
-            }
 
-            // Conditional stats D→H only when user wants stats output
-            if (d_stats_ptr && stats != nullptr) {
-                GC_LOG("[XFER D→H] stats: entropy (%zu B)\n", sizeof(double));
-                XFER_TRACK("compress/auto: D->H stats entropy", sizeof(double), cudaMemcpyDeviceToHost);
-                cudaMemcpyAsync(&entropy, &d_stats_ptr->entropy, sizeof(double),
-                                cudaMemcpyDeviceToHost, stream);
-                // mad_normalized and deriv_normalized are contiguous
-                GC_LOG("[XFER D→H] stats: mad_normalized (%zu B)\n", sizeof(double));
-                XFER_TRACK("compress/auto: D->H stats mad", sizeof(double), cudaMemcpyDeviceToHost);
-                cudaMemcpyAsync(&mad, &d_stats_ptr->mad_normalized, sizeof(double),
-                                cudaMemcpyDeviceToHost, stream);
-                GC_LOG("[XFER D→H] stats: deriv_normalized (%zu B)\n", sizeof(double));
-                XFER_TRACK("compress/auto: D->H stats deriv", sizeof(double), cudaMemcpyDeviceToHost);
-                cudaMemcpyAsync(&second_derivative, &d_stats_ptr->deriv_normalized, sizeof(double),
-                                cudaMemcpyDeviceToHost, stream);
-                cudaStreamSynchronize(stream);
-            }
+                // Conditional stats D→H only when user wants stats output
+                if (d_stats_ptr && stats != nullptr) {
+                    GC_LOG("[XFER D→H] stats: entropy (%zu B)\n", sizeof(double));
+                    XFER_TRACK("compress/auto: D->H stats entropy", sizeof(double), cudaMemcpyDeviceToHost);
+                    cudaMemcpyAsync(&entropy, &d_stats_ptr->entropy, sizeof(double),
+                                    cudaMemcpyDeviceToHost, stream);
+                    // mad_normalized and deriv_normalized are contiguous
+                    GC_LOG("[XFER D→H] stats: mad_normalized (%zu B)\n", sizeof(double));
+                    XFER_TRACK("compress/auto: D->H stats mad", sizeof(double), cudaMemcpyDeviceToHost);
+                    cudaMemcpyAsync(&mad, &d_stats_ptr->mad_normalized, sizeof(double),
+                                    cudaMemcpyDeviceToHost, stream);
+                    GC_LOG("[XFER D→H] stats: deriv_normalized (%zu B)\n", sizeof(double));
+                    XFER_TRACK("compress/auto: D->H stats deriv", sizeof(double), cudaMemcpyDeviceToHost);
+                    cudaMemcpyAsync(&second_derivative, &d_stats_ptr->deriv_normalized, sizeof(double),
+                                    cudaMemcpyDeviceToHost, stream);
+                    cudaStreamSynchronize(stream);
+                }
+            } // auto_lk released
 
             if (rc == 0) {
                 nn_was_used = true;
@@ -520,8 +534,10 @@ extern "C" gpucompress_error_t gpucompress_compress(
                    (preproc_to_use & GPUCOMPRESS_PREPROC_QUANTIZE)  ? " +quant"   : "",
                    action, predicted_ratio);
         } else {
-            algo_to_use = GPUCOMPRESS_ALGO_LZ4;
-            GC_LOG("NN: fallback to lz4 (inference failed)\n");
+            fprintf(stderr, "gpucompress ERROR: ALGO_AUTO requested but NN inference failed "
+                    "(weights not loaded or inference error). Load weights via gpucompress_init() "
+                    "or use an explicit algorithm.\n");
+            return GPUCOMPRESS_ERROR_NN_NOT_LOADED;
         }
     }
 
@@ -554,6 +570,11 @@ extern "C" gpucompress_error_t gpucompress_compress(
                 d_quantized = static_cast<uint8_t*>(quant_result.d_quantized);
                 d_compress_input = d_quantized;
                 compress_input_size = quant_result.quantized_bytes;
+            } else {
+                fprintf(stderr, "gpucompress ERROR: quantization failed but was requested "
+                        "(error_bound=%.6e, num_elements=%zu)\n", cfg.error_bound, num_elements);
+                cudaFree(d_input);
+                return GPUCOMPRESS_ERROR_COMPRESSION;
             }
         }
     }
@@ -571,6 +592,12 @@ extern "C" gpucompress_error_t gpucompress_compress(
 
         if (d_shuffled != nullptr) {
             d_compress_input = d_shuffled;
+        } else {
+            fprintf(stderr, "gpucompress ERROR: byte shuffle failed but was requested "
+                    "(element_size=%u, input_size=%zu)\n", shuffle_size, compress_input_size);
+            if (d_quantized) cudaFree(d_quantized);
+            cudaFree(d_input);
+            return GPUCOMPRESS_ERROR_COMPRESSION;
         }
     }
 
@@ -620,8 +647,9 @@ extern "C" gpucompress_error_t gpucompress_compress(
 
     // Compress (with timing for reinforcement)
     float primary_comp_time_ms = 0.0f;
-    bool timing_ok = (g_t_start != nullptr && g_t_stop != nullptr);
-    if (timing_ok) cudaEventRecord(g_t_start, stream);
+    ensure_timing_events();
+    bool timing_ok = (tl_t_start != nullptr && tl_t_stop != nullptr);
+    if (timing_ok) cudaEventRecord(tl_t_start, stream);
 
     try {
         compressor->compress(d_compress_input, d_compressed, comp_config);
@@ -634,9 +662,9 @@ extern "C" gpucompress_error_t gpucompress_compress(
     }
 
     if (timing_ok) {
-        cudaEventRecord(g_t_stop, stream);
-        cudaEventSynchronize(g_t_stop);
-        cudaEventElapsedTime(&primary_comp_time_ms, g_t_start, g_t_stop);
+        cudaEventRecord(tl_t_stop, stream);
+        cudaEventSynchronize(tl_t_stop);
+        cudaEventElapsedTime(&primary_comp_time_ms, tl_t_start, tl_t_stop);
     }
     diag_compression_ms = primary_comp_time_ms;
 
@@ -730,9 +758,16 @@ extern "C" gpucompress_error_t gpucompress_compress(
         struct ExploredResult { int action; double ratio; double comp_time_ms;
                                 double decomp_time_ms; double psnr; };
         std::vector<ExploredResult> explored_samples;
+        double primary_psnr = 120.0;
+        if (d_quantized && quant_result.isValid()) {
+            double range = quant_result.data_max - quant_result.data_min;
+            if (range > 0.0 && quant_result.error_bound > 0.0) {
+                primary_psnr = fmin(20.0 * log10(range / quant_result.error_bound), 120.0);
+            }
+        }
         explored_samples.push_back({nn_action, actual_ratio,
                                     static_cast<double>(primary_comp_time_ms),
-                                    0.0, 0.0});
+                                    0.0, primary_psnr});
 
         if (g_exploration_enabled && error_pct > g_exploration_threshold) {
             exploration_triggered = true;
@@ -743,7 +778,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
             if (g_exploration_k_override > 0) {
                 K = g_exploration_k_override;
             } else {
-                K = 5;  // Top-5 alternatives (safe for GPU memory budget)
+                K = 3;  // Top-3 alternatives (limits GPU memory pressure)
             }
 
             gpucompress::DecodedAction primary_dec = gpucompress::decodeAction(nn_action);
@@ -830,14 +865,14 @@ extern "C" gpucompress_error_t gpucompress_compress(
                         size_t alt_max = alt_cc.max_compressed_buffer_size;
                         if (cudaMalloc(&d_alt_out, alt_max) == cudaSuccess) {
                             float alt_ct_ms = 0.0f;
-                            if (timing_ok) cudaEventRecord(g_t_start, stream);
+                            if (timing_ok) cudaEventRecord(tl_t_start, stream);
 
                             alt_comp->compress(d_alt_input, d_alt_out, alt_cc);
 
                             if (timing_ok) {
-                                cudaEventRecord(g_t_stop, stream);
-                                cudaEventSynchronize(g_t_stop);
-                                cudaEventElapsedTime(&alt_ct_ms, g_t_start, g_t_stop);
+                                cudaEventRecord(tl_t_stop, stream);
+                                cudaEventSynchronize(tl_t_stop);
+                                cudaEventElapsedTime(&alt_ct_ms, tl_t_start, tl_t_stop);
                             }
 
                             alt_comp_size = alt_comp->get_compressed_output_size(d_alt_out);
@@ -857,7 +892,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
                                         size_t rt_decomp_size = rt_dc.decomp_data_size;
                                         uint8_t* d_rt_decompressed = nullptr;
                                         if (cudaMalloc(&d_rt_decompressed, rt_decomp_size) == cudaSuccess) {
-                                            if (timing_ok) cudaEventRecord(g_t_start, stream);
+                                            if (timing_ok) cudaEventRecord(tl_t_start, stream);
 
                                             try {
                                                 rt_decomp->decompress(d_rt_decompressed, d_alt_out, rt_dc);
@@ -897,10 +932,10 @@ extern "C" gpucompress_error_t gpucompress_compress(
                                             }
 
                                             if (timing_ok) {
-                                                cudaEventRecord(g_t_stop, stream);
-                                                cudaEventSynchronize(g_t_stop);
+                                                cudaEventRecord(tl_t_stop, stream);
+                                                cudaEventSynchronize(tl_t_stop);
                                                 float dt_ms = 0.0f;
-                                                cudaEventElapsedTime(&dt_ms, g_t_start, g_t_stop);
+                                                cudaEventElapsedTime(&dt_ms, tl_t_start, tl_t_stop);
                                                 alt_decomp_ms = static_cast<double>(dt_ms);
                                             }
 
@@ -994,6 +1029,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
                                         alt_hdr.data_min = 0.0;
                                         alt_hdr.data_max = 0.0;
                                     }
+                                    alt_hdr.setAlgorithmId((uint8_t)alt_algo);
 
                                     // Write header + compressed data to host output
                                     memcpy(output, &alt_hdr, sizeof(CompressionHeader));
@@ -1064,11 +1100,14 @@ extern "C" gpucompress_error_t gpucompress_compress(
 
             float sgd_grad_norm = 0.0f;
             int sgd_clipped = 0, sgd_count = 0;
-            if (gpucompress::runNNSGD(d_stats_ptr, sgd_samples,
-                    static_cast<int>(sgd_limit), input_size, cfg.error_bound,
-                    g_reinforce_lr, stream,
-                    &sgd_grad_norm, &sgd_clipped, &sgd_count) == 0) {
-                sgd_fired = true;
+            {
+                std::lock_guard<std::mutex> sgd_lk(g_sgd_mutex);
+                if (gpucompress::runNNSGD(d_stats_ptr, sgd_samples,
+                        static_cast<int>(sgd_limit), input_size, cfg.error_bound,
+                        g_reinforce_lr, stream,
+                        &sgd_grad_norm, &sgd_clipped, &sgd_count) == 0) {
+                    sgd_fired = true;
+                }
             }
         }
         if (sgd_fired) {
@@ -1099,10 +1138,11 @@ extern "C" gpucompress_error_t gpucompress_compress(
         stats->sgd_fired = sgd_fired ? 1 : 0;
         stats->exploration_triggered = exploration_triggered ? 1 : 0;
         stats->nn_original_action = nn_original_action;
-        stats->nn_final_action = g_last_nn_action.load();
+        stats->nn_final_action = nn_action;
     }
 
     /* Update globals for query after HDF5 filter path */
+    g_last_nn_action.store(nn_action);
     g_last_nn_original_action.store(nn_original_action);
     g_last_exploration_triggered.store(exploration_triggered ? 1 : 0);
     g_last_sgd_fired.store(sgd_fired ? 1 : 0);
@@ -1119,7 +1159,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
         }
         if (idx < g_chunk_history_cap) {
             gpucompress_chunk_diag_t *h = &g_chunk_history[idx];
-            h->nn_action             = g_last_nn_action.load();
+            h->nn_action             = nn_action;
             h->nn_original_action    = nn_original_action;
             h->exploration_triggered = exploration_triggered ? 1 : 0;
             h->sgd_fired             = sgd_fired ? 1 : 0;
@@ -1163,8 +1203,18 @@ extern "C" gpucompress_error_t gpucompress_decompress(
     CompressionHeader header;
     memcpy(&header, input, sizeof(CompressionHeader));
 
-    // Validate header
-    if (header.magic != COMPRESSION_MAGIC) {
+    // Validate header (checks both magic and version range)
+    if (!header.isValid()) {
+        return GPUCOMPRESS_ERROR_INVALID_HEADER;
+    }
+
+    // Handle zero compressed_size
+    size_t compressed_size = header.compressed_size;
+    if (compressed_size == 0) {
+        if (header.original_size == 0) {
+            *output_size = 0;
+            return GPUCOMPRESS_SUCCESS;
+        }
         return GPUCOMPRESS_ERROR_INVALID_HEADER;
     }
 
@@ -1175,7 +1225,6 @@ extern "C" gpucompress_error_t gpucompress_decompress(
     }
 
     // Validate that input_size can hold header + claimed compressed data
-    size_t compressed_size = header.compressed_size;
     size_t header_size = GPUCOMPRESS_HEADER_SIZE;
 
     if (input_size < header_size + compressed_size) {
@@ -1242,6 +1291,12 @@ extern "C" gpucompress_error_t gpucompress_decompress(
 
         if (d_unshuffled != nullptr) {
             d_result = d_unshuffled;
+        } else {
+            fprintf(stderr, "gpucompress ERROR: byte unshuffle failed during decompression "
+                    "(element_size=%u, size=%zu)\n", header.shuffle_element_size, decompressed_size);
+            cudaFree(d_decompressed);
+            cudaFree(d_compressed_data);
+            return GPUCOMPRESS_ERROR_DECOMPRESSION;
         }
     }
 
@@ -1270,6 +1325,14 @@ extern "C" gpucompress_error_t gpucompress_decompress(
                 d_unshuffled = nullptr;
             }
             d_result = static_cast<uint8_t*>(d_dequantized);
+        } else {
+            fprintf(stderr, "gpucompress ERROR: dequantization failed during decompression "
+                    "(precision=%d, num_elements=%zu)\n",
+                    quant_result.actual_precision, quant_result.num_elements);
+            if (d_unshuffled) cudaFree(d_unshuffled);
+            cudaFree(d_decompressed);
+            cudaFree(d_compressed_data);
+            return GPUCOMPRESS_ERROR_DECOMPRESSION;
         }
     }
 
@@ -1659,7 +1722,11 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
     if (!guard.ctx) return GPUCOMPRESS_ERROR_CUDA_FAILED;
     CompContext* ctx = guard.ctx;
     cudaStream_t stream = ctx->stream;
-    (void)stream_arg; /* ignored — each call uses its own ctx->stream */
+    cudaStream_t caller_stream = stream_arg ? static_cast<cudaStream_t>(stream_arg) : nullptr;
+    if (caller_stream) {
+        cudaEventRecord(ctx->t_start, caller_stream);
+        cudaStreamWaitEvent(stream, ctx->t_start, 0);
+    }
 
     /* d_input is already on GPU — no H→D copy */
     gpucompress_algorithm_t algo_to_use = cfg.algorithm;
@@ -1741,7 +1808,10 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
             if (decoded.use_quantization)
                 preproc_to_use |= GPUCOMPRESS_PREPROC_QUANTIZE;
         } else {
-            algo_to_use = GPUCOMPRESS_ALGO_LZ4;
+            fprintf(stderr, "gpucompress ERROR: ALGO_AUTO requested but NN inference failed "
+                    "(weights not loaded or inference error). Load weights via gpucompress_init() "
+                    "or use an explicit algorithm.\n");
+            return GPUCOMPRESS_ERROR_NN_NOT_LOADED;
         }
     }
 
@@ -1767,6 +1837,10 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
                 d_quantized = static_cast<uint8_t*>(quant_result.d_quantized);
                 d_compress_input = d_quantized;
                 compress_input_size = quant_result.quantized_bytes;
+            } else {
+                fprintf(stderr, "gpucompress ERROR: quantization failed but was requested "
+                        "(error_bound=%.6e, num_elements=%zu)\n", cfg.error_bound, num_elements);
+                return GPUCOMPRESS_ERROR_COMPRESSION;
             }
         }
     }
@@ -1776,7 +1850,14 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
         d_shuffled = byte_shuffle_simple(
             const_cast<uint8_t*>(d_compress_input), compress_input_size,
             shuffle_size, gpucompress::SHUFFLE_CHUNK_SIZE, stream);
-        if (d_shuffled) d_compress_input = d_shuffled;
+        if (d_shuffled) {
+            d_compress_input = d_shuffled;
+        } else {
+            fprintf(stderr, "gpucompress ERROR: byte shuffle failed but was requested "
+                    "(element_size=%u, input_size=%zu)\n", shuffle_size, compress_input_size);
+            if (d_quantized) cudaFree(d_quantized);
+            return GPUCOMPRESS_ERROR_COMPRESSION;
+        }
     }
 
     /* Only sync when preprocessing actually ran (shuffle/quant allocated GPU buffers).
@@ -1802,6 +1883,9 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
     auto compressor = createCompressionManager(
         internal_algo, gpucompress::DEFAULT_CHUNK_SIZE, stream, d_compress_input);
     if (!compressor) {
+        fprintf(stderr, "gpucompress ERROR: createCompressionManager failed for algo=%d "
+                "(GPU OOM or unsupported algo, input_size=%zu)\n",
+                (int)algo_to_use, compress_input_size);
         if (d_quantized) cudaFree(d_quantized);
         if (d_shuffled)  cudaFree(d_shuffled);
         return GPUCOMPRESS_ERROR_COMPRESSION;
@@ -1824,6 +1908,8 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
 
     if (total_max_needed > *output_size) {
         if (cudaMalloc(&d_temp_out, total_max_needed) != cudaSuccess) {
+            fprintf(stderr, "gpucompress ERROR: cudaMalloc failed for temp compression buffer "
+                    "(needed=%zu bytes, algo=%d)\n", total_max_needed, (int)algo_to_use);
             if (d_quantized) cudaFree(d_quantized);
             if (d_shuffled)  cudaFree(d_shuffled);
             return GPUCOMPRESS_ERROR_OUT_OF_MEMORY;
@@ -1839,7 +1925,16 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
 
     try {
         compressor->compress(d_compress_input, d_comp_target, comp_config);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "gpucompress ERROR: nvcomp compress threw exception: %s "
+                "(algo=%d, input_size=%zu)\n", e.what(), (int)algo_to_use, compress_input_size);
+        if (d_temp_out)  cudaFree(d_temp_out);
+        if (d_quantized) cudaFree(d_quantized);
+        if (d_shuffled)  cudaFree(d_shuffled);
+        return GPUCOMPRESS_ERROR_COMPRESSION;
     } catch (...) {
+        fprintf(stderr, "gpucompress ERROR: nvcomp compress threw unknown exception "
+                "(algo=%d, input_size=%zu)\n", (int)algo_to_use, compress_input_size);
         if (d_temp_out)  cudaFree(d_temp_out);
         if (d_quantized) cudaFree(d_quantized);
         if (d_shuffled)  cudaFree(d_shuffled);
@@ -1924,9 +2019,16 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
         struct ExploredResult { int action; double ratio; double comp_time_ms;
                                 double decomp_time_ms; double psnr; };
         std::vector<ExploredResult> explored_samples;
+        double primary_psnr = 120.0;
+        if (d_quantized && quant_result.isValid()) {
+            double range = quant_result.data_max - quant_result.data_min;
+            if (range > 0.0 && quant_result.error_bound > 0.0) {
+                primary_psnr = fmin(20.0 * log10(range / quant_result.error_bound), 120.0);
+            }
+        }
         explored_samples.push_back({nn_action, actual_ratio,
                                     static_cast<double>(primary_comp_time_ms),
-                                    0.0, 0.0});
+                                    0.0, primary_psnr});
 
         if (g_exploration_enabled && error_pct > g_exploration_threshold) {
             exploration_triggered = true;
@@ -1934,7 +2036,7 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
             if (g_exploration_k_override > 0) {
                 K = g_exploration_k_override;
             } else {
-                K = 5;  // Top-5 alternatives (safe for GPU memory budget)
+                K = 3;  // Top-3 alternatives (limits GPU memory pressure)
             }
 
             gpucompress::DecodedAction primary_dec = gpucompress::decodeAction(nn_action);
@@ -2169,6 +2271,7 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
                                         alt_hdr.data_min = 0.0;
                                         alt_hdr.data_max = 0.0;
                                     }
+                                    alt_hdr.setAlgorithmId((uint8_t)alt_algo);
 
                                     /* GPU path: write header H→D, payload D→D */
                                     XFER_TRACK("explore_gpu winner: H->D alt header", sizeof(CompressionHeader), cudaMemcpyHostToDevice);
@@ -2262,10 +2365,11 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
         stats->sgd_fired = sgd_fired ? 1 : 0;
         stats->exploration_triggered = exploration_triggered ? 1 : 0;
         stats->nn_original_action = nn_original_action;
-        stats->nn_final_action = g_last_nn_action.load();
+        stats->nn_final_action = nn_action;
     }
 
     /* Update globals for query after HDF5 filter path */
+    g_last_nn_action.store(nn_action);
     g_last_nn_original_action.store(nn_original_action);
     g_last_exploration_triggered.store(exploration_triggered ? 1 : 0);
     g_last_sgd_fired.store(sgd_fired ? 1 : 0);
@@ -2282,7 +2386,7 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
         }
         if (idx < g_chunk_history_cap) {
             gpucompress_chunk_diag_t *h = &g_chunk_history[idx];
-            h->nn_action             = g_last_nn_action.load();
+            h->nn_action             = nn_action;
             h->nn_original_action    = nn_original_action;
             h->exploration_triggered = exploration_triggered ? 1 : 0;
             h->sgd_fired             = sgd_fired ? 1 : 0;
@@ -2296,6 +2400,11 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
                 : 0.0f;
             h->predicted_ratio       = predicted_ratio;
         }
+    }
+
+    if (caller_stream) {
+        cudaEventRecord(ctx->t_stop, stream);
+        cudaStreamWaitEvent(caller_stream, ctx->t_stop, 0);
     }
 
     return GPUCOMPRESS_SUCCESS;
@@ -2360,7 +2469,14 @@ extern "C" gpucompress_error_t gpucompress_decompress_gpu(
             d_decompressed, decompressed_size,
             header.shuffle_element_size,
             gpucompress::SHUFFLE_CHUNK_SIZE, stream);
-        if (d_unshuffled) d_result = d_unshuffled;
+        if (d_unshuffled) {
+            d_result = d_unshuffled;
+        } else {
+            fprintf(stderr, "gpucompress ERROR: byte unshuffle failed during GPU decompression "
+                    "(element_size=%u, size=%zu)\n", header.shuffle_element_size, decompressed_size);
+            cudaFree(d_decompressed);
+            return GPUCOMPRESS_ERROR_DECOMPRESSION;
+        }
     }
 
     void* d_dequantized = nullptr;
@@ -2380,6 +2496,13 @@ extern "C" gpucompress_error_t gpucompress_decompress_gpu(
         if (d_dequantized) {
             if (d_unshuffled) { cudaFree(d_unshuffled); d_unshuffled = nullptr; }
             d_result = static_cast<uint8_t*>(d_dequantized);
+        } else {
+            fprintf(stderr, "gpucompress ERROR: dequantization failed during GPU decompression "
+                    "(precision=%d, num_elements=%zu)\n",
+                    qr.actual_precision, qr.num_elements);
+            if (d_unshuffled) cudaFree(d_unshuffled);
+            cudaFree(d_decompressed);
+            return GPUCOMPRESS_ERROR_DECOMPRESSION;
         }
     }
 

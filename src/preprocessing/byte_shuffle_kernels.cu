@@ -130,10 +130,22 @@ __global__ void byte_unshuffle_kernel_specialized(
     }
 }
 
-// Explicit instantiation for float32
+// Explicit instantiations for supported element sizes
+template __global__ void byte_shuffle_kernel_specialized<1>(
+    const uint8_t**, uint8_t**, const size_t*, size_t);
+template __global__ void byte_shuffle_kernel_specialized<2>(
+    const uint8_t**, uint8_t**, const size_t*, size_t);
 template __global__ void byte_shuffle_kernel_specialized<4>(
     const uint8_t**, uint8_t**, const size_t*, size_t);
+template __global__ void byte_shuffle_kernel_specialized<8>(
+    const uint8_t**, uint8_t**, const size_t*, size_t);
+template __global__ void byte_unshuffle_kernel_specialized<1>(
+    const uint8_t**, uint8_t**, const size_t*, size_t);
+template __global__ void byte_unshuffle_kernel_specialized<2>(
+    const uint8_t**, uint8_t**, const size_t*, size_t);
 template __global__ void byte_unshuffle_kernel_specialized<4>(
+    const uint8_t**, uint8_t**, const size_t*, size_t);
+template __global__ void byte_unshuffle_kernel_specialized<8>(
     const uint8_t**, uint8_t**, const size_t*, size_t);
 
 // ============================================================================
@@ -235,9 +247,16 @@ cudaError_t launch_byte_shuffle(
     constexpr int THREADS_PER_BLOCK = WARP_SIZE * WARPS_PER_BLOCK;
     const int num_blocks = (num_chunks + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
 
-    (void)element_size;  // Always use specialized<4>
-    byte_shuffle_kernel_specialized<4><<<num_blocks, THREADS_PER_BLOCK, 0, stream>>>(
-        input_chunks, output_chunks, chunk_sizes, num_chunks);
+    switch (element_size) {
+        case 1: byte_shuffle_kernel_specialized<1><<<num_blocks, THREADS_PER_BLOCK, 0, stream>>>(
+                    input_chunks, output_chunks, chunk_sizes, num_chunks); break;
+        case 2: byte_shuffle_kernel_specialized<2><<<num_blocks, THREADS_PER_BLOCK, 0, stream>>>(
+                    input_chunks, output_chunks, chunk_sizes, num_chunks); break;
+        case 8: byte_shuffle_kernel_specialized<8><<<num_blocks, THREADS_PER_BLOCK, 0, stream>>>(
+                    input_chunks, output_chunks, chunk_sizes, num_chunks); break;
+        default: byte_shuffle_kernel_specialized<4><<<num_blocks, THREADS_PER_BLOCK, 0, stream>>>(
+                    input_chunks, output_chunks, chunk_sizes, num_chunks); break;
+    }
 
     return cudaGetLastError();
 }
@@ -257,9 +276,16 @@ cudaError_t launch_byte_unshuffle(
     constexpr int THREADS_PER_BLOCK = WARP_SIZE * WARPS_PER_BLOCK;
     const int num_blocks = (num_chunks + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
 
-    (void)element_size;  // Always use specialized<4>
-    byte_unshuffle_kernel_specialized<4><<<num_blocks, THREADS_PER_BLOCK, 0, stream>>>(
-        input_chunks, output_chunks, chunk_sizes, num_chunks);
+    switch (element_size) {
+        case 1: byte_unshuffle_kernel_specialized<1><<<num_blocks, THREADS_PER_BLOCK, 0, stream>>>(
+                    input_chunks, output_chunks, chunk_sizes, num_chunks); break;
+        case 2: byte_unshuffle_kernel_specialized<2><<<num_blocks, THREADS_PER_BLOCK, 0, stream>>>(
+                    input_chunks, output_chunks, chunk_sizes, num_chunks); break;
+        case 8: byte_unshuffle_kernel_specialized<8><<<num_blocks, THREADS_PER_BLOCK, 0, stream>>>(
+                    input_chunks, output_chunks, chunk_sizes, num_chunks); break;
+        default: byte_unshuffle_kernel_specialized<4><<<num_blocks, THREADS_PER_BLOCK, 0, stream>>>(
+                    input_chunks, output_chunks, chunk_sizes, num_chunks); break;
+    }
 
     return cudaGetLastError();
 }
@@ -307,6 +333,7 @@ uint8_t* byte_shuffle_simple(
         return nullptr;
     }
 
+    cudaStreamSynchronize(stream);
     return device_output;
 }
 
@@ -349,5 +376,6 @@ uint8_t* byte_unshuffle_simple(
         return nullptr;
     }
 
+    cudaStreamSynchronize(stream);
     return device_output;
 }

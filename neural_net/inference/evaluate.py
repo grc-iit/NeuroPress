@@ -41,7 +41,8 @@ def load_trained_model(weights_path: str, device: torch.device) -> tuple:
 
 
 def evaluate_ranking(model, data: Dict, device: torch.device,
-                     rank_by: str = 'compression_ratio'):
+                     rank_by: str = 'compression_ratio',
+                     checkpoint: Dict = None):
     """
     Evaluate ranking accuracy on validation set.
 
@@ -49,6 +50,9 @@ def evaluate_ranking(model, data: Dict, device: torch.device,
     - Predict all 64 configs
     - Rank by the specified metric
     - Compare to actual ranking
+
+    If checkpoint is provided, its normalization stats are used (matching
+    the training-time normalization). Falls back to data stats otherwise.
     """
     df_val = data['df_val']
 
@@ -64,10 +68,10 @@ def evaluate_ranking(model, data: Dict, device: torch.device,
     higher_is_better = rank_by in ('compression_ratio', 'psnr_db')
 
     feature_cols = data['feature_names']
-    x_means = data['x_means']
-    x_stds = data['x_stds']
-    y_means = data['y_means']
-    y_stds = data['y_stds']
+    x_means = checkpoint.get('x_means', data['x_means']) if checkpoint else data['x_means']
+    x_stds = checkpoint.get('x_stds', data['x_stds']) if checkpoint else data['x_stds']
+    y_means = checkpoint.get('y_means', data['y_means']) if checkpoint else data['y_means']
+    y_stds = checkpoint.get('y_stds', data['y_stds']) if checkpoint else data['y_stds']
 
     for (fname, eb), group in groups:
         if len(group) < 8:  # Skip incomplete groups (need at least 8 algos)
@@ -175,14 +179,15 @@ def evaluate_ranking(model, data: Dict, device: torch.device,
     }
 
 
-def show_sample_predictions(model, data: Dict, device: torch.device, n_samples: int = 3):
+def show_sample_predictions(model, data: Dict, device: torch.device,
+                            n_samples: int = 3, checkpoint: Dict = None):
     """Show detailed predictions for a few validation files."""
     df_val = data['df_val']
     feature_cols = data['feature_names']
-    x_means = data['x_means']
-    x_stds = data['x_stds']
-    y_means = data['y_means']
-    y_stds = data['y_stds']
+    x_means = checkpoint.get('x_means', data['x_means']) if checkpoint else data['x_means']
+    x_stds = checkpoint.get('x_stds', data['x_stds']) if checkpoint else data['x_stds']
+    y_means = checkpoint.get('y_means', data['y_means']) if checkpoint else data['y_means']
+    y_stds = checkpoint.get('y_stds', data['y_stds']) if checkpoint else data['y_stds']
 
     # Pick a few random files
     files = df_val['file'].unique()
@@ -271,10 +276,10 @@ if __name__ == '__main__':
 
     # Evaluate ranking for different criteria
     for criterion in ['compression_ratio', 'compression_time_ms', 'psnr_db']:
-        evaluate_ranking(model, data, device, rank_by=criterion)
+        evaluate_ranking(model, data, device, rank_by=criterion, checkpoint=checkpoint)
 
     # Show sample predictions
     print("\n\n" + "=" * 65)
     print("SAMPLE PREDICTIONS (lossless, top-8 by actual ratio)")
     print("=" * 65)
-    show_sample_predictions(model, data, device, n_samples=3)
+    show_sample_predictions(model, data, device, n_samples=3, checkpoint=checkpoint)

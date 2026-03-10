@@ -93,7 +93,8 @@ typedef enum {
     GPUCOMPRESS_ERROR_RESERVED_6      = -6,  /**< Reserved (formerly Q-Table) */
     GPUCOMPRESS_ERROR_INVALID_HEADER  = -7,  /**< Invalid compression header */
     GPUCOMPRESS_ERROR_NOT_INITIALIZED = -8,  /**< Library not initialized */
-    GPUCOMPRESS_ERROR_BUFFER_TOO_SMALL = -9  /**< Output buffer too small */
+    GPUCOMPRESS_ERROR_BUFFER_TOO_SMALL = -9, /**< Output buffer too small */
+    GPUCOMPRESS_ERROR_NN_NOT_LOADED    = -10 /**< ALGO_AUTO requires NN weights but none are loaded */
 } gpucompress_error_t;
 
 /**

@@ -197,7 +197,10 @@ def compute_stats_cpu(raw_bytes, dtype=np.float32):
     second_deriv = flat[2:] - 2.0 * flat[1:-1] + flat[:-2]
     second_derivative = np.mean(np.abs(second_deriv)) / data_range
 
-    return float(entropy), float(mad), float(second_derivative)
+    entropy = 0.0 if np.isnan(entropy) else float(entropy)
+    mad = 0.0 if np.isnan(mad) else float(mad)
+    second_derivative = 0.0 if np.isnan(second_derivative) else float(second_derivative)
+    return entropy, mad, second_derivative
 
 
 def load_from_csv(csv_paths, val_fraction=0.2, seed=42):

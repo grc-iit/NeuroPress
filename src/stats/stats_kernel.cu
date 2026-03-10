@@ -363,13 +363,24 @@ AutoStatsGPU* runStatsKernelsNoSync(
         static_cast<const float*>(d_input), num_elements, d_stats,
         g_d_stats_init_flag);
 
-    launchEntropyKernelsAsync(d_input, input_size, d_histogram,
+    int entropy_rc = launchEntropyKernelsAsync(d_input, input_size, d_histogram,
                               &d_stats->entropy, stream);
+    if (entropy_rc != 0) {
+        fprintf(stderr, "gpucompress ERROR: entropy kernel launch failed\n");
+        return nullptr;
+    }
 
     madPass2Kernel<<<num_blocks, STATS_BLOCK_SIZE, 0, stream>>>(
         static_cast<const float*>(d_input), num_elements, d_stats);
 
     finalizeStatsOnlyKernel<<<1, 1, 0, stream>>>(d_stats);
+
+    cudaError_t kernel_err = cudaGetLastError();
+    if (kernel_err != cudaSuccess) {
+        fprintf(stderr, "gpucompress ERROR: stats kernel launch failed: %s\n",
+                cudaGetErrorString(kernel_err));
+        return nullptr;
+    }
 
     return d_stats;
 }
@@ -404,13 +415,24 @@ AutoStatsGPU* runStatsKernelsNoSync(
         static_cast<const float*>(d_input), num_elements, d_stats,
         d_init_flag);
 
-    launchEntropyKernelsAsync(d_input, input_size, d_histogram,
+    int entropy_rc = launchEntropyKernelsAsync(d_input, input_size, d_histogram,
                               &d_stats->entropy, stream);
+    if (entropy_rc != 0) {
+        fprintf(stderr, "gpucompress ERROR: entropy kernel launch failed (ctx path)\n");
+        return nullptr;
+    }
 
     madPass2Kernel<<<num_blocks, STATS_BLOCK_SIZE, 0, stream>>>(
         static_cast<const float*>(d_input), num_elements, d_stats);
 
     finalizeStatsOnlyKernel<<<1, 1, 0, stream>>>(d_stats);
+
+    cudaError_t kernel_err = cudaGetLastError();
+    if (kernel_err != cudaSuccess) {
+        fprintf(stderr, "gpucompress ERROR: stats kernel launch failed (ctx path): %s\n",
+                cudaGetErrorString(kernel_err));
+        return nullptr;
+    }
 
     return d_stats;
 }
