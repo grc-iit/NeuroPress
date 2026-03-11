@@ -140,12 +140,20 @@ static std::mutex g_auto_mutex;
  *  lazy-initialized on first use. Avoids the race on global events
  *  while keeping the zero-contention benefit of per-thread storage.
  *  Cleanup handled by CUDA context teardown (single GPU node). */
-static thread_local cudaEvent_t tl_t_start = nullptr;
-static thread_local cudaEvent_t tl_t_stop  = nullptr;
+static thread_local cudaEvent_t tl_t_start    = nullptr;
+static thread_local cudaEvent_t tl_t_stop     = nullptr;
+static thread_local cudaEvent_t tl_nn_start   = nullptr;
+static thread_local cudaEvent_t tl_nn_stop    = nullptr;
+static thread_local cudaEvent_t tl_stats_start = nullptr;
+static thread_local cudaEvent_t tl_stats_stop  = nullptr;
 
 static inline void ensure_timing_events() {
-    if (!tl_t_start) cudaEventCreate(&tl_t_start);
-    if (!tl_t_stop)  cudaEventCreate(&tl_t_stop);
+    if (!tl_t_start)     cudaEventCreate(&tl_t_start);
+    if (!tl_t_stop)      cudaEventCreate(&tl_t_stop);
+    if (!tl_nn_start)    cudaEventCreate(&tl_nn_start);
+    if (!tl_nn_stop)     cudaEventCreate(&tl_nn_stop);
+    if (!tl_stats_start) cudaEventCreate(&tl_stats_start);
+    if (!tl_stats_stop)  cudaEventCreate(&tl_stats_stop);
 }
 
 /** Online reinforcement (SGD) state */
@@ -199,8 +207,12 @@ int initCompContextPool() {
         CompContext& ctx = g_comp_pool[i];
         ctx.slot_id = i;
         if (cudaStreamCreate(&ctx.stream)   != cudaSuccess) return -1;
-        if (cudaEventCreate (&ctx.t_start)  != cudaSuccess) return -1;
-        if (cudaEventCreate (&ctx.t_stop)   != cudaSuccess) return -1;
+        if (cudaEventCreate (&ctx.t_start)     != cudaSuccess) return -1;
+        if (cudaEventCreate (&ctx.t_stop)      != cudaSuccess) return -1;
+        if (cudaEventCreate (&ctx.nn_start)    != cudaSuccess) return -1;
+        if (cudaEventCreate (&ctx.nn_stop)     != cudaSuccess) return -1;
+        if (cudaEventCreate (&ctx.stats_start) != cudaSuccess) return -1;
+        if (cudaEventCreate (&ctx.stats_stop)  != cudaSuccess) return -1;
 
         if (cudaMalloc(&ctx.d_stats_workspace, kPoolStatsWSZ) != cudaSuccess) return -1;
         ctx.d_stats     = static_cast<AutoStatsGPU*>(ctx.d_stats_workspace);
@@ -233,8 +245,12 @@ void destroyCompContextPool() {
     for (int i = 0; i < N_COMP_CTX; i++) {
         CompContext& ctx = g_comp_pool[i];
         if (ctx.stream)              { cudaStreamDestroy(ctx.stream); ctx.stream = nullptr; }
-        if (ctx.t_start)             { cudaEventDestroy(ctx.t_start); ctx.t_start = nullptr; }
-        if (ctx.t_stop)              { cudaEventDestroy(ctx.t_stop);  ctx.t_stop  = nullptr; }
+        if (ctx.t_start)             { cudaEventDestroy(ctx.t_start);     ctx.t_start     = nullptr; }
+        if (ctx.t_stop)              { cudaEventDestroy(ctx.t_stop);      ctx.t_stop      = nullptr; }
+        if (ctx.nn_start)            { cudaEventDestroy(ctx.nn_start);    ctx.nn_start    = nullptr; }
+        if (ctx.nn_stop)             { cudaEventDestroy(ctx.nn_stop);     ctx.nn_stop     = nullptr; }
+        if (ctx.stats_start)         { cudaEventDestroy(ctx.stats_start); ctx.stats_start = nullptr; }
+        if (ctx.stats_stop)          { cudaEventDestroy(ctx.stats_stop);  ctx.stats_stop  = nullptr; }
         if (ctx.d_stats_workspace)   { cudaFree(ctx.d_stats_workspace);
                                        ctx.d_stats_workspace = nullptr;
                                        ctx.d_stats = nullptr; ctx.d_histogram = nullptr; }
@@ -473,6 +489,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
 
     /* Per-chunk timing breakdown */
     float diag_nn_inference_ms  = 0.0f;
+    float diag_stats_ms         = 0.0f;
     float diag_preprocessing_ms = 0.0f;
     float diag_compression_ms   = 0.0f;
     float diag_exploration_ms   = 0.0f;
@@ -484,42 +501,51 @@ extern "C" gpucompress_error_t gpucompress_compress(
         int rc = -1;
 
         if (num_elements > 0 && gpucompress_nn_is_loaded_impl()) {
-            auto t_nn_start = std::chrono::steady_clock::now();
+            bool nn_timed = false;
             {
                 // Lock protects global stats + inference GPU buffers.
                 std::lock_guard<std::mutex> auto_lk(g_auto_mutex);
+                ensure_timing_events();
+
+                // Stats timing
+                cudaEventRecord(tl_stats_start, stream);
 
                 // Fused stats→NN: run stats kernels (no D→H, no sync)
                 d_stats_ptr = gpucompress::runStatsKernelsNoSync(d_input, input_size, stream);
 
-                if (d_stats_ptr) {
+                if (d_stats_ptr && stats != nullptr) {
                     // Enqueue stats D→H copies now (before inference kernel) so
                     // the single cudaStreamSynchronize inside runNNFusedInference
                     // drains both stats copies and inference D→H in one sync.
-                    if (stats != nullptr) {
-                        GC_LOG("[XFER D→H] stats: entropy (%zu B)\n", sizeof(double));
-                        XFER_TRACK("compress/auto: D->H stats entropy", sizeof(double), cudaMemcpyDeviceToHost);
-                        cudaMemcpyAsync(&entropy, &d_stats_ptr->entropy, sizeof(double),
-                                        cudaMemcpyDeviceToHost, stream);
-                        GC_LOG("[XFER D→H] stats: mad_normalized (%zu B)\n", sizeof(double));
-                        XFER_TRACK("compress/auto: D->H stats mad", sizeof(double), cudaMemcpyDeviceToHost);
-                        cudaMemcpyAsync(&mad, &d_stats_ptr->mad_normalized, sizeof(double),
-                                        cudaMemcpyDeviceToHost, stream);
-                        GC_LOG("[XFER D→H] stats: deriv_normalized (%zu B)\n", sizeof(double));
-                        XFER_TRACK("compress/auto: D->H stats deriv", sizeof(double), cudaMemcpyDeviceToHost);
-                        cudaMemcpyAsync(&second_derivative, &d_stats_ptr->deriv_normalized, sizeof(double),
-                                        cudaMemcpyDeviceToHost, stream);
-                    }
+                    GC_LOG("[XFER D→H] stats: entropy (%zu B)\n", sizeof(double));
+                    XFER_TRACK("compress/auto: D->H stats entropy", sizeof(double), cudaMemcpyDeviceToHost);
+                    cudaMemcpyAsync(&entropy, &d_stats_ptr->entropy, sizeof(double),
+                                    cudaMemcpyDeviceToHost, stream);
+                    GC_LOG("[XFER D→H] stats: mad_normalized (%zu B)\n", sizeof(double));
+                    XFER_TRACK("compress/auto: D->H stats mad", sizeof(double), cudaMemcpyDeviceToHost);
+                    cudaMemcpyAsync(&mad, &d_stats_ptr->mad_normalized, sizeof(double),
+                                    cudaMemcpyDeviceToHost, stream);
+                    GC_LOG("[XFER D→H] stats: deriv_normalized (%zu B)\n", sizeof(double));
+                    XFER_TRACK("compress/auto: D->H stats deriv", sizeof(double), cudaMemcpyDeviceToHost);
+                    cudaMemcpyAsync(&second_derivative, &d_stats_ptr->deriv_normalized, sizeof(double),
+                                    cudaMemcpyDeviceToHost, stream);
+                }
+                cudaEventRecord(tl_stats_stop, stream);
 
+                if (d_stats_ptr) {
                     float* p_ratio = &predicted_ratio;  // always capture — no extra cost
                     float* p_comp_time = &predicted_comp_time;
                     int* p_top = g_online_learning_enabled ? top_actions : nullptr;
                     int fused_ood = 0;
 
+                    // NN timing — nn_start recorded here, nn_stop inside runNNFusedInference
+                    cudaEventRecord(tl_nn_start, stream);
                     action = gpucompress::runNNFusedInference(
                         d_stats_ptr, input_size, cfg.error_bound, stream,
                         &action, p_ratio, p_comp_time,
-                        g_online_learning_enabled ? &fused_ood : nullptr, p_top);
+                        g_online_learning_enabled ? &fused_ood : nullptr, p_top,
+                        tl_nn_stop);
+                    nn_timed = true;
                     rc = (action >= 0) ? 0 : -1;
 
                     if (rc == 0) {
@@ -535,8 +561,11 @@ extern "C" gpucompress_error_t gpucompress_compress(
                 g_last_nn_action.store(action);
             }
 
-            diag_nn_inference_ms = std::chrono::duration<float, std::milli>(
-                std::chrono::steady_clock::now() - t_nn_start).count();
+            // Events already synchronized by runNNFusedInference's internal sync
+            if (nn_timed) {
+                cudaEventElapsedTime(&diag_nn_inference_ms, tl_nn_start, tl_nn_stop);
+                cudaEventElapsedTime(&diag_stats_ms, tl_stats_start, tl_stats_stop);
+            }
         }
 
         if (rc == 0) {
@@ -1185,6 +1214,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
             h->exploration_triggered = exploration_triggered ? 1 : 0;
             h->sgd_fired             = sgd_fired ? 1 : 0;
             h->nn_inference_ms       = diag_nn_inference_ms;
+            h->stats_ms             = diag_stats_ms;
             h->preprocessing_ms      = diag_preprocessing_ms;
             h->compression_ms        = diag_compression_ms;
             h->exploration_ms        = diag_exploration_ms;
@@ -1784,6 +1814,7 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
     /* Per-chunk timing breakdown */
     bool timing_ok = (ctx->t_start != nullptr && ctx->t_stop != nullptr);
     float diag_nn_inference_ms  = 0.0f;
+    float diag_stats_ms         = 0.0f;
     float diag_preprocessing_ms = 0.0f;
     float diag_compression_ms   = 0.0f;
     float diag_exploration_ms   = 0.0f;
@@ -1813,36 +1844,44 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
         int rc = -1;
 
         if (num_elements > 0 && gpucompress_nn_is_loaded_impl()) {
-            auto t_nn_start = std::chrono::steady_clock::now();
+            bool nn_timed = false;
+
+            /* Stats timing */
+            cudaEventRecord(ctx->stats_start, stream);
 
             /* d_input is already on GPU — use ctx-aware overload */
             d_stats_ptr = gpucompress::runStatsKernelsNoSync(d_input, input_size, stream, ctx);
 
-            if (d_stats_ptr) {
+            if (d_stats_ptr && stats != nullptr) {
                 /* Enqueue stats D→H copies now (before inference kernel) so
                  * the single cudaStreamSynchronize inside runNNFusedInferenceCtx
                  * drains both stats copies and inference D→H in one sync. */
-                if (stats != nullptr) {
-                    XFER_TRACK("compress_gpu/auto: D->H stats entropy", sizeof(double), cudaMemcpyDeviceToHost);
-                    cudaMemcpyAsync(&entropy, &d_stats_ptr->entropy, sizeof(double),
-                                    cudaMemcpyDeviceToHost, stream);
-                    XFER_TRACK("compress_gpu/auto: D->H stats mad", sizeof(double), cudaMemcpyDeviceToHost);
-                    cudaMemcpyAsync(&mad, &d_stats_ptr->mad_normalized, sizeof(double),
-                                    cudaMemcpyDeviceToHost, stream);
-                    XFER_TRACK("compress_gpu/auto: D->H stats deriv", sizeof(double), cudaMemcpyDeviceToHost);
-                    cudaMemcpyAsync(&second_derivative, &d_stats_ptr->deriv_normalized, sizeof(double),
-                                    cudaMemcpyDeviceToHost, stream);
-                }
+                XFER_TRACK("compress_gpu/auto: D->H stats entropy", sizeof(double), cudaMemcpyDeviceToHost);
+                cudaMemcpyAsync(&entropy, &d_stats_ptr->entropy, sizeof(double),
+                                cudaMemcpyDeviceToHost, stream);
+                XFER_TRACK("compress_gpu/auto: D->H stats mad", sizeof(double), cudaMemcpyDeviceToHost);
+                cudaMemcpyAsync(&mad, &d_stats_ptr->mad_normalized, sizeof(double),
+                                cudaMemcpyDeviceToHost, stream);
+                XFER_TRACK("compress_gpu/auto: D->H stats deriv", sizeof(double), cudaMemcpyDeviceToHost);
+                cudaMemcpyAsync(&second_derivative, &d_stats_ptr->deriv_normalized, sizeof(double),
+                                cudaMemcpyDeviceToHost, stream);
+            }
+            cudaEventRecord(ctx->stats_stop, stream);
 
+            if (d_stats_ptr) {
                 float* p_ratio = &predicted_ratio;  // always capture — no extra cost
                 float* p_comp_time = &predicted_comp_time;
                 int* p_top = g_online_learning_enabled ? top_actions : nullptr;
                 int fused_ood = 0;
 
+                /* NN timing — nn_start recorded here, nn_stop inside runNNFusedInferenceCtx */
+                cudaEventRecord(ctx->nn_start, stream);
                 action = gpucompress::runNNFusedInferenceCtx(
                     d_stats_ptr, input_size, cfg.error_bound, stream, ctx,
                     &action, p_ratio, p_comp_time,
-                    g_online_learning_enabled ? &fused_ood : nullptr, p_top);
+                    g_online_learning_enabled ? &fused_ood : nullptr, p_top,
+                    ctx->nn_stop);
+                nn_timed = true;
                 rc = (action >= 0) ? 0 : -1;
                 if (rc == 0) is_ood = (fused_ood != 0);
             }
@@ -1854,8 +1893,11 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
                 g_last_nn_action.store(action);
             }
 
-            diag_nn_inference_ms = std::chrono::duration<float, std::milli>(
-                std::chrono::steady_clock::now() - t_nn_start).count();
+            /* Events already synchronized by runNNFusedInferenceCtx's internal sync */
+            if (nn_timed) {
+                cudaEventElapsedTime(&diag_nn_inference_ms, ctx->nn_start, ctx->nn_stop);
+                cudaEventElapsedTime(&diag_stats_ms, ctx->stats_start, ctx->stats_stop);
+            }
         }
 
         if (rc == 0) {
@@ -2451,6 +2493,7 @@ skip_nn:
             h->exploration_triggered = exploration_triggered ? 1 : 0;
             h->sgd_fired             = sgd_fired ? 1 : 0;
             h->nn_inference_ms       = diag_nn_inference_ms;
+            h->stats_ms             = diag_stats_ms;
             h->preprocessing_ms      = diag_preprocessing_ms;
             h->compression_ms        = diag_compression_ms;
             h->exploration_ms        = diag_exploration_ms;

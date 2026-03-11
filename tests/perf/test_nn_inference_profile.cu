@@ -192,6 +192,7 @@ int main(void)
 
     /* Per-component timing from diag */
     float total_nn_ms      = 0.0f;
+    float total_stats_ms   = 0.0f;
     float total_preproc_ms = 0.0f;
     float total_comp_ms    = 0.0f;
 
@@ -225,6 +226,7 @@ int main(void)
         if (event_ms > max_event_ms) max_event_ms = event_ms;
 
         total_nn_ms      += diag.nn_inference_ms;
+        total_stats_ms   += diag.stats_ms;
         total_preproc_ms += diag.preprocessing_ms;
         total_comp_ms    += diag.compression_ms;
 
@@ -245,6 +247,7 @@ int main(void)
     /* ── Summary ── */
     float avg_event_ms = total_event_ms / n_iters;
     float avg_nn_ms    = total_nn_ms / n_iters;
+    float avg_stats_ms = total_stats_ms / n_iters;
     float avg_prep_ms  = total_preproc_ms / n_iters;
     float avg_comp_ms  = total_comp_ms / n_iters;
 
@@ -255,6 +258,8 @@ int main(void)
     printf("  Max per call    : %.3f ms\n", max_event_ms);
     printf("\n");
     printf("  Component breakdown (avg per call):\n");
+    printf("    Stats compute : %.3f ms  (%.1f%%)\n",
+           avg_stats_ms, avg_stats_ms / avg_event_ms * 100.0f);
     printf("    NN inference  : %.3f ms  (%.1f%%)\n",
            avg_nn_ms, avg_nn_ms / avg_event_ms * 100.0f);
     printf("    Preprocessing : %.3f ms  (%.1f%%)\n",
@@ -262,8 +267,8 @@ int main(void)
     printf("    Compression   : %.3f ms  (%.1f%%)\n",
            avg_comp_ms, avg_comp_ms / avg_event_ms * 100.0f);
     printf("    Other/overhead: %.3f ms  (%.1f%%)\n",
-           avg_event_ms - avg_nn_ms - avg_prep_ms - avg_comp_ms,
-           (avg_event_ms - avg_nn_ms - avg_prep_ms - avg_comp_ms) / avg_event_ms * 100.0f);
+           avg_event_ms - avg_stats_ms - avg_nn_ms - avg_prep_ms - avg_comp_ms,
+           (avg_event_ms - avg_stats_ms - avg_nn_ms - avg_prep_ms - avg_comp_ms) / avg_event_ms * 100.0f);
     printf("\n");
 
     /* ── Throughput ── */

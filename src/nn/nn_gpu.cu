@@ -1178,7 +1178,8 @@ int runNNFusedInference(
     float* out_ratio,
     float* out_comp_time,
     int* out_is_ood,
-    int* out_top_actions
+    int* out_top_actions,
+    cudaEvent_t nn_stop_event
 ) {
     if (!g_nn_loaded.load() || d_nn_weights == nullptr || d_stats == nullptr) {
         return -1;
@@ -1222,6 +1223,8 @@ int runNNFusedInference(
                                cudaMemcpyDeviceToHost, stream);
         if (err != cudaSuccess) return -1;
     }
+
+    if (nn_stop_event) cudaEventRecord(nn_stop_event, stream);
 
     err = cudaStreamSynchronize(stream);
     if (err != cudaSuccess) return -1;
@@ -1326,7 +1329,8 @@ int runNNFusedInferenceCtx(
     float* out_ratio,
     float* out_comp_time,
     int* out_is_ood,
-    int* out_top_actions
+    int* out_top_actions,
+    cudaEvent_t nn_stop_event
 ) {
     if (!g_nn_loaded.load() || d_nn_weights == nullptr || d_stats == nullptr || ctx == nullptr) {
         return -1;
@@ -1361,6 +1365,8 @@ int runNNFusedInferenceCtx(
                                cudaMemcpyDeviceToHost, stream);
         if (err != cudaSuccess) return -1;
     }
+
+    if (nn_stop_event) cudaEventRecord(nn_stop_event, stream);
 
     err = cudaStreamSynchronize(stream);
     if (err != cudaSuccess) return -1;

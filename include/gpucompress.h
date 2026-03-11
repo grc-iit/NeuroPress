@@ -543,7 +543,8 @@ typedef struct {
     int    sgd_fired;
 
     /* Per-chunk timing breakdown (ms, 0.0 if not applicable) */
-    float  nn_inference_ms;      /* stats kernels + NN forward pass       */
+    float  nn_inference_ms;      /* NN forward pass kernel + result D→H   */
+    float  stats_ms;             /* stats kernels + stats D→H copies      */
     float  preprocessing_ms;     /* quantization + byte shuffle           */
     float  compression_ms;       /* primary nvCOMP kernel only            */
     float  exploration_ms;       /* exploration loop (0 if not triggered) */

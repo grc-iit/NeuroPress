@@ -32,6 +32,8 @@ struct CompContext {
     int           slot_id;
     cudaStream_t  stream;
     cudaEvent_t   t_start, t_stop;
+    cudaEvent_t   nn_start, nn_stop;
+    cudaEvent_t   stats_start, stats_stop;
 
     /* Stats workspace (~1.1 KB) */
     void*          d_stats_workspace;
@@ -303,7 +305,8 @@ AutoStatsGPU* runStatsKernelsNoSync(const void* d_input, size_t input_size,
 int runNNFusedInferenceCtx(const AutoStatsGPU* d_stats, size_t data_size,
     double error_bound, cudaStream_t stream, CompContext* ctx,
     int* out_action, float* out_ratio = nullptr, float* out_comp_time = nullptr,
-    int* out_is_ood = nullptr, int* out_top_actions = nullptr);
+    int* out_is_ood = nullptr, int* out_top_actions = nullptr,
+    cudaEvent_t nn_stop_event = nullptr);
 
 /** ctx overload: launches nnSGDKernel on g_sgd_stream (not ctx->stream),
  *  uses ctx->d_sgd_* buffers, records g_sgd_done, syncs g_sgd_stream. */
@@ -318,7 +321,8 @@ int runNNSGDCtx(const AutoStatsGPU* d_stats, const SGDSample* samples,
  */
 int runNNFusedInference(const AutoStatsGPU* d_stats, size_t data_size, double error_bound,
     cudaStream_t stream, int* out_action, float* out_ratio = nullptr,
-    float* out_comp_time = nullptr, int* out_is_ood = nullptr, int* out_top_actions = nullptr);
+    float* out_comp_time = nullptr, int* out_is_ood = nullptr, int* out_top_actions = nullptr,
+    cudaEvent_t nn_stop_event = nullptr);
 
 /**
  * GPU-native SGD: forward/backward pass + weight update entirely on GPU.
