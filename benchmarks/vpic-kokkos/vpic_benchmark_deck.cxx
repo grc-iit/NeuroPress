@@ -62,7 +62,7 @@
 #define N_PHASES 5
 
 #define TMP_NOCOMP   "/tmp/bm_vpic_nocomp.h5"
-#define TMP_ORACLE   "/tmp/bm_vpic_oracle.bin"
+#define TMP_ORACLE   "/tmp/bm_vpic_oracle.h5"
 #define TMP_NN       "/tmp/bm_vpic_nn.h5"
 #define TMP_NN_RL    "/tmp/bm_vpic_nn_rl.h5"
 #define TMP_NN_RLEXP "/tmp/bm_vpic_nn_rlexp.h5"
@@ -193,7 +193,7 @@ static hid_t make_dcpl_nocomp(hsize_t chunk_floats)
     return dcpl;
 }
 
-static hid_t make_dcpl_auto(hsize_t chunk_floats)
+static hid_t make_dcpl_auto(hsize_t chunk_floats, double eb = 0.0)
 {
     hsize_t cdims[1] = { chunk_floats };
     hid_t dcpl = H5Pcreate(H5P_DATASET_CREATE);
@@ -203,7 +203,7 @@ static hid_t make_dcpl_auto(hsize_t chunk_floats)
     cd[0] = 0; // ALGO_AUTO
     cd[1] = 0;
     cd[2] = 0;
-    pack_double_cd(0.0, &cd[3], &cd[4]);
+    pack_double_cd(eb, &cd[3], &cd[4]);
     H5Pset_filter(dcpl, H5Z_FILTER_GPUCOMPRESS,
                   H5Z_FLAG_OPTIONAL, H5Z_GPUCOMPRESS_CD_NELMTS, cd);
     return dcpl;
@@ -249,8 +249,15 @@ static int run_oracle_pass(const float* d_data, float* d_read_buf,
     };
 
     /* ── Stage 1: Exhaustive search — find best config per chunk ─── */
+    /* Try 8 algos × 2 shuffle × (1 or 2 quant) configs per chunk.
+     * Quantization is only tried when error_bound > 0. */
+    const char* env_eb = getenv("VPIC_ERROR_BOUND");
+    double error_bound = env_eb ? atof(env_eb) : 0.0;
+    int n_quant = (error_bound > 0.0) ? 2 : 1;
+
     int* best_algos    = (int*)calloc(n_chunks, sizeof(int));
     int* best_shuffles = (int*)calloc(n_chunks, sizeof(int));
+    int* best_quants   = (int*)calloc(n_chunks, sizeof(int));
     size_t total_best_compressed = 0;
 
     for (int c = 0; c < n_chunks; c++) {
@@ -267,44 +274,51 @@ static int run_oracle_pass(const float* d_data, float* d_read_buf,
         double best_throughput = 0;
         int best_algo_enum = 1;
         int best_shuffle = 0;
+        int best_quant = 0;
         const char* best_algo = "none";
 
         for (int algo_enum = 1; algo_enum <= 8; algo_enum++) {
             for (int shuffle = 0; shuffle <= 1; shuffle++) {
-                gpucompress_config_t cfg = gpucompress_default_config();
-                cfg.algorithm = (gpucompress_algorithm_t)algo_enum;
-                cfg.preprocessing = 0;
-                if (shuffle) cfg.preprocessing |= GPUCOMPRESS_PREPROC_SHUFFLE_4;
-                cfg.error_bound = 0.0;
+                for (int quant = 0; quant < n_quant; quant++) {
+                    gpucompress_config_t cfg = gpucompress_default_config();
+                    cfg.algorithm = (gpucompress_algorithm_t)algo_enum;
+                    cfg.preprocessing = 0;
+                    if (shuffle) cfg.preprocessing |= GPUCOMPRESS_PREPROC_SHUFFLE_4;
+                    if (quant) cfg.preprocessing |= GPUCOMPRESS_PREPROC_QUANTIZE;
+                    cfg.error_bound = quant ? error_bound : 0.0;
 
-                size_t out_size = out_buf_size;
-                gpucompress_stats_t stats;
-                gpucompress_error_t err = gpucompress_compress_gpu(
-                    d_chunk, this_bytes,
-                    d_comp_buf, &out_size, &cfg, &stats, NULL);
+                    size_t out_size = out_buf_size;
+                    gpucompress_stats_t stats;
+                    gpucompress_error_t err = gpucompress_compress_gpu(
+                        d_chunk, this_bytes,
+                        d_comp_buf, &out_size, &cfg, &stats, NULL);
 
-                double ratio = (err == GPUCOMPRESS_SUCCESS)
-                    ? stats.compression_ratio : 0;
+                    double ratio = (err == GPUCOMPRESS_SUCCESS)
+                        ? stats.compression_ratio : 0;
 
-                if (ratio > best_ratio) {
-                    best_ratio = ratio;
-                    best_compressed = stats.compressed_size;
-                    best_comp_ms = stats.actual_comp_time_ms;
-                    best_throughput = stats.throughput_mbps;
-                    best_algo_enum = algo_enum;
-                    best_shuffle = shuffle;
-                    best_algo = ALGO_NAMES[algo_enum];
+                    if (ratio > best_ratio) {
+                        best_ratio = ratio;
+                        best_compressed = stats.compressed_size;
+                        best_comp_ms = stats.actual_comp_time_ms;
+                        best_throughput = stats.throughput_mbps;
+                        best_algo_enum = algo_enum;
+                        best_shuffle = shuffle;
+                        best_quant = quant;
+                        best_algo = ALGO_NAMES[algo_enum];
+                    }
                 }
             }
         }
 
         best_algos[c]    = best_algo_enum;
         best_shuffles[c] = best_shuffle;
+        best_quants[c]   = best_quant;
         total_best_compressed += best_compressed;
 
-        printf("  chunk %3d/%d: best=%s%s  ratio=%.2fx  comp=%.1f MiB/s (%.2f ms)\n",
+        printf("  chunk %3d/%d: best=%s%s%s  ratio=%.2fx  comp=%.1f MiB/s (%.2f ms)\n",
                c + 1, n_chunks, best_algo,
-               best_shuffle ? "+shuf" : "      ",
+               best_shuffle ? "+shuf" : "",
+               best_quant   ? "+quant" : "",
                best_ratio, best_throughput, best_comp_ms);
 
         /* Write oracle row to per-chunk CSV */
@@ -319,8 +333,9 @@ static int run_oracle_pass(const float* d_data, float* d_read_buf,
                                 "nn_inference_ms,preprocessing_ms,compression_ms,"
                                 "exploration_ms,sgd_update_ms\n");
                 char algo_str[40];
-                snprintf(algo_str, sizeof(algo_str), "%s%s",
-                         best_algo, best_shuffle ? "+shuf" : "");
+                snprintf(algo_str, sizeof(algo_str), "%s%s%s",
+                         best_algo, best_shuffle ? "+shuf" : "",
+                         best_quant ? "+quant" : "");
                 fprintf(cf, "exhaustive,%d,%s,%s,%.4f,0.0000,0,0,"
                             "0.000,0.000,%.3f,0.000,0.000\n",
                         c + 1, algo_str, algo_str, best_ratio, best_comp_ms);
@@ -332,84 +347,96 @@ static int run_oracle_pass(const float* d_data, float* d_read_buf,
     double oracle_ratio = (total_best_compressed > 0)
         ? (double)total_bytes / (double)total_best_compressed : 1.0;
 
-    /* ── Stage 2: E2E write — compress per-chunk best + D2H + disk ── */
-    printf("  [exhaustive] E2E write (per-chunk best -> D2H -> disk)... "); fflush(stdout);
+    /* Push per-chunk best configs into force-algorithm queue */
+    gpucompress_force_algorithm_reset();
+    for (int c = 0; c < n_chunks; c++)
+        gpucompress_force_algorithm_push(best_algos[c], best_shuffles[c],
+                                         best_quants[c], error_bound);
+    printf("  [exhaustive] VOL E2E using per-chunk best via force-algorithm queue\n");
+
+    /* ── Stage 2: E2E write via HDF5 VOL (ALGO_AUTO + force queue) ── */
+    printf("  [exhaustive] E2E write (GPU ptr → VOL → HDF5)... "); fflush(stdout);
     remove(TMP_ORACLE);
-    int fd = open(TMP_ORACLE, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) { perror("open"); free(best_algos); free(best_shuffles);
-                   free(h_comp_buf); cudaFree(d_comp_buf); return 1; }
+    {
+        hid_t dcpl_ex = make_dcpl_auto((hsize_t)chunk_floats, error_bound);
+        hid_t fapl = make_vol_fapl();
+        hid_t file = H5Fcreate(TMP_ORACLE, H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+        H5Pclose(fapl);
+        if (file < 0) { free(best_algos); free(best_shuffles); free(best_quants);
+                         free(h_comp_buf); cudaFree(d_comp_buf);
+                         H5Pclose(dcpl_ex); return 1; }
 
-    size_t total_file_bytes = 0;
-    double t_write_start = now_ms();
-    for (int c = 0; c < n_chunks; c++) {
-        size_t offset = (size_t)c * chunk_floats;
-        size_t this_floats = chunk_floats;
-        if (offset + this_floats > n_floats)
-            this_floats = n_floats - offset;
-        size_t this_bytes = this_floats * sizeof(float);
-        const float* d_chunk = d_data + offset;
+        hsize_t dims[1] = { (hsize_t)n_floats };
+        hid_t fsp  = H5Screate_simple(1, dims, NULL);
+        hid_t dset = H5Dcreate2(file, "fields", H5T_NATIVE_FLOAT,
+                                 fsp, H5P_DEFAULT, dcpl_ex, H5P_DEFAULT);
+        H5Sclose(fsp);
 
-        gpucompress_config_t cfg = gpucompress_default_config();
-        cfg.algorithm = (gpucompress_algorithm_t)best_algos[c];
-        cfg.preprocessing = 0;
-        if (best_shuffles[c]) cfg.preprocessing |= GPUCOMPRESS_PREPROC_SHUFFLE_4;
-        cfg.error_bound = 0.0;
+        double t_write_start = now_ms();
+        herr_t wret = H5Dwrite(dset, H5T_NATIVE_FLOAT,
+                               H5S_ALL, H5S_ALL, H5P_DEFAULT, d_data);
+        H5Dclose(dset);
+        H5Fclose(file);
+        H5Pclose(dcpl_ex);
+        double write_ms = now_ms() - t_write_start;
+        printf("%.0f ms\n", write_ms);
 
-        size_t comp_size = out_buf_size;
-        gpucompress_stats_t stats;
-        gpucompress_compress_gpu(d_chunk, this_bytes,
-                                d_comp_buf, &comp_size, &cfg, &stats, NULL);
-        cudaDeviceSynchronize();
+        if (wret < 0) { fprintf(stderr, "  [exhaustive] H5Dwrite failed\n");
+                         free(best_algos); free(best_shuffles); free(best_quants);
+                         free(h_comp_buf); cudaFree(d_comp_buf); return 1; }
 
-        cudaMemcpy(h_comp_buf, d_comp_buf, comp_size, cudaMemcpyDeviceToHost);
-        write(fd, &comp_size, sizeof(comp_size));
-        write(fd, h_comp_buf, comp_size);
-        total_file_bytes += sizeof(comp_size) + comp_size;
+        r->write_ms   = write_ms;
+        r->write_mbps = (double)total_bytes / (1 << 20) / (write_ms / 1000.0);
     }
-    fdatasync(fd);
-    close(fd);
-    double write_ms = now_ms() - t_write_start;
-    printf("%.0f ms\n", write_ms);
 
     drop_pagecache(TMP_ORACLE);
 
-    /* ── Stage 3: E2E read — disk → H2D → decompress → verify ────── */
-    printf("  [exhaustive] E2E read  (disk -> H2D -> decompress)... "); fflush(stdout);
-    fd = open(TMP_ORACLE, O_RDONLY);
-    if (fd < 0) { perror("open"); free(best_algos); free(best_shuffles);
-                   free(h_comp_buf); cudaFree(d_comp_buf); return 1; }
+    /* ── Stage 3: E2E read via HDF5 VOL ── */
+    printf("  [exhaustive] E2E read  (HDF5 → VOL → GPU ptr)... "); fflush(stdout);
+    {
+        hid_t fapl = make_vol_fapl();
+        hid_t file = H5Fopen(TMP_ORACLE, H5F_ACC_RDONLY, fapl);
+        H5Pclose(fapl);
+        hid_t dset = H5Dopen2(file, "fields", H5P_DEFAULT);
 
-    double t_read_start = now_ms();
-    for (int c = 0; c < n_chunks; c++) {
-        size_t offset = (size_t)c * chunk_floats;
-        size_t comp_size = 0;
-        read(fd, &comp_size, sizeof(comp_size));
-        read(fd, h_comp_buf, comp_size);
-
-        cudaMemcpy(d_comp_buf, h_comp_buf, comp_size, cudaMemcpyHostToDevice);
-        size_t decomp_size = chunk_bytes;
-        gpucompress_decompress_gpu(d_comp_buf, comp_size,
-                                   d_read_buf + offset, &decomp_size, NULL);
+        double t_read_start = now_ms();
+        herr_t rret = H5Dread(dset, H5T_NATIVE_FLOAT,
+                              H5S_ALL, H5S_ALL, H5P_DEFAULT, d_read_buf);
         cudaDeviceSynchronize();
+        H5Dclose(dset);
+        H5Fclose(file);
+        double read_ms = now_ms() - t_read_start;
+        printf("%.0f ms\n", read_ms);
+
+        if (rret < 0) { fprintf(stderr, "  [exhaustive] H5Dread failed\n");
+                         free(best_algos); free(best_shuffles); free(best_quants);
+                         free(h_comp_buf); cudaFree(d_comp_buf); return 1; }
+
+        r->read_ms   = read_ms;
+        r->read_mbps = (double)total_bytes / (1 << 20) / (read_ms / 1000.0);
     }
-    close(fd);
-    double read_ms = now_ms() - t_read_start;
-    printf("%.0f ms\n", read_ms);
 
     /* CPU bitwise verification */
     cudaMemcpy(h_orig, d_data, total_bytes, cudaMemcpyDeviceToHost);
     cudaMemcpy(h_read, d_read_buf, total_bytes, cudaMemcpyDeviceToHost);
     unsigned long long mm = cpu_compare(h_orig, h_read, n_floats);
 
+    size_t total_file_bytes = get_file_size(TMP_ORACLE);
+    /* Preserve write_ms/read_ms/write_mbps/read_mbps set above */
+    double saved_write_ms   = r->write_ms;
+    double saved_read_ms    = r->read_ms;
+    double saved_write_mbps = r->write_mbps;
+    double saved_read_mbps  = r->read_mbps;
     memset(r, 0, sizeof(*r));
     snprintf(r->phase, sizeof(r->phase), "exhaustive");
     r->orig_bytes = total_bytes;
     r->file_bytes = total_file_bytes;
-    r->ratio      = oracle_ratio;
-    r->write_ms   = write_ms;
-    r->read_ms    = read_ms;
-    r->write_mbps = (double)total_bytes / (1 << 20) / (write_ms / 1000.0);
-    r->read_mbps  = (double)total_bytes / (1 << 20) / (read_ms / 1000.0);
+    r->ratio      = (total_file_bytes > 0)
+                    ? (double)total_bytes / (double)total_file_bytes : oracle_ratio;
+    r->write_ms   = saved_write_ms;
+    r->read_ms    = saved_read_ms;
+    r->write_mbps = saved_write_mbps;
+    r->read_mbps  = saved_read_mbps;
     r->mismatches = mm;
     r->n_chunks   = n_chunks;
 
@@ -421,6 +448,7 @@ static int run_oracle_pass(const float* d_data, float* d_read_buf,
     remove(TMP_ORACLE);
     free(best_algos);
     free(best_shuffles);
+    free(best_quants);
     free(h_comp_buf);
     cudaFree(d_comp_buf);
     return (mm == 0) ? 0 : 1;
@@ -615,11 +643,11 @@ begin_initialization {
     double Ti_Te   = 1;
     double wpe_wce = 3;
 
-    // Grid size configurable via VPIC_NX env var (default 128)
+    // Grid size configurable via VPIC_NX env var (default 200 ≈ 512 MB)
     // Field data = (nx+2)^3 * 16 * 4 bytes
-    //   128 → ~134 MB    256 → ~1.1 GB    404 → ~4.0 GB    512 → ~8.6 GB
+    //   128 → ~134 MB    200 → ~520 MB    256 → ~1.1 GB    404 → ~4.0 GB
     const char* env_nx = getenv("VPIC_NX");
-    int grid_n = env_nx ? atoi(env_nx) : 128;
+    int grid_n = env_nx ? atoi(env_nx) : 200;
     if (grid_n < 16) grid_n = 16;
 
     double Lx   = 80*L;
@@ -669,7 +697,7 @@ begin_initialization {
     if (warmup < 1) warmup = 1;
 
     const char* env_chunk = getenv("VPIC_CHUNK_MB");
-    int chunk_mb = env_chunk ? atoi(env_chunk) : 2;
+    int chunk_mb = env_chunk ? atoi(env_chunk) : 8;
     if (chunk_mb < 1) chunk_mb = 1;
 
     // Run warmup steps to develop physics, then one benchmark step
@@ -821,6 +849,9 @@ begin_diagnostics {
     // Truncate per-chunk CSV for fresh run
     remove(CHUNKS_CSV);
 
+    const char* env_eb_diag = getenv("VPIC_ERROR_BOUND");
+    double diag_error_bound = env_eb_diag ? atof(env_eb_diag) : 0.0;
+
     PhaseResult results[N_PHASES];
     int n_phases = 0;
     int any_fail = 0;
@@ -855,7 +886,7 @@ begin_diagnostics {
     gpucompress_disable_online_learning();
     gpucompress_set_exploration(0);
     {
-        hid_t dcpl = make_dcpl_auto((hsize_t)chunk_floats);
+        hid_t dcpl = make_dcpl_auto((hsize_t)chunk_floats, diag_error_bound);
         int rc = run_phase("nn", TMP_NN,
                            d_fields, global->d_read, global->h_orig, global->h_read,
                            n_floats, n_chunks, dcpl, &results[n_phases]);
@@ -870,7 +901,7 @@ begin_diagnostics {
     gpucompress_set_reinforcement(1, REINFORCE_LR, REINFORCE_MAPE, REINFORCE_MAPE);
     gpucompress_set_exploration(0);
     {
-        hid_t dcpl = make_dcpl_auto((hsize_t)chunk_floats);
+        hid_t dcpl = make_dcpl_auto((hsize_t)chunk_floats, diag_error_bound);
         int rc = run_phase("nn-rl", TMP_NN_RL,
                            d_fields, global->d_read, global->h_orig, global->h_read,
                            n_floats, n_chunks, dcpl, &results[n_phases]);
@@ -888,7 +919,7 @@ begin_diagnostics {
     gpucompress_set_exploration_threshold(0.50);
     gpucompress_set_exploration_k(2);
     {
-        hid_t dcpl = make_dcpl_auto((hsize_t)chunk_floats);
+        hid_t dcpl = make_dcpl_auto((hsize_t)chunk_floats, diag_error_bound);
         int rc = run_phase("nn-rl+exp50", TMP_NN_RLEXP,
                            d_fields, global->d_read, global->h_orig, global->h_read,
                            n_floats, n_chunks, dcpl, &results[n_phases]);

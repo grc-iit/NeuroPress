@@ -447,3 +447,11 @@ target_include_directories(test_nn_inference_profile PRIVATE
 target_link_libraries(test_nn_inference_profile PRIVATE gpucompress CUDA::cudart m)
 set_target_properties(test_nn_inference_profile PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
+add_executable(test_shuffle_quant_effect tests/test_shuffle_quant_effect.cu)
+target_include_directories(test_shuffle_quant_effect PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_shuffle_quant_effect PRIVATE gpucompress CUDA::cudart)
+set_target_properties(test_shuffle_quant_effect PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+

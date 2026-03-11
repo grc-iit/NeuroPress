@@ -20,14 +20,14 @@
  *
  * Usage:
  *   ./build/grayscott_benchmark model.nnwt \
- *       [--L 256] [--steps 1000] [--chunk-mb 4] \
+ *       [--L 512] [--steps 1000] [--chunk-mb 8] \
  *       [--F 0.04] [--k 0.06075] [--phase <name>] ...
  *
  * Options:
  *   model.nnwt       Path to NN weights (required, or GPUCOMPRESS_WEIGHTS env)
- *   --L N            Grid side length (dataset = N^3 floats, default 256)
+ *   --L N            Grid side length (dataset = N^3 floats, default 512 ≈ 512 MB)
  *   --steps N        Simulation time-steps before snapshot (default 1000)
- *   --chunk-mb N     Chunk size in MB (auto-calculates chunk_z, default 4)
+ *   --chunk-mb N     Chunk size in MB (auto-calculates chunk_z, default 8)
  *   --chunk-z Z      Set Z-dimension of chunk directly (overrides --chunk-mb)
  *   --F val          Feed rate (default 0.04)
  *   --k val          Kill rate (default 0.06075)
@@ -83,9 +83,9 @@
  * Compile-time constants
  * ============================================================ */
 
-#define DEFAULT_L           256
+#define DEFAULT_L           512
 #define DEFAULT_STEPS       1000
-#define DEFAULT_CHUNK_MB    4
+#define DEFAULT_CHUNK_MB    8
 #define DEFAULT_F           0.04f
 #define DEFAULT_K           0.06075f
 
@@ -252,7 +252,7 @@ static void pack_double_cd(double v, unsigned int *lo, unsigned int *hi)
 }
 
 /* 3D chunked DCPL for ALGO_AUTO lossless */
-static hid_t make_dcpl_auto(int L, int chunk_z)
+static hid_t make_dcpl_auto(int L, int chunk_z, double eb = 0.0)
 {
     hsize_t cdims[3] = { (hsize_t)L, (hsize_t)L, (hsize_t)chunk_z };
     hid_t dcpl = H5Pcreate(H5P_DATASET_CREATE);
@@ -262,7 +262,7 @@ static hid_t make_dcpl_auto(int L, int chunk_z)
     cd[0] = 0; /* ALGO_AUTO */
     cd[1] = 0;
     cd[2] = 0;
-    pack_double_cd(0.0, &cd[3], &cd[4]);
+    pack_double_cd(eb, &cd[3], &cd[4]);
     H5Pset_filter(dcpl, H5Z_FILTER_GPUCOMPRESS,
                   H5Z_FLAG_OPTIONAL, H5Z_GPUCOMPRESS_CD_NELMTS, cd);
     return dcpl;
@@ -364,6 +364,7 @@ static int run_oracle_pass(const float *d_data, int L, int chunk_z,
                            const char *tmp_file,
                            float *d_decomp_field,
                            unsigned long long *d_count,
+                           double error_bound,
                            PhaseResult *r)
 {
     size_t max_chunk_floats = (size_t)L * L * chunk_z;
@@ -390,8 +391,12 @@ static int run_oracle_pass(const float *d_data, int L, int chunk_z,
     };
 
     /* ── Stage 1: Exhaustive search — find best config per chunk ─── */
+    /* Try 8 algos × 2 shuffle × (1 or 2 quant) configs per chunk.
+     * Quantization is only tried when error_bound > 0. */
+    int n_quant = (error_bound > 0.0) ? 2 : 1;
     int *best_algos    = (int *)calloc(n_chunks, sizeof(int));
     int *best_shuffles = (int *)calloc(n_chunks, sizeof(int));
+    int *best_quants   = (int *)calloc(n_chunks, sizeof(int));
     size_t total_best_compressed = 0;
 
     for (int c = 0; c < n_chunks; c++) {
@@ -408,55 +413,63 @@ static int run_oracle_pass(const float *d_data, int L, int chunk_z,
         double best_throughput = 0;
         int best_algo_enum = 1;
         int best_shuffle = 0;
+        int best_quant = 0;
         const char *best_algo = "none";
 
         for (int algo_enum = 1; algo_enum <= 8; algo_enum++) {
             for (int shuffle = 0; shuffle <= 1; shuffle++) {
-                gpucompress_config_t cfg = gpucompress_default_config();
-                cfg.algorithm = (gpucompress_algorithm_t)algo_enum;
-                cfg.preprocessing = 0;
-                if (shuffle) cfg.preprocessing |= GPUCOMPRESS_PREPROC_SHUFFLE_4;
-                cfg.error_bound = 0.0;
+                for (int quant = 0; quant < n_quant; quant++) {
+                    gpucompress_config_t cfg = gpucompress_default_config();
+                    cfg.algorithm = (gpucompress_algorithm_t)algo_enum;
+                    cfg.preprocessing = 0;
+                    if (shuffle) cfg.preprocessing |= GPUCOMPRESS_PREPROC_SHUFFLE_4;
+                    if (quant) cfg.preprocessing |= GPUCOMPRESS_PREPROC_QUANTIZE;
+                    cfg.error_bound = quant ? error_bound : 0.0;
 
-                size_t out_size = out_buf_size;
-                gpucompress_stats_t stats;
-                gpucompress_error_t err = gpucompress_compress_gpu(
-                    d_chunk_buf, chunk_bytes,
-                    d_comp_buf, &out_size, &cfg, &stats, NULL);
+                    size_t out_size = out_buf_size;
+                    gpucompress_stats_t stats;
+                    gpucompress_error_t err = gpucompress_compress_gpu(
+                        d_chunk_buf, chunk_bytes,
+                        d_comp_buf, &out_size, &cfg, &stats, NULL);
 
-                double ratio = (err == GPUCOMPRESS_SUCCESS)
-                    ? stats.compression_ratio : 0;
+                    double ratio = (err == GPUCOMPRESS_SUCCESS)
+                        ? stats.compression_ratio : 0;
 
-                if (f_ub) {
-                    fprintf(f_ub, "%d,grayscott,%s,%d,0,0,%.4f,%zu,%zu,%.3f,%.1f,%s\n",
-                            c, ALGO_NAMES[algo_enum],
-                            shuffle ? 4 : 0, ratio,
-                            (err == GPUCOMPRESS_SUCCESS) ? stats.compressed_size : 0,
-                            chunk_bytes,
-                            (err == GPUCOMPRESS_SUCCESS) ? stats.actual_comp_time_ms : 0,
-                            (err == GPUCOMPRESS_SUCCESS) ? stats.throughput_mbps : 0,
-                            (err == GPUCOMPRESS_SUCCESS) ? "ok" : "fail");
-                }
+                    if (f_ub) {
+                        fprintf(f_ub, "%d,grayscott,%s,%d,%d,%.6f,%.4f,%zu,%zu,%.3f,%.1f,%s\n",
+                                c, ALGO_NAMES[algo_enum],
+                                shuffle ? 4 : 0, quant, quant ? error_bound : 0.0,
+                                ratio,
+                                (err == GPUCOMPRESS_SUCCESS) ? stats.compressed_size : 0,
+                                chunk_bytes,
+                                (err == GPUCOMPRESS_SUCCESS) ? stats.actual_comp_time_ms : 0,
+                                (err == GPUCOMPRESS_SUCCESS) ? stats.throughput_mbps : 0,
+                                (err == GPUCOMPRESS_SUCCESS) ? "ok" : "fail");
+                    }
 
-                if (ratio > best_ratio) {
-                    best_ratio = ratio;
-                    best_compressed = stats.compressed_size;
-                    best_comp_ms = stats.actual_comp_time_ms;
-                    best_throughput = stats.throughput_mbps;
-                    best_algo_enum = algo_enum;
-                    best_shuffle = shuffle;
-                    best_algo = ALGO_NAMES[algo_enum];
+                    if (ratio > best_ratio) {
+                        best_ratio = ratio;
+                        best_compressed = stats.compressed_size;
+                        best_comp_ms = stats.actual_comp_time_ms;
+                        best_throughput = stats.throughput_mbps;
+                        best_algo_enum = algo_enum;
+                        best_shuffle = shuffle;
+                        best_quant = quant;
+                        best_algo = ALGO_NAMES[algo_enum];
+                    }
                 }
             }
         }
 
         best_algos[c]    = best_algo_enum;
         best_shuffles[c] = best_shuffle;
+        best_quants[c]   = best_quant;
         total_best_compressed += best_compressed;
 
-        printf("  chunk %3d/%d: best=%s%s  ratio=%.2fx  comp=%.1f MiB/s (%.2f ms)\n",
+        printf("  chunk %3d/%d: best=%s%s%s  ratio=%.2fx  comp=%.1f MiB/s (%.2f ms)\n",
                c + 1, n_chunks, best_algo,
-               best_shuffle ? "+shuf" : "      ",
+               best_shuffle ? "+shuf" : "",
+               best_quant   ? "+quant" : "",
                best_ratio, best_throughput, best_comp_ms);
 
         /* Write oracle row to per-chunk CSV */
@@ -471,8 +484,9 @@ static int run_oracle_pass(const float *d_data, int L, int chunk_z,
                                 "nn_inference_ms,preprocessing_ms,compression_ms,"
                                 "exploration_ms,sgd_update_ms\n");
                 char algo_str[40];
-                snprintf(algo_str, sizeof(algo_str), "%s%s",
-                         best_algo, best_shuffle ? "+shuf" : "");
+                snprintf(algo_str, sizeof(algo_str), "%s%s%s",
+                         best_algo, best_shuffle ? "+shuf" : "",
+                         best_quant ? "+quant" : "");
                 fprintf(cf, "exhaustive,%d,%s,%s,%.4f,0.0000,0,0,"
                             "0.000,0.000,%.3f,0.000,0.000\n",
                         c, algo_str, algo_str, best_ratio, best_comp_ms);
@@ -484,29 +498,22 @@ static int run_oracle_pass(const float *d_data, int L, int chunk_z,
     double oracle_ratio = (total_best_compressed > 0)
         ? (double)total_bytes / (double)total_best_compressed : 1.0;
 
-    /* Find the most frequently winning algo+shuffle config */
-    int algo_votes[9][2] = {};  /* [algo_enum][shuffle] */
+    /* Push per-chunk best configs into force-algorithm queue */
+    gpucompress_force_algorithm_reset();
     for (int c = 0; c < n_chunks; c++)
-        algo_votes[best_algos[c]][best_shuffles[c]]++;
-    int vol_algo = 1, vol_shuffle = 0, max_votes = 0;
-    for (int a = 1; a <= 8; a++)
-        for (int s = 0; s <= 1; s++)
-            if (algo_votes[a][s] > max_votes) {
-                max_votes = algo_votes[a][s];
-                vol_algo = a; vol_shuffle = s;
-            }
-    printf("[exhaustive] VOL E2E using best config: %s%s (%d/%d chunks)\n",
-           ALGO_NAMES[vol_algo], vol_shuffle ? "+shuf" : "", max_votes, n_chunks);
+        gpucompress_force_algorithm_push(best_algos[c], best_shuffles[c],
+                                         best_quants[c], error_bound);
+    printf("[exhaustive] VOL E2E using per-chunk best via force-algorithm queue\n");
 
-    /* ── Stage 2: E2E write via HDF5 VOL ── */
+    /* ── Stage 2: E2E write via HDF5 VOL (ALGO_AUTO + force queue) ── */
     printf("[exhaustive] E2E write (GPU ptr → VOL → HDF5)... "); fflush(stdout);
     remove(tmp_file);
     {
-        hid_t dcpl_ex = make_dcpl_fixed(L, chunk_z, vol_algo, vol_shuffle);
+        hid_t dcpl_ex = make_dcpl_auto(L, chunk_z, error_bound);
         hid_t fapl = make_vol_fapl();
         hid_t file = H5Fcreate(tmp_file, H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
         H5Pclose(fapl);
-        if (file < 0) { free(best_algos); free(best_shuffles);
+        if (file < 0) { free(best_algos); free(best_shuffles); free(best_quants);
                          free(h_comp_buf); cudaFree(d_chunk_buf); cudaFree(d_comp_buf);
                          H5Pclose(dcpl_ex); return 1; }
 
@@ -526,7 +533,7 @@ static int run_oracle_pass(const float *d_data, int L, int chunk_z,
         printf("%.0f ms\n", write_ms);
 
         if (wret < 0) { fprintf(stderr, "[exhaustive] H5Dwrite failed\n");
-                         free(best_algos); free(best_shuffles);
+                         free(best_algos); free(best_shuffles); free(best_quants);
                          free(h_comp_buf); cudaFree(d_chunk_buf); cudaFree(d_comp_buf); return 1; }
 
         r->write_ms   = write_ms;
@@ -553,7 +560,7 @@ static int run_oracle_pass(const float *d_data, int L, int chunk_z,
         printf("%.0f ms\n", read_ms);
 
         if (rret < 0) { fprintf(stderr, "[exhaustive] H5Dread failed\n");
-                         free(best_algos); free(best_shuffles);
+                         free(best_algos); free(best_shuffles); free(best_quants);
                          free(h_comp_buf); cudaFree(d_chunk_buf); cudaFree(d_comp_buf); return 1; }
 
         r->read_ms   = read_ms;
@@ -583,6 +590,7 @@ static int run_oracle_pass(const float *d_data, int L, int chunk_z,
 
     free(best_algos);
     free(best_shuffles);
+    free(best_quants);
     free(h_comp_buf);
     cudaFree(d_chunk_buf);
     cudaFree(d_comp_buf);
@@ -992,6 +1000,7 @@ int main(int argc, char **argv)
     int chunk_mb = DEFAULT_CHUNK_MB;
     float F      = DEFAULT_F;
     float k      = DEFAULT_K;
+    double error_bound = 0.0;  /* 0 = lossless, >0 = lossy quantization */
 
     /* Phase selection: bit flags */
     enum { P_NOCOMP = 1, P_EXHAUSTIVE = 2, P_NN = 4, P_NNRL = 8, P_NNRLEXP = 16 };
@@ -1013,6 +1022,8 @@ int main(int argc, char **argv)
             F = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--k") == 0 && i + 1 < argc) {
             k = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--error-bound") == 0 && i + 1 < argc) {
+            error_bound = atof(argv[++i]);
         } else if (strcmp(argv[i], "--phase") == 0 && i + 1 < argc) {
             const char *p = argv[++i];
             if      (strcmp(p, "no-comp") == 0)      phase_mask |= P_NOCOMP;
@@ -1140,7 +1151,7 @@ int main(int argc, char **argv)
 
             rc = run_oracle_pass(d_v, L, chunk_z, n_chunks, f_ub,
                                  TMP_ORACLE, d_read, d_count,
-                                 &results[n_phases]);
+                                 error_bound, &results[n_phases]);
             if (f_ub) fclose(f_ub);
             results[n_phases].sim_ms = sim_ms;
             if (rc) any_fail = 1;
@@ -1154,7 +1165,7 @@ int main(int argc, char **argv)
         printf("\n── Phase %d: nn (VOL, ALGO_AUTO, inference-only) ────────────\n", n_phases + 1);
         gpucompress_disable_online_learning();
         gpucompress_set_exploration(0);
-        hid_t dcpl_nn = make_dcpl_auto(L, chunk_z);
+        hid_t dcpl_nn = make_dcpl_auto(L, chunk_z, error_bound);
         rc = run_phase_vol(d_v, d_read, d_count,
                            n_floats, L, chunk_z,
                            "nn", TMP_NN, dcpl_nn,
@@ -1172,7 +1183,7 @@ int main(int argc, char **argv)
         gpucompress_enable_online_learning();
         gpucompress_set_reinforcement(1, REINFORCE_LR, REINFORCE_MAPE, REINFORCE_MAPE);
         gpucompress_set_exploration(0);
-        hid_t dcpl_rl = make_dcpl_auto(L, chunk_z);
+        hid_t dcpl_rl = make_dcpl_auto(L, chunk_z, error_bound);
         rc = run_phase_vol(d_v, d_read, d_count,
                            n_floats, L, chunk_z,
                            "nn-rl", TMP_NN_RL, dcpl_rl,
@@ -1193,7 +1204,7 @@ int main(int argc, char **argv)
         gpucompress_set_exploration(1);
         gpucompress_set_exploration_threshold(0.50);
         gpucompress_set_exploration_k(1);  // K=1 to avoid GPU OOM with large chunks + 8 workers
-        hid_t dcpl_rlexp = make_dcpl_auto(L, chunk_z);
+        hid_t dcpl_rlexp = make_dcpl_auto(L, chunk_z, error_bound);
         rc = run_phase_vol(d_v, d_read, d_count,
                            n_floats, L, chunk_z,
                            "nn-rl+exp50", TMP_NN_RLEXP, dcpl_rlexp,

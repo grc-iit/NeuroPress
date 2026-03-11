@@ -570,6 +570,31 @@ int  gpucompress_get_chunk_history_count(void);
  */
 int  gpucompress_get_chunk_diag(int idx, gpucompress_chunk_diag_t *out);
 
+/* ============================================================
+ * Force-Algorithm Queue
+ *
+ * Allows callers to override ALGO_AUTO's NN-based algorithm selection
+ * on a per-chunk basis.  Push one entry per chunk before calling
+ * H5Dwrite; each call to gpucompress_compress_gpu() with ALGO_AUTO
+ * will dequeue the next entry instead of running NN inference.
+ * ============================================================ */
+
+/**
+ * Reset (clear) the force-algorithm queue.
+ */
+void gpucompress_force_algorithm_reset(void);
+
+/**
+ * Push one per-chunk algorithm override onto the queue.
+ *
+ * @param algorithm    Algorithm enum (1-8, e.g. GPUCOMPRESS_ALGO_ZSTD)
+ * @param shuffle      1 to enable byte-shuffle, 0 to disable
+ * @param quant        1 to enable lossy quantization, 0 to disable
+ * @param error_bound  Error bound for quantization (ignored when quant=0)
+ */
+void gpucompress_force_algorithm_push(int algorithm, int shuffle,
+                                      int quant, double error_bound);
+
 /**
  * Parse algorithm from string.
  *

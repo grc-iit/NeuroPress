@@ -80,7 +80,9 @@ static void inspect_chunks(const char* filepath, const char* label, int n_chunks
         }
 
         uint8_t* buf = (uint8_t*)malloc(chunk_nbytes);
-        ret = H5Dread_chunk(dset, H5P_DEFAULT, offset, &filter_mask, buf);
+        size_t read_sz = chunk_nbytes;
+        ret = H5Dread_chunk(dset, H5P_DEFAULT, offset, &filter_mask, buf, &read_sz);
+        (void)filter_mask;
         if (ret < 0) {
             printf("    %5d | ERROR reading chunk\n", c + 1);
             free(buf);

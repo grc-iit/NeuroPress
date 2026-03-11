@@ -111,6 +111,18 @@ static int                       g_chunk_history_cap   = 0;
 std::atomic<int>                 g_chunk_history_count{0};
 static std::mutex                g_chunk_history_mutex;
 
+/** Force-algorithm queue: per-chunk algorithm overrides for ALGO_AUTO */
+struct ForcedAlgo {
+    int algorithm;      // gpucompress_algorithm_t enum (1-8)
+    int shuffle;        // 1 = enable byte shuffle, 0 = disable
+    int quant;          // 1 = enable quantization, 0 = disable
+    double error_bound; // error bound for quantization (ignored when quant=0)
+};
+static ForcedAlgo*   g_force_algo_queue    = nullptr;
+static int           g_force_algo_cap      = 0;
+static int           g_force_algo_count    = 0;
+static std::atomic<int> g_force_algo_idx{0};
+
 /* ---- CompContext pool ---- */
 static CompContext g_comp_pool[N_COMP_CTX];
 static bool g_pool_slot_free[N_COMP_CTX];
@@ -362,6 +374,14 @@ extern "C" void gpucompress_cleanup(void) {
                 g_chunk_history_cap = 0;
             }
             g_chunk_history_count.store(0);
+        }
+        /* Free force-algorithm queue */
+        if (g_force_algo_queue) {
+            free(g_force_algo_queue);
+            g_force_algo_queue = nullptr;
+            g_force_algo_cap = 0;
+            g_force_algo_count = 0;
+            g_force_algo_idx.store(0);
         }
     }
 }
@@ -1561,6 +1581,24 @@ extern "C" void gpucompress_reset_chunk_history(void) {
     /* keep allocated buffer for reuse */
 }
 
+extern "C" void gpucompress_force_algorithm_reset(void) {
+    g_force_algo_count = 0;
+    g_force_algo_idx.store(0);
+}
+
+extern "C" void gpucompress_force_algorithm_push(int algorithm, int shuffle,
+                                                  int quant, double error_bound) {
+    if (g_force_algo_count >= g_force_algo_cap) {
+        int new_cap = (g_force_algo_cap == 0) ? 256 : g_force_algo_cap * 2;
+        auto* p = static_cast<ForcedAlgo*>(
+            realloc(g_force_algo_queue, (size_t)new_cap * sizeof(ForcedAlgo)));
+        if (!p) return;
+        g_force_algo_queue = p;
+        g_force_algo_cap = new_cap;
+    }
+    g_force_algo_queue[g_force_algo_count++] = {algorithm, shuffle, quant, error_bound};
+}
+
 extern "C" int gpucompress_get_chunk_history_count(void) {
     return g_chunk_history_count.load();
 }
@@ -1752,6 +1790,24 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
     float diag_sgd_ms           = 0.0f;
 
     if (algo_to_use == GPUCOMPRESS_ALGO_AUTO) {
+        /* Check force-algorithm queue first — oracle/exhaustive uses this
+         * to inject per-chunk algorithm choices without NN inference. */
+        int fidx = g_force_algo_idx.fetch_add(1);
+        if (fidx < g_force_algo_count && g_force_algo_queue) {
+            algo_to_use = static_cast<gpucompress_algorithm_t>(
+                g_force_algo_queue[fidx].algorithm);
+            preproc_to_use = 0;
+            if (g_force_algo_queue[fidx].shuffle)
+                preproc_to_use |= GPUCOMPRESS_PREPROC_SHUFFLE_4;
+            if (g_force_algo_queue[fidx].quant) {
+                preproc_to_use |= GPUCOMPRESS_PREPROC_QUANTIZE;
+                cfg.error_bound = g_force_algo_queue[fidx].error_bound;
+            }
+            goto skip_nn;
+        }
+        /* No forced entry — revert the index bump and fall through to NN */
+        g_force_algo_idx.fetch_sub(1);
+
         size_t num_elements = input_size / sizeof(float);
         int action = 0;
         int rc = -1;
@@ -1817,6 +1873,7 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
             return GPUCOMPRESS_ERROR_NN_NOT_LOADED;
         }
     }
+skip_nn:
 
     /* Apply preprocessing on GPU (same kernels as host path) */
     const uint8_t* d_compress_input = static_cast<const uint8_t*>(d_input);
@@ -2431,6 +2488,12 @@ extern "C" gpucompress_error_t gpucompress_decompress_gpu(
     cudaError_t cuda_err = readHeaderFromDevice(d_input, header, stream);
     if (cuda_err != cudaSuccess) return GPUCOMPRESS_ERROR_CUDA_FAILED;
     if (!header.isValid())       return GPUCOMPRESS_ERROR_INVALID_HEADER;
+
+    GC_LOG("[decompress_gpu] algo_id=%d  shuffle=%s  orig=%zuB  comp=%zuB\n",
+           header.getAlgorithmId(),
+           header.hasShuffleApplied() ? "yes" : "no",
+           (size_t)header.original_size,
+           (size_t)header.compressed_size);
 
     if (header.original_size > *output_size) {
         *output_size = header.original_size;
