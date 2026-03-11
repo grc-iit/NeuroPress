@@ -438,6 +438,15 @@ target_include_directories(test_perf14_atomic_double PRIVATE
 target_link_libraries(test_perf14_atomic_double PRIVATE gpucompress CUDA::cudart m)
 set_target_properties(test_perf14_atomic_double PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
+add_executable(test_nn_ratio_prediction tests/regression/test_nn_ratio_prediction.cu)
+set_source_files_properties(tests/regression/test_nn_ratio_prediction.cu PROPERTIES LANGUAGE CUDA)
+target_include_directories(test_nn_ratio_prediction PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_nn_ratio_prediction PRIVATE gpucompress CUDA::cudart m)
+set_target_properties(test_nn_ratio_prediction PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
 add_executable(test_nn_timing_inflation tests/regression/test_nn_timing_inflation.cu)
 set_source_files_properties(tests/regression/test_nn_timing_inflation.cu PROPERTIES LANGUAGE CUDA)
 target_include_directories(test_nn_timing_inflation PRIVATE

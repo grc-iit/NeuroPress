@@ -89,7 +89,7 @@
 #define DEFAULT_F           0.04f
 #define DEFAULT_K           0.06075f
 
-#define REINFORCE_LR        0.4f
+#define REINFORCE_LR        0.05f
 #define REINFORCE_MAPE      0.20f
 
 #define TMP_NOCOMP   "/tmp/bm_gs_nocomp.h5"
@@ -777,9 +777,13 @@ static int run_phase_vol(float *d_v, float *d_read,
             char final_str[40], orig_str[40];
             action_to_str(d.nn_action, final_str, sizeof(final_str));
             action_to_str(d.nn_original_action, orig_str, sizeof(orig_str));
-            printf("  chunk %3d/%d: algo=%-18s ratio=%.2fx  pred=%.2fx",
+            double chunk_mape = (d.actual_ratio > 0.0f)
+                ? fabs((double)d.predicted_ratio - (double)d.actual_ratio)
+                  / (double)d.actual_ratio * 100.0
+                : 0.0;
+            printf("  chunk %3d/%d: algo=%-18s ratio=%.2fx  pred=%.2fx  MAPE=%.1f%%",
                    i + 1, n_chunks, final_str, (double)d.actual_ratio,
-                   (double)d.predicted_ratio);
+                   (double)d.predicted_ratio, chunk_mape);
             if (d.exploration_triggered)
                 printf("  (orig=%s, explored)", orig_str);
             if (d.sgd_fired)
@@ -881,7 +885,7 @@ static void write_chunk_csv(const char *phase_name, int n_chunks)
     if (!f) { perror("fopen " OUT_CHUNKS); return; }
     if (need_hdr) {
         fprintf(f, "phase,chunk,action_final,action_orig,actual_ratio,"
-                   "predicted_ratio,sgd_fired,exploration_triggered,"
+                   "predicted_ratio,mape_pct,sgd_fired,exploration_triggered,"
                    "nn_inference_ms,preprocessing_ms,compression_ms,"
                    "exploration_ms,sgd_update_ms\n");
     }
@@ -893,16 +897,21 @@ static void write_chunk_csv(const char *phase_name, int n_chunks)
             char final_str[40], orig_str[40];
             action_to_str(d.nn_action, final_str, sizeof(final_str));
             action_to_str(d.nn_original_action, orig_str, sizeof(orig_str));
-            fprintf(f, "%s,%d,%s,%s,%.4f,%.4f,%d,%d,"
+            double chunk_mape = (d.actual_ratio > 0.0f)
+                ? fabs((double)d.predicted_ratio - (double)d.actual_ratio)
+                  / (double)d.actual_ratio * 100.0
+                : 0.0;
+            fprintf(f, "%s,%d,%s,%s,%.4f,%.4f,%.1f,%d,%d,"
                        "%.3f,%.3f,%.3f,%.3f,%.3f\n",
                     phase_name, i, final_str, orig_str,
                     (double)d.actual_ratio, (double)d.predicted_ratio,
+                    chunk_mape,
                     d.sgd_fired, d.exploration_triggered,
                     (double)d.nn_inference_ms, (double)d.preprocessing_ms,
                     (double)d.compression_ms, (double)d.exploration_ms,
                     (double)d.sgd_update_ms);
         } else {
-            fprintf(f, "%s,%d,none,none,0,0,0,0,0,0,0,0,0\n", phase_name, i);
+            fprintf(f, "%s,%d,none,none,0,0,0.0,0,0,0,0,0,0,0\n", phase_name, i);
         }
     }
     fclose(f);

@@ -621,7 +621,7 @@ __global__ void nnSGDKernel(
             // This prevents extreme out-of-distribution samples from
             // producing unbounded normalized targets that cause gradient
             // explosion and weight oscillation (Issue #1).
-            float clamped_ratio     = fmaxf(0.5f,  fminf(sample.actual_ratio,     200.0f));
+            float clamped_ratio     = fmaxf(0.5f,  fminf(sample.actual_ratio,   10000.0f));
             float clamped_comp_time = fmaxf(0.01f, fminf(sample.actual_comp_time, 5000.0f));
             float clamped_decomp    = fmaxf(0.01f, fminf(sample.actual_decomp_time, 5000.0f));
 
