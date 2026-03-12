@@ -82,6 +82,7 @@ add_vol_test(test_vol_pipeline_comprehensive  tests/hdf5/test_vol_pipeline_compr
 add_vol_test(test_vol_verify_gpu_path        tests/hdf5/test_vol_verify_gpu_path.cu)
 add_vol_test(test_nn_algo_convergence        tests/test_nn_algo_convergence.cu)
 add_vol_test(test_nn_bitcomp                 tests/test_nn_bitcomp.cu)
+add_vol_test(test_nn_predict_vs_actual       tests/test_nn_predict_vs_actual.cu)
 
 # ============================================================
 # VOL Regression Tests
@@ -133,9 +134,6 @@ endforeach()
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/grayscott/grayscott-benchmark.cu")
     add_vol_demo(grayscott_benchmark       benchmarks/grayscott/grayscott-benchmark.cu)
 endif()
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/NN-Accuracy-Adaptiveness/nn_adaptiveness/NNaccuracy.cu")
-    add_vol_demo(NNaccuracy                    NN-Accuracy-Adaptiveness/nn_adaptiveness/NNaccuracy.cu)
-endif()
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/NN-Accuracy-Adaptiveness/grayscott/grayscott_NN_accuracy.cu")
-    add_vol_demo(grayscott_NN_accuracy         NN-Accuracy-Adaptiveness/grayscott/grayscott_NN_accuracy.cu)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/synthetic/synthetic-nn-benchmark.cu")
+    add_vol_demo(synthetic_nn_benchmark    benchmarks/synthetic/synthetic-nn-benchmark.cu)
 endif()

@@ -483,6 +483,8 @@ extern "C" gpucompress_error_t gpucompress_compress(
     int nn_original_action = -1;
     float predicted_ratio = 0.0f;
     float predicted_comp_time = 0.0f;
+    float predicted_decomp_time = 0.0f;
+    float predicted_psnr = 0.0f;
     int top_actions[32] = {0};
     bool is_ood = false;
     AutoStatsGPU* d_stats_ptr = nullptr;
@@ -535,6 +537,8 @@ extern "C" gpucompress_error_t gpucompress_compress(
                 if (d_stats_ptr) {
                     float* p_ratio = &predicted_ratio;  // always capture — no extra cost
                     float* p_comp_time = &predicted_comp_time;
+                    float* p_decomp_time = &predicted_decomp_time;
+                    float* p_psnr = &predicted_psnr;
                     int* p_top = g_online_learning_enabled ? top_actions : nullptr;
                     int fused_ood = 0;
 
@@ -542,7 +546,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
                     cudaEventRecord(tl_nn_start, stream);
                     action = gpucompress::runNNFusedInference(
                         d_stats_ptr, input_size, cfg.error_bound, stream,
-                        &action, p_ratio, p_comp_time,
+                        &action, p_ratio, p_comp_time, p_decomp_time, p_psnr,
                         g_online_learning_enabled ? &fused_ood : nullptr, p_top,
                         tl_nn_stop);
                     nn_timed = true;
@@ -1185,6 +1189,8 @@ extern "C" gpucompress_error_t gpucompress_compress(
             (input_size / (1024.0 * 1024.0)) / (primary_comp_time_ms / 1000.0) : 0.0;
         stats->predicted_ratio = static_cast<double>(predicted_ratio);
         stats->predicted_comp_time_ms = static_cast<double>(predicted_comp_time);
+        stats->predicted_decomp_time_ms = static_cast<double>(predicted_decomp_time);
+        stats->predicted_psnr_db = static_cast<double>(predicted_psnr);
         stats->actual_comp_time_ms = static_cast<double>(primary_comp_time_ms);
         stats->sgd_fired = sgd_fired ? 1 : 0;
         stats->exploration_triggered = exploration_triggered ? 1 : 0;
@@ -1224,6 +1230,10 @@ extern "C" gpucompress_error_t gpucompress_compress(
                 ? static_cast<float>(input_size) / static_cast<float>(compressed_size)
                 : 0.0f;
             h->predicted_ratio       = predicted_ratio;
+            h->predicted_comp_time   = predicted_comp_time;
+            h->predicted_decomp_time = predicted_decomp_time;
+            h->predicted_psnr        = predicted_psnr;
+            h->decompression_ms      = 0.0f;  /* filled later during read */
         }
     }
 
@@ -1644,6 +1654,12 @@ extern "C" int gpucompress_get_chunk_diag(int idx, gpucompress_chunk_diag_t *out
     return 0;
 }
 
+extern "C" void gpucompress_record_chunk_decomp_ms(int idx, float ms) {
+    std::lock_guard<std::mutex> lk(g_chunk_history_mutex);
+    if (idx >= 0 && idx < g_chunk_history_count.load() && idx < g_chunk_history_cap)
+        g_chunk_history[idx].decompression_ms = ms;
+}
+
 extern "C" const char* gpucompress_algorithm_name(gpucompress_algorithm_t algorithm) {
     int idx = static_cast<int>(algorithm);
     if (idx >= 0 && idx <= 8) {
@@ -1807,7 +1823,8 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
     double entropy = 0.0, mad = 0.0, second_derivative = 0.0;
     bool nn_was_used = false, sgd_fired = false, exploration_triggered = false;
     int nn_action = 0, nn_original_action = -1;
-    float predicted_ratio = 0.0f, predicted_comp_time = 0.0f;
+    float predicted_ratio = 0.0f, predicted_comp_time = 0.0f,
+          predicted_decomp_time = 0.0f, predicted_psnr = 0.0f;
     int top_actions[32] = {0};
     bool is_ood = false;
     AutoStatsGPU* d_stats_ptr = nullptr;
@@ -1872,6 +1889,8 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
             if (d_stats_ptr) {
                 float* p_ratio = &predicted_ratio;  // always capture — no extra cost
                 float* p_comp_time = &predicted_comp_time;
+                float* p_decomp_time = &predicted_decomp_time;
+                float* p_psnr = &predicted_psnr;
                 int* p_top = g_online_learning_enabled ? top_actions : nullptr;
                 int fused_ood = 0;
 
@@ -1879,7 +1898,7 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
                 cudaEventRecord(ctx->nn_start, stream);
                 action = gpucompress::runNNFusedInferenceCtx(
                     d_stats_ptr, input_size, cfg.error_bound, stream, ctx,
-                    &action, p_ratio, p_comp_time,
+                    &action, p_ratio, p_comp_time, p_decomp_time, p_psnr,
                     g_online_learning_enabled ? &fused_ood : nullptr, p_top,
                     ctx->nn_stop);
                 nn_timed = true;
@@ -2465,6 +2484,8 @@ skip_nn:
             (input_size / (1024.0 * 1024.0)) / (primary_comp_time_ms / 1000.0) : 0.0;
         stats->predicted_ratio = static_cast<double>(predicted_ratio);
         stats->predicted_comp_time_ms = static_cast<double>(predicted_comp_time);
+        stats->predicted_decomp_time_ms = static_cast<double>(predicted_decomp_time);
+        stats->predicted_psnr_db = static_cast<double>(predicted_psnr);
         stats->actual_comp_time_ms = static_cast<double>(primary_comp_time_ms);
         stats->sgd_fired = sgd_fired ? 1 : 0;
         stats->exploration_triggered = exploration_triggered ? 1 : 0;
@@ -2504,6 +2525,10 @@ skip_nn:
                 ? static_cast<float>(input_size) / static_cast<float>(compressed_size)
                 : 0.0f;
             h->predicted_ratio       = predicted_ratio;
+            h->predicted_comp_time   = predicted_comp_time;
+            h->predicted_decomp_time = predicted_decomp_time;
+            h->predicted_psnr        = predicted_psnr;
+            h->decompression_ms      = 0.0f;  /* filled later during read */
         }
     }
 

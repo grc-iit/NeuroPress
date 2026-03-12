@@ -132,6 +132,8 @@ typedef struct {
     double throughput_mbps;              /**< Compression throughput (MB/s) */
     double predicted_ratio;              /**< NN-predicted compression ratio (0.0 if not ALGO_AUTO/NN) */
     double predicted_comp_time_ms;       /**< NN-predicted compression time in ms (0.0 if not ALGO_AUTO/NN) */
+    double predicted_decomp_time_ms;     /**< NN-predicted decompression time in ms (0.0 if not ALGO_AUTO/NN) */
+    double predicted_psnr_db;            /**< NN-predicted PSNR in dB (0.0 if not ALGO_AUTO/NN) */
     double actual_comp_time_ms;          /**< Actual GPU compression time in ms (CUDA event timing) */
     int    sgd_fired;                    /**< 1 if online reinforcement (SGD) was triggered, 0 otherwise */
     int    exploration_triggered;         /**< 1 if Level 2 exploration was triggered, 0 otherwise */
@@ -553,6 +555,12 @@ typedef struct {
     /* Per-chunk ratio and prediction accuracy */
     float  actual_ratio;         /* input_size / compressed_size          */
     float  predicted_ratio;      /* NN-predicted ratio (0 if not AUTO)    */
+    float  predicted_comp_time;  /* NN-predicted compression time ms      */
+    float  predicted_decomp_time;/* NN-predicted decompression time ms    */
+    float  predicted_psnr;       /* NN-predicted PSNR in dB               */
+
+    /* Filled during read (decompression) — 0 until VOL read completes   */
+    float  decompression_ms;     /* actual decompression time (nvCOMP)    */
 } gpucompress_chunk_diag_t;
 
 /**
@@ -570,6 +578,11 @@ int  gpucompress_get_chunk_history_count(void);
  * @return 0 on success, -1 if idx is out of range or out is NULL.
  */
 int  gpucompress_get_chunk_diag(int idx, gpucompress_chunk_diag_t *out);
+
+/**
+ * Record actual decompression time for chunk @p idx (called from VOL read).
+ */
+void gpucompress_record_chunk_decomp_ms(int idx, float ms);
 
 /* ============================================================
  * Force-Algorithm Queue

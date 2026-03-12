@@ -749,8 +749,8 @@ static int run_phase_vol(float *d_v, float *d_read,
     /* Collect per-chunk diagnostics */
     int sgd_fires  = 0;
     int explorations = 0;
-    double ape_sum = 0.0;
-    int    ape_cnt = 0;
+    double ape_ratio_sum = 0.0, ape_comp_sum = 0.0, ape_decomp_sum = 0.0;
+    int    ape_ratio_cnt = 0,   ape_comp_cnt = 0,   ape_decomp_cnt = 0;
     double total_nn_ms     = 0.0;
     double total_stats_ms  = 0.0;
     double total_preproc_ms = 0.0;
@@ -769,26 +769,48 @@ static int run_phase_vol(float *d_v, float *d_read,
             total_comp_ms    += d.compression_ms;
             total_explore_ms += d.exploration_ms;
             total_sgd_ms     += d.sgd_update_ms;
+
+            /* Per-metric MAPE */
+            double mape_ratio = (d.actual_ratio > 0)
+                ? fabs(d.predicted_ratio - d.actual_ratio) / d.actual_ratio * 100.0 : 0.0;
+            double mape_comp = (d.compression_ms > 0)
+                ? fabs(d.predicted_comp_time - d.compression_ms) / d.compression_ms * 100.0 : 0.0;
+            double mape_decomp = (d.decompression_ms > 0)
+                ? fabs(d.predicted_decomp_time - d.decompression_ms) / d.decompression_ms * 100.0 : 0.0;
+
             if (d.predicted_ratio > 0 && d.actual_ratio > 0) {
-                ape_sum += fabs(d.predicted_ratio - d.actual_ratio)
-                           / d.actual_ratio;
-                ape_cnt++;
+                ape_ratio_sum += mape_ratio; ape_ratio_cnt++;
             }
+            if (d.compression_ms > 0) {
+                ape_comp_sum += mape_comp; ape_comp_cnt++;
+            }
+            if (d.decompression_ms > 0) {
+                ape_decomp_sum += mape_decomp; ape_decomp_cnt++;
+            }
+
             char final_str[40], orig_str[40];
             action_to_str(d.nn_action, final_str, sizeof(final_str));
             action_to_str(d.nn_original_action, orig_str, sizeof(orig_str));
-            double chunk_mape = (d.actual_ratio > 0.0f)
-                ? fabs((double)d.predicted_ratio - (double)d.actual_ratio)
-                  / (double)d.actual_ratio * 100.0
-                : 0.0;
-            printf("  chunk %3d/%d: algo=%-18s ratio=%.2fx  pred=%.2fx  MAPE=%.1f%%",
-                   i + 1, n_chunks, final_str, (double)d.actual_ratio,
-                   (double)d.predicted_ratio, chunk_mape);
-            if (d.exploration_triggered)
-                printf("  (orig=%s, explored)", orig_str);
-            if (d.sgd_fired)
-                printf("  [SGD]");
-            printf("\n");
+
+            printf("\n  Chunk %3d/%d  [%s]%s%s\n",
+                   i + 1, n_chunks, final_str,
+                   d.exploration_triggered ? " [EXPLORE]" : "",
+                   d.sgd_fired ? " [SGD]" : "");
+            printf("  %-14s  %12s  %12s  %9s\n",
+                   "Metric", "Predicted", "Actual", "MAPE");
+            printf("  ─────────────────────────────────────────────────\n");
+            printf("  %-14s  %10.3fx  %10.3fx  %6.1f%%\n",
+                   "ratio", (double)d.predicted_ratio, (double)d.actual_ratio, mape_ratio);
+            printf("  %-14s  %9.3f ms  %9.3f ms  %6.1f%%\n",
+                   "comp_time", (double)d.predicted_comp_time, (double)d.compression_ms, mape_comp);
+            if (d.decompression_ms > 0) {
+                printf("  %-14s  %9.3f ms  %9.3f ms  %6.1f%%\n",
+                       "decomp_time", (double)d.predicted_decomp_time,
+                       (double)d.decompression_ms, mape_decomp);
+            } else {
+                printf("  %-14s  %9.3f ms  %12s\n",
+                       "decomp_time", (double)d.predicted_decomp_time, "n/a");
+            }
         }
     }
 
@@ -806,7 +828,12 @@ static int run_phase_vol(float *d_v, float *d_read,
     r->sgd_fires   = sgd_fires;
     r->explorations = explorations;
     r->n_chunks    = n_chunks;
-    r->mape_pct    = (ape_cnt > 0) ? 100.0 * ape_sum / ape_cnt : 0.0;
+    r->mape_pct    = (ape_ratio_cnt > 0) ? ape_ratio_sum / ape_ratio_cnt : 0.0;
+
+    printf("\n  MAPE avg:  ratio=%.1f%%  comp_time=%.1f%%  decomp_time=%.1f%%\n",
+           r->mape_pct,
+           (ape_comp_cnt > 0) ? ape_comp_sum / ape_comp_cnt : 0.0,
+           (ape_decomp_cnt > 0) ? ape_decomp_sum / ape_decomp_cnt : 0.0);
     r->nn_ms       = total_nn_ms;
     r->stats_ms    = total_stats_ms;
     r->preproc_ms  = total_preproc_ms;
@@ -884,8 +911,11 @@ static void write_chunk_csv(const char *phase_name, int n_chunks)
     FILE *f = fopen(OUT_CHUNKS, "a");
     if (!f) { perror("fopen " OUT_CHUNKS); return; }
     if (need_hdr) {
-        fprintf(f, "phase,chunk,action_final,action_orig,actual_ratio,"
-                   "predicted_ratio,mape_pct,sgd_fired,exploration_triggered,"
+        fprintf(f, "phase,chunk,action_final,action_orig,"
+                   "actual_ratio,predicted_ratio,mape_ratio,"
+                   "actual_comp_ms,predicted_comp_ms,mape_comp,"
+                   "actual_decomp_ms,predicted_decomp_ms,mape_decomp,"
+                   "sgd_fired,exploration_triggered,"
                    "nn_inference_ms,preprocessing_ms,compression_ms,"
                    "exploration_ms,sgd_update_ms\n");
     }
@@ -897,21 +927,25 @@ static void write_chunk_csv(const char *phase_name, int n_chunks)
             char final_str[40], orig_str[40];
             action_to_str(d.nn_action, final_str, sizeof(final_str));
             action_to_str(d.nn_original_action, orig_str, sizeof(orig_str));
-            double chunk_mape = (d.actual_ratio > 0.0f)
-                ? fabs((double)d.predicted_ratio - (double)d.actual_ratio)
-                  / (double)d.actual_ratio * 100.0
-                : 0.0;
-            fprintf(f, "%s,%d,%s,%s,%.4f,%.4f,%.1f,%d,%d,"
-                       "%.3f,%.3f,%.3f,%.3f,%.3f\n",
+            double mape_ratio = (d.actual_ratio > 0)
+                ? fabs(d.predicted_ratio - d.actual_ratio) / d.actual_ratio * 100.0 : 0.0;
+            double mape_comp = (d.compression_ms > 0)
+                ? fabs(d.predicted_comp_time - d.compression_ms) / d.compression_ms * 100.0 : 0.0;
+            double mape_decomp = (d.decompression_ms > 0)
+                ? fabs(d.predicted_decomp_time - d.decompression_ms) / d.decompression_ms * 100.0 : 0.0;
+            fprintf(f, "%s,%d,%s,%s,%.4f,%.4f,%.1f,"
+                       "%.3f,%.3f,%.1f,%.3f,%.3f,%.1f,"
+                       "%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f\n",
                     phase_name, i, final_str, orig_str,
-                    (double)d.actual_ratio, (double)d.predicted_ratio,
-                    chunk_mape,
+                    (double)d.actual_ratio, (double)d.predicted_ratio, mape_ratio,
+                    (double)d.compression_ms, (double)d.predicted_comp_time, mape_comp,
+                    (double)d.decompression_ms, (double)d.predicted_decomp_time, mape_decomp,
                     d.sgd_fired, d.exploration_triggered,
                     (double)d.nn_inference_ms, (double)d.preprocessing_ms,
                     (double)d.compression_ms, (double)d.exploration_ms,
                     (double)d.sgd_update_ms);
         } else {
-            fprintf(f, "%s,%d,none,none,0,0,0.0,0,0,0,0,0,0,0\n", phase_name, i);
+            fprintf(f, "%s,%d,none,none,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n", phase_name, i);
         }
     }
     fclose(f);

@@ -41,6 +41,8 @@ struct NNInferenceOutput {
     int action;
     float predicted_ratio;
     float predicted_comp_time;
+    float predicted_decomp_time;
+    float predicted_psnr;
     int is_ood;
 };
 

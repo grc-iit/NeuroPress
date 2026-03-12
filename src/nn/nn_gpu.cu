@@ -112,7 +112,9 @@ __device__ static void nnForwardPass(
     int   criterion,
     float* out_rank_val,
     float* out_ratio,
-    float* out_comp_time
+    float* out_comp_time,
+    float* out_decomp_time,
+    float* out_psnr
 ) {
     int algo_idx = tid % 8;
     int quant    = (tid / 8) % 2;
@@ -184,9 +186,11 @@ __device__ static void nnForwardPass(
     if (!higher_is_better) rank_val = -rank_val;
     if (quant == 1 && error_bound <= 0.0) rank_val = -INFINITY;
 
-    *out_rank_val  = rank_val;
-    *out_ratio     = ratio;
-    *out_comp_time = comp_time;
+    *out_rank_val   = rank_val;
+    *out_ratio      = ratio;
+    *out_comp_time  = comp_time;
+    *out_decomp_time = decomp_time;
+    *out_psnr       = psnr;
 }
 
 /* ============================================================
@@ -246,17 +250,21 @@ __global__ void nnInferenceKernel(
     __syncthreads();
 
     // ---- Forward pass via shared device function ----
-    float rank_val, ratio, comp_time;
+    float rank_val, ratio, comp_time, decomp_time, psnr;
     nnForwardPass(weights, tid,
                   s_enc[0], s_enc[1], s_enc[2], s_enc[3], s_enc[4],
                   error_bound, criterion,
-                  &rank_val, &ratio, &comp_time);
+                  &rank_val, &ratio, &comp_time, &decomp_time, &psnr);
 
-    // ---- Store per-thread predicted ratio and comp_time for later retrieval ----
+    // ---- Store per-thread predictions for later retrieval ----
     __shared__ float s_ratios[NN_NUM_CONFIGS];
     __shared__ float s_comp_times[NN_NUM_CONFIGS];
-    s_ratios[tid] = ratio;
-    s_comp_times[tid] = comp_time;
+    __shared__ float s_decomp_times[NN_NUM_CONFIGS];
+    __shared__ float s_psnrs[NN_NUM_CONFIGS];
+    s_ratios[tid]      = ratio;
+    s_comp_times[tid]  = comp_time;
+    s_decomp_times[tid] = decomp_time;
+    s_psnrs[tid]       = psnr;
 
     // ---- Parallel reduction to find best config ----
     __shared__ float s_vals[NN_NUM_CONFIGS];
@@ -295,10 +303,12 @@ __global__ void nnInferenceKernel(
         // All threads write their sorted slot in parallel; thread 0 is the winner.
         out_top_actions[tid] = my_idx;
         if (tid == 0) {
-            out_result->action             = my_idx;
-            out_result->predicted_ratio    = s_ratios[my_idx];
+            out_result->action              = my_idx;
+            out_result->predicted_ratio     = s_ratios[my_idx];
             out_result->predicted_comp_time = s_comp_times[my_idx];
-            out_result->is_ood             = 0;  // OOD not computed in non-fused path
+            out_result->predicted_decomp_time = s_decomp_times[my_idx];
+            out_result->predicted_psnr      = s_psnrs[my_idx];
+            out_result->is_ood              = 0;  // OOD not computed in non-fused path
         }
     } else {
         // Tree reduction (32 → 16 → 8 → 4 → 2 → 1)
@@ -318,6 +328,8 @@ __global__ void nnInferenceKernel(
             out_result->action              = winner;
             out_result->predicted_ratio     = s_ratios[winner];
             out_result->predicted_comp_time = s_comp_times[winner];
+            out_result->predicted_decomp_time = s_decomp_times[winner];
+            out_result->predicted_psnr      = s_psnrs[winner];
             out_result->is_ood              = 0;  // OOD not computed in non-fused path
         }
     }
@@ -378,16 +390,20 @@ __global__ void nnFusedInferenceKernel(
     __syncthreads();
 
     // ---- Forward pass via shared device function ----
-    float rank_val, ratio, comp_time;
+    float rank_val, ratio, comp_time, decomp_time, psnr;
     nnForwardPass(weights, tid,
                   s_enc[0], s_enc[1], s_enc[2], s_enc[3], s_enc[4],
                   error_bound, criterion,
-                  &rank_val, &ratio, &comp_time);
+                  &rank_val, &ratio, &comp_time, &decomp_time, &psnr);
 
     __shared__ float s_ratios[NN_NUM_CONFIGS];
     __shared__ float s_comp_times[NN_NUM_CONFIGS];
-    s_ratios[tid] = ratio;
-    s_comp_times[tid] = comp_time;
+    __shared__ float s_decomp_times[NN_NUM_CONFIGS];
+    __shared__ float s_psnrs[NN_NUM_CONFIGS];
+    s_ratios[tid]      = ratio;
+    s_comp_times[tid]  = comp_time;
+    s_decomp_times[tid] = decomp_time;
+    s_psnrs[tid]       = psnr;
 
     __shared__ float s_vals[NN_NUM_CONFIGS];
     __shared__ int   s_idxs[NN_NUM_CONFIGS];
@@ -425,6 +441,8 @@ __global__ void nnFusedInferenceKernel(
             out_result->action = winner;
             out_result->predicted_ratio = s_ratios[winner];
             out_result->predicted_comp_time = s_comp_times[winner];
+            out_result->predicted_decomp_time = s_decomp_times[winner];
+            out_result->predicted_psnr = s_psnrs[winner];
 
             out_result->is_ood = detect_ood(s_enc, weights);
         }
@@ -444,6 +462,8 @@ __global__ void nnFusedInferenceKernel(
             out_result->action = winner;
             out_result->predicted_ratio = s_ratios[winner];
             out_result->predicted_comp_time = s_comp_times[winner];
+            out_result->predicted_decomp_time = s_decomp_times[winner];
+            out_result->predicted_psnr = s_psnrs[winner];
 
             out_result->is_ood = detect_ood(s_enc, weights);
         }
@@ -1111,6 +1131,8 @@ int runNNInference(
     cudaStream_t stream,
     float* out_predicted_ratio,
     float* out_predicted_comp_time,
+    float* out_predicted_decomp_time,
+    float* out_predicted_psnr,
     int* out_top_actions
 ) {
     if (!g_nn_loaded.load() || d_nn_weights == nullptr) {
@@ -1159,8 +1181,10 @@ int runNNInference(
     err = cudaStreamSynchronize(stream);
     if (err != cudaSuccess) return -1;
 
-    if (out_predicted_ratio)    *out_predicted_ratio    = h_result.predicted_ratio;
-    if (out_predicted_comp_time) *out_predicted_comp_time = h_result.predicted_comp_time;
+    if (out_predicted_ratio)      *out_predicted_ratio      = h_result.predicted_ratio;
+    if (out_predicted_comp_time)  *out_predicted_comp_time  = h_result.predicted_comp_time;
+    if (out_predicted_decomp_time)*out_predicted_decomp_time = h_result.predicted_decomp_time;
+    if (out_predicted_psnr)       *out_predicted_psnr       = h_result.predicted_psnr;
 
     return h_result.action;
 }
@@ -1177,6 +1201,8 @@ int runNNFusedInference(
     int* out_action,
     float* out_ratio,
     float* out_comp_time,
+    float* out_decomp_time,
+    float* out_psnr,
     int* out_is_ood,
     int* out_top_actions,
     cudaEvent_t nn_stop_event
@@ -1229,10 +1255,12 @@ int runNNFusedInference(
     err = cudaStreamSynchronize(stream);
     if (err != cudaSuccess) return -1;
 
-    if (out_action) *out_action = h_result.action;
-    if (out_ratio) *out_ratio = h_result.predicted_ratio;
-    if (out_comp_time) *out_comp_time = h_result.predicted_comp_time;
-    if (out_is_ood) *out_is_ood = h_result.is_ood;
+    if (out_action)     *out_action     = h_result.action;
+    if (out_ratio)      *out_ratio      = h_result.predicted_ratio;
+    if (out_comp_time)  *out_comp_time  = h_result.predicted_comp_time;
+    if (out_decomp_time)*out_decomp_time = h_result.predicted_decomp_time;
+    if (out_psnr)       *out_psnr       = h_result.predicted_psnr;
+    if (out_is_ood)     *out_is_ood     = h_result.is_ood;
 
     return h_result.action;
 }
@@ -1328,6 +1356,8 @@ int runNNFusedInferenceCtx(
     int* out_action,
     float* out_ratio,
     float* out_comp_time,
+    float* out_decomp_time,
+    float* out_psnr,
     int* out_is_ood,
     int* out_top_actions,
     cudaEvent_t nn_stop_event
@@ -1371,10 +1401,12 @@ int runNNFusedInferenceCtx(
     err = cudaStreamSynchronize(stream);
     if (err != cudaSuccess) return -1;
 
-    if (out_action)   *out_action   = h_result.action;
-    if (out_ratio)    *out_ratio    = h_result.predicted_ratio;
-    if (out_comp_time)*out_comp_time = h_result.predicted_comp_time;
-    if (out_is_ood)   *out_is_ood   = h_result.is_ood;
+    if (out_action)      *out_action      = h_result.action;
+    if (out_ratio)       *out_ratio       = h_result.predicted_ratio;
+    if (out_comp_time)   *out_comp_time   = h_result.predicted_comp_time;
+    if (out_decomp_time) *out_decomp_time = h_result.predicted_decomp_time;
+    if (out_psnr)        *out_psnr        = h_result.predicted_psnr;
+    if (out_is_ood)      *out_is_ood      = h_result.is_ood;
 
     return h_result.action;
 }

@@ -1630,12 +1630,20 @@ gpu_aware_chunked_read(H5VL_gpucompress_t *o,
             { std::lock_guard<std::mutex> lk(free_mtx); free_slots_count++; }
             free_cv.notify_one();
 
-            /* Decompress on GPU */
+            /* Decompress on GPU — measure wall-clock time */
             size_t decomp_size = chunk_bytes;
+            cudaDeviceSynchronize();
+            struct timespec _ts0, _ts1;
+            clock_gettime(CLOCK_MONOTONIC, &_ts0);
             gpucompress_error_t ce = gpucompress_decompress_gpu(
                 d_compressed, item.comp_sz, dst_ptr, &decomp_size, NULL);
+            cudaDeviceSynchronize();
+            clock_gettime(CLOCK_MONOTONIC, &_ts1);
             if (ce != GPUCOMPRESS_SUCCESS) { ret = -1; break; }
-            VOL_TRACE("    gpucompress_decompress_gpu() → %zuB", decomp_size);
+            float _decomp_ms = (float)((_ts1.tv_sec - _ts0.tv_sec) * 1000.0
+                              + (_ts1.tv_nsec - _ts0.tv_nsec) / 1e6);
+            gpucompress_record_chunk_decomp_ms((int)ci, _decomp_ms);
+            VOL_TRACE("    gpucompress_decompress_gpu() → %zuB (%.2f ms)", decomp_size, _decomp_ms);
 
             if (direct_decomp) {
                 s_chunks_decomp++;

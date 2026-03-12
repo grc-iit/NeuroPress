@@ -246,6 +246,8 @@ int runNNInference(
     cudaStream_t stream,
     float* out_predicted_ratio = nullptr,
     float* out_predicted_comp_time = nullptr,
+    float* out_predicted_decomp_time = nullptr,
+    float* out_predicted_psnr = nullptr,
     int* out_top_actions = nullptr
 );
 
@@ -305,6 +307,7 @@ AutoStatsGPU* runStatsKernelsNoSync(const void* d_input, size_t input_size,
 int runNNFusedInferenceCtx(const AutoStatsGPU* d_stats, size_t data_size,
     double error_bound, cudaStream_t stream, CompContext* ctx,
     int* out_action, float* out_ratio = nullptr, float* out_comp_time = nullptr,
+    float* out_decomp_time = nullptr, float* out_psnr = nullptr,
     int* out_is_ood = nullptr, int* out_top_actions = nullptr,
     cudaEvent_t nn_stop_event = nullptr);
 
@@ -321,8 +324,9 @@ int runNNSGDCtx(const AutoStatsGPU* d_stats, const SGDSample* samples,
  */
 int runNNFusedInference(const AutoStatsGPU* d_stats, size_t data_size, double error_bound,
     cudaStream_t stream, int* out_action, float* out_ratio = nullptr,
-    float* out_comp_time = nullptr, int* out_is_ood = nullptr, int* out_top_actions = nullptr,
-    cudaEvent_t nn_stop_event = nullptr);
+    float* out_comp_time = nullptr, float* out_decomp_time = nullptr,
+    float* out_psnr = nullptr, int* out_is_ood = nullptr,
+    int* out_top_actions = nullptr, cudaEvent_t nn_stop_event = nullptr);
 
 /**
  * GPU-native SGD: forward/backward pass + weight update entirely on GPU.
