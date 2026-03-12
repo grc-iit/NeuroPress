@@ -13,6 +13,11 @@
  *   1. NN Baseline  : ALGO_AUTO inference-only (every step)
  *   2. NN + SGD     : ALGO_AUTO with online learning (every step, persistent)
  *
+ * PHASE SELECTION:
+ *   GPUCOMPRESS_PHASES env var — comma-separated list of phases to run.
+ *   Valid names: exhaustive, nn, nn-sgd
+ *   Default: all phases.  Example: GPUCOMPRESS_PHASES=nn,nn-sgd
+ *
  * OUTPUT:
  *   benchmarks/vpic/sim_timestep_metrics.csv   — per-timestep ratio/MAPE
  *   benchmarks/vpic/sim_chunk_metrics.csv      — per-chunk per-timestep detail
@@ -50,7 +55,7 @@
 //   GPUCOMPRESS_NUM_STEPS      — total simulation steps  (default: 1000)
 //   GPUCOMPRESS_CHUNK_MB       — chunk size in MB        (default: 8)
 // ============================================================
-#define DEFAULT_SGD_LR          0.5f
+#define DEFAULT_SGD_LR          0.05f
 #define DEFAULT_SGD_MAPE_THRESH 0.25f
 #define DEFAULT_DIAG_INTERVAL   20
 #define DEFAULT_NUM_STEPS       1000
@@ -58,6 +63,9 @@
 
 #define H5Z_FILTER_GPUCOMPRESS    305
 #define H5Z_GPUCOMPRESS_CD_NELMTS 5
+
+// Phase bitmask constants
+enum { P_EXHAUSTIVE = 1, P_NN = 2, P_NN_SGD = 4 };
 
 #define TMP_NN       "/tmp/bm_vpic_sim_nn.h5"
 #define TMP_SGD      "/tmp/bm_vpic_sim_sgd.h5"
@@ -90,6 +98,7 @@ begin_globals {
     float              sgd_mape_thresh;
     int                diag_interval;
     int                num_steps;
+    unsigned int       phase_mask;
 };
 
 // ============================================================
@@ -537,10 +546,30 @@ begin_initialization {
     env_val = getenv("GPUCOMPRESS_CHUNK_MB");
     if (env_val) chunk_mb = atoi(env_val);
 
+    /* Parse GPUCOMPRESS_PHASES: comma-separated list (exhaustive,nn,nn-sgd) */
+    unsigned int phase_mask = 0;
+    env_val = getenv("GPUCOMPRESS_PHASES");
+    if (env_val) {
+        char buf[256];
+        strncpy(buf, env_val, sizeof(buf) - 1);
+        buf[sizeof(buf) - 1] = '\0';
+        char* tok = strtok(buf, ",");
+        while (tok) {
+            while (*tok == ' ') tok++;  /* trim leading spaces */
+            if      (strcmp(tok, "exhaustive") == 0) phase_mask |= P_EXHAUSTIVE;
+            else if (strcmp(tok, "nn") == 0)         phase_mask |= P_NN;
+            else if (strcmp(tok, "nn-sgd") == 0)     phase_mask |= P_NN_SGD;
+            else fprintf(stderr, "Warning: unknown phase '%s' (valid: exhaustive, nn, nn-sgd)\n", tok);
+            tok = strtok(NULL, ",");
+        }
+    }
+    if (phase_mask == 0) phase_mask = P_EXHAUSTIVE | P_NN | P_NN_SGD;
+
     global->sgd_lr          = sgd_lr;
     global->sgd_mape_thresh = sgd_mape;
     global->diag_interval   = diag_interval;
     global->num_steps       = total_steps;
+    global->phase_mask      = phase_mask;
 
     num_step        = total_steps + 1;
     status_interval = 50;
@@ -684,7 +713,7 @@ begin_diagnostics {
     if (step() == 0) return;
 
     int ts = step();
-    int is_last = (ts >= global->num_steps);
+    int is_last = (ts == global->num_steps);
     int is_diag = (ts == 1) || is_last
                   || (ts % global->diag_interval == 0);
 
@@ -710,7 +739,7 @@ begin_diagnostics {
     }
 
     /* ── Exhaustive: only at diag interval, first step, and last step ── */
-    if (is_diag) {
+    if ((global->phase_mask & P_EXHAUSTIVE) && is_diag) {
         FILE* f_ub = fopen(OUT_UB_CSV, "a");
         oracle_ratio = run_oracle_pass(d_fields, n_floats,
                                        chunk_floats, n_chunks,
@@ -732,7 +761,7 @@ begin_diagnostics {
     }
 
     /* ── NN Baseline: every step (fresh weights) ── */
-    {
+    if (global->phase_mask & P_NN) {
         const char* wp = getenv("GPUCOMPRESS_WEIGHTS");
         if (wp) gpucompress_reload_nn(wp);
         gpucompress_disable_online_learning();
@@ -757,7 +786,7 @@ begin_diagnostics {
     }
 
     /* ── NN + SGD: every step (persistent learning) ── */
-    {
+    if (global->phase_mask & P_NN_SGD) {
         if (step() == 1) {
             const char* wp = getenv("GPUCOMPRESS_WEIGHTS");
             if (wp) gpucompress_reload_nn(wp);
@@ -808,43 +837,26 @@ begin_diagnostics {
 
     /* ── Write aggregate CSV + cleanup on last step ── */
     if (is_last) {
-        /* Find the nn_baseline and nn_sgd results (last two in array) */
-        int bl_idx = n_results - 2;
-        int sgd_idx = n_results - 1;
-
         FILE* f = fopen(OUT_AGG_CSV, "w");
         if (f) {
             fprintf(f, "phase,ratio,write_ms,read_ms,file_mib,orig_mib,"
                        "write_mibps,read_mibps,mismatches,sgd_fires,n_chunks,"
                        "ratio_min,ratio_max,ratio_stddev,mean_prediction_error_pct\n");
-            fprintf(f, "exhaustive,%.4f,0,0,0,%.2f,0,0,0,0,%d,0,0,0,0\n",
-                    oracle_ratio,
-                    (double)(n_floats * sizeof(float)) / (1 << 20),
-                    n_chunks);
-            fprintf(f, "baseline,%.4f,%.2f,%.2f,%.2f,%.2f,"
-                       "%.1f,0,%llu,%d,%d,"
-                       "%.4f,%.4f,%.4f,%.2f\n",
-                    results[bl_idx].ratio,
-                    results[bl_idx].write_ms, results[bl_idx].read_ms,
-                    (double)results[bl_idx].file_bytes / (1 << 20),
-                    (double)results[bl_idx].orig_bytes / (1 << 20),
-                    results[bl_idx].write_mbps,
-                    results[bl_idx].mismatches, results[bl_idx].sgd_fires,
-                    results[bl_idx].n_chunks,
-                    results[bl_idx].ratio_min, results[bl_idx].ratio_max,
-                    results[bl_idx].ratio_stddev, results[bl_idx].mean_mape);
-            fprintf(f, "best_sgd,%.4f,%.2f,%.2f,%.2f,%.2f,"
-                       "%.1f,0,%llu,%d,%d,"
-                       "%.4f,%.4f,%.4f,%.2f\n",
-                    results[sgd_idx].ratio,
-                    results[sgd_idx].write_ms, results[sgd_idx].read_ms,
-                    (double)results[sgd_idx].file_bytes / (1 << 20),
-                    (double)results[sgd_idx].orig_bytes / (1 << 20),
-                    results[sgd_idx].write_mbps,
-                    results[sgd_idx].mismatches, results[sgd_idx].sgd_fires,
-                    results[sgd_idx].n_chunks,
-                    results[sgd_idx].ratio_min, results[sgd_idx].ratio_max,
-                    results[sgd_idx].ratio_stddev, results[sgd_idx].mean_mape);
+            for (int i = 0; i < n_results; i++) {
+                StepResult* r = &results[i];
+                fprintf(f, "%s,%.4f,%.2f,%.2f,%.2f,%.2f,"
+                           "%.1f,0,%llu,%d,%d,"
+                           "%.4f,%.4f,%.4f,%.2f\n",
+                        r->phase, r->ratio,
+                        r->write_ms, r->read_ms,
+                        (double)r->file_bytes / (1 << 20),
+                        (double)r->orig_bytes / (1 << 20),
+                        r->write_mbps,
+                        r->mismatches, r->sgd_fires,
+                        r->n_chunks,
+                        r->ratio_min, r->ratio_max,
+                        r->ratio_stddev, r->mean_mape);
+            }
             fclose(f);
         }
 
@@ -867,7 +879,10 @@ begin_diagnostics {
         global->d_read = NULL;
         global->h_orig = NULL;
         global->h_read = NULL;
-        gpucompress_vpic_destroy(global->vpic_fields_h);
+        if (global->vpic_fields_h) {
+            gpucompress_vpic_destroy(global->vpic_fields_h);
+            global->vpic_fields_h = NULL;
+        }
         gpucompress_cleanup();
     }
 };

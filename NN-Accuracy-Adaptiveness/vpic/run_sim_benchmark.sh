@@ -83,6 +83,7 @@ if [ "$BUILD_ONLY" -eq 0 ]; then
     echo "  Diag interval: ${GPUCOMPRESS_DIAG_INTERVAL:-20 (default)}"
     echo "  Num steps    : ${GPUCOMPRESS_NUM_STEPS:-1000 (default)}"
     echo "  Chunk MB     : ${GPUCOMPRESS_CHUNK_MB:-8 (default)}"
+    echo "  Phases       : ${GPUCOMPRESS_PHASES:-all (default)}"
     echo ""
 
     cd "$GPUCOMPRESS_DIR"

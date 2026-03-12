@@ -53,7 +53,7 @@
 // ============================================================
 // Constants
 // ============================================================
-#define REINFORCE_LR        0.4f
+#define REINFORCE_LR        0.9f
 #define REINFORCE_MAPE      0.20f
 
 #define H5Z_FILTER_GPUCOMPRESS    305
@@ -329,14 +329,14 @@ static int run_oracle_pass(const float* d_data, float* d_read_buf,
             if (cf) {
                 if (need_hdr)
                     fprintf(cf, "phase,chunk,action_final,action_orig,actual_ratio,"
-                                "predicted_ratio,sgd_fired,exploration_triggered,"
+                                "predicted_ratio,mape_pct,sgd_fired,exploration_triggered,"
                                 "nn_inference_ms,preprocessing_ms,compression_ms,"
                                 "exploration_ms,sgd_update_ms\n");
                 char algo_str[40];
                 snprintf(algo_str, sizeof(algo_str), "%s%s%s",
                          best_algo, best_shuffle ? "+shuf" : "",
                          best_quant ? "+quant" : "");
-                fprintf(cf, "exhaustive,%d,%s,%s,%.4f,0.0000,0,0,"
+                fprintf(cf, "exhaustive,%d,%s,%s,%.4f,0.0000,0.0,0,0,"
                             "0.000,0.000,%.3f,0.000,0.000\n",
                         c + 1, algo_str, algo_str, best_ratio, best_comp_ms);
                 fclose(cf);
@@ -531,15 +531,15 @@ static int run_phase(const char* phase_name, const char* tmp_file,
     int n_hist       = gpucompress_get_chunk_history_count();
     FILE *chunk_csv  = NULL;
     if (n_hist > 0) {
-        printf("    chunk | action (final)       | action (orig)        | ratio  | pred   | sgd | expl\n");
-        printf("    ------+----------------------+----------------------+--------+--------+-----+-----\n");
+        printf("    chunk | action (final)       | action (orig)        | ratio  | pred   | MAPE   | sgd | expl\n");
+        printf("    ------+----------------------+----------------------+--------+--------+--------+-----+-----\n");
         // Open chunks CSV: create with header on first phase, append on subsequent
         struct stat st;
         bool need_header = (stat(CHUNKS_CSV, &st) != 0 || st.st_size == 0);
         chunk_csv = fopen(CHUNKS_CSV, "a");
         if (chunk_csv && need_header) {
             fprintf(chunk_csv, "phase,chunk,action_final,action_orig,actual_ratio,"
-                               "predicted_ratio,sgd_fired,exploration_triggered,"
+                               "predicted_ratio,mape_pct,sgd_fired,exploration_triggered,"
                                "nn_inference_ms,preprocessing_ms,compression_ms,"
                                "exploration_ms,sgd_update_ms\n");
         }
@@ -562,16 +562,22 @@ static int run_phase(const char* phase_name, const char* tmp_file,
             char final_str[40], orig_str[40];
             action_to_str(d.nn_action, final_str, sizeof(final_str));
             action_to_str(d.nn_original_action, orig_str, sizeof(orig_str));
-            printf("    %5d | %-20s | %-20s | %5.2fx | %5.2fx | %s | %s\n",
+            double chunk_mape = (d.actual_ratio > 0.0f)
+                ? fabs((double)d.predicted_ratio - (double)d.actual_ratio)
+                  / (double)d.actual_ratio * 100.0
+                : 0.0;
+            printf("    %5d | %-20s | %-20s | %5.2fx | %5.2fx | %5.1f%% | %s | %s\n",
                    i + 1, final_str, orig_str,
                    (double)d.actual_ratio, (double)d.predicted_ratio,
+                   chunk_mape,
                    d.sgd_fired ? "yes" : "  -",
                    d.exploration_triggered ? "yes" : "  -");
             if (chunk_csv) {
-                fprintf(chunk_csv, "%s,%d,%s,%s,%.4f,%.4f,%d,%d,"
+                fprintf(chunk_csv, "%s,%d,%s,%s,%.4f,%.4f,%.1f,%d,%d,"
                                    "%.3f,%.3f,%.3f,%.3f,%.3f\n",
                         phase_name, i + 1, final_str, orig_str,
                         (double)d.actual_ratio, (double)d.predicted_ratio,
+                        chunk_mape,
                         d.sgd_fired, d.exploration_triggered,
                         (double)d.nn_inference_ms, (double)d.preprocessing_ms,
                         (double)d.compression_ms, (double)d.exploration_ms,
