@@ -1,11 +1,10 @@
 /**
  * @file vpic_benchmark_deck.cxx
- * @brief VPIC Benchmark Deck: No-Comp vs Oracle vs NN+SGD
+ * @brief VPIC Benchmark Deck: No-Comp vs NN+SGD
  *
  * A real VPIC-Kokkos Harris sheet input deck that benchmarks GPU-resident
- * field data compression through the GPUCompress VOL connector under five
- * compression phases — matching the benchmark_vol_gpu / benchmark_grayscott_vol
- * structure.
+ * field data compression through the GPUCompress VOL connector under four
+ * compression phases — matching the benchmark_grayscott_vol structure.
  *
  * Pipeline per phase:
  *   VPIC simulation (GPU) → field_array->k_f_d → H5Dwrite(d_ptr) → VOL →
@@ -13,10 +12,9 @@
  *
  * Phases (run sequentially after simulation reaches steady state):
  *   1. no-comp      : H5Dwrite via VOL (no filter, VOL-2 D→H fallback)
- *   2. oracle       : Exhaustive search (8 algos × 2 shuffle per chunk)
- *   3. nn           : H5Dwrite via VOL (ALGO_AUTO, inference-only)
- *   4. nn-rl        : ALGO_AUTO + online SGD (MAPE≥20%, LR=0.4)
- *   5. nn-rl+exp50  : ALGO_AUTO + online SGD + Level-2 exploration (MAPE≥50%)
+ *   2. nn           : H5Dwrite via VOL (ALGO_AUTO, inference-only)
+ *   3. nn-rl        : ALGO_AUTO + online SGD (MAPE≥20%, LR=0.4)
+ *   4. nn-rl+exp50  : ALGO_AUTO + online SGD + Level-2 exploration (MAPE≥50%)
  *
  * BUILD:
  *   See benchmarks/vpic-kokkos/build_vpic_benchmark.sh
@@ -59,10 +57,9 @@
 #define H5Z_FILTER_GPUCOMPRESS    305
 #define H5Z_GPUCOMPRESS_CD_NELMTS 5
 
-#define N_PHASES 5
+#define N_PHASES 4
 
 #define TMP_NOCOMP   "/tmp/bm_vpic_nocomp.h5"
-#define TMP_ORACLE   "/tmp/bm_vpic_oracle.h5"
 #define TMP_NN       "/tmp/bm_vpic_nn.h5"
 #define TMP_NN_RL    "/tmp/bm_vpic_nn_rl.h5"
 #define TMP_NN_RLEXP "/tmp/bm_vpic_nn_rlexp.h5"
@@ -225,236 +222,6 @@ static unsigned long long cpu_compare(const float* a, const float* b, size_t n)
 }
 
 // ============================================================
-// Oracle: exhaustive best-config per chunk (1D flat data)
-// Tries 8 algos × 2 shuffle = 16 configs per chunk.
-// ============================================================
-static int run_oracle_pass(const float* d_data, float* d_read_buf,
-                           float* h_orig, float* h_read,
-                           size_t n_floats, size_t chunk_floats,
-                           int n_chunks, PhaseResult* r)
-{
-    size_t chunk_bytes  = chunk_floats * sizeof(float);
-    size_t out_buf_size = chunk_bytes + 65536;
-    size_t total_bytes  = n_floats * sizeof(float);
-
-    void* d_comp_buf = NULL;
-    void* h_comp_buf = NULL;
-    if (cudaMalloc(&d_comp_buf, out_buf_size) != cudaSuccess) return 1;
-    h_comp_buf = malloc(out_buf_size);
-    if (!h_comp_buf) { cudaFree(d_comp_buf); return 1; }
-
-    static const char* ALGO_NAMES[] = {
-        "auto", "lz4", "snappy", "deflate", "gdeflate",
-        "zstd", "ans", "cascaded", "bitcomp"
-    };
-
-    /* ── Stage 1: Exhaustive search — find best config per chunk ─── */
-    /* Try 8 algos × 2 shuffle × (1 or 2 quant) configs per chunk.
-     * Quantization is only tried when error_bound > 0. */
-    const char* env_eb = getenv("VPIC_ERROR_BOUND");
-    double error_bound = env_eb ? atof(env_eb) : 0.0;
-    int n_quant = (error_bound > 0.0) ? 2 : 1;
-
-    int* best_algos    = (int*)calloc(n_chunks, sizeof(int));
-    int* best_shuffles = (int*)calloc(n_chunks, sizeof(int));
-    int* best_quants   = (int*)calloc(n_chunks, sizeof(int));
-    size_t total_best_compressed = 0;
-
-    for (int c = 0; c < n_chunks; c++) {
-        size_t offset = (size_t)c * chunk_floats;
-        size_t this_floats = chunk_floats;
-        if (offset + this_floats > n_floats)
-            this_floats = n_floats - offset;
-        size_t this_bytes = this_floats * sizeof(float);
-        const float* d_chunk = d_data + offset;
-
-        double best_ratio = 0;
-        size_t best_compressed = this_bytes;
-        double best_comp_ms = 0;
-        double best_throughput = 0;
-        int best_algo_enum = 1;
-        int best_shuffle = 0;
-        int best_quant = 0;
-        const char* best_algo = "none";
-
-        for (int algo_enum = 1; algo_enum <= 8; algo_enum++) {
-            for (int shuffle = 0; shuffle <= 1; shuffle++) {
-                for (int quant = 0; quant < n_quant; quant++) {
-                    gpucompress_config_t cfg = gpucompress_default_config();
-                    cfg.algorithm = (gpucompress_algorithm_t)algo_enum;
-                    cfg.preprocessing = 0;
-                    if (shuffle) cfg.preprocessing |= GPUCOMPRESS_PREPROC_SHUFFLE_4;
-                    if (quant) cfg.preprocessing |= GPUCOMPRESS_PREPROC_QUANTIZE;
-                    cfg.error_bound = quant ? error_bound : 0.0;
-
-                    size_t out_size = out_buf_size;
-                    gpucompress_stats_t stats;
-                    gpucompress_error_t err = gpucompress_compress_gpu(
-                        d_chunk, this_bytes,
-                        d_comp_buf, &out_size, &cfg, &stats, NULL);
-
-                    double ratio = (err == GPUCOMPRESS_SUCCESS)
-                        ? stats.compression_ratio : 0;
-
-                    if (ratio > best_ratio) {
-                        best_ratio = ratio;
-                        best_compressed = stats.compressed_size;
-                        best_comp_ms = stats.actual_comp_time_ms;
-                        best_throughput = stats.throughput_mbps;
-                        best_algo_enum = algo_enum;
-                        best_shuffle = shuffle;
-                        best_quant = quant;
-                        best_algo = ALGO_NAMES[algo_enum];
-                    }
-                }
-            }
-        }
-
-        best_algos[c]    = best_algo_enum;
-        best_shuffles[c] = best_shuffle;
-        best_quants[c]   = best_quant;
-        total_best_compressed += best_compressed;
-
-        printf("  chunk %3d/%d: best=%s%s%s  ratio=%.2fx  comp=%.1f MiB/s (%.2f ms)\n",
-               c + 1, n_chunks, best_algo,
-               best_shuffle ? "+shuf" : "",
-               best_quant   ? "+quant" : "",
-               best_ratio, best_throughput, best_comp_ms);
-
-        /* Write oracle row to per-chunk CSV */
-        {
-            struct stat csv_st;
-            bool need_hdr = (stat(CHUNKS_CSV, &csv_st) != 0 || csv_st.st_size == 0);
-            FILE *cf = fopen(CHUNKS_CSV, "a");
-            if (cf) {
-                if (need_hdr)
-                    fprintf(cf, "phase,chunk,action_final,action_orig,actual_ratio,"
-                                "predicted_ratio,mape_pct,sgd_fired,exploration_triggered,"
-                                "nn_inference_ms,preprocessing_ms,compression_ms,"
-                                "exploration_ms,sgd_update_ms\n");
-                char algo_str[40];
-                snprintf(algo_str, sizeof(algo_str), "%s%s%s",
-                         best_algo, best_shuffle ? "+shuf" : "",
-                         best_quant ? "+quant" : "");
-                fprintf(cf, "exhaustive,%d,%s,%s,%.4f,0.0000,0.0,0,0,"
-                            "0.000,0.000,%.3f,0.000,0.000\n",
-                        c + 1, algo_str, algo_str, best_ratio, best_comp_ms);
-                fclose(cf);
-            }
-        }
-    }
-
-    double oracle_ratio = (total_best_compressed > 0)
-        ? (double)total_bytes / (double)total_best_compressed : 1.0;
-
-    /* Push per-chunk best configs into force-algorithm queue */
-    gpucompress_force_algorithm_reset();
-    for (int c = 0; c < n_chunks; c++)
-        gpucompress_force_algorithm_push(best_algos[c], best_shuffles[c],
-                                         best_quants[c], error_bound);
-    printf("  [exhaustive] VOL E2E using per-chunk best via force-algorithm queue\n");
-
-    /* ── Stage 2: E2E write via HDF5 VOL (ALGO_AUTO + force queue) ── */
-    printf("  [exhaustive] E2E write (GPU ptr → VOL → HDF5)... "); fflush(stdout);
-    remove(TMP_ORACLE);
-    {
-        hid_t dcpl_ex = make_dcpl_auto((hsize_t)chunk_floats, error_bound);
-        hid_t fapl = make_vol_fapl();
-        hid_t file = H5Fcreate(TMP_ORACLE, H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
-        H5Pclose(fapl);
-        if (file < 0) { free(best_algos); free(best_shuffles); free(best_quants);
-                         free(h_comp_buf); cudaFree(d_comp_buf);
-                         H5Pclose(dcpl_ex); return 1; }
-
-        hsize_t dims[1] = { (hsize_t)n_floats };
-        hid_t fsp  = H5Screate_simple(1, dims, NULL);
-        hid_t dset = H5Dcreate2(file, "fields", H5T_NATIVE_FLOAT,
-                                 fsp, H5P_DEFAULT, dcpl_ex, H5P_DEFAULT);
-        H5Sclose(fsp);
-
-        double t_write_start = now_ms();
-        herr_t wret = H5Dwrite(dset, H5T_NATIVE_FLOAT,
-                               H5S_ALL, H5S_ALL, H5P_DEFAULT, d_data);
-        H5Dclose(dset);
-        H5Fclose(file);
-        H5Pclose(dcpl_ex);
-        double write_ms = now_ms() - t_write_start;
-        printf("%.0f ms\n", write_ms);
-
-        if (wret < 0) { fprintf(stderr, "  [exhaustive] H5Dwrite failed\n");
-                         free(best_algos); free(best_shuffles); free(best_quants);
-                         free(h_comp_buf); cudaFree(d_comp_buf); return 1; }
-
-        r->write_ms   = write_ms;
-        r->write_mbps = (double)total_bytes / (1 << 20) / (write_ms / 1000.0);
-    }
-
-    drop_pagecache(TMP_ORACLE);
-
-    /* ── Stage 3: E2E read via HDF5 VOL ── */
-    printf("  [exhaustive] E2E read  (HDF5 → VOL → GPU ptr)... "); fflush(stdout);
-    {
-        hid_t fapl = make_vol_fapl();
-        hid_t file = H5Fopen(TMP_ORACLE, H5F_ACC_RDONLY, fapl);
-        H5Pclose(fapl);
-        hid_t dset = H5Dopen2(file, "fields", H5P_DEFAULT);
-
-        double t_read_start = now_ms();
-        herr_t rret = H5Dread(dset, H5T_NATIVE_FLOAT,
-                              H5S_ALL, H5S_ALL, H5P_DEFAULT, d_read_buf);
-        cudaDeviceSynchronize();
-        H5Dclose(dset);
-        H5Fclose(file);
-        double read_ms = now_ms() - t_read_start;
-        printf("%.0f ms\n", read_ms);
-
-        if (rret < 0) { fprintf(stderr, "  [exhaustive] H5Dread failed\n");
-                         free(best_algos); free(best_shuffles); free(best_quants);
-                         free(h_comp_buf); cudaFree(d_comp_buf); return 1; }
-
-        r->read_ms   = read_ms;
-        r->read_mbps = (double)total_bytes / (1 << 20) / (read_ms / 1000.0);
-    }
-
-    /* CPU bitwise verification */
-    cudaMemcpy(h_orig, d_data, total_bytes, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_read, d_read_buf, total_bytes, cudaMemcpyDeviceToHost);
-    unsigned long long mm = cpu_compare(h_orig, h_read, n_floats);
-
-    size_t total_file_bytes = get_file_size(TMP_ORACLE);
-    /* Preserve write_ms/read_ms/write_mbps/read_mbps set above */
-    double saved_write_ms   = r->write_ms;
-    double saved_read_ms    = r->read_ms;
-    double saved_write_mbps = r->write_mbps;
-    double saved_read_mbps  = r->read_mbps;
-    memset(r, 0, sizeof(*r));
-    snprintf(r->phase, sizeof(r->phase), "exhaustive");
-    r->orig_bytes = total_bytes;
-    r->file_bytes = total_file_bytes;
-    r->ratio      = (total_file_bytes > 0)
-                    ? (double)total_bytes / (double)total_file_bytes : oracle_ratio;
-    r->write_ms   = saved_write_ms;
-    r->read_ms    = saved_read_ms;
-    r->write_mbps = saved_write_mbps;
-    r->read_mbps  = saved_read_mbps;
-    r->mismatches = mm;
-    r->n_chunks   = n_chunks;
-
-    printf("  [exhaustive] ratio=%.2fx  write=%.0f MiB/s  read=%.0f MiB/s  "
-           "file=%.0f MiB  mismatches=%llu\n",
-           r->ratio, r->write_mbps, r->read_mbps,
-           (double)total_file_bytes / (1 << 20), mm);
-
-    remove(TMP_ORACLE);
-    free(best_algos);
-    free(best_shuffles);
-    free(best_quants);
-    free(h_comp_buf);
-    cudaFree(d_comp_buf);
-    return (mm == 0) ? 0 : 1;
-}
-
-// ============================================================
 // Run one benchmark phase: write → read → verify
 // ============================================================
 static int run_phase(const char* phase_name, const char* tmp_file,
@@ -539,7 +306,10 @@ static int run_phase(const char* phase_name, const char* tmp_file,
         chunk_csv = fopen(CHUNKS_CSV, "a");
         if (chunk_csv && need_header) {
             fprintf(chunk_csv, "phase,chunk,action_final,action_orig,actual_ratio,"
-                               "predicted_ratio,mape_pct,sgd_fired,exploration_triggered,"
+                               "predicted_ratio,mape_ratio,"
+                               "actual_comp_ms,predicted_comp_ms,mape_comp,"
+                               "actual_decomp_ms,predicted_decomp_ms,mape_decomp,"
+                               "sgd_fired,exploration_triggered,"
                                "nn_inference_ms,preprocessing_ms,compression_ms,"
                                "exploration_ms,sgd_update_ms\n");
         }
@@ -573,11 +343,23 @@ static int run_phase(const char* phase_name, const char* tmp_file,
                    d.sgd_fired ? "yes" : "  -",
                    d.exploration_triggered ? "yes" : "  -");
             if (chunk_csv) {
-                fprintf(chunk_csv, "%s,%d,%s,%s,%.4f,%.4f,%.1f,%d,%d,"
+                double mape_comp = (d.compression_ms > 0 && d.predicted_comp_time > 0)
+                    ? fabs((double)d.predicted_comp_time - (double)d.compression_ms)
+                      / (double)d.compression_ms * 100.0 : 0.0;
+                double mape_decomp = (d.decompression_ms > 0 && d.predicted_decomp_time > 0)
+                    ? fabs((double)d.predicted_decomp_time - (double)d.decompression_ms)
+                      / (double)d.decompression_ms * 100.0 : 0.0;
+                fprintf(chunk_csv, "%s,%d,%s,%s,%.4f,%.4f,%.1f,"
+                                   "%.3f,%.3f,%.1f,%.3f,%.3f,%.1f,"
+                                   "%d,%d,"
                                    "%.3f,%.3f,%.3f,%.3f,%.3f\n",
                         phase_name, i + 1, final_str, orig_str,
                         (double)d.actual_ratio, (double)d.predicted_ratio,
                         chunk_mape,
+                        (double)d.compression_ms, (double)d.predicted_comp_time,
+                        mape_comp,
+                        (double)d.decompression_ms, (double)d.predicted_decomp_time,
+                        mape_decomp,
                         d.sgd_fired, d.exploration_triggered,
                         (double)d.nn_inference_ms, (double)d.preprocessing_ms,
                         (double)d.compression_ms, (double)d.exploration_ms,
@@ -844,7 +626,7 @@ begin_diagnostics {
 
     sim_log("");
     sim_log("╔═══════════════════════════════════════════════════════════════════════════╗");
-    sim_log("║  VPIC Benchmark: No-Comp vs Exhaustive vs NN+SGD (Real Harris Sheet)    ║");
+    sim_log("║  VPIC Benchmark: No-Comp vs NN+SGD (Real Harris Sheet)                  ║");
     sim_log("╚═══════════════════════════════════════════════════════════════════════════╝");
     sim_log("");
     sim_log("  Step " << step() << ": field data on GPU, " << nbytes_f / (1024*1024)
@@ -858,8 +640,8 @@ begin_diagnostics {
     const char* env_eb_diag = getenv("VPIC_ERROR_BOUND");
     double diag_error_bound = env_eb_diag ? atof(env_eb_diag) : 0.0;
 
-    /* Phase selection: VPIC_PHASES="exhaustive,nn-rl" to run only those.
-     * Default (unset or empty): run all 5 phases. */
+    /* Phase selection: VPIC_PHASES="nn-rl" to run only those.
+     * Default (unset or empty): run all 4 phases. */
     const char* env_phases = getenv("VPIC_PHASES");
     auto phase_enabled = [&](const char* name) -> bool {
         if (!env_phases || env_phases[0] == '\0') return true;  /* all */
@@ -875,7 +657,7 @@ begin_diagnostics {
 
     // ── Phase 1: no-comp ──────────────────────────────────────────
     if (phase_enabled("no-comp")) {
-    sim_log("── Phase 1/5: no-comp (GPU→Host→HDF5, VOL-2 fallback) ────────");
+    sim_log("── Phase 1/4: no-comp (GPU→Host→HDF5, VOL-2 fallback) ────────");
     gpucompress_disable_online_learning();
     gpucompress_set_exploration(0);
     {
@@ -889,22 +671,9 @@ begin_diagnostics {
     }
     }
 
-    // ── Phase 2: oracle (exhaustive search + end-to-end I/O) ──────
-    if (phase_enabled("exhaustive")) {
-    sim_log("── Phase 2/5: exhaustive search (8 algos × 2 shuffle per chunk) ──");
-    {
-        int rc = run_oracle_pass(d_fields, global->d_read,
-                                 global->h_orig, global->h_read,
-                                 n_floats, chunk_floats, n_chunks,
-                                 &results[n_phases]);
-        if (rc) any_fail = 1;
-        n_phases++;
-    }
-    }
-
-    // ── Phase 3: nn (inference-only) ──────────────────────────────
+    // ── Phase 2: nn (inference-only) ──────────────────────────────
     if (phase_enabled("nn-only") || (phase_enabled("nn") && !env_phases)) {
-    sim_log("── Phase 3/5: nn (VOL, ALGO_AUTO, inference-only) ───────────");
+    sim_log("── Phase 2/4: nn (VOL, ALGO_AUTO, inference-only) ───────────");
     gpucompress_disable_online_learning();
     gpucompress_set_exploration(0);
     {
@@ -918,9 +687,9 @@ begin_diagnostics {
     }
     }
 
-    // ── Phase 4: nn-rl (SGD, no exploration) ──────────────────────
+    // ── Phase 3: nn-rl (SGD, no exploration) ──────────────────────
     if (phase_enabled("nn-rl")) {
-    sim_log("── Phase 4/5: nn-rl (ALGO_AUTO + SGD, MAPE>=20%, LR=0.4) ───");
+    sim_log("── Phase 3/4: nn-rl (ALGO_AUTO + SGD, MAPE>=20%, LR=0.4) ───");
     gpucompress_enable_online_learning();
     gpucompress_set_reinforcement(1, REINFORCE_LR, REINFORCE_MAPE, REINFORCE_MAPE);
     gpucompress_set_exploration(0);
@@ -936,9 +705,9 @@ begin_diagnostics {
     }
     }
 
-    // ── Phase 5: nn-rl+exp50 (SGD + exploration) ──────────────────
+    // ── Phase 4: nn-rl+exp50 (SGD + exploration) ──────────────────
     if (phase_enabled("nn-rl+exp")) {
-    sim_log("── Phase 5/5: nn-rl+exp50 (ALGO_AUTO + SGD + expl@MAPE>=50%) ");
+    sim_log("── Phase 4/4: nn-rl+exp50 (ALGO_AUTO + SGD + expl@MAPE>=50%) ");
     gpucompress_enable_online_learning();
     gpucompress_set_reinforcement(1, REINFORCE_LR, REINFORCE_MAPE, REINFORCE_MAPE);
     gpucompress_set_exploration(1);
