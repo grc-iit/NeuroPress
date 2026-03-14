@@ -2389,239 +2389,203 @@ skip_nn:
 
             double best_ratio = actual_ratio;
 
-            /* N3 fix: pre-allocate scratch buffers for exploration, reuse across K alts.
-             * Avoids per-alt cudaMalloc/cudaFree for the two largest buffers. */
-            size_t explore_max_comp = gpucompress_max_compressed_size(input_size);
-            uint8_t* d_explore_out = nullptr;
-            uint8_t* d_explore_decomp = nullptr;
-            cudaMalloc(&d_explore_out, explore_max_comp);
-            cudaMalloc(&d_explore_decomp, input_size);
+            /* ---- Parallel exploration: K alternatives on K separate streams ----
+             * Phase 1: launch all K compressions in parallel.
+             * Phase 2: sync all, read sizes, pick winner by ratio.
+             * Phase 3: decompress+verify only the winner (if any). */
 
-            for (int i = 1; i <= K && i < 32; i++) {
+            constexpr int MAX_EXPLORE_K = 8;
+            int actual_K = std::min(K, MAX_EXPLORE_K);
+
+            struct ExploreSlot {
+                int       action;
+                int       algo;             /* gpucompress_algorithm_t */
+                unsigned  preproc;
+                unsigned  shuf_size;
+                bool      has_quant;
+                QuantizationResult quant_result;
+                cudaStream_t       stream;
+                uint8_t*  d_out;            /* compressed output */
+                uint8_t*  d_quant;          /* quantized buffer (owned) */
+                uint8_t*  d_shuf;           /* shuffled buffer (owned) */
+                void*     d_range_min;      /* per-slot quantization range */
+                void*     d_range_max;
+                std::unique_ptr<nvcomp::nvcompManagerBase> comp_mgr;
+                size_t    comp_size;        /* filled after sync */
+                double    ratio;
+                bool      valid;            /* compression succeeded */
+            };
+
+            ExploreSlot slots[MAX_EXPLORE_K];
+            int n_slots = 0;
+            size_t explore_max_comp = gpucompress_max_compressed_size(input_size);
+
+            /* ---- Phase 1: prepare and launch K compressions in parallel ---- */
+            for (int i = 1; i <= actual_K && i < 32; i++) {
                 int alt_action = top_actions[i];
                 if (alt_action == nn_action) continue;
 
                 gpucompress::DecodedAction alt = gpucompress::decodeAction(alt_action);
                 if (alt.use_quantization && cfg.error_bound <= 0.0) continue;
-                gpucompress_algorithm_t alt_algo =
-                    static_cast<gpucompress_algorithm_t>(alt.algorithm + 1);
-                unsigned int alt_preproc = 0;
-                if (alt.shuffle_size > 0)
-                    alt_preproc |= GPUCOMPRESS_PREPROC_SHUFFLE_4;
-                if (alt.use_quantization)
-                    alt_preproc |= GPUCOMPRESS_PREPROC_QUANTIZE;
 
-                /* d_input is caller's device buffer — use directly, no copy */
-                uint8_t* d_alt_input = const_cast<uint8_t*>(static_cast<const uint8_t*>(d_input));
+                ExploreSlot& s = slots[n_slots];
+                memset(&s, 0, sizeof(s));
+                s.action    = alt_action;
+                s.algo      = alt.algorithm + 1;
+                s.shuf_size = (alt.shuffle_size > 0) ? 4 : 0;
+                s.has_quant = alt.use_quantization;
+                s.preproc   = 0;
+                if (s.shuf_size > 0) s.preproc |= GPUCOMPRESS_PREPROC_SHUFFLE_4;
+                if (s.has_quant)     s.preproc |= GPUCOMPRESS_PREPROC_QUANTIZE;
+                s.valid = false;
+
+                /* Create per-slot stream and output buffer */
+                if (cudaStreamCreate(&s.stream) != cudaSuccess) continue;
+                if (cudaMalloc(&s.d_out, explore_max_comp) != cudaSuccess) {
+                    cudaStreamDestroy(s.stream); s.stream = nullptr; continue;
+                }
+
+                /* Per-slot quantization range buffers (8B each) */
+                if (s.has_quant) {
+                    if (cudaMalloc(&s.d_range_min, sizeof(double)) != cudaSuccess ||
+                        cudaMalloc(&s.d_range_max, sizeof(double)) != cudaSuccess) {
+                        cudaFree(s.d_out); cudaStreamDestroy(s.stream);
+                        if (s.d_range_min) cudaFree(s.d_range_min);
+                        continue;
+                    }
+                }
+
+                /* Preprocessing on per-slot stream */
+                uint8_t* d_alt_input = const_cast<uint8_t*>(
+                    static_cast<const uint8_t*>(d_input));
                 size_t alt_compress_size = input_size;
-                uint8_t* d_alt_quant = nullptr;
-                uint8_t* d_alt_shuf = nullptr;
-                QuantizationResult alt_quant_result;
 
-                if ((alt_preproc & GPUCOMPRESS_PREPROC_QUANTIZE) && cfg.error_bound > 0.0) {
+                if (s.has_quant && cfg.error_bound > 0.0) {
                     size_t num_el = input_size / sizeof(float);
                     if (num_el > 0) {
-                        QuantizationConfig qcfg(
-                            QuantizationType::LINEAR, cfg.error_bound,
-                            num_el, sizeof(float));
-                        alt_quant_result = quantize_simple(
-                            d_alt_input, num_el, sizeof(float), qcfg,
-                            ctx->d_range_min, ctx->d_range_max, stream);
-                        if (alt_quant_result.isValid()) {
-                            d_alt_quant = static_cast<uint8_t*>(alt_quant_result.d_quantized);
-                            d_alt_input = d_alt_quant;
-                            alt_compress_size = alt_quant_result.quantized_bytes;
+                        QuantizationConfig qcfg(QuantizationType::LINEAR,
+                            cfg.error_bound, num_el, sizeof(float));
+                        s.quant_result = quantize_simple(d_alt_input, num_el,
+                            sizeof(float), qcfg, s.d_range_min, s.d_range_max,
+                            s.stream);
+                        if (s.quant_result.isValid()) {
+                            s.d_quant = static_cast<uint8_t*>(s.quant_result.d_quantized);
+                            d_alt_input = s.d_quant;
+                            alt_compress_size = s.quant_result.quantized_bytes;
                         }
                     }
                 }
 
-                unsigned int alt_shuf_size = GPUCOMPRESS_GET_SHUFFLE_SIZE(alt_preproc);
-                if (alt_shuf_size > 0) {
-                    uint8_t* shuf = byte_shuffle_simple(
-                        d_alt_input, alt_compress_size, alt_shuf_size,
-                        gpucompress::SHUFFLE_CHUNK_SIZE, stream);
-                    if (shuf) {
-                        d_alt_shuf = shuf;
-                        d_alt_input = d_alt_shuf;
-                    }
+                if (s.shuf_size > 0) {
+                    uint8_t* shuf = byte_shuffle_simple(d_alt_input,
+                        alt_compress_size, s.shuf_size,
+                        gpucompress::SHUFFLE_CHUNK_SIZE, s.stream);
+                    if (shuf) { s.d_shuf = shuf; d_alt_input = shuf; }
                 }
 
-                /* S1 fix: sync removed — compression on same stream as
-                 * preprocessing; GPU ordering ensures completion. */
+                /* Create fresh compression manager on per-slot stream */
+                CompressionAlgorithm alt_internal = gpucompress::toInternalAlgorithm(
+                    static_cast<gpucompress_algorithm_t>(s.algo));
+                s.comp_mgr = createCompressionManager(alt_internal,
+                    gpucompress::DEFAULT_CHUNK_SIZE, s.stream, nullptr);
 
-                /* N1 fix: use cached manager for exploration alternatives */
-                CompressionAlgorithm alt_internal =
-                    gpucompress::toInternalAlgorithm(alt_algo);
-                auto* alt_comp = gpucompress::getCachedCompManager(ctx, alt_internal);
-
-                size_t alt_comp_size = 0;
-
-                if (alt_comp && d_explore_out) {
-                    uint8_t* d_alt_out = d_explore_out;  /* N3 fix: reuse scratch */
+                if (s.comp_mgr) {
                     try {
                         CompressionConfig alt_cc =
-                            alt_comp->configure_compression(alt_compress_size);
-                        size_t alt_max = alt_cc.max_compressed_buffer_size;
-                        if (alt_max <= explore_max_comp) {
-                            float alt_ct_ms = 0.0f;
-
-                            /* S6 fix: removed per-alt event-based timing sync.
-                             * Still need stream sync before reading compressed size —
-                             * get_compressed_output_size reads from device memory. */
-                            alt_comp->compress(d_alt_input, d_alt_out, alt_cc);
-                            cudaStreamSynchronize(stream);
-
-                            alt_comp_size = alt_comp->get_compressed_output_size(d_alt_out);
-
-                            double alt_ratio = static_cast<double>(input_size) /
-                                               static_cast<double>(alt_comp_size);
-
-                            /* Round-trip decompress + PSNR — no per-alt event sync */
-                            double alt_decomp_ms = 0.0;
-                            double alt_psnr = 0.0;
-                            {
-                                {
-                                    auto rt_decomp = createDecompressionManager(d_alt_out, stream);
-                                    if (rt_decomp) {
-                                        DecompressionConfig rt_dc = rt_decomp->configure_decompression(d_alt_out);
-                                        size_t rt_decomp_size = rt_dc.decomp_data_size;
-                                        /* N3 fix: reuse pre-allocated decomp scratch */
-                                        uint8_t* d_rt_decompressed = d_explore_decomp;
-                                        if (d_rt_decompressed && rt_decomp_size <= input_size) {
-                                            try {
-                                                rt_decomp->decompress(d_rt_decompressed, d_alt_out, rt_dc);
-                                            } catch (...) {
-                                                /* N3: d_rt_decompressed is scratch, don't free */
-                                                goto gpu_skip_roundtrip;
-                                            }
-
-                                            uint8_t* d_rt_result = d_rt_decompressed;
-                                            uint8_t* d_rt_unshuf = nullptr;
-                                            if (alt_shuf_size > 0) {
-                                                d_rt_unshuf = byte_unshuffle_simple(
-                                                    d_rt_decompressed, rt_decomp_size,
-                                                    alt_shuf_size, gpucompress::SHUFFLE_CHUNK_SIZE,
-                                                    stream);
-                                                if (d_rt_unshuf) d_rt_result = d_rt_unshuf;
-                                            }
-
-                                            void* d_rt_dequant = nullptr;
-                                            if (d_alt_quant && alt_quant_result.isValid()) {
-                                                QuantizationResult rt_qr;
-                                                rt_qr.scale_factor = alt_quant_result.scale_factor;
-                                                rt_qr.data_min = alt_quant_result.data_min;
-                                                rt_qr.data_max = alt_quant_result.data_max;
-                                                rt_qr.error_bound = alt_quant_result.error_bound;
-                                                rt_qr.type = alt_quant_result.type;
-                                                rt_qr.actual_precision = alt_quant_result.actual_precision;
-                                                rt_qr.num_elements = input_size / sizeof(float);
-                                                rt_qr.original_element_size = sizeof(float);
-                                                rt_qr.d_quantized = d_rt_result;
-                                                rt_qr.quantized_bytes = rt_decomp_size;
-                                                d_rt_dequant = dequantize_simple(d_rt_result, rt_qr, stream);
-                                                if (d_rt_dequant) d_rt_result = static_cast<uint8_t*>(d_rt_dequant);
-                                            }
-
-                                            /* S6 fix: PSNR for lossless alts is trivially 120.
-                                             * For lossy alts, compute from error bound (avoids D→H). */
-                                            if (!d_alt_quant) {
-                                                alt_psnr = 120.0;
-                                            } else {
-                                                double range = alt_quant_result.data_max - alt_quant_result.data_min;
-                                                if (range > 0.0 && alt_quant_result.error_bound > 0.0) {
-                                                    alt_psnr = fmin(20.0 * log10(range / alt_quant_result.error_bound), 120.0);
-                                                } else {
-                                                    alt_psnr = 120.0;
-                                                }
-                                            }
-
-                                            if (d_rt_dequant) cudaFree(d_rt_dequant);
-                                            if (d_rt_unshuf) cudaFree(d_rt_unshuf);
-                                            /* N3: d_rt_decompressed is scratch, freed after loop */
-                                        }
-                                    }
-                                }
-                            }
-                            gpu_skip_roundtrip:
-
-                            explored_samples.push_back({alt_action, alt_ratio,
-                                                        static_cast<double>(alt_ct_ms),
-                                                        alt_decomp_ms, alt_psnr});
-
-                            GC_LOG("[EXPLORE-GPU]   alt %d/%d: action%d (%s%s%s) "
-                                    "ratio=%.3f comp=%.2fms%s\n",
-                                    i, K, alt_action,
-                                    ALGORITHM_NAMES[alt.algorithm + 1],
-                                    alt.shuffle_size > 0 ? "+shuf" : "",
-                                    alt.use_quantization ? "+quant" : "",
-                                    alt_ratio, alt_ct_ms,
-                                    (alt_ratio > best_ratio) ? " << NEW BEST" : "");
-
-                            if (alt_ratio > best_ratio) {
-                                best_ratio = alt_ratio;
-                                nn_action = alt_action;  // update so diagnostics & SGD see the real winner
-                                g_last_nn_action.store(alt_action);
-                                diag_compression_ms = alt_ct_ms;
-
-                                size_t hdr_sz = GPUCOMPRESS_HEADER_SIZE;
-                                size_t alt_total = hdr_sz + alt_comp_size;
-                                if (alt_total <= *output_size) {
-                                    CompressionHeader alt_hdr;
-                                    alt_hdr.magic = COMPRESSION_MAGIC;
-                                    alt_hdr.version = COMPRESSION_HEADER_VERSION;
-                                    alt_hdr.shuffle_element_size = alt_shuf_size;
-                                    alt_hdr.original_size = input_size;
-                                    alt_hdr.compressed_size = alt_comp_size;
-
-                                    if (d_alt_quant && alt_quant_result.isValid()) {
-                                        alt_hdr.setQuantizationFlags(
-                                            static_cast<uint32_t>(alt_quant_result.type),
-                                            alt_quant_result.actual_precision, true);
-                                        alt_hdr.quant_error_bound = alt_quant_result.error_bound;
-                                        alt_hdr.quant_scale = alt_quant_result.scale_factor;
-                                        alt_hdr.data_min = alt_quant_result.data_min;
-                                        alt_hdr.data_max = alt_quant_result.data_max;
-                                    } else {
-                                        alt_hdr.quant_flags = 0;
-                                        alt_hdr.quant_error_bound = 0.0;
-                                        alt_hdr.quant_scale = 0.0;
-                                        alt_hdr.data_min = 0.0;
-                                        alt_hdr.data_max = 0.0;
-                                    }
-                                    alt_hdr.setAlgorithmId((uint8_t)alt_algo);
-
-                                    /* GPU path: write header H→D, payload D→D */
-                                    XFER_TRACK("explore_gpu winner: H->D alt header", sizeof(CompressionHeader), cudaMemcpyHostToDevice);
-                                    cudaMemcpyAsync(d_out, &alt_hdr, sizeof(CompressionHeader),
-                                                    cudaMemcpyHostToDevice, stream);
-                                    XFER_TRACK("explore_gpu winner: D->D alt payload", alt_comp_size, cudaMemcpyDeviceToDevice);
-                                    cudaMemcpyAsync(d_out + hdr_sz, d_alt_out, alt_comp_size,
-                                                    cudaMemcpyDeviceToDevice, stream);
-                                    /* S1 fix: sync removed — final sync at scope exit
-                                     * ensures all stream ops complete before release. */
-                                    *output_size = alt_total;
-                                    total_size = alt_total;
-                                    compressed_size = alt_comp_size;
-                                    actual_ratio = static_cast<double>(input_size) /
-                                                   static_cast<double>(compressed_size);
-                                    algo_to_use = alt_algo;
-                                    preproc_to_use = alt_preproc;
-                                }
-                            }
+                            s.comp_mgr->configure_compression(alt_compress_size);
+                        if (alt_cc.max_compressed_buffer_size <= explore_max_comp) {
+                            s.comp_mgr->compress(d_alt_input, s.d_out, alt_cc);
+                            s.valid = true;
                         }
-                    } catch (...) {
-                        /* Compression failed for this config, skip it */
-                    }
-                    /* N3 fix: d_alt_out is scratch — don't free per-alt */
+                    } catch (...) { /* compression failed, s.valid stays false */ }
                 }
 
-                if (d_alt_quant) cudaFree(d_alt_quant);
-                if (d_alt_shuf) cudaFree(d_alt_shuf);
+                n_slots++;
             }
 
-            /* N3 fix: free exploration scratch buffers after the loop */
-            if (d_explore_out)    cudaFree(d_explore_out);
-            if (d_explore_decomp) cudaFree(d_explore_decomp);
+            /* ---- Phase 2: sync all streams, read sizes, pick winner ---- */
+            for (int k = 0; k < n_slots; k++) {
+                ExploreSlot& s = slots[k];
+                if (!s.valid) continue;
+
+                cudaStreamSynchronize(s.stream);
+                s.comp_size = s.comp_mgr->get_compressed_output_size(s.d_out);
+                s.ratio = static_cast<double>(input_size) /
+                          static_cast<double>(s.comp_size);
+
+                /* PSNR: analytical from error bound (no D→H needed) */
+                double alt_psnr = 120.0;
+                if (s.has_quant && s.quant_result.isValid()) {
+                    double range = s.quant_result.data_max - s.quant_result.data_min;
+                    if (range > 0.0 && s.quant_result.error_bound > 0.0)
+                        alt_psnr = fmin(20.0 * log10(range / s.quant_result.error_bound), 120.0);
+                }
+
+                explored_samples.push_back({s.action, s.ratio, 0.0, 0.0, alt_psnr});
+
+                GC_LOG("[EXPLORE-GPU]   slot %d: action%d ratio=%.3f%s\n",
+                        k, s.action, s.ratio,
+                        (s.ratio > best_ratio) ? " << NEW BEST" : "");
+
+                if (s.ratio > best_ratio) {
+                    best_ratio = s.ratio;
+                    nn_action = s.action;
+                    g_last_nn_action.store(s.action);
+
+                    /* Write winner to output */
+                    size_t hdr_sz = GPUCOMPRESS_HEADER_SIZE;
+                    size_t alt_total = hdr_sz + s.comp_size;
+                    if (alt_total <= *output_size) {
+                        CompressionHeader alt_hdr;
+                        alt_hdr.magic = COMPRESSION_MAGIC;
+                        alt_hdr.version = COMPRESSION_HEADER_VERSION;
+                        alt_hdr.shuffle_element_size = s.shuf_size;
+                        alt_hdr.original_size = input_size;
+                        alt_hdr.compressed_size = s.comp_size;
+
+                        if (s.d_quant && s.quant_result.isValid()) {
+                            alt_hdr.setQuantizationFlags(
+                                static_cast<uint32_t>(s.quant_result.type),
+                                s.quant_result.actual_precision, true);
+                            alt_hdr.quant_error_bound = s.quant_result.error_bound;
+                            alt_hdr.quant_scale = s.quant_result.scale_factor;
+                            alt_hdr.data_min = s.quant_result.data_min;
+                            alt_hdr.data_max = s.quant_result.data_max;
+                        } else {
+                            alt_hdr.quant_flags = 0;
+                            alt_hdr.quant_error_bound = 0.0;
+                            alt_hdr.quant_scale = 0.0;
+                            alt_hdr.data_min = 0.0;
+                            alt_hdr.data_max = 0.0;
+                        }
+                        alt_hdr.setAlgorithmId((uint8_t)s.algo);
+
+                        /* Copy winner to output on ctx->stream (sync with caller) */
+                        cudaMemcpyAsync(d_out, &alt_hdr, sizeof(CompressionHeader),
+                                        cudaMemcpyHostToDevice, stream);
+                        cudaMemcpyAsync(d_out + hdr_sz, s.d_out, s.comp_size,
+                                        cudaMemcpyDeviceToDevice, stream);
+                        *output_size = alt_total;
+                        total_size = alt_total;
+                        compressed_size = s.comp_size;
+                        actual_ratio = s.ratio;
+                        algo_to_use = static_cast<gpucompress_algorithm_t>(s.algo);
+                        preproc_to_use = s.preproc;
+                    }
+                }
+            }
+
+            /* ---- Phase 3: cleanup per-slot resources ---- */
+            for (int k = 0; k < n_slots; k++) {
+                ExploreSlot& s = slots[k];
+                s.comp_mgr.reset();  /* release manager before destroying stream */
+                if (s.d_quant)     cudaFree(s.d_quant);
+                if (s.d_shuf)      cudaFree(s.d_shuf);
+                if (s.d_out)       cudaFree(s.d_out);
+                if (s.d_range_min) cudaFree(s.d_range_min);
+                if (s.d_range_max) cudaFree(s.d_range_max);
+                if (s.stream)      cudaStreamDestroy(s.stream);
+            }
         }
 
         if (exploration_triggered) {
