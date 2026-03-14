@@ -79,7 +79,8 @@ begin_globals {
 
     // Buffers for benchmark
     float*             d_read;            // GPU read-back buffer
-    unsigned long long* d_count;          // GPU mismatch counter
+    float*             h_orig;            // Host buffer for verification
+    float*             h_read;            // Host buffer for verification
 };
 
 // ============================================================
@@ -157,7 +158,9 @@ struct PhaseResult {
     int    sgd_fires;
     int    explorations;
     int    n_chunks;
-    double mape_pct;
+    double mape_ratio_pct;
+    double mape_comp_pct;
+    double mape_decomp_pct;
     double stats_ms;
     double nn_ms;
     double preproc_ms;
@@ -206,30 +209,25 @@ static hid_t make_dcpl_auto(hsize_t chunk_floats, double eb = 0.0)
 }
 
 // ============================================================
-// GPU-side byte-exact comparison
+// Bitwise comparison (D→H copy then CPU compare)
+// VPIC deck is compiled through VPIC's .cxx wrapper which does
+// not support __global__ kernels, so we compare on the host.
 // ============================================================
-__global__ void count_mismatches_kernel(const float * __restrict__ a,
-                                        const float * __restrict__ b,
-                                        size_t n,
-                                        unsigned long long *count)
+static unsigned long long host_compare(const float* d_a, const float* d_b,
+                                       float* h_a, float* h_b,
+                                       size_t n_floats)
 {
-    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned long long local = 0;
-    for (; i < n; i += (size_t)gridDim.x * blockDim.x)
-        if (a[i] != b[i]) local++;
-    atomicAdd(count, local);
-}
-
-static unsigned long long gpu_compare(const float *a, const float *b,
-                                      size_t n_floats,
-                                      unsigned long long *d_count)
-{
-    cudaMemset(d_count, 0, sizeof(unsigned long long));
-    count_mismatches_kernel<<<512, 256>>>(a, b, n_floats, d_count);
-    cudaDeviceSynchronize();
-    unsigned long long h_count = 0;
-    cudaMemcpy(&h_count, d_count, sizeof(h_count), cudaMemcpyDeviceToHost);
-    return h_count;
+    size_t bytes = n_floats * sizeof(float);
+    cudaMemcpy(h_a, d_a, bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_b, d_b, bytes, cudaMemcpyDeviceToHost);
+    unsigned long long mm = 0;
+    for (size_t i = 0; i < n_floats; i++) {
+        unsigned int ua, ub;
+        memcpy(&ua, &h_a[i], sizeof(unsigned int));
+        memcpy(&ub, &h_b[i], sizeof(unsigned int));
+        if (ua != ub) mm++;
+    }
+    return mm;
 }
 
 // ============================================================
@@ -237,7 +235,7 @@ static unsigned long long gpu_compare(const float *a, const float *b,
 // ============================================================
 static int run_phase(const char* phase_name, const char* tmp_file,
                      float* d_data, float* d_read,
-                     unsigned long long* d_count,
+                     float* h_a, float* h_b,
                      size_t n_floats, int n_chunks, hid_t dcpl,
                      PhaseResult* r)
 {
@@ -291,14 +289,14 @@ static int run_phase(const char* phase_name, const char* tmp_file,
 
     if (rret < 0) { fprintf(stderr, "  [%s] H5Dread failed\n", phase_name); return 1; }
 
-    // GPU bitwise verify
-    unsigned long long mm = gpu_compare(d_data, d_read, n_floats, d_count);
+    // Bitwise verify (D→H then CPU compare; VPIC .cxx can't use __global__)
+    unsigned long long mm = host_compare(d_data, d_read, h_a, h_b, n_floats);
 
     // Collect per-chunk diagnostics and write to CSV
     int sgd_fires    = 0;
     int explorations = 0;
-    double ape_sum   = 0.0;
-    int    ape_cnt   = 0;
+    double ape_ratio_sum = 0.0, ape_comp_sum = 0.0, ape_decomp_sum = 0.0;
+    int    ape_ratio_cnt = 0,   ape_comp_cnt = 0,   ape_decomp_cnt = 0;
     double total_stats_ms   = 0.0;
     double total_nn_ms      = 0.0;
     double total_preproc_ms = 0.0;
@@ -336,9 +334,19 @@ static int run_phase(const char* phase_name, const char* tmp_file,
             total_explore_ms += d.exploration_ms;
             total_sgd_ms     += d.sgd_update_ms;
             if (d.predicted_ratio > 0 && d.actual_ratio > 0) {
-                ape_sum += fabs(d.predicted_ratio - d.actual_ratio)
-                           / d.actual_ratio;
-                ape_cnt++;
+                ape_ratio_sum += fabs(d.predicted_ratio - d.actual_ratio)
+                                 / d.actual_ratio * 100.0;
+                ape_ratio_cnt++;
+            }
+            if (d.compression_ms > 0) {
+                ape_comp_sum += fabs(d.predicted_comp_time - d.compression_ms)
+                                / d.compression_ms * 100.0;
+                ape_comp_cnt++;
+            }
+            if (d.decompression_ms > 0) {
+                ape_decomp_sum += fabs(d.predicted_decomp_time - d.decompression_ms)
+                                  / d.decompression_ms * 100.0;
+                ape_decomp_cnt++;
             }
             char final_str[40], orig_str[40];
             action_to_str(d.nn_action, final_str, sizeof(final_str));
@@ -393,7 +401,9 @@ static int run_phase(const char* phase_name, const char* tmp_file,
     r->sgd_fires    = sgd_fires;
     r->explorations = explorations;
     r->n_chunks     = n_chunks;
-    r->mape_pct     = (ape_cnt > 0) ? 100.0 * ape_sum / ape_cnt : 0.0;
+    r->mape_ratio_pct  = (ape_ratio_cnt > 0) ? ape_ratio_sum / ape_ratio_cnt : 0.0;
+    r->mape_comp_pct   = (ape_comp_cnt > 0) ? ape_comp_sum / ape_comp_cnt : 0.0;
+    r->mape_decomp_pct = (ape_decomp_cnt > 0) ? ape_decomp_sum / ape_decomp_cnt : 0.0;
     r->stats_ms     = total_stats_ms;
     r->nn_ms        = total_nn_ms;
     r->preproc_ms   = total_preproc_ms;
@@ -565,7 +575,8 @@ begin_initialization {
     // ---- GPUCompress + HDF5 VOL initialization ----
     global->gpucompress_ready = 0;
     global->d_read    = NULL;
-    global->d_count   = NULL;
+    global->h_orig    = NULL;
+    global->h_read    = NULL;
 
     const char* weights_path = getenv("GPUCOMPRESS_WEIGHTS");
     gpucompress_error_t gerr = gpucompress_init(weights_path);
@@ -610,9 +621,10 @@ begin_initialization {
     sim_log("  Weights  : " << (weights_path ? weights_path : "(none, fallback to LZ4)"));
     sim_log("  NN loaded: " << (gpucompress_nn_is_loaded() ? "yes" : "no"));
 
-    // Allocate GPU read-back buffer and mismatch counter
+    // Allocate GPU read-back buffer and host verification buffers
     cudaMalloc(&global->d_read, field_bytes);
-    cudaMalloc(&global->d_count, sizeof(unsigned long long));
+    global->h_orig = (float*)malloc(field_bytes);
+    global->h_read = (float*)malloc(field_bytes);
 };
 
 // ============================================================
@@ -673,7 +685,7 @@ begin_diagnostics {
     {
         hid_t dcpl = make_dcpl_nocomp((hsize_t)chunk_floats);
         int rc = run_phase("no-comp", TMP_NOCOMP,
-                           d_fields, global->d_read, global->d_count,
+                           d_fields, global->d_read, global->h_orig, global->h_read,
                            n_floats, n_chunks, dcpl, &results[n_phases]);
         H5Pclose(dcpl);
         if (rc) any_fail = 1;
@@ -689,7 +701,7 @@ begin_diagnostics {
     {
         hid_t dcpl = make_dcpl_auto((hsize_t)chunk_floats, diag_error_bound);
         int rc = run_phase("nn", TMP_NN,
-                           d_fields, global->d_read, global->d_count,
+                           d_fields, global->d_read, global->h_orig, global->h_read,
                            n_floats, n_chunks, dcpl, &results[n_phases]);
         H5Pclose(dcpl);
         if (rc) any_fail = 1;
@@ -706,7 +718,7 @@ begin_diagnostics {
     {
         hid_t dcpl = make_dcpl_auto((hsize_t)chunk_floats, diag_error_bound);
         int rc = run_phase("nn-rl", TMP_NN_RL,
-                           d_fields, global->d_read, global->d_count,
+                           d_fields, global->d_read, global->h_orig, global->h_read,
                            n_floats, n_chunks, dcpl, &results[n_phases]);
         H5Pclose(dcpl);
         gpucompress_disable_online_learning();
@@ -730,7 +742,7 @@ begin_diagnostics {
     {
         hid_t dcpl = make_dcpl_auto((hsize_t)chunk_floats, diag_error_bound);
         int rc = run_phase("nn-rl+exp50", TMP_NN_RLEXP,
-                           d_fields, global->d_read, global->d_count,
+                           d_fields, global->d_read, global->h_orig, global->h_read,
                            n_floats, n_chunks, dcpl, &results[n_phases]);
         H5Pclose(dcpl);
         gpucompress_disable_online_learning();
@@ -756,11 +768,11 @@ begin_diagnostics {
 
     for (int i = 0; i < n_phases; i++) {
         if (strncmp(results[i].phase, "nn", 2) == 0 && results[i].n_chunks > 0) {
-            printf("\n  %-14s SGD fired: %d/%d chunks  Explorations: %d/%d chunks  MAPE: %.1f%%\n",
+            printf("\n  %-14s SGD: %d/%d  Expl: %d/%d  MAPE: ratio=%.1f%% comp=%.1f%% decomp=%.1f%%\n",
                    results[i].phase,
                    results[i].sgd_fires,   results[i].n_chunks,
                    results[i].explorations, results[i].n_chunks,
-                   results[i].mape_pct);
+                   results[i].mape_ratio_pct, results[i].mape_comp_pct, results[i].mape_decomp_pct);
         }
     }
 
@@ -816,17 +828,17 @@ begin_diagnostics {
         if (csv) {
             fprintf(csv, "source,phase,write_ms,read_ms,file_mib,orig_mib,ratio,"
                          "write_mibps,read_mibps,mismatches,sgd_fires,explorations,n_chunks,"
-                         "mean_prediction_error_pct\n");
+                         "mape_ratio_pct,mape_comp_pct,mape_decomp_pct\n");
             for (int i = 0; i < n_phases; i++) {
                 PhaseResult* rr = &results[i];
                 fprintf(csv, "vpic,%s,%.2f,%.2f,%.2f,%.2f,%.4f,"
-                             "%.1f,%.1f,%llu,%d,%d,%d,%.2f\n",
+                             "%.1f,%.1f,%llu,%d,%d,%d,%.2f,%.2f,%.2f\n",
                         rr->phase, rr->write_ms, rr->read_ms,
                         (double)rr->file_bytes / (1 << 20),
                         (double)rr->orig_bytes / (1 << 20), rr->ratio,
                         rr->write_mbps, rr->read_mbps,
                         rr->mismatches, rr->sgd_fires, rr->explorations, rr->n_chunks,
-                        rr->mape_pct);
+                        rr->mape_ratio_pct, rr->mape_comp_pct, rr->mape_decomp_pct);
             }
             fclose(csv);
         }
@@ -840,9 +852,11 @@ begin_diagnostics {
 
     // Cleanup
     cudaFree(global->d_read);
-    cudaFree(global->d_count);
+    free(global->h_orig);
+    free(global->h_read);
     global->d_read  = NULL;
-    global->d_count = NULL;
+    global->h_orig  = NULL;
+    global->h_read  = NULL;
 
     gpucompress_vpic_destroy(global->vpic_fields_h);
     H5Pclose(global->vol_fapl);

@@ -246,7 +246,9 @@ typedef struct {
     int    sgd_fires;
     int    explorations;
     int    n_chunks;
-    double mape_pct;
+    double mape_ratio_pct;
+    double mape_comp_pct;
+    double mape_decomp_pct;
     /* Per-component GPU-time (cumulative across chunks) */
     double nn_ms;
     double stats_ms;
@@ -353,7 +355,9 @@ static int run_phase_nocomp(float *d_v, float *d_read,
     r->sgd_fires   = 0;
     r->explorations = 0;
     r->n_chunks    = n_chunks;
-    r->mape_pct    = 0.0;
+    r->mape_ratio_pct  = 0.0;
+    r->mape_comp_pct   = 0.0;
+    r->mape_decomp_pct = 0.0;
     snprintf(r->phase, sizeof(r->phase), "no-comp");
 
     printf("[no-comp] ratio=%.2fx  write=%.0f MiB/s  read=%.0f MiB/s  "
@@ -510,12 +514,12 @@ static int run_phase_vol(float *d_v, float *d_read,
     r->sgd_fires   = sgd_fires;
     r->explorations = explorations;
     r->n_chunks    = n_chunks;
-    r->mape_pct    = (ape_ratio_cnt > 0) ? ape_ratio_sum / ape_ratio_cnt : 0.0;
+    r->mape_ratio_pct  = (ape_ratio_cnt > 0) ? ape_ratio_sum / ape_ratio_cnt : 0.0;
+    r->mape_comp_pct   = (ape_comp_cnt > 0) ? ape_comp_sum / ape_comp_cnt : 0.0;
+    r->mape_decomp_pct = (ape_decomp_cnt > 0) ? ape_decomp_sum / ape_decomp_cnt : 0.0;
 
     printf("\n  MAPE avg:  ratio=%.1f%%  comp_time=%.1f%%  decomp_time=%.1f%%\n",
-           r->mape_pct,
-           (ape_comp_cnt > 0) ? ape_comp_sum / ape_comp_cnt : 0.0,
-           (ape_decomp_cnt > 0) ? ape_decomp_sum / ape_decomp_cnt : 0.0);
+           r->mape_ratio_pct, r->mape_comp_pct, r->mape_decomp_pct);
     r->nn_ms       = total_nn_ms;
     r->stats_ms    = total_stats_ms;
     r->preproc_ms  = total_preproc_ms;
@@ -568,19 +572,19 @@ static void write_aggregate_csv(PhaseResult *res, int n_phases,
     fprintf(f, "phase,L,steps,F,k,chunk_z,n_chunks,"
                "sim_ms,write_ms,read_ms,file_mib,orig_mib,ratio,"
                "write_mibps,read_mibps,mismatches,sgd_fires,explorations,"
-               "mean_prediction_error_pct\n");
+               "mape_ratio_pct,mape_comp_pct,mape_decomp_pct\n");
     for (int i = 0; i < n_phases; i++) {
         PhaseResult *r = &res[i];
         fprintf(f, "%s,%d,%d,%.4f,%.5f,%d,%d,"
                    "%.2f,%.2f,%.2f,%.2f,%.2f,%.4f,"
-                   "%.1f,%.1f,%llu,%d,%d,%.2f\n",
+                   "%.1f,%.1f,%llu,%d,%d,%.2f,%.2f,%.2f\n",
                 r->phase, L, steps, F, k, chunk_z, r->n_chunks,
                 r->sim_ms, r->write_ms, r->read_ms,
                 (double)r->file_bytes / (1 << 20),
                 (double)r->orig_bytes / (1 << 20), r->ratio,
                 r->write_mbps, r->read_mbps,
                 r->mismatches, r->sgd_fires, r->explorations,
-                r->mape_pct);
+                r->mape_ratio_pct, r->mape_comp_pct, r->mape_decomp_pct);
     }
     fclose(f);
     printf("\nAggregate CSV written to: %s\n", OUT_CSV);
@@ -667,12 +671,11 @@ static void print_summary(PhaseResult *res, int n_phases,
     /* NN phase SGD/exploration summary */
     for (int i = 0; i < n_phases; i++) {
         if (strncmp(res[i].phase, "nn", 2) == 0 && res[i].n_chunks > 0) {
-            printf("\n  %-14s SGD fired: %d/%d chunks  Explorations: %d/%d chunks  MAPE: %.1f%%",
+            printf("\n  %-14s SGD: %d/%d  Expl: %d/%d  MAPE: ratio=%.1f%% comp=%.1f%% decomp=%.1f%%\n",
                    res[i].phase,
                    res[i].sgd_fires,   res[i].n_chunks,
                    res[i].explorations, res[i].n_chunks,
-                   res[i].mape_pct);
-            printf("\n");
+                   res[i].mape_ratio_pct, res[i].mape_comp_pct, res[i].mape_decomp_pct);
         }
     }
 
