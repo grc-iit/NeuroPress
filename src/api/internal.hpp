@@ -57,6 +57,21 @@ struct CompContext {
     void* d_range_max;
 
     static constexpr int N_COMP_ALGOS = 8;
+
+    /* LRU-3 nvcomp manager cache — up to 3 managers per slot.
+     * Raw pointers: CompContext is memset-zeroed in initCompContextPool(),
+     * which would corrupt non-trivial dtors (unique_ptr).
+     * Deleted safely in destroyCompContextSlot() after cudaStreamSynchronize.
+     *
+     * comp_mgr[i]      : cached nvcomp manager (nullptr = empty slot)
+     * comp_mgr_algo[i] : CompressionAlgorithm index (0-7), or -1 = empty
+     * comp_mgr_tick[i] : access recency (higher = more recent)
+     * comp_mgr_clock   : monotonic tick counter for LRU eviction */
+    static constexpr int LRU_DEPTH = 3;
+    nvcomp::nvcompManagerBase* comp_mgr[LRU_DEPTH];
+    int                        comp_mgr_algo[LRU_DEPTH];
+    int                        comp_mgr_tick[LRU_DEPTH];
+    int                        comp_mgr_clock;
 };
 
 /** Runtime verbose-logging flag — set via gpucompress_set_verbose(). */
@@ -301,8 +316,13 @@ void         releaseCompContext(CompContext*);
 void         syncAllCompContextStreams();
 
 /** Create a fresh compression manager for this context+algorithm.
- *  Caller owns the returned unique_ptr. */
+ *  Caller owns the returned unique_ptr.  Used for exploration alternatives. */
 std::unique_ptr<nvcomp::nvcompManagerBase> createCompManagerForCtx(CompContext* ctx, CompressionAlgorithm algo);
+
+/** LRU-3: return a cached manager if algo is in the 3-deep cache, else evict
+ *  the least-recently-used entry and create a new one.  Thread-safe because
+ *  each CompContext is exclusively owned by one thread at a time. */
+nvcomp::nvcompManagerBase* getOrCreateCompManager(CompContext* ctx, CompressionAlgorithm algo);
 
 /* ============================================================
  * Context-aware inference / SGD overloads (used by pool)

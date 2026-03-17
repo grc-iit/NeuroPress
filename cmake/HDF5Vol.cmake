@@ -87,6 +87,7 @@ add_vol_test(test_vol_nn_predictions         tests/hdf5/test_vol_nn_predictions.
 add_vol_test(test_nn_vol_correctness         tests/hdf5/test_nn_vol_correctness.cu)
 add_vol_test(test_hdf5_compat                tests/hdf5/test_hdf5_compat.cu)
 target_link_libraries(test_hdf5_compat PRIVATE H5Zgpucompress)
+add_vol_test(test_lru1_manager_cache         tests/hdf5/test_lru1_manager_cache.cu)
 
 # ============================================================
 # VOL Regression Tests

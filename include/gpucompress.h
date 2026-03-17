@@ -651,6 +651,24 @@ gpucompress_algorithm_t gpucompress_algorithm_from_string(const char* name);
  */
 const char* gpucompress_version(void);
 
+/* ============================================================
+ * nvcomp Manager Cache Statistics
+ * ============================================================ */
+
+/**
+ * Reset the nvcomp manager cache hit/miss counters to zero.
+ * Call before a benchmark or test to get clean counts.
+ */
+void gpucompress_reset_cache_stats(void);
+
+/**
+ * Read the nvcomp manager cache hit/miss counters.
+ * A "hit" means an existing cached manager was reused (zero alloc).
+ * A "miss" means a new manager was created (workspace alloc on GPU).
+ * Any pointer may be NULL if that value is not needed.
+ */
+void gpucompress_get_cache_stats(int *hits, int *misses);
+
 #ifdef __cplusplus
 }
 #endif

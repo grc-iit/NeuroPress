@@ -1,0 +1,276 @@
+######### Build Details ##########
+# VPIC Git Hash: c27edaadda2bea58729b3fa59d89be3e128d7455
+# Built on: 2026-03-05T10:27:52
+## CMake options ##
+# ENABLE_INTEGRATED_TESTS: OFF
+# ENABLE_UNIT_TESTS: OFF
+# USE_V4_ALTIVEC: OFF
+# USE_V4_PORTABLE: OFF
+# USE_V4_SSE: OFF
+# ENABLE_OPENSSL: OFF
+# ENABLE_KOKKOS_OPENMP: OFF
+# ENABLE_KOKKOS_CUDA: ON
+# BUILD_INTERNAL_KOKKOS: OFF
+# VPIC_DUMP_ENERGIES: OFF
+# VPIC_ENABLE_AUTO_TUNING: ON
+# NOTE: Auto tuning may have overwritten what CMake set these as.
+# VPIC_ENABLE_HIERARCHICAL: OFF
+# VPIC_ENABLE_TEAM_REDUCTION: OFF
+# VPIC_ENABLE_VECTORIZATION: OFF
+# VPIC_ENABLE_ACCUMULATOR: OFF
+# Using sort method: strided_sort
+######### End Build Details ########
+
+NN: Loaded 19076 parameters from /u/imuradli/GPUCompress/neural_net/weights/model.nnwt (74.8 KB on GPU)
+######### Run Details ##########
+# MPI Ranks: 1
+# Threads: 1
+## Global:
+  # Num Step 101
+  # px 1 py 1 pz 1
+  # gnx 200 gny 200 gnz 200
+  # dx 0.4 dy 0.4 dz 0.4
+  # dt 0.101823 cvac 1 eps0 1
+## Local:
+  # nx 200 ny 200 nz 200
+## Local Particle Species: 2
+  # electron np 8000000 max_np 12000000
+  # ion np 8000000 max_np 12000000
+######### End Run Details ######
+
+  [no-comp] H5Dwrite (GPU ptr, VOL)... 690 ms
+  [no-comp] H5Dread (GPU ptr, VOL)... 651 ms
+  [no-comp] ratio=1.00x  write=729 MiB/s  read=773 MiB/s  file=504 MiB  sgd=0 expl=0/0  mismatches=0
+  [no-comp] Overhead breakdown (0 chunks, write=690.0 ms, total GPU-time=0.0 ms):
+    Stats compute:      0.0 ms  ( 0.0% of GPU-time)
+    NN inference :      0.0 ms  ( 0.0% of GPU-time)
+    Preprocessing:      0.0 ms  ( 0.0% of GPU-time)
+    Compression  :      0.0 ms  ( 0.0% of GPU-time)
+    Exploration  :      0.0 ms  ( 0.0% of GPU-time)
+    SGD update   :      0.0 ms  ( 0.0% of GPU-time)
+  [nn] H5Dwrite (GPU ptr, VOL)... 315 ms
+  [nn] H5Dread (GPU ptr, VOL)... 184 ms
+    chunk | action (final)       | action (orig)        | ratio  | pred   | MAPE   | sgd | expl
+    ------+----------------------+----------------------+--------+--------+--------+-----+-----
+        1 | bitcomp              | bitcomp              |  1.07x |  2.71x | 153.2% |   - |   -
+        2 | bitcomp              | bitcomp              |  1.06x |  2.42x | 127.4% |   - |   -
+        3 | bitcomp              | bitcomp              |  1.05x |  2.57x | 144.6% |   - |   -
+        4 | bitcomp              | bitcomp              |  1.05x |  2.48x | 136.4% |   - |   -
+        5 | bitcomp              | bitcomp              |  1.05x |  2.53x | 141.0% |   - |   -
+        6 | bitcomp              | bitcomp              |  1.05x |  2.38x | 126.8% |   - |   -
+        7 | bitcomp              | bitcomp              |  1.04x |  2.23x | 113.9% |   - |   -
+        8 | bitcomp              | bitcomp              |  1.05x |  2.25x | 114.4% |   - |   -
+        9 | bitcomp              | bitcomp              |  1.04x |  2.35x | 125.9% |   - |   -
+       10 | bitcomp              | bitcomp              |  1.05x |  2.35x | 123.4% |   - |   -
+       11 | bitcomp              | bitcomp              |  1.05x |  2.35x | 124.5% |   - |   -
+       12 | bitcomp              | bitcomp              |  1.04x |  2.41x | 131.1% |   - |   -
+       13 | bitcomp              | bitcomp              |  1.04x |  2.51x | 140.6% |   - |   -
+       14 | bitcomp              | bitcomp              |  1.04x |  2.40x | 129.3% |   - |   -
+       15 | cascaded             | cascaded             |  1.24x | 25.10x | 1926.5% |   - |   -
+       16 | cascaded             | cascaded             |  1.20x |  2.98x | 148.9% |   - |   -
+       17 | cascaded             | cascaded             |  1.21x | 20.54x | 1601.4% |   - |   -
+       18 | cascaded             | cascaded             |  1.23x | 25.12x | 1936.2% |   - |   -
+       19 | cascaded             | cascaded             |  1.24x | 26.55x | 2047.3% |   - |   -
+       20 | bitcomp              | bitcomp              |  1.04x |  2.18x | 109.0% |   - |   -
+       21 | bitcomp              | bitcomp              |  1.05x |  2.23x | 112.4% |   - |   -
+       22 | bitcomp              | bitcomp              |  1.04x |  2.18x | 109.3% |   - |   -
+       23 | bitcomp              | bitcomp              |  1.05x |  2.13x | 104.1% |   - |   -
+       24 | cascaded             | cascaded             |  1.40x |  2.20x |  56.5% |   - |   -
+       25 | cascaded             | cascaded             |  1.94x | 20.79x | 972.3% |   - |   -
+       26 | cascaded             | cascaded             |  1.94x | 20.74x | 969.9% |   - |   -
+       27 | cascaded             | cascaded             |  1.93x | 20.84x | 982.3% |   - |   -
+       28 | cascaded             | cascaded             |  1.51x | 29.74x | 1871.5% |   - |   -
+       29 | cascaded             | cascaded             |  1.23x |  2.71x | 119.5% |   - |   -
+       30 | cascaded             | cascaded             |  1.23x |  2.70x | 118.4% |   - |   -
+       31 | cascaded             | cascaded             |  1.23x |  2.70x | 120.0% |   - |   -
+       32 | cascaded             | cascaded             |  1.22x |  6.08x | 397.7% |   - |   -
+       33 | bitcomp              | bitcomp              |  1.05x |  2.16x | 106.6% |   - |   -
+       34 | bitcomp              | bitcomp              |  1.05x |  2.29x | 118.0% |   - |   -
+       35 | bitcomp              | bitcomp              |  1.05x |  2.16x | 106.3% |   - |   -
+       36 | bitcomp              | bitcomp              |  1.07x |  2.84x | 164.9% |   - |   -
+       37 | bitcomp              | bitcomp              |  1.06x |  2.50x | 136.7% |   - |   -
+       38 | bitcomp              | bitcomp              |  1.06x |  2.49x | 135.2% |   - |   -
+       39 | bitcomp              | bitcomp              |  1.06x |  2.33x | 121.1% |   - |   -
+       40 | bitcomp              | bitcomp              |  1.07x |  2.72x | 154.2% |   - |   -
+       41 | bitcomp              | bitcomp              |  1.04x |  2.19x | 110.7% |   - |   -
+       42 | bitcomp              | bitcomp              |  1.04x |  2.15x | 106.3% |   - |   -
+       43 | bitcomp              | bitcomp              |  1.04x |  2.07x |  99.0% |   - |   -
+       44 | cascaded             | cascaded             |  3.65x | 26.68x | 631.2% |   - |   -
+       45 | cascaded             | cascaded             |  8.35x | 41.36x | 395.6% |   - |   -
+       46 | cascaded             | cascaded             |  8.35x | 42.60x | 410.1% |   - |   -
+       47 | cascaded             | cascaded             |  8.34x | 41.93x | 402.7% |   - |   -
+       48 | cascaded             | cascaded             |  7.24x | 28.05x | 287.4% |   - |   -
+       49 | cascaded             | cascaded             |  6.93x | 23.47x | 238.8% |   - |   -
+       50 | cascaded             | cascaded             |  6.91x | 22.37x | 223.7% |   - |   -
+       51 | cascaded             | cascaded             |  6.90x | 23.24x | 236.8% |   - |   -
+       52 | cascaded             | cascaded             |  7.20x | 38.15x | 429.9% |   - |   -
+       53 | cascaded             | cascaded             |  7.11x | 36.98x | 420.4% |   - |   -
+       54 | cascaded             | cascaded             |  7.11x | 35.68x | 402.2% |   - |   -
+       55 | cascaded             | cascaded             |  7.08x | 34.83x | 391.7% |   - |   -
+       56 | cascaded             | cascaded             |  7.20x | 35.92x | 398.9% |   - |   -
+       57 | cascaded             | cascaded             |  7.07x | 26.32x | 272.2% |   - |   -
+       58 | cascaded             | cascaded             |  7.08x | 26.68x | 276.7% |   - |   -
+       59 | cascaded             | cascaded             |  7.30x | 37.92x | 419.2% |   - |   -
+       60 | cascaded             | cascaded             |  6.67x | 19.19x | 187.7% |   - |   -
+       61 | cascaded             | cascaded             |  6.66x | 18.58x | 179.0% |   - |   -
+       62 | cascaded             | cascaded             |  6.69x | 19.33x | 189.2% |   - |   -
+       63 | cascaded             | cascaded             |  6.65x | 18.50x | 178.3% |   - |   -
+  [nn] ratio=1.54x  write=1595 MiB/s  read=2739 MiB/s  file=326 MiB  sgd=0 expl=0/63  mismatches=0
+  [nn] Overhead breakdown (63 chunks, write=315.4 ms, total GPU-time=171.3 ms):
+    Stats compute:     32.1 ms  (18.8% of GPU-time)
+    NN inference :     25.6 ms  (15.0% of GPU-time)
+    Preprocessing:      0.0 ms  ( 0.0% of GPU-time)
+    Compression  :    113.5 ms  (66.3% of GPU-time)
+    Exploration  :      0.0 ms  ( 0.0% of GPU-time)
+    SGD update   :      0.0 ms  ( 0.0% of GPU-time)
+  [nn-rl] H5Dwrite (GPU ptr, VOL)... 285 ms
+  [nn-rl] H5Dread (GPU ptr, VOL)... 178 ms
+    chunk | action (final)       | action (orig)        | ratio  | pred   | MAPE   | sgd | expl
+    ------+----------------------+----------------------+--------+--------+--------+-----+-----
+        1 | bitcomp              | bitcomp              |  1.06x |  2.42x | 127.4% | yes |   -
+        2 | bitcomp              | bitcomp              |  1.05x |  2.38x | 126.8% | yes |   -
+        3 | bitcomp              | bitcomp              |  1.05x |  2.48x | 136.4% | yes |   -
+        4 | bitcomp              | bitcomp              |  1.04x |  2.23x | 113.9% | yes |   -
+        5 | bitcomp              | bitcomp              |  1.05x |  2.57x | 144.6% | yes |   -
+        6 | bitcomp              | bitcomp              |  1.05x |  2.53x | 141.0% | yes |   -
+        7 | bitcomp              | bitcomp              |  1.05x |  2.25x | 114.4% | yes |   -
+        8 | bitcomp              | bitcomp              |  1.07x |  2.71x | 153.2% | yes |   -
+        9 | bitcomp              | bitcomp              |  1.06x |  1.51x |  42.6% |   - |   -
+       10 | cascaded             | cascaded             |  1.17x |  1.15x |   1.9% | yes |   -
+       11 | cascaded             | cascaded             |  1.17x |  1.05x |  10.2% | yes |   -
+       12 | cascaded             | cascaded             |  1.17x |  1.06x |  10.1% | yes |   -
+       13 | cascaded             | cascaded             |  1.24x |  7.31x | 490.0% | yes |   -
+       14 | cascaded             | cascaded             |  1.23x |  5.98x | 384.4% | yes |   -
+       15 | cascaded             | cascaded             |  1.21x |  1.75x |  45.3% |   - |   -
+       16 | cascaded             | cascaded             |  1.24x |  2.43x |  96.7% | yes |   -
+       17 | cascaded+shuf        | cascaded+shuf        |  1.15x |  0.57x |  50.3% | yes |   -
+       18 | cascaded+shuf        | cascaded+shuf        |  1.15x |  0.58x |  49.3% | yes |   -
+       19 | cascaded             | cascaded             |  1.94x |  6.81x | 251.4% |   - |   -
+       20 | cascaded             | cascaded             |  1.40x |  0.89x |  36.7% | yes |   -
+       21 | cascaded+shuf        | cascaded+shuf        |  1.14x |  0.52x |  54.8% | yes |   -
+       22 | cascaded+shuf        | cascaded+shuf        |  1.15x |  0.57x |  50.5% | yes |   -
+       23 | cascaded+shuf        | cascaded+shuf        |  1.14x |  0.52x |  54.3% | yes |   -
+       24 | cascaded             | cascaded             |  1.94x |  5.92x | 205.3% |   - |   -
+       25 | cascaded             | cascaded             |  1.93x |  6.71x | 248.4% |   - |   -
+       26 | cascaded+shuf        | cascaded+shuf        |  1.15x |  0.53x |  53.9% | yes |   -
+       27 | cascaded             | cascaded             |  1.51x |  3.45x | 129.0% | yes |   -
+       28 | cascaded+shuf        | cascaded+shuf        |  1.14x |  0.54x |  52.9% | yes |   -
+       29 | zstd                 | zstd                 |  2.20x |  1.57x |  28.6% | yes |   -
+       30 | zstd                 | zstd                 |  2.20x |  1.70x |  22.9% | yes |   -
+       31 | cascaded             | cascaded             |  1.23x |  0.94x |  23.9% |   - |   -
+       32 | cascaded             | cascaded             |  1.18x |  0.98x |  16.8% |   - |   -
+       33 | cascaded             | cascaded             |  1.18x |  0.97x |  17.4% |   - |   -
+       34 | cascaded             | cascaded             |  1.21x |  1.11x |   8.0% |   - |   -
+       35 | cascaded             | cascaded             |  1.17x |  0.96x |  18.2% |   - |   -
+       36 | cascaded             | cascaded             |  1.19x |  1.09x |   8.3% |   - |   -
+       37 | cascaded+shuf        | cascaded+shuf        |  1.29x |  1.27x |   1.0% |   - |   -
+       38 | cascaded             | cascaded             |  1.19x |  1.08x |   9.0% |   - |   -
+       39 | cascaded             | cascaded             |  1.20x |  1.10x |   7.7% |   - |   -
+       40 | cascaded             | cascaded             |  1.20x |  1.07x |  10.8% |   - |   -
+       41 | cascaded             | cascaded             |  1.17x |  0.96x |  18.4% |   - |   -
+       42 | cascaded             | cascaded             |  1.17x |  0.96x |  18.1% |   - |   -
+       43 | cascaded             | cascaded             |  1.17x |  0.93x |  20.0% |   - |   -
+       44 | cascaded             | cascaded             |  3.65x |  1.89x |  48.1% | yes |   -
+       45 | cascaded             | cascaded             |  8.35x |  8.56x |   2.6% |   - |   -
+       46 | cascaded             | cascaded             |  8.35x |  8.71x |   4.3% |   - |   -
+       47 | cascaded             | cascaded             |  8.34x |  8.63x |   3.5% |   - |   -
+       48 | cascaded             | cascaded             |  7.24x |  6.56x |   9.4% |   - |   -
+       49 | cascaded             | cascaded             |  6.93x |  5.92x |  14.5% |   - |   -
+       50 | cascaded             | cascaded             |  6.91x |  5.71x |  17.5% |   - |   -
+       51 | cascaded             | cascaded             |  6.90x |  5.88x |  14.8% |   - |   -
+       52 | cascaded             | cascaded             |  7.20x |  8.27x |  14.9% |   - |   -
+       53 | cascaded             | cascaded             |  7.11x |  8.31x |  16.9% |   - |   -
+       54 | cascaded             | cascaded             |  7.11x |  8.25x |  16.0% |   - |   -
+       55 | cascaded             | cascaded             |  7.08x |  8.19x |  15.6% |   - |   -
+       56 | cascaded             | cascaded             |  7.20x |  7.28x |   1.1% |   - |   -
+       57 | cascaded             | cascaded             |  7.07x |  6.33x |  10.4% |   - |   -
+       58 | cascaded             | cascaded             |  7.08x |  6.37x |  10.0% |   - |   -
+       59 | cascaded             | cascaded             |  7.30x |  7.46x |   2.1% |   - |   -
+       60 | cascaded             | cascaded             |  6.67x |  5.14x |  22.9% |   - |   -
+       61 | cascaded             | cascaded             |  6.66x |  5.05x |  24.2% |   - |   -
+       62 | cascaded             | cascaded             |  6.69x |  5.17x |  22.7% |   - |   -
+       63 | cascaded             | cascaded             |  6.65x |  5.10x |  23.3% |   - |   -
+  [nn-rl] ratio=1.65x  write=1765 MiB/s  read=2832 MiB/s  file=305 MiB  sgd=26 expl=0/63  mismatches=0
+  [nn-rl] Overhead breakdown (63 chunks, write=285.0 ms, total GPU-time=235.6 ms):
+    Stats compute:     32.7 ms  (13.9% of GPU-time)
+    NN inference :     39.1 ms  (16.6% of GPU-time)
+    Preprocessing:     67.7 ms  (28.8% of GPU-time)
+    Compression  :     70.3 ms  (29.8% of GPU-time)
+    Exploration  :      0.0 ms  ( 0.0% of GPU-time)
+    SGD update   :     25.7 ms  (10.9% of GPU-time)
+NN: Loaded 19076 parameters from /u/imuradli/GPUCompress/neural_net/weights/model.nnwt (74.8 KB on GPU)
+  [nn-rl+exp50] H5Dwrite (GPU ptr, VOL)... 288 ms
+  [nn-rl+exp50] H5Dread (GPU ptr, VOL)... 181 ms
+    chunk | action (final)       | action (orig)        | ratio  | pred   | MAPE   | sgd | expl
+    ------+----------------------+----------------------+--------+--------+--------+-----+-----
+        1 | bitcomp              | bitcomp              |  1.05x |  2.48x | 136.4% | yes |   -
+        2 | bitcomp              | bitcomp              |  1.05x |  2.38x | 126.8% | yes |   -
+        3 | bitcomp              | bitcomp              |  1.07x |  2.71x | 153.2% | yes |   -
+        4 | bitcomp              | bitcomp              |  1.06x |  2.42x | 127.4% | yes |   -
+        5 | bitcomp              | bitcomp              |  1.04x |  2.23x | 113.9% | yes |   -
+        6 | bitcomp              | bitcomp              |  1.05x |  2.53x | 141.0% | yes |   -
+        7 | bitcomp              | bitcomp              |  1.05x |  2.25x | 114.4% | yes |   -
+        8 | bitcomp              | bitcomp              |  1.05x |  2.57x | 144.6% | yes |   -
+        9 | cascaded             | cascaded             |  1.17x |  1.15x |   2.3% | yes |   -
+       10 | cascaded             | cascaded             |  1.17x |  1.24x |   5.2% |   - |   -
+       11 | cascaded             | cascaded             |  1.17x |  1.12x |   4.2% | yes |   -
+       12 | cascaded             | cascaded             |  1.20x |  1.27x |   5.8% |   - |   -
+       13 | cascaded             | cascaded             |  1.24x |  6.57x | 430.5% | yes |   -
+       14 | cascaded             | cascaded             |  1.23x |  6.01x | 387.3% | yes |   -
+       15 | cascaded             | cascaded             |  1.21x |  1.92x |  59.0% |   - |   -
+       16 | cascaded             | cascaded             |  1.24x |  5.02x | 305.9% | yes |   -
+       17 | cascaded             | cascaded             |  1.40x |  0.87x |  38.4% | yes |   -
+       18 | cascaded             | cascaded             |  1.94x |  6.52x | 236.4% |   - |   -
+       19 | cascaded             | cascaded             |  1.94x |  6.46x | 233.4% |   - |   -
+       20 | cascaded             | cascaded             |  1.93x |  6.54x | 239.7% |   - |   -
+       21 | cascaded             | cascaded             |  1.51x |  3.55x | 135.4% | yes |   -
+       22 | cascaded+shuf        | cascaded+shuf        |  1.15x |  0.55x |  52.4% | yes | yes
+       23 | cascaded+shuf        | cascaded+shuf        |  1.14x |  0.50x |  56.2% | yes | yes
+       24 | cascaded+shuf        | cascaded+shuf        |  1.14x |  0.50x |  56.6% | yes | yes
+       25 | cascaded+shuf        | cascaded+shuf        |  1.14x |  0.52x |  54.7% | yes | yes
+       26 | cascaded             | cascaded             |  1.23x |  0.98x |  20.3% |   - |   -
+       27 | zstd                 | zstd                 |  2.20x |  1.28x |  41.8% |   - |   -
+       28 | cascaded+shuf        | cascaded+shuf        |  1.15x |  0.51x |  55.8% | yes | yes
+       29 | cascaded             | cascaded+shuf        |  1.18x |  0.58x |  50.7% | yes | yes
+       30 | cascaded             | cascaded             |  1.18x |  1.09x |   7.6% |   - |   -
+       31 | cascaded             | cascaded             |  1.23x |  1.10x |  10.7% |   - |   -
+       32 | cascaded             | cascaded             |  1.18x |  1.11x |   6.4% |   - |   -
+       33 | cascaded             | cascaded             |  1.17x |  1.08x |   8.0% |   - |   -
+       34 | cascaded             | cascaded+shuf        |  1.18x |  0.59x |  49.7% | yes | yes
+       35 | cascaded             | cascaded             |  1.21x |  1.27x |   5.5% |   - |   -
+       36 | cascaded             | cascaded             |  1.20x |  0.96x |  19.9% |   - |   -
+       37 | cascaded             | cascaded             |  1.19x |  0.95x |  20.4% |   - |   -
+       38 | cascaded+shuf        | cascaded+shuf        |  1.29x |  1.47x |  14.1% |   - |   -
+       39 | cascaded             | cascaded             |  1.19x |  0.93x |  21.4% |   - |   -
+       40 | cascaded             | cascaded             |  1.20x |  0.91x |  24.0% | yes |   -
+       41 | cascaded             | cascaded             |  1.17x |  1.05x |  10.5% |   - |   -
+       42 | cascaded             | cascaded             |  1.17x |  1.05x |  10.6% |   - |   -
+       43 | cascaded             | cascaded             |  1.17x |  1.02x |  12.4% |   - |   -
+       44 | cascaded             | cascaded             |  3.65x |  1.82x |  50.0% | yes |   -
+       45 | cascaded             | cascaded             |  8.35x |  7.08x |  15.1% |   - |   -
+       46 | cascaded             | cascaded             |  8.35x |  7.21x |  13.7% |   - |   -
+       47 | cascaded             | cascaded             |  8.34x |  7.14x |  14.4% |   - |   -
+       48 | cascaded             | cascaded             |  7.24x |  5.42x |  25.1% |   - |   -
+       49 | cascaded             | cascaded             |  6.93x |  4.93x |  28.9% |   - |   -
+       50 | cascaded             | cascaded             |  6.91x |  4.75x |  31.3% |   - |   -
+       51 | cascaded             | cascaded             |  6.90x |  4.89x |  29.1% |   - |   -
+       52 | cascaded             | cascaded             |  7.20x |  6.93x |   3.8% |   - |   -
+       53 | cascaded             | cascaded             |  7.11x |  6.94x |   2.3% |   - |   -
+       54 | cascaded             | cascaded             |  7.11x |  6.88x |   3.1% |   - |   -
+       55 | cascaded             | cascaded             |  7.08x |  6.83x |   3.5% |   - |   -
+       56 | cascaded             | cascaded             |  7.20x |  6.04x |  16.1% |   - |   -
+       57 | cascaded             | cascaded             |  7.07x |  5.24x |  25.9% |   - |   -
+       58 | cascaded             | cascaded             |  7.08x |  5.27x |  25.6% |   - |   -
+       59 | cascaded             | cascaded             |  7.30x |  6.22x |  14.8% |   - |   -
+       60 | cascaded             | cascaded             |  6.67x |  4.25x |  36.3% |   - |   -
+       61 | cascaded             | cascaded             |  6.66x |  4.16x |  37.6% | yes |   -
+       62 | cascaded             | cascaded             |  6.69x |  8.25x |  23.5% |   - |   -
+       63 | cascaded             | cascaded             |  6.65x |  8.16x |  22.7% |   - |   -
+  [nn-rl+exp50] ratio=1.64x  write=1746 MiB/s  read=2776 MiB/s  file=306 MiB  sgd=25 expl=7/63  mismatches=0
+  [nn-rl+exp50] Overhead breakdown (63 chunks, write=288.1 ms, total GPU-time=352.0 ms):
+    Stats compute:     37.5 ms  (10.6% of GPU-time)
+    NN inference :     29.9 ms  ( 8.5% of GPU-time)
+    Preprocessing:     47.9 ms  (13.6% of GPU-time)
+    Compression  :     49.1 ms  (14.0% of GPU-time)
+    Exploration  :    158.7 ms  (45.1% of GPU-time)
+    SGD update   :     28.9 ms  ( 8.2% of GPU-time)

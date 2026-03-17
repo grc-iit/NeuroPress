@@ -131,6 +131,10 @@ static int           g_force_algo_count    = 0;
 static std::atomic<int> g_force_algo_idx{0};
 static std::mutex    g_force_algo_mutex;
 
+/* ---- nvcomp manager cache stats ---- */
+static std::atomic<int> g_mgr_cache_hits{0};
+static std::atomic<int> g_mgr_cache_misses{0};
+
 /* ---- CompContext pool ---- */
 static CompContext g_comp_pool[N_COMP_CTX];
 static bool g_pool_slot_free[N_COMP_CTX];
@@ -197,7 +201,19 @@ static constexpr size_t kPoolStatsWSZ =
 
 /** Destroy a single CompContext slot (null-safe). Caller must hold g_pool_mutex. */
 static void destroyCompContextSlot(CompContext& ctx) {
-    /* No cached managers to clean up — managers are created fresh per call. */
+    /* LRU-3: sync stream to drain in-flight kernels that may reference
+     * manager workspace, then safely delete cached managers.
+     * Safe because gpucompress_cleanup() runs while CUDA context is alive. */
+    if (ctx.stream)
+        cudaStreamSynchronize(ctx.stream);
+    for (int i = 0; i < CompContext::LRU_DEPTH; i++) {
+        delete ctx.comp_mgr[i];
+        ctx.comp_mgr[i]      = nullptr;
+        ctx.comp_mgr_algo[i] = -1;
+        ctx.comp_mgr_tick[i] = 0;
+    }
+    ctx.comp_mgr_clock = 0;
+
     if (ctx.stream)              { cudaStreamDestroy(ctx.stream); ctx.stream = nullptr; }
     if (ctx.t_start)             { cudaEventDestroy(ctx.t_start);     ctx.t_start     = nullptr; }
     if (ctx.t_stop)              { cudaEventDestroy(ctx.t_stop);      ctx.t_stop      = nullptr; }
@@ -222,8 +238,13 @@ static void destroyCompContextSlot(CompContext& ctx) {
 
 int initCompContextPool() {
     std::lock_guard<std::mutex> lk(g_pool_mutex);
-    /* No cached managers to clean up. */
     memset(g_comp_pool, 0, sizeof(g_comp_pool));
+    /* memset zeros comp_mgr[] (nullptr OK) but sets comp_mgr_algo[] to 0
+     * (= LZ4 enum, wrong sentinel).  Set -1 to mark all cache slots empty. */
+    for (int s = 0; s < N_COMP_CTX; s++)
+        for (int d = 0; d < CompContext::LRU_DEPTH; d++)
+            g_comp_pool[s].comp_mgr_algo[d] = -1;
+
     g_pool_free_count = 0;
     for (int i = 0; i < N_COMP_CTX; i++) {
         CompContext& ctx = g_comp_pool[i];
@@ -320,7 +341,49 @@ void syncAllCompContextStreams() {
 std::unique_ptr<nvcomp::nvcompManagerBase> createCompManagerForCtx(CompContext* ctx, CompressionAlgorithm algo) {
     int idx = static_cast<int>(algo);
     if (idx < 0 || idx >= CompContext::N_COMP_ALGOS) return nullptr;
+    g_mgr_cache_misses.fetch_add(1);
     return createCompressionManager(algo, gpucompress::DEFAULT_CHUNK_SIZE, ctx->stream, nullptr);
+}
+
+nvcomp::nvcompManagerBase* getOrCreateCompManager(CompContext* ctx, CompressionAlgorithm algo) {
+    int idx = static_cast<int>(algo);
+    if (idx < 0 || idx >= CompContext::N_COMP_ALGOS) return nullptr;
+
+    /* 1. Scan the 3-deep cache for a hit */
+    for (int i = 0; i < CompContext::LRU_DEPTH; i++) {
+        if (ctx->comp_mgr[i] && ctx->comp_mgr_algo[i] == idx) {
+            ctx->comp_mgr_tick[i] = ++ctx->comp_mgr_clock;
+            g_mgr_cache_hits.fetch_add(1);
+            return ctx->comp_mgr[i];
+        }
+    }
+
+    /* 2. Cache miss — find an empty slot or evict LRU */
+    int victim = -1;
+    for (int i = 0; i < CompContext::LRU_DEPTH; i++) {
+        if (!ctx->comp_mgr[i]) { victim = i; break; }
+    }
+    if (victim < 0) {
+        /* All 3 occupied — evict the least-recently-used (lowest tick) */
+        int min_tick = ctx->comp_mgr_tick[0];
+        victim = 0;
+        for (int i = 1; i < CompContext::LRU_DEPTH; i++) {
+            if (ctx->comp_mgr_tick[i] < min_tick) {
+                min_tick = ctx->comp_mgr_tick[i];
+                victim = i;
+            }
+        }
+        delete ctx->comp_mgr[victim];   /* CUDA alive here — safe */
+    }
+
+    /* 3. Create new manager in the victim slot */
+    auto mgr = createCompressionManager(
+        algo, gpucompress::DEFAULT_CHUNK_SIZE, ctx->stream, nullptr);
+    ctx->comp_mgr[victim]      = mgr.release();
+    ctx->comp_mgr_algo[victim] = idx;
+    ctx->comp_mgr_tick[victim] = ++ctx->comp_mgr_clock;
+    g_mgr_cache_misses.fetch_add(1);
+    return ctx->comp_mgr[victim];
 }
 
 } // namespace gpucompress
@@ -745,8 +808,7 @@ extern "C" gpucompress_error_t gpucompress_compress(
     }
 
     CompressionAlgorithm internal_algo = gpucompress::toInternalAlgorithm(algo_to_use);
-    auto compressor_uptr = gpucompress::createCompManagerForCtx(ctx, internal_algo);
-    auto* compressor = compressor_uptr.get();
+    auto* compressor = gpucompress::getOrCreateCompManager(ctx, internal_algo);
 
     if (!compressor) {
         if (d_quantized) cudaFree(d_quantized);
@@ -1743,6 +1805,16 @@ extern "C" void gpucompress_reset_chunk_history(void) {
     /* keep allocated buffer for reuse */
 }
 
+extern "C" void gpucompress_reset_cache_stats(void) {
+    g_mgr_cache_hits.store(0);
+    g_mgr_cache_misses.store(0);
+}
+
+extern "C" void gpucompress_get_cache_stats(int *hits, int *misses) {
+    if (hits)   *hits   = g_mgr_cache_hits.load();
+    if (misses) *misses = g_mgr_cache_misses.load();
+}
+
 extern "C" void gpucompress_force_algorithm_reset(void) {
     std::lock_guard<std::mutex> lock(g_force_algo_mutex);
     g_force_algo_count = 0;
@@ -2130,10 +2202,9 @@ skip_nn:
     }
 
     CompressionAlgorithm internal_algo = gpucompress::toInternalAlgorithm(algo_to_use);
-    auto compressor_uptr = gpucompress::createCompManagerForCtx(ctx, internal_algo);
-    auto* compressor = compressor_uptr.get();
+    auto* compressor = gpucompress::getOrCreateCompManager(ctx, internal_algo);
     if (!compressor) {
-        fprintf(stderr, "gpucompress ERROR: createCompManagerForCtx failed for algo=%d "
+        fprintf(stderr, "gpucompress ERROR: getOrCreateCompManager failed for algo=%d "
                 "(GPU OOM or unsupported algo, input_size=%zu)\n",
                 (int)algo_to_use, compress_input_size);
         if (d_quantized) cudaFree(d_quantized);
