@@ -2,23 +2,19 @@
 """
 Unified benchmark visualizer for GPUCompress.
 
-Combines three views into a single script:
-  1. Aggregate summary  — bar charts of ratio, throughput, file sizes, NN stats
-  2. Per-chunk algorithm — color-coded algorithm selection strip + ratio bars
-  3. Per-chunk MAPE      — ratio/comp/decomp prediction error over chunks
+Combines two views into a single script:
+  1. Aggregate summary       — bar charts of ratio, throughput, file sizes, NN stats
+  2. Timestep adaptation     — MAPE over timesteps + per-chunk milestone detail
 
 Usage:
   # Auto-detect all CSVs and generate all figures
   python3 benchmarks/visualize.py
 
   # Specific CSVs
-  python3 benchmarks/visualize.py --gs-csv path/to/vol.csv --gs-chunks-csv path/to/chunks.csv
-
-  # Only MAPE for specific phases
-  python3 benchmarks/visualize.py --phase nn-rl --phase nn-rl+exp50
+  python3 benchmarks/visualize.py --gs-csv path/to/vol.csv
 
   # Only specific views
-  python3 benchmarks/visualize.py --view summary --view mape
+  python3 benchmarks/visualize.py --view summary --view timesteps
 """
 
 import argparse
@@ -43,11 +39,11 @@ PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 PHASE_ORDER = ["no-comp", "exhaustive", "nn", "nn-rl", "nn-rl+exp50"]
 
 PHASE_COLORS = {
-    "no-comp":     "#95a5a6",
-    "exhaustive":  "#8e44ad",
-    "nn":          "#2ecc71",
-    "nn-rl":       "#e67e22",
-    "nn-rl+exp50": "#e74c3c",
+    "no-comp":     "#999999",
+    "exhaustive":  "#5778a4",
+    "nn":          "#e49444",
+    "nn-rl":       "#6a9f58",
+    "nn-rl+exp50": "#c85a5a",
 }
 
 PHASE_LABELS = {
@@ -58,45 +54,15 @@ PHASE_LABELS = {
     "nn-rl+exp50": "NN+SGD\n+Explore",
 }
 
-ALGO_NAMES = ["lz4", "snappy", "deflate", "gdeflate", "zstd", "ans", "cascaded", "bitcomp"]
-
-ALGO_COLORS = OrderedDict([
-    ("lz4",              "#1f77b4"), ("lz4+shuf",         "#aec7e8"),
-    ("lz4+quant",        "#08519c"), ("lz4+shuf+quant",   "#6baed6"),
-    ("snappy",           "#ff7f0e"), ("snappy+shuf",      "#ffbb78"),
-    ("snappy+quant",     "#e6550d"), ("snappy+shuf+quant","#fdae6b"),
-    ("deflate",          "#2ca02c"), ("deflate+shuf",     "#98df8a"),
-    ("deflate+quant",    "#006d2c"), ("deflate+shuf+quant","#74c476"),
-    ("gdeflate",         "#d62728"), ("gdeflate+shuf",    "#ff9896"),
-    ("gdeflate+quant",   "#a50f15"), ("gdeflate+shuf+quant","#fc9272"),
-    ("zstd",             "#9467bd"), ("zstd+shuf",        "#c5b0d5"),
-    ("zstd+quant",       "#6a3d9a"), ("zstd+shuf+quant",  "#b294c7"),
-    ("ans",              "#8c564b"), ("ans+shuf",         "#c49c94"),
-    ("ans+quant",        "#5b3a29"), ("ans+shuf+quant",   "#a97e6e"),
-    ("cascaded",         "#e377c2"), ("cascaded+shuf",    "#f7b6d2"),
-    ("cascaded+quant",   "#c51b8a"), ("cascaded+shuf+quant","#f768a1"),
-    ("bitcomp",          "#7f7f7f"), ("bitcomp+shuf",     "#c7c7c7"),
-    ("bitcomp+quant",    "#525252"), ("bitcomp+shuf+quant","#969696"),
-])
-
 # Auto-detection paths
 DEFAULT_GS_AGG = [
     os.path.join(PROJECT_ROOT, "benchmarks/grayscott/results/benchmark_grayscott_vol.csv"),
     os.path.join(PROJECT_ROOT, "benchmarks/grayscott/benchmark_grayscott_vol.csv"),
 ]
-DEFAULT_GS_CHUNKS = [
-    os.path.join(PROJECT_ROOT, "benchmarks/grayscott/results/benchmark_grayscott_vol_chunks.csv"),
-    os.path.join(PROJECT_ROOT, "benchmarks/grayscott/benchmark_grayscott_vol_chunks.csv"),
-]
 DEFAULT_VPIC_AGG = [
     os.path.join(PROJECT_ROOT, "benchmarks/vpic-kokkos/results/benchmark_vpic_deck.csv"),
     os.path.join(PROJECT_ROOT, "benchmarks/vpic-kokkos/benchmark_vpic_deck.csv"),
     os.path.join(PROJECT_ROOT, "benchmarks/vpic/benchmark_vpic_deck.csv"),
-]
-DEFAULT_VPIC_CHUNKS = [
-    os.path.join(PROJECT_ROOT, "benchmarks/vpic-kokkos/results/benchmark_vpic_chunks.csv"),
-    os.path.join(PROJECT_ROOT, "benchmarks/vpic-kokkos/benchmark_vpic_chunks.csv"),
-    os.path.join(PROJECT_ROOT, "benchmarks/vpic/benchmark_vpic_chunks.csv"),
 ]
 DEFAULT_GS_TIMESTEPS = [
     os.path.join(PROJECT_ROOT, "benchmarks/grayscott/results/benchmark_grayscott_timesteps.csv"),
@@ -105,7 +71,6 @@ DEFAULT_GS_TIMESTEPS = [
 DEFAULT_GS_TSTEP_CHUNKS = [
     os.path.join(PROJECT_ROOT, "benchmarks/grayscott/results/benchmark_grayscott_timestep_chunks.csv"),
 ]
-DEFAULT_PREDICTIONS = ["/tmp/test_vol_nn_predictions.csv"]
 
 
 def find_csv(candidates):
@@ -142,22 +107,6 @@ def g(row, *keys, default=0.0):
     return default
 
 
-def decode_action(action_int):
-    algo = action_int % 8
-    quant = (action_int // 8) % 2
-    shuf = (action_int // 16) % 2
-    s = ALGO_NAMES[algo]
-    if shuf:
-        s += "+shuf"
-    if quant:
-        s += "+quant"
-    return s
-
-
-def get_algo_color(algo_str):
-    return ALGO_COLORS.get(algo_str, "#333333")
-
-
 _PHASE_ALIASES = {"oracle": "exhaustive"}
 
 
@@ -179,19 +128,21 @@ def _ordered(rows):
 def plot_bars(ax, phases, values, title, ylabel, fmt="%.2f", annotate=True):
     x = np.arange(len(phases))
     colors = [PHASE_COLORS.get(p, "#bdc3c7") for p in phases]
-    bars = ax.bar(x, values, color=colors, edgecolor="white", linewidth=0.5)
+    bars = ax.bar(x, values, color=colors, edgecolor="black", linewidth=0.5,
+                  width=0.6, zorder=3)
     if annotate:
         for bar, v in zip(bars, values):
             if v > 0:
                 ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
-                        fmt % v, ha="center", va="bottom", fontsize=8,
-                        fontweight="bold")
+                        fmt % v, ha="center", va="bottom", fontsize=9, fontweight="bold")
     ax.set_xticks(x)
-    ax.set_xticklabels([PHASE_LABELS.get(p, p) for p in phases],
-                       fontsize=8, rotation=15, ha="right")
-    ax.set_ylabel(ylabel, fontsize=9)
+    ax.set_xticklabels([PHASE_LABELS.get(p, p) for p in phases], fontsize=9)
+    ax.set_ylabel(ylabel, fontsize=10)
     ax.set_title(title, fontsize=11, fontweight="bold")
-    ax.grid(axis="y", alpha=0.3)
+    ax.grid(axis="y", alpha=0.3, linestyle="--", zorder=0)
+    ax.set_axisbelow(True)
+    for spine in ["top", "right"]:
+        ax.spines[spine].set_visible(False)
 
 
 def plot_file_sizes(ax, phases, rows):
@@ -199,22 +150,28 @@ def plot_file_sizes(ax, phases, rows):
     colors = [PHASE_COLORS.get(p, "#bdc3c7") for p in phases]
     orig = [g(r, "orig_mib", "orig_mb") for r in rows]
     comp = [g(r, "file_mib", "file_mb") for r in rows]
-    w = 0.35
-    ax.bar(x - w / 2, orig, w, color="#d5d8dc", edgecolor="white", label="Original")
-    cbars = ax.bar(x + w / 2, comp, w, color=colors, edgecolor="white", label="Compressed")
+    w = 0.3
+    ax.bar(x - w / 2, orig, w, color="#cccccc", edgecolor="black", linewidth=0.5,
+           label="Original", zorder=3)
+    cbars = ax.bar(x + w / 2, comp, w, color=colors, edgecolor="black", linewidth=0.5,
+                   label="Compressed", zorder=3)
     for bar, v in zip(cbars, comp):
         if v > 0:
             ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
-                    f"{v:.1f}", ha="center", va="bottom", fontsize=8, fontweight="bold")
-    if orig and max(orig) > 0:
-        ax.axhline(max(orig), color="black", linewidth=0.8, linestyle="--", alpha=0.4)
+                    f"{v:.1f}", ha="center", va="bottom", fontsize=9, fontweight="bold")
+    for bar, v in zip(ax.containers[0], orig):
+        if v > 0:
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                    f"{v:.0f}", ha="center", va="bottom", fontsize=8, color="#555")
     ax.set_xticks(x)
-    ax.set_xticklabels([PHASE_LABELS.get(p, p) for p in phases],
-                       fontsize=8, rotation=15, ha="right")
-    ax.set_ylabel("Size (MB)", fontsize=9)
+    ax.set_xticklabels([PHASE_LABELS.get(p, p) for p in phases], fontsize=9)
+    ax.set_ylabel("Size (MB)", fontsize=10)
     ax.set_title("Original vs Compressed File Size", fontsize=11, fontweight="bold")
     ax.legend(fontsize=8)
-    ax.grid(axis="y", alpha=0.3)
+    ax.grid(axis="y", alpha=0.3, linestyle="--", zorder=0)
+    ax.set_axisbelow(True)
+    for spine in ["top", "right"]:
+        ax.spines[spine].set_visible(False)
 
 
 def plot_nn_stats(ax, phases, rows):
@@ -222,30 +179,34 @@ def plot_nn_stats(ax, phases, rows):
     if not nn_idx:
         ax.text(0.5, 0.5, "No NN phases", ha="center", va="center",
                 transform=ax.transAxes, fontsize=12, color="gray")
-        ax.set_title("NN Adaptation", fontsize=11, fontweight="bold")
+        ax.set_title("NN Adaptation", fontsize=12, fontweight="bold")
         return
     nn_x = np.arange(len(nn_idx))
     nn_labels = [PHASE_LABELS.get(phases[i], phases[i]) for i in nn_idx]
-    w = 0.35
+    w = 0.3
     sgd_pct = [100.0 * g(rows[i], "sgd_fires") / max(g(rows[i], "n_chunks"), 1) for i in nn_idx]
     expl_pct = [100.0 * g(rows[i], "explorations") / max(g(rows[i], "n_chunks"), 1) for i in nn_idx]
-    ax.bar(nn_x - w / 2, sgd_pct, w, color="#e67e22", edgecolor="white", label="SGD Fires %")
-    ax.bar(nn_x + w / 2, expl_pct, w, color="#e74c3c", edgecolor="white", label="Explorations %")
+    ax.bar(nn_x - w / 2, sgd_pct, w, color="#e49444", edgecolor="black", linewidth=0.5,
+           label="SGD Fires %", zorder=3)
+    ax.bar(nn_x + w / 2, expl_pct, w, color="#c85a5a", edgecolor="black", linewidth=0.5,
+           label="Explorations %", zorder=3)
+    ymax = max(max(sgd_pct, default=0), max(expl_pct, default=0))
     for xi, (s, e) in enumerate(zip(sgd_pct, expl_pct)):
-        ax.text(xi - w / 2, s, f"{s:.0f}%", ha="center", va="bottom", fontsize=8, fontweight="bold")
-        ax.text(xi + w / 2, e, f"{e:.0f}%", ha="center", va="bottom", fontsize=8, fontweight="bold")
+        ax.text(xi - w / 2, s, f"{s:.0f}%", ha="center", va="bottom", fontsize=9,
+                fontweight="bold")
+        if e > 0:
+            ax.text(xi + w / 2, e, f"{e:.0f}%", ha="center", va="bottom", fontsize=9,
+                    fontweight="bold")
     ax.set_xticks(nn_x)
-    ax.set_xticklabels(nn_labels, fontsize=8)
-    ax.set_ylabel("% of chunks", fontsize=9)
-    ax.set_ylim(0, max(max(sgd_pct, default=0), max(expl_pct, default=0)) * 1.3 + 5)
-    ax.set_title("NN Adaptation: SGD Fires & Explorations", fontsize=11, fontweight="bold")
-    ax.legend(fontsize=8, loc="upper left")
-    ax.grid(axis="y", alpha=0.3)
-    param_text = "SGD:  LR=0.4, MAPE thresh=20%\nExplore:  MAPE thresh=50%, K=2"
-    ax.text(0.98, 0.97, param_text, transform=ax.transAxes, fontsize=7.5,
-            verticalalignment="top", horizontalalignment="right",
-            bbox=dict(boxstyle="round,pad=0.4", facecolor="#f8f9fa",
-                      edgecolor="#aab0b5", alpha=0.9), family="monospace")
+    ax.set_xticklabels(nn_labels, fontsize=9)
+    ax.set_ylabel("% of chunks", fontsize=10)
+    ax.set_ylim(0, ymax * 1.3 + 5)
+    ax.set_title("Online Learning Activity", fontsize=11, fontweight="bold")
+    ax.legend(fontsize=8, loc="upper right")
+    ax.grid(axis="y", alpha=0.3, linestyle="--", zorder=0)
+    ax.set_axisbelow(True)
+    for spine in ["top", "right"]:
+        ax.spines[spine].set_visible(False)
 
 
 def plot_verification(ax, phases, rows):
@@ -256,23 +217,28 @@ def plot_verification(ax, phases, rows):
         r = rows[i]
         mm = int(g(r, "mismatches"))
         status = "PASS" if mm == 0 else f"FAIL ({mm})"
-        color = "#d5f5e3" if mm == 0 else "#fadbd8"
+        verify_color = "#d5f5e3" if mm == 0 else "#fadbd8"
         orig = g(r, "orig_mib", "orig_mb")
         comp = g(r, "file_mib", "file_mb")
         ratio = g(r, "ratio")
+        row_bg = "#f8f9fa" if i % 2 == 0 else "white"
         cell_text.append([PHASE_LABELS.get(p, p).replace("\n", " "),
                           f"{orig:.0f}", f"{comp:.1f}", f"{ratio:.2f}x", status])
-        cell_colors.append(["white", "white", "white", "white", color])
+        cell_colors.append([row_bg, row_bg, row_bg, row_bg, verify_color])
     table = ax.table(cellText=cell_text,
                      colLabels=["Phase", "Orig (MB)", "Comp (MB)", "Ratio", "Verify"],
                      cellColours=cell_colors, loc="center", cellLoc="center")
     table.auto_set_font_size(False)
-    table.set_fontsize(9)
+    table.set_fontsize(10)
     table.scale(1.0, 1.8)
     for (row, col), cell in table.get_celld().items():
+        cell.set_edgecolor("#aaa")
+        cell.set_linewidth(0.5)
         if row == 0:
-            cell.set_text_props(fontweight="bold")
-            cell.set_facecolor("#d6eaf8")
+            cell.set_text_props(fontweight="bold", fontsize=9)
+            cell.set_facecolor("#d9e2ec")
+        else:
+            cell.set_text_props(fontsize=9)
     ax.set_title("Summary & Verification", fontsize=11, fontweight="bold", pad=20)
 
 
@@ -281,17 +247,14 @@ def make_summary_figure(source_name, rows, output_path, meta_text=""):
     if not phases:
         print(f"  {source_name}: no valid phases, skipping summary.")
         return
-    fig = plt.figure(figsize=(16, 15))
+    fig = plt.figure(figsize=(16, 14), facecolor="white")
     fig.text(0.5, 0.99, f"GPUCompress Benchmark: {source_name}",
-             ha="center", fontsize=15, fontweight="bold", va="top")
-    fig.text(0.5, 0.97,
-             "Compression ratio, read/write throughput, timing breakdown, and data verification.",
-             ha="center", fontsize=9, color="#555", va="top", style="italic")
+             ha="center", fontsize=14, fontweight="bold", va="top")
     if meta_text:
-        fig.text(0.5, 0.955, meta_text, ha="center", fontsize=10,
-                 color="#333", va="top", fontfamily="monospace")
-    gs = gridspec.GridSpec(3, 2, hspace=0.50, wspace=0.30,
-                           top=0.90, bottom=0.04, left=0.08, right=0.96)
+        fig.text(0.5, 0.965, meta_text, ha="center", fontsize=9,
+                 color="#444", va="top", fontfamily="monospace")
+    gs = gridspec.GridSpec(3, 2, hspace=0.45, wspace=0.30,
+                           top=0.92, bottom=0.04, left=0.08, right=0.96)
     ax1 = fig.add_subplot(gs[0, 0])
     plot_bars(ax1, phases, [g(r, "ratio") for r in ordered],
               "Compression Ratio (higher = better)", "Ratio", fmt="%.2fx")
@@ -314,526 +277,103 @@ def make_summary_figure(source_name, rows, output_path, meta_text=""):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# View 2: Per-Chunk Algorithm Selection
-# ═══════════════════════════════════════════════════════════════════════
-
-def load_chunks_csv(path):
-    """Returns {(timestep, phase): [Row, ...]} and sorted timesteps."""
-    data = OrderedDict()
-    timesteps = set()
-    with open(path) as f:
-        reader = csv.DictReader(f)
-        fields = reader.fieldnames
-        has_timestep = "timestep" in fields
-        for row in reader:
-            ts = int(row["timestep"]) if has_timestep else 0
-            phase = row["phase"]
-            if phase == "oracle":
-                phase = "exhaustive"
-            chunk = int(row["chunk"])
-            algo = row.get("action_final", "")
-            if not algo:
-                action = int(row.get("nn_action", 0))
-                algo = decode_action(action)
-            ratio = float(row.get("actual_ratio", 0))
-            pred = float(row.get("predicted_ratio", 0))
-            sgd = int(row.get("sgd_fired", 0))
-            expl = int(row.get("exploration_triggered", row.get("explored", 0)))
-            key = (ts, phase)
-            timesteps.add(ts)
-            data.setdefault(key, []).append((ts, chunk, algo, ratio, pred, sgd, expl))
-    return data, sorted(timesteps)
-
-
-def plot_chunks_single(data, timesteps, out_path):
-    from matplotlib.patches import Patch
-    from matplotlib.lines import Line2D
-
-    ts = timesteps[0]
-    phases = OrderedDict()
-    for (t, phase), recs in data.items():
-        if t == ts:
-            phases[phase] = recs
-    phase_names = list(phases.keys())
-    n_phases = len(phase_names)
-    has_ratio = any(r[3] > 0 for recs in phases.values() for r in recs)
-    exhaustive_ratios = [r[3] for r in phases["exhaustive"]] if "exhaustive" in phases else None
-
-    if has_ratio:
-        fig, axes = plt.subplots(n_phases, 2, figsize=(18, 3.0 * n_phases + 1.5),
-                                 gridspec_kw={"width_ratios": [3, 1]})
-        if n_phases == 1:
-            axes = [axes]
-    else:
-        fig, axes_raw = plt.subplots(n_phases, 1, figsize=(14, 2.5 * n_phases + 1.5))
-        if n_phases == 1:
-            axes_raw = [axes_raw]
-        axes = [(ax, None) for ax in axes_raw]
-
-    all_algos = OrderedDict()
-    for recs in phases.values():
-        for r in recs:
-            if r[2] not in all_algos:
-                all_algos[r[2]] = get_algo_color(r[2])
-
-    for idx, phase in enumerate(phase_names):
-        recs = phases[phase]
-        n_chunks = len(recs)
-        algos = [r[2] for r in recs]
-        ratios = [r[3] for r in recs]
-        preds = [r[4] for r in recs]
-        sgds = [r[5] for r in recs]
-        expls = [r[6] for r in recs]
-        colors = [all_algos[a] for a in algos]
-
-        if has_ratio:
-            ax_bar, ax_ratio = axes[idx]
-        else:
-            ax_bar, ax_ratio = axes[idx]
-
-        for i, color in enumerate(colors):
-            ax_bar.barh(0, 1, left=i, color=color, edgecolor="white", linewidth=0.3)
-            if sgds[i]:
-                ax_bar.plot(i + 0.5, 0.35, marker="v", color="black", markersize=4)
-            if expls[i]:
-                ax_bar.plot(i + 0.5, -0.35, marker="*", color="red", markersize=5)
-        ax_bar.set_xlim(0, n_chunks)
-        ax_bar.set_ylim(-0.5, 0.5)
-        ax_bar.set_yticks([])
-        ax_bar.set_xlabel("Chunk index")
-        ax_bar.set_title(f"Phase: {phase}  ({n_chunks} chunks)", fontsize=11, fontweight="bold")
-
-        if ax_ratio is not None and has_ratio:
-            x = np.arange(n_chunks)
-            ax_ratio.bar(x, ratios, color=colors, edgecolor="white", linewidth=0.3, width=1.0)
-            if exhaustive_ratios and phase != "exhaustive" and len(exhaustive_ratios) == n_chunks:
-                ax_ratio.plot(x, exhaustive_ratios, color="goldenrod", linewidth=1.5,
-                              alpha=0.85, label="exhaustive best", zorder=5)
-            all_y = list(ratios) + (list(exhaustive_ratios) if exhaustive_ratios and phase != "exhaustive" else [])
-            all_y_sorted = sorted(all_y)
-            p95 = all_y_sorted[min(len(all_y_sorted) - 1, int(0.95 * len(all_y_sorted)))]
-            y_ceil = p95 * 1.5
-            if any(p > 0 for p in preds):
-                in_range = sum(1 for p in preds if 0 < p <= y_ceil) / max(len(preds), 1)
-                if in_range > 0.3:
-                    clipped = [min(p, y_ceil) for p in preds]
-                    ax_ratio.plot(x, clipped, "k--", linewidth=0.8, alpha=0.5, label="predicted (clipped)")
-            ax_ratio.set_ylim(0, y_ceil)
-            handles, labels = ax_ratio.get_legend_handles_labels()
-            if handles:
-                ax_ratio.legend(fontsize=7, loc="upper right")
-            ax_ratio.set_xlabel("Chunk index")
-            ax_ratio.set_ylabel("Compression ratio")
-            ax_ratio.set_title("Per-chunk ratio", fontsize=10)
-            ax_ratio.set_xlim(-0.5, n_chunks - 0.5)
-
-    legend_elements = [Patch(facecolor=c, edgecolor="gray", label=a) for a, c in all_algos.items()]
-    legend_elements.append(Line2D([0], [0], marker="v", color="w", markerfacecolor="black",
-                                  markersize=6, label="SGD fired"))
-    legend_elements.append(Line2D([0], [0], marker="*", color="w", markerfacecolor="red",
-                                  markersize=8, label="Exploration"))
-    fig.legend(handles=legend_elements, loc="lower center",
-               ncol=min(len(legend_elements), 8), fontsize=8,
-               bbox_to_anchor=(0.5, -0.02), frameon=True)
-    fig.tight_layout(rect=[0, 0.05, 1, 1])
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved: {out_path}")
-
-
-def plot_chunks_multi(data, timesteps, out_path):
-    from matplotlib.patches import Patch
-    from matplotlib.colors import ListedColormap, BoundaryNorm
-
-    exhaustive_key = (0, "exhaustive")
-    exhaustive_recs = data.get(exhaustive_key, [])
-    n_chunks = len(exhaustive_recs) if exhaustive_recs else 0
-    adapt_phase = "nn-rl+exp50"
-    adapt_ts = [ts for ts in timesteps if (ts, adapt_phase) in data]
-
-    if not adapt_ts:
-        return plot_chunks_single(data, timesteps, out_path)
-
-    nn_key = (0, "nn")
-    all_algos = OrderedDict()
-    for recs in data.values():
-        for r in recs:
-            if r[2] not in all_algos:
-                all_algos[r[2]] = get_algo_color(r[2])
-    algo_list = list(all_algos.keys())
-    algo_to_idx = {a: i for i, a in enumerate(algo_list)}
-
-    row_labels = []
-    heatmap_rows = []
-    ratio_rows = []
-
-    if exhaustive_recs:
-        row_labels.append("exhaustive (t=0)")
-        heatmap_rows.append([algo_to_idx.get(r[2], 0) for r in exhaustive_recs])
-        ratio_rows.append([r[3] for r in exhaustive_recs])
-    if nn_key in data:
-        recs = data[nn_key]
-        row_labels.append("nn (t=0)")
-        heatmap_rows.append([algo_to_idx.get(r[2], 0) for r in recs])
-        ratio_rows.append([r[3] for r in recs])
-    for ts in adapt_ts:
-        recs = data[(ts, adapt_phase)]
-        row_labels.append(f"nn-rl+exp50 (t={ts})")
-        heatmap_rows.append([algo_to_idx.get(r[2], 0) for r in recs])
-        ratio_rows.append([r[3] for r in recs])
-
-    n_rows = len(heatmap_rows)
-    if n_chunks == 0:
-        n_chunks = max(len(r) for r in heatmap_rows)
-    for i in range(n_rows):
-        while len(heatmap_rows[i]) < n_chunks:
-            heatmap_rows[i].append(0)
-        while len(ratio_rows[i]) < n_chunks:
-            ratio_rows[i].append(0)
-
-    hmap = np.array(heatmap_rows)
-    rmap = np.array(ratio_rows)
-    cmap_colors = [all_algos[a] for a in algo_list]
-    cmap = ListedColormap(cmap_colors)
-    bounds = np.arange(len(algo_list) + 1) - 0.5
-    norm = BoundaryNorm(bounds, cmap.N)
-
-    fig_h = max(4, 0.4 * n_rows + 2.5)
-    fig, (ax_heat, ax_rat) = plt.subplots(1, 2, figsize=(18, fig_h),
-                                           gridspec_kw={"width_ratios": [2, 1]})
-    im = ax_heat.imshow(hmap, aspect="auto", cmap=cmap, norm=norm,
-                        interpolation="nearest", origin="upper")
-    ax_heat.set_yticks(np.arange(n_rows))
-    ax_heat.set_yticklabels(row_labels, fontsize=8)
-    ax_heat.set_xlabel("Chunk index", fontsize=10)
-    ax_heat.set_title("Algorithm selection per chunk", fontsize=12, fontweight="bold")
-    n_baseline = 1 + (1 if nn_key in data else 0)
-    if n_baseline < n_rows:
-        ax_heat.axhline(n_baseline - 0.5, color="white", linewidth=2)
-
-    all_rats = rmap[rmap > 0]
-    vmax = np.percentile(all_rats, 95) * 1.3 if len(all_rats) > 0 else 1
-    ax_rat.imshow(rmap, aspect="auto", cmap="YlOrRd", vmin=0, vmax=vmax,
-                  interpolation="nearest", origin="upper")
-    ax_rat.set_yticks(np.arange(n_rows))
-    ax_rat.set_yticklabels(row_labels, fontsize=8)
-    ax_rat.set_xlabel("Chunk index", fontsize=10)
-    ax_rat.set_title("Compression ratio per chunk", fontsize=12, fontweight="bold")
-    if n_baseline < n_rows:
-        ax_rat.axhline(n_baseline - 0.5, color="white", linewidth=2)
-
-    legend_elements = [Patch(facecolor=c, edgecolor="gray", label=a) for a, c in all_algos.items()]
-    fig.legend(handles=legend_elements, loc="lower center",
-               ncol=min(len(legend_elements), 8), fontsize=8,
-               bbox_to_anchor=(0.5, -0.04), frameon=True)
-    fig.tight_layout(rect=[0, 0.06, 1, 1])
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved: {out_path}")
-
-
-def make_chunks_figure(chunks_csv, output_path):
-    data, timesteps = load_chunks_csv(chunks_csv)
-    if not data:
-        print(f"  No chunk data in {chunks_csv}, skipping.")
-        return
-    if len(timesteps) > 1:
-        plot_chunks_multi(data, timesteps, output_path)
-    else:
-        plot_chunks_single(data, timesteps, output_path)
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# View 3: Per-Chunk MAPE
-# ═══════════════════════════════════════════════════════════════════════
-
-def detect_mape_format(fieldnames):
-    if "ratio_mape" in fieldnames and "pattern" in fieldnames:
-        return "predictions"
-    if "mape_ratio" in fieldnames and "phase" in fieldnames:
-        return "benchmark"
-    return None
-
-
-def load_mape_csv(path, phases=None):
-    """Load CSV and return {phase: [rows]} dict."""
-    data = {}
-    with open(path) as f:
-        reader = csv.DictReader(f)
-        fmt = detect_mape_format(reader.fieldnames)
-        if fmt is None:
-            return None  # not a MAPE-compatible CSV
-
-        for row in reader:
-            if fmt == "predictions":
-                phase = "predictions"
-                entry = {
-                    "chunk":       int(row["chunk"]),
-                    "label":       row.get("pattern", ""),
-                    "algo":        row.get("nn_pick", ""),
-                    "ratio_mape":  float(row["ratio_mape"]),
-                    "comp_mape":   float(row["comp_mape"]),
-                    "decomp_mape": float(row["decomp_mape"]),
-                    "sgd_fired":   int(row["sgd_fired"]),
-                    "exploration": int(row.get("explored", row.get("exploration_triggered", 0))),
-                }
-            else:
-                phase = row["phase"]
-                if phase == "no-comp":
-                    continue
-                entry = {
-                    "chunk":       int(row["chunk"]),
-                    "label":       row.get("action_final", ""),
-                    "algo":        row.get("action_final", ""),
-                    "ratio_mape":  float(row["mape_ratio"]),
-                    "comp_mape":   float(row["mape_comp"]),
-                    "decomp_mape": float(row["mape_decomp"]),
-                    "sgd_fired":   int(row.get("sgd_fired", 0)),
-                    "exploration": int(row.get("exploration_triggered", 0)),
-                }
-            if phases and phase not in phases:
-                continue
-            data.setdefault(phase, []).append(entry)
-    return data
-
-
-def make_mape_figure(mape_data, output_path):
-    phase_names = list(mape_data.keys())
-    n_phases = len(phase_names)
-    if n_phases == 0:
-        return
-
-    fig, all_axes = plt.subplots(n_phases, 3, figsize=(18, 3.5 * n_phases + 1.5),
-                                  sharex=False, squeeze=False)
-    metric_labels = ["Ratio MAPE (%)", "Comp Time MAPE (%)", "Decomp Time MAPE (%)"]
-    metric_keys = ["ratio_mape", "comp_mape", "decomp_mape"]
-
-    for row_idx, phase in enumerate(phase_names):
-        rows = mape_data[phase]
-        chunks = np.array([r["chunk"] for r in rows])
-        sgd_fired = np.array([r["sgd_fired"] for r in rows], dtype=bool)
-        exploration = np.array([r["exploration"] for r in rows], dtype=bool)
-        labels = [r["label"] for r in rows]
-
-        unique_labels = list(dict.fromkeys(labels))
-        label_colors = plt.cm.tab10(np.linspace(0, 1, max(len(unique_labels), 1)))
-        label_cmap = {lb: label_colors[i] for i, lb in enumerate(unique_labels)}
-        colors = [label_cmap[lb] for lb in labels]
-
-        for col_idx, key in enumerate(metric_keys):
-            ax = all_axes[row_idx, col_idx]
-            mape = np.array([r[key] for r in rows])
-            bars = ax.bar(chunks, mape, color=colors, edgecolor="white", linewidth=0.3, width=1.0)
-
-            # Add value labels on bars
-            for bar, val in zip(bars, mape):
-                if val > 0:
-                    ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
-                            f"{val:.0f}", ha="center", va="bottom",
-                            fontsize=5, rotation=90, color="#333333")
-
-            sgd_chunks = chunks[sgd_fired]
-            sgd_vals = mape[sgd_fired]
-            if len(sgd_chunks) > 0:
-                ax.scatter(sgd_chunks, sgd_vals + max(mape) * 0.02,
-                           marker="v", color="black", s=18, zorder=5, label="SGD fired")
-            expl_chunks = chunks[exploration]
-            expl_vals = mape[exploration]
-            if len(expl_chunks) > 0:
-                ax.scatter(expl_chunks, expl_vals + max(mape) * 0.04,
-                           marker="*", color="red", s=24, zorder=5, label="Exploration")
-
-            if len(mape) >= 6:
-                window = min(6, len(mape))
-                kernel = np.ones(window) / window
-                rolling = np.convolve(mape, kernel, mode="valid")
-                x_roll = chunks[window - 1:]
-                ax.plot(x_roll, rolling, color="red", linewidth=2, alpha=0.8,
-                        label=f"rolling avg (w={window})")
-
-            if len(mape) > 0 and max(mape) > 0:
-                p95 = np.percentile(mape, 95)
-                if p95 > 0:
-                    ax.set_ylim(0, min(max(mape) * 1.1, p95 * 2.0))
-
-            if row_idx == 0:
-                ax.set_title(metric_labels[col_idx], fontsize=11, fontweight="bold")
-            if col_idx == 0:
-                ax.set_ylabel(f"{phase}\nMAPE (%)", fontsize=10, fontweight="bold")
-            else:
-                ax.set_ylabel("MAPE (%)", fontsize=9)
-            if row_idx == n_phases - 1:
-                ax.set_xlabel("Chunk index", fontsize=10)
-            ax.grid(alpha=0.25)
-            ax.legend(fontsize=7, loc="upper right")
-
-    fig.suptitle("NN Prediction MAPE over Chunks", fontsize=14, fontweight="bold", y=1.01)
-
-    from matplotlib.patches import Patch
-    all_unique = []
-    for rows in mape_data.values():
-        for r in rows:
-            if r["label"] not in all_unique:
-                all_unique.append(r["label"])
-    g_colors = plt.cm.tab10(np.linspace(0, 1, max(len(all_unique), 1)))
-    g_cmap = {lb: g_colors[i] for i, lb in enumerate(all_unique)}
-    legend_pats = [Patch(facecolor=g_cmap[lb], edgecolor="gray", label=lb) for lb in all_unique]
-    fig.legend(handles=legend_pats, loc="lower center",
-               ncol=min(len(legend_pats), 8), fontsize=8,
-               bbox_to_anchor=(0.5, -0.02), frameon=True)
-
-    fig.tight_layout(rect=[0, 0.04, 1, 0.98])
-    fig.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved: {output_path}")
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# View 4: Timestep Adaptation (sMAPE over timesteps)
+# View 2: Timestep Adaptation (MAPE over timesteps)
 # ═══════════════════════════════════════════════════════════════════════
 
 def make_timestep_figure(ts_csv_path, output_path):
-    """Plot MAPE and sMAPE for ratio/comp_time/decomp_time over timesteps."""
+    """Plot MAPE for ratio/comp_time/decomp_time over all timesteps."""
     rows = parse_csv(ts_csv_path)
     if not rows:
         print(f"  No timestep data in {ts_csv_path}, skipping.")
         return
 
     timesteps = np.array([g(r, "timestep") for r in rows])
-    smape_r = np.array([g(r, "smape_ratio") for r in rows])
-    smape_c = np.array([g(r, "smape_comp") for r in rows])
-    smape_d = np.array([g(r, "smape_decomp") for r in rows])
-    # Real MAPE (falls back to sMAPE if columns missing)
     mape_r = np.array([g(r, "mape_ratio", default=-1) for r in rows])
     mape_c = np.array([g(r, "mape_comp", default=-1) for r in rows])
     mape_d = np.array([g(r, "mape_decomp", default=-1) for r in rows])
     has_mape = mape_r[0] >= 0
     if not has_mape:
-        mape_r, mape_c, mape_d = smape_r, smape_c, smape_d
+        mape_r = np.array([g(r, "smape_ratio") for r in rows])
+        mape_c = np.array([g(r, "smape_comp") for r in rows])
+        mape_d = np.array([g(r, "smape_decomp") for r in rows])
     sgd_fires = np.array([g(r, "sgd_fires") for r in rows])
-    ratio = np.array([g(r, "ratio") for r in rows])
 
-    fig, axes = plt.subplots(3, 2, figsize=(18, 15))
-    fig.suptitle("NN Adaptation Over Timesteps (Multi-Timestep SGD)",
-                 fontsize=14, fontweight="bold", y=0.98)
+    metrics = [
+        ("Compression Ratio",  mape_r, "#27ae60", "#2ecc71"),
+        ("Compression Time",   mape_c, "#2471a3", "#3498db"),
+        ("Decompression Time", mape_d, "#c0392b", "#e74c3c"),
+    ]
 
-    # ── Panel 1: All three MAPE on one plot ──
-    ax = axes[0, 0]
-    ax.plot(timesteps, mape_r, "o-", color="#2ecc71", markersize=3,
-            linewidth=1.5, label="Ratio MAPE", alpha=0.9)
-    ax.plot(timesteps, mape_c, "s-", color="#3498db", markersize=3,
-            linewidth=1.5, label="Comp Time MAPE", alpha=0.9)
-    ax.plot(timesteps, mape_d, "D-", color="#e74c3c", markersize=3,
-            linewidth=1.5, label="Decomp Time MAPE", alpha=0.9)
-    ax.set_xlabel("Timestep", fontsize=10)
-    ax.set_ylabel("MAPE (%)", fontsize=10)
-    ax.set_title("Prediction MAPE Over Time", fontsize=11, fontweight="bold")
-    ax.legend(fontsize=9, loc="upper right")
-    ax.grid(alpha=0.3)
-    ax.set_ylim(bottom=0)
-    # Cap y-axis to avoid T=0 decomp dominating
-    if has_mape and len(mape_d) > 2:
-        p95 = np.percentile(mape_d[1:], 95)
-        ax.set_ylim(0, min(max(mape_d[1:]) * 1.1, p95 * 2.5))
-    if len(timesteps) > 1:
-        ax.axvspan(timesteps[0] - 0.5, timesteps[0] + 0.5,
-                   color="#fee0d2", alpha=0.5, label="_nolegend_")
+    fig, axes = plt.subplots(3, 1, figsize=(14, 12))
+    fig.suptitle("Online SGD Prediction Accuracy Over Timesteps",
+                 fontsize=15, fontweight="bold", y=0.98)
 
-    # ── Panel 2: Decomp time MAPE zoomed ──
-    ax = axes[0, 1]
-    ax.plot(timesteps, mape_d, "D-", color="#e74c3c", markersize=4,
-            linewidth=2, label="Decomp Time MAPE")
-    if len(mape_d) >= 5:
-        w = min(5, len(mape_d))
-        kernel = np.ones(w) / w
-        rolling = np.convolve(mape_d, kernel, mode="valid")
-        x_roll = timesteps[w - 1:]
-        ax.plot(x_roll, rolling, "--", color="#c0392b", linewidth=1.5,
-                alpha=0.7, label=f"Rolling avg (w={w})")
-    ax.set_xlabel("Timestep", fontsize=10)
-    ax.set_ylabel("MAPE (%)", fontsize=10)
-    ax.set_title("Decomp Time MAPE (Deferred Head-Only SGD)",
-                 fontsize=11, fontweight="bold")
-    ax.legend(fontsize=9)
-    ax.grid(alpha=0.3)
-    ax.set_ylim(bottom=0)
-    ax.axhline(20, color="#e67e22", linewidth=0.8, linestyle=":", alpha=0.6)
-    ax.text(timesteps[-1], 21, "20%", fontsize=7, color="#e67e22", ha="right")
-    if has_mape and len(mape_d) > 2:
-        p95 = np.percentile(mape_d[1:], 95)
-        ax.set_ylim(0, min(max(mape_d[1:]) * 1.1, p95 * 2.5))
+    n_ts = len(timesteps)
+    bar_w = max(0.6, (timesteps[-1] - timesteps[0]) / n_ts * 0.75) if n_ts > 1 else 0.8
 
-    # ── Panel 3: All three sMAPE (bounded 0-200%) ──
-    ax = axes[1, 0]
-    ax.plot(timesteps, smape_r, "o-", color="#2ecc71", markersize=3,
-            linewidth=1.5, label="Ratio sMAPE", alpha=0.9)
-    ax.plot(timesteps, smape_c, "s-", color="#3498db", markersize=3,
-            linewidth=1.5, label="Comp Time sMAPE", alpha=0.9)
-    ax.plot(timesteps, smape_d, "D-", color="#e74c3c", markersize=3,
-            linewidth=1.5, label="Decomp Time sMAPE", alpha=0.9)
-    ax.set_xlabel("Timestep", fontsize=10)
-    ax.set_ylabel("sMAPE (%)", fontsize=10)
-    ax.set_title("Prediction sMAPE Over Time (bounded 0-200%)", fontsize=11, fontweight="bold")
-    ax.legend(fontsize=9, loc="upper right")
-    ax.grid(alpha=0.3)
-    ax.set_ylim(0, 200)
+    for ax, (label, mape, dark, light) in zip(axes, metrics):
+        clipped = np.clip(mape, 0, 200)
 
-    # ── Panel 4: SGD fires per timestep ──
-    ax = axes[1, 1]
-    ax.bar(timesteps, sgd_fires, color="#e67e22", edgecolor="white",
-           linewidth=0.3, alpha=0.8, width=max(0.8, len(timesteps) * 0.01))
-    ax.set_xlabel("Timestep", fontsize=10)
-    ax.set_ylabel("SGD Fires", fontsize=10)
-    ax.set_title("SGD Updates Per Timestep", fontsize=11, fontweight="bold")
-    ax.grid(axis="y", alpha=0.3)
+        # Gradient-colored bars: green < 20%, orange 20-50%, red > 50%
+        colors = [("#27ae60" if v <= 20 else "#f39c12" if v <= 50 else "#e74c3c")
+                  for v in mape]
+        bars = ax.bar(timesteps, clipped, color=colors, edgecolor="white",
+                       linewidth=0.4, alpha=0.85, width=bar_w)
 
-    # ── Panel 5: Compression ratio over time ──
-    ax = axes[2, 0]
-    ax.plot(timesteps, ratio, "o-", color="#8e44ad", markersize=3,
-            linewidth=1.5)
-    ax.set_xlabel("Timestep", fontsize=10)
-    ax.set_ylabel("Compression Ratio", fontsize=10)
-    ax.set_title("Compression Ratio Over Time", fontsize=11, fontweight="bold")
-    ax.grid(alpha=0.3)
+        # Value labels on bars
+        for bar, val in zip(bars, mape):
+            if val > 0 and val <= 180:
+                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 2,
+                        f"{val:.0f}%", ha="center", va="bottom",
+                        fontsize=7, color="#444444")
+            elif val > 200:
+                ax.text(bar.get_x() + bar.get_width() / 2, 192,
+                        f"{val:.0f}%", ha="center", va="top",
+                        fontsize=6, color="white", fontweight="bold")
 
-    # ── Panel 6: MAPE comparison (ratio vs comp vs decomp, log scale) ──
-    ax = axes[2, 1]
-    if has_mape:
-        ax.semilogy(timesteps, np.clip(mape_r, 0.1, None), "o-", color="#2ecc71",
-                     markersize=3, linewidth=1.5, label="Ratio", alpha=0.9)
-        ax.semilogy(timesteps, np.clip(mape_c, 0.1, None), "s-", color="#3498db",
-                     markersize=3, linewidth=1.5, label="Comp Time", alpha=0.9)
-        ax.semilogy(timesteps, np.clip(mape_d, 0.1, None), "D-", color="#e74c3c",
-                     markersize=3, linewidth=1.5, label="Decomp Time", alpha=0.9)
-        ax.set_xlabel("Timestep", fontsize=10)
-        ax.set_ylabel("MAPE (%, log scale)", fontsize=10)
-        ax.set_title("MAPE Log Scale (shows convergence from large errors)",
-                     fontsize=11, fontweight="bold")
-        ax.legend(fontsize=9)
-        ax.grid(alpha=0.3, which="both")
-        ax.axhline(20, color="#e67e22", linewidth=0.8, linestyle=":", alpha=0.6)
-    else:
-        ax.text(0.5, 0.5, "MAPE columns not available", ha="center", va="center",
-                transform=ax.transAxes, fontsize=12, color="gray")
+        # Trend line
+        if n_ts >= 5:
+            w = min(5, n_ts)
+            kernel = np.ones(w) / w
+            rolling = np.clip(np.convolve(mape, kernel, mode="valid"), 0, 200)
+            x_roll = timesteps[w - 1:]
+            ax.plot(x_roll, rolling, color="#2c3e50", linewidth=2.5, alpha=0.9,
+                    label=f"Trend (w={w})", zorder=5)
 
-    # Summary text box
-    if len(mape_d) > 1:
-        t0_d = mape_d[0]
-        t1_d = mape_d[1]
-        # Find steady-state range (T >= 5, excluding first few)
-        ss_start = min(5, len(mape_d) - 1)
-        avg_d = np.mean(mape_d[ss_start:])
-        min_d = np.min(mape_d[ss_start:])
-        summary = (f"Decomp MAPE:  T=0: {t0_d:.0f}%  →  T=1: {t1_d:.0f}%  →  "
-                   f"avg(T≥{ss_start}): {avg_d:.1f}%  min: {min_d:.1f}%\n"
-                   f"Ratio MAPE avg(T≥{ss_start}): {np.mean(mape_r[ss_start:]):.1f}%   "
-                   f"Comp MAPE avg(T≥{ss_start}): {np.mean(mape_c[ss_start:]):.1f}%")
-        fig.text(0.5, 0.005, summary, ha="center", fontsize=9,
-                 fontfamily="monospace",
-                 bbox=dict(boxstyle="round,pad=0.5", facecolor="#f8f9fa",
-                           edgecolor="#aab0b5", alpha=0.9))
+        # 20% target
+        ax.axhline(20, color="#e67e22", linewidth=1.2, linestyle="--", alpha=0.7)
+        ax.text(timesteps[-1] + bar_w, 20, " 20% target", fontsize=8,
+                color="#e67e22", va="center", fontweight="bold")
 
-    fig.tight_layout(rect=[0, 0.04, 1, 0.96])
+        ax.set_ylabel(f"{label}\nMAPE (%)", fontsize=11, fontweight="bold")
+        ax.set_ylim(0, 200)
+        ax.set_xlim(timesteps[0] - bar_w, timesteps[-1] + bar_w * 3)
+        ax.grid(axis="y", alpha=0.2, linestyle="-")
+        ax.tick_params(axis="both", labelsize=9)
+        ax.legend(fontsize=9, loc="upper right", framealpha=0.9)
+
+        # Stats annotation
+        best = np.min(mape)
+        avg_all = np.mean(mape)
+        ax.text(0.01, 0.95,
+                f"Start: {mape[0]:.0f}%    Best: {best:.0f}%    Avg: {avg_all:.0f}%",
+                transform=ax.transAxes, fontsize=9, ha="left", va="top",
+                fontfamily="monospace",
+                bbox=dict(facecolor="white", alpha=0.9, edgecolor="#bbb",
+                          boxstyle="round,pad=0.4"))
+
+    axes[-1].set_xlabel("Timestep", fontsize=11, fontweight="bold")
+
+    # SGD fires as subtle secondary axis on bottom panel
+    ax2 = axes[-1].twinx()
+    ax2.bar(timesteps, sgd_fires, width=bar_w * 0.3, color="#95a5a6",
+            alpha=0.4, zorder=1, label="SGD fires")
+    ax2.set_ylabel("SGD Fires", fontsize=9, color="#7f8c8d")
+    ax2.tick_params(axis="y", labelcolor="#7f8c8d", labelsize=8)
+    ax2.set_ylim(0, max(sgd_fires) * 3 if max(sgd_fires) > 0 else 10)
+    ax2.legend(fontsize=8, loc="lower right", framealpha=0.8)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -852,61 +392,78 @@ def make_timestep_chunks_figure(tc_csv_path, output_path):
     for r in rows:
         ts = int(g(r, "timestep"))
         by_ts.setdefault(ts, []).append(r)
-    timestep_list = sorted(by_ts.keys())
-    n_ts = len(timestep_list)
-    if n_ts == 0:
+    all_ts = sorted(by_ts.keys())
+    if len(all_ts) == 0:
         return
+    # Pick 5 milestones: 0%, 25%, 50%, 75%, 100% of available timesteps
+    indices = [0, len(all_ts) // 4, len(all_ts) // 2, 3 * len(all_ts) // 4, len(all_ts) - 1]
+    seen = set()
+    timestep_list = [all_ts[i] for i in indices if not (all_ts[i] in seen or seen.add(all_ts[i]))]
+    n_ts = len(timestep_list)
 
-    fig, axes = plt.subplots(n_ts, 2, figsize=(18, 3.5 * n_ts + 1.5),
+    metrics = [
+        ("Compression Ratio",  "predicted_ratio",    "actual_ratio",      "x",  "mape_ratio"),
+        ("Comp Time",          "predicted_comp_ms",  "actual_comp_ms",    "ms", "mape_comp"),
+        ("Decomp Time",        "predicted_decomp_ms","actual_decomp_ms",  "ms", "mape_decomp"),
+    ]
+
+    fig, axes = plt.subplots(n_ts, 3, figsize=(20, 3.2 * n_ts + 2),
                               squeeze=False)
-    fig.suptitle("Per-Chunk MAPE at Milestone Timesteps",
+    fig.suptitle("NN Predicted vs Actual Per Chunk at Milestone Timesteps",
                  fontsize=14, fontweight="bold", y=0.99)
 
     for row_idx, ts in enumerate(timestep_list):
         chunk_rows = by_ts[ts]
         chunks = np.array([int(g(r, "chunk")) for r in chunk_rows])
-        mape_d = np.array([g(r, "mape_decomp") for r in chunk_rows])
-        mape_r = np.array([g(r, "mape_ratio") for r in chunk_rows])
-        mape_c = np.array([g(r, "mape_comp") for r in chunk_rows])
-        pred_d = np.array([g(r, "predicted_decomp_ms") for r in chunk_rows])
-        act_d = np.array([g(r, "actual_decomp_ms") for r in chunk_rows])
+        sort_idx = np.argsort(chunks)
+        chunks = chunks[sort_idx]
 
-        # Left panel: Decomp MAPE per chunk
-        ax = axes[row_idx, 0]
-        colors = ["#e74c3c" if m > 50 else "#f39c12" if m > 20 else "#2ecc71"
-                  for m in mape_d]
-        ax.bar(chunks, mape_d, color=colors, edgecolor="white", linewidth=0.3, width=1.0)
-        ax.axhline(20, color="#e67e22", linewidth=1, linestyle="--", alpha=0.6)
-        ax.set_ylabel(f"T={ts}\nMAPE (%)", fontsize=10, fontweight="bold")
-        if row_idx == 0:
-            ax.set_title("Decomp Time MAPE per Chunk", fontsize=11, fontweight="bold")
-        if row_idx == n_ts - 1:
-            ax.set_xlabel("Chunk", fontsize=10)
-        ax.grid(axis="y", alpha=0.3)
-        # Cap y-axis
-        p95 = np.percentile(mape_d, 95) if len(mape_d) > 0 else 100
-        ax.set_ylim(0, max(p95 * 1.5, 50))
-        # Annotate avg
-        avg_d = np.mean(mape_d)
-        ax.text(0.98, 0.95, f"avg={avg_d:.1f}%", transform=ax.transAxes,
-                fontsize=9, ha="right", va="top",
-                bbox=dict(facecolor="white", alpha=0.8, edgecolor="#ccc"))
+        for col_idx, (label, pred_key, act_key, unit, mape_key) in enumerate(metrics):
+            ax = axes[row_idx, col_idx]
+            pred = np.array([g(r, pred_key) for r in chunk_rows])[sort_idx]
+            act = np.array([g(r, act_key) for r in chunk_rows])[sort_idx]
+            mape_vals = np.array([g(r, mape_key) for r in chunk_rows])[sort_idx]
 
-        # Right panel: Predicted vs actual decomp time
-        ax = axes[row_idx, 1]
-        ax.bar(chunks - 0.2, pred_d, width=0.4, color="#3498db", alpha=0.8, label="Predicted")
-        ax.bar(chunks + 0.2, act_d, width=0.4, color="#e74c3c", alpha=0.8, label="Actual")
-        if row_idx == 0:
-            ax.set_title("Predicted vs Actual Decomp Time (ms)", fontsize=11, fontweight="bold")
-            ax.legend(fontsize=8)
-        if row_idx == n_ts - 1:
-            ax.set_xlabel("Chunk", fontsize=10)
-        ax.set_ylabel("ms", fontsize=10)
-        ax.grid(axis="y", alpha=0.3)
-        # Cap y-axis to avoid T=0 dominating
-        all_vals = np.concatenate([pred_d, act_d])
-        p95 = np.percentile(all_vals[all_vals > 0], 95) if np.any(all_vals > 0) else 1
-        ax.set_ylim(0, p95 * 1.5)
+            # Lines with shaded error region
+            ax.plot(chunks, act, color="#2c3e50", linewidth=1.8, label="Actual",
+                    zorder=3)
+            ax.plot(chunks, pred, color="#3498db", linewidth=1.5, linestyle="--",
+                    alpha=0.9, label="Predicted", zorder=3)
+            ax.fill_between(chunks, act, pred, color="#3498db", alpha=0.15,
+                            zorder=2)
+
+            # Highlight chunks with MAPE > 50%
+            bad = mape_vals > 50
+            if np.any(bad):
+                ax.scatter(chunks[bad], pred[bad], color="#e74c3c", s=20,
+                           zorder=4, marker="x", linewidths=1.5)
+
+            if row_idx == 0:
+                ax.set_title(f"{label} ({unit})", fontsize=12, fontweight="bold")
+            if row_idx == 0 and col_idx == 2:
+                ax.legend(fontsize=9, loc="upper left", framealpha=0.9)
+            if row_idx == n_ts - 1:
+                ax.set_xlabel("Chunk Index", fontsize=10)
+            if col_idx == 0:
+                ax.set_ylabel(f"T={ts}", fontsize=11, fontweight="bold")
+            ax.grid(alpha=0.2, linestyle="-")
+            ax.tick_params(labelsize=8)
+
+            # Cap y-axis
+            all_vals = np.concatenate([pred, act])
+            pos = all_vals[all_vals > 0]
+            p95 = np.percentile(pos, 95) if len(pos) > 0 else 1
+            ax.set_ylim(0, p95 * 1.6)
+
+            # Stats box
+            avg_mape = np.mean(mape_vals)
+            median_mape = np.median(mape_vals)
+            ax.text(0.98, 0.95,
+                    f"MAPE: avg={avg_mape:.0f}%  med={median_mape:.0f}%",
+                    transform=ax.transAxes, fontsize=8, ha="right", va="top",
+                    fontfamily="monospace",
+                    bbox=dict(facecolor="white", alpha=0.9, edgecolor="#bbb",
+                              boxstyle="round,pad=0.3"))
 
     fig.tight_layout(rect=[0, 0, 1, 0.97])
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
@@ -919,23 +476,18 @@ def make_timestep_chunks_figure(tc_csv_path, output_path):
 # Main
 # ═══════════════════════════════════════════════════════════════════════
 
-ALL_VIEWS = ["summary", "chunks", "mape", "timesteps"]
+ALL_VIEWS = ["summary", "timesteps"]
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Unified GPUCompress benchmark visualizer (summary + chunks + MAPE)")
+        description="Unified GPUCompress benchmark visualizer (summary + timesteps)")
     parser.add_argument("csvs", nargs="*",
-                        help="Positional CSV paths (auto-classified as gs/vpic, agg/chunks)")
+                        help="Positional CSV paths (auto-classified as gs/vpic)")
     parser.add_argument("--gs-csv", help="Gray-Scott aggregate CSV")
-    parser.add_argument("--gs-chunks-csv", help="Gray-Scott per-chunk CSV")
     parser.add_argument("--gs-timesteps-csv", help="Gray-Scott timestep adaptation CSV")
     parser.add_argument("--vpic-csv", help="VPIC aggregate CSV")
-    parser.add_argument("--vpic-chunks-csv", help="VPIC per-chunk CSV")
-    parser.add_argument("--predictions-csv", help="test_vol_nn_predictions CSV")
     parser.add_argument("--output-dir", help="Output directory (default: alongside CSV)")
-    parser.add_argument("--phase", action="append", default=None,
-                        help="Phase filter for MAPE view (repeat for multiple)")
     parser.add_argument("--view", action="append", default=None,
                         help=f"Views to generate: {ALL_VIEWS} (default: all)")
     args = parser.parse_args()
@@ -946,31 +498,17 @@ def main():
     for csv_path in args.csvs:
         low = csv_path.lower()
         is_vpic = "vpic" in low
-        is_chunks = "chunk" in low
-        is_pred = "prediction" in low
-        if is_pred:
-            if not args.predictions_csv:
-                args.predictions_csv = csv_path
-        elif is_vpic and is_chunks:
-            if not args.vpic_chunks_csv:
-                args.vpic_chunks_csv = csv_path
-        elif is_vpic:
+        if is_vpic:
             if not args.vpic_csv:
                 args.vpic_csv = csv_path
-        elif is_chunks:
-            if not args.gs_chunks_csv:
-                args.gs_chunks_csv = csv_path
         else:
             if not args.gs_csv:
                 args.gs_csv = csv_path
 
     # Auto-detect
     gs_agg = args.gs_csv or find_csv(DEFAULT_GS_AGG)
-    gs_chunks = args.gs_chunks_csv or find_csv(DEFAULT_GS_CHUNKS)
     gs_tsteps = args.gs_timesteps_csv or find_csv(DEFAULT_GS_TIMESTEPS)
     vpic_agg = args.vpic_csv or find_csv(DEFAULT_VPIC_AGG)
-    vpic_chunks = args.vpic_chunks_csv or find_csv(DEFAULT_VPIC_CHUNKS)
-    pred_csv = args.predictions_csv or find_csv(DEFAULT_PREDICTIONS)
 
     found_any = False
 
@@ -994,32 +532,11 @@ def main():
             make_summary_figure("Gray-Scott Simulation", rows,
                                 os.path.join(out_dir, "benchmark_grayscott.png"), meta)
 
-    if gs_chunks and os.path.exists(gs_chunks):
-        found_any = True
-        out_dir = args.output_dir or os.path.dirname(os.path.abspath(gs_chunks))
-        if "chunks" in views:
-            print(f"Loading Gray-Scott chunks: {gs_chunks}")
-            make_chunks_figure(gs_chunks, os.path.join(out_dir, "chunks_viz.png"))
-        if "mape" in views:
-            print(f"Loading Gray-Scott MAPE: {gs_chunks}")
-            mape_data = load_mape_csv(gs_chunks, phases=args.phase)
-            if mape_data:
-                total = sum(len(v) for v in mape_data.values())
-                print(f"  {total} chunks across {len(mape_data)} phase(s)")
-                for phase, mrows in mape_data.items():
-                    avg_r = np.mean([r["ratio_mape"] for r in mrows])
-                    avg_c = np.mean([r["comp_mape"] for r in mrows])
-                    sgd_n = sum(1 for r in mrows if r["sgd_fired"])
-                    exp_n = sum(1 for r in mrows if r["exploration"])
-                    print(f"    {phase}: {len(mrows)} chunks, avg ratio MAPE={avg_r:.1f}%, "
-                          f"avg comp MAPE={avg_c:.1f}%, SGD={sgd_n}, explorations={exp_n}")
-                make_mape_figure(mape_data, os.path.join(out_dir, "mape_over_chunks.png"))
-
     if gs_tsteps and os.path.exists(gs_tsteps) and "timesteps" in views:
         found_any = True
         print(f"Loading Gray-Scott timestep adaptation: {gs_tsteps}")
         out_dir = args.output_dir or os.path.dirname(os.path.abspath(gs_tsteps))
-        make_timestep_figure(gs_tsteps, os.path.join(out_dir, "timestep_adaptation.png"))
+        make_timestep_figure(gs_tsteps, os.path.join(out_dir, "sgd_accuracy_over_time.png"))
 
     gs_tc = find_csv(DEFAULT_GS_TSTEP_CHUNKS)
     if gs_tc and os.path.exists(gs_tc) and "timesteps" in views:
@@ -1027,7 +544,7 @@ def main():
         print(f"Loading Gray-Scott per-chunk milestones: {gs_tc}")
         out_dir = args.output_dir or os.path.dirname(os.path.abspath(gs_tc))
         try:
-            make_timestep_chunks_figure(gs_tc, os.path.join(out_dir, "timestep_chunks_mape.png"))
+            make_timestep_chunks_figure(gs_tc, os.path.join(out_dir, "predicted_vs_actual_per_chunk.png"))
         except Exception as e:
             print(f"  Warning: per-chunk milestone plot failed: {e}")
 
@@ -1047,33 +564,10 @@ def main():
             make_summary_figure("VPIC Harris Sheet Reconnection", rows,
                                 os.path.join(out_dir, "benchmark_vpic.png"), meta)
 
-    if vpic_chunks and os.path.exists(vpic_chunks):
-        found_any = True
-        out_dir = args.output_dir or os.path.dirname(os.path.abspath(vpic_chunks))
-        if "chunks" in views:
-            print(f"Loading VPIC chunks: {vpic_chunks}")
-            make_chunks_figure(vpic_chunks, os.path.join(out_dir, "chunks_viz.png"))
-        if "mape" in views:
-            print(f"Loading VPIC MAPE: {vpic_chunks}")
-            mape_data = load_mape_csv(vpic_chunks, phases=args.phase)
-            if mape_data:
-                total = sum(len(v) for v in mape_data.values())
-                print(f"  {total} chunks across {len(mape_data)} phase(s)")
-                make_mape_figure(mape_data, os.path.join(out_dir, "mape_over_chunks.png"))
-
-    # ── Predictions CSV (from test_vol_nn_predictions) ──
-    if pred_csv and os.path.exists(pred_csv) and "mape" in views:
-        found_any = True
-        print(f"Loading predictions MAPE: {pred_csv}")
-        mape_data = load_mape_csv(pred_csv, phases=args.phase)
-        if mape_data:
-            out_dir = args.output_dir or os.path.dirname(os.path.abspath(pred_csv))
-            make_mape_figure(mape_data, os.path.join(out_dir, "mape_over_chunks.png"))
-
     if not found_any:
         print("ERROR: No benchmark CSV files found.")
         print("Expected locations:")
-        for p in DEFAULT_GS_AGG + DEFAULT_GS_CHUNKS + DEFAULT_VPIC_AGG + DEFAULT_VPIC_CHUNKS:
+        for p in DEFAULT_GS_AGG + DEFAULT_VPIC_AGG:
             print(f"  {p}")
         print("\nRun benchmarks first, or specify paths explicitly.")
         sys.exit(1)
