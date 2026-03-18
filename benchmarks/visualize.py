@@ -98,6 +98,10 @@ DEFAULT_VPIC_CHUNKS = [
     os.path.join(PROJECT_ROOT, "benchmarks/vpic-kokkos/benchmark_vpic_chunks.csv"),
     os.path.join(PROJECT_ROOT, "benchmarks/vpic/benchmark_vpic_chunks.csv"),
 ]
+DEFAULT_GS_TIMESTEPS = [
+    os.path.join(PROJECT_ROOT, "benchmarks/grayscott/results/benchmark_grayscott_timesteps.csv"),
+    os.path.join(PROJECT_ROOT, "benchmarks/grayscott/benchmark_grayscott_timesteps.csv"),
+]
 DEFAULT_PREDICTIONS = ["/tmp/test_vol_nn_predictions.csv"]
 
 
@@ -682,10 +686,117 @@ def make_mape_figure(mape_data, output_path):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# View 4: Timestep Adaptation (sMAPE over timesteps)
+# ═══════════════════════════════════════════════════════════════════════
+
+def make_timestep_figure(ts_csv_path, output_path):
+    """Plot sMAPE for ratio/comp_time/decomp_time over timesteps."""
+    rows = parse_csv(ts_csv_path)
+    if not rows:
+        print(f"  No timestep data in {ts_csv_path}, skipping.")
+        return
+
+    timesteps = np.array([g(r, "timestep") for r in rows])
+    smape_r = np.array([g(r, "smape_ratio") for r in rows])
+    smape_c = np.array([g(r, "smape_comp") for r in rows])
+    smape_d = np.array([g(r, "smape_decomp") for r in rows])
+    sgd_fires = np.array([g(r, "sgd_fires") for r in rows])
+    ratio = np.array([g(r, "ratio") for r in rows])
+
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+    fig.suptitle("NN Adaptation Over Timesteps (Multi-Timestep SGD)",
+                 fontsize=14, fontweight="bold", y=0.98)
+
+    # ── Panel 1: All three sMAPE on one plot ──
+    ax = axes[0, 0]
+    ax.plot(timesteps, smape_r, "o-", color="#2ecc71", markersize=3,
+            linewidth=1.5, label="Ratio sMAPE", alpha=0.9)
+    ax.plot(timesteps, smape_c, "s-", color="#3498db", markersize=3,
+            linewidth=1.5, label="Comp Time sMAPE", alpha=0.9)
+    ax.plot(timesteps, smape_d, "D-", color="#e74c3c", markersize=3,
+            linewidth=1.5, label="Decomp Time sMAPE", alpha=0.9)
+    ax.set_xlabel("Timestep", fontsize=10)
+    ax.set_ylabel("sMAPE (%)", fontsize=10)
+    ax.set_title("Prediction sMAPE Over Time", fontsize=11, fontweight="bold")
+    ax.legend(fontsize=9, loc="upper right")
+    ax.grid(alpha=0.3)
+    ax.set_ylim(bottom=0)
+    # Shade T=0 region
+    if len(timesteps) > 1:
+        ax.axvspan(timesteps[0] - 0.5, timesteps[0] + 0.5,
+                   color="#fee0d2", alpha=0.5, label="_nolegend_")
+        ax.annotate("pretrained\n(no reads yet)", xy=(timesteps[0], smape_d[0]),
+                    xytext=(timesteps[0] + max(1, len(timesteps) * 0.08), smape_d[0] * 0.85),
+                    fontsize=8, color="#666", arrowprops=dict(arrowstyle="->", color="#999"))
+
+    # ── Panel 2: Decomp time sMAPE zoomed ──
+    ax = axes[0, 1]
+    ax.plot(timesteps, smape_d, "D-", color="#e74c3c", markersize=4,
+            linewidth=2, label="Decomp Time sMAPE")
+    # Rolling average
+    if len(smape_d) >= 5:
+        w = min(5, len(smape_d))
+        kernel = np.ones(w) / w
+        rolling = np.convolve(smape_d, kernel, mode="valid")
+        x_roll = timesteps[w - 1:]
+        ax.plot(x_roll, rolling, "--", color="#c0392b", linewidth=1.5,
+                alpha=0.7, label=f"Rolling avg (w={w})")
+    ax.set_xlabel("Timestep", fontsize=10)
+    ax.set_ylabel("sMAPE (%)", fontsize=10)
+    ax.set_title("Decomp Time sMAPE (Deferred Head-Only SGD)",
+                 fontsize=11, fontweight="bold")
+    ax.legend(fontsize=9)
+    ax.grid(alpha=0.3)
+    ax.set_ylim(bottom=0)
+    # Add horizontal reference lines
+    ax.axhline(20, color="#e67e22", linewidth=0.8, linestyle=":", alpha=0.6)
+    ax.text(timesteps[-1], 21, "20%", fontsize=7, color="#e67e22", ha="right")
+
+    # ── Panel 3: SGD fires per timestep ──
+    ax = axes[1, 0]
+    ax.bar(timesteps, sgd_fires, color="#e67e22", edgecolor="white",
+           linewidth=0.3, alpha=0.8, width=0.8)
+    ax.set_xlabel("Timestep", fontsize=10)
+    ax.set_ylabel("SGD Fires", fontsize=10)
+    ax.set_title("SGD Updates Per Timestep", fontsize=11, fontweight="bold")
+    ax.grid(axis="y", alpha=0.3)
+
+    # ── Panel 4: Compression ratio over time ──
+    ax = axes[1, 1]
+    ax.plot(timesteps, ratio, "o-", color="#8e44ad", markersize=3,
+            linewidth=1.5)
+    ax.set_xlabel("Timestep", fontsize=10)
+    ax.set_ylabel("Compression Ratio", fontsize=10)
+    ax.set_title("Compression Ratio Over Time", fontsize=11, fontweight="bold")
+    ax.grid(alpha=0.3)
+
+    # Add summary text box
+    if len(smape_d) > 1:
+        t0_d = smape_d[0]
+        t1_d = smape_d[1] if len(smape_d) > 1 else t0_d
+        avg_d = np.mean(smape_d[1:]) if len(smape_d) > 1 else t0_d
+        max_d = np.max(smape_d[1:]) if len(smape_d) > 1 else t0_d
+        summary = (f"Decomp sMAPE:  T=0: {t0_d:.1f}%  →  T=1: {t1_d:.1f}%\n"
+                   f"  avg(T≥1): {avg_d:.1f}%   max(T≥1): {max_d:.1f}%\n"
+                   f"Ratio sMAPE avg: {np.mean(smape_r[1:]):.1f}%\n"
+                   f"Comp sMAPE avg:  {np.mean(smape_c[1:]):.1f}%")
+        fig.text(0.5, 0.01, summary, ha="center", fontsize=9,
+                 fontfamily="monospace",
+                 bbox=dict(boxstyle="round,pad=0.5", facecolor="#f8f9fa",
+                           edgecolor="#aab0b5", alpha=0.9))
+
+    fig.tight_layout(rect=[0, 0.06, 1, 0.96])
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {output_path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════════
 
-ALL_VIEWS = ["summary", "chunks", "mape"]
+ALL_VIEWS = ["summary", "chunks", "mape", "timesteps"]
 
 
 def main():
@@ -695,6 +806,7 @@ def main():
                         help="Positional CSV paths (auto-classified as gs/vpic, agg/chunks)")
     parser.add_argument("--gs-csv", help="Gray-Scott aggregate CSV")
     parser.add_argument("--gs-chunks-csv", help="Gray-Scott per-chunk CSV")
+    parser.add_argument("--gs-timesteps-csv", help="Gray-Scott timestep adaptation CSV")
     parser.add_argument("--vpic-csv", help="VPIC aggregate CSV")
     parser.add_argument("--vpic-chunks-csv", help="VPIC per-chunk CSV")
     parser.add_argument("--predictions-csv", help="test_vol_nn_predictions CSV")
@@ -732,6 +844,7 @@ def main():
     # Auto-detect
     gs_agg = args.gs_csv or find_csv(DEFAULT_GS_AGG)
     gs_chunks = args.gs_chunks_csv or find_csv(DEFAULT_GS_CHUNKS)
+    gs_tsteps = args.gs_timesteps_csv or find_csv(DEFAULT_GS_TIMESTEPS)
     vpic_agg = args.vpic_csv or find_csv(DEFAULT_VPIC_AGG)
     vpic_chunks = args.vpic_chunks_csv or find_csv(DEFAULT_VPIC_CHUNKS)
     pred_csv = args.predictions_csv or find_csv(DEFAULT_PREDICTIONS)
@@ -778,6 +891,12 @@ def main():
                     print(f"    {phase}: {len(mrows)} chunks, avg ratio MAPE={avg_r:.1f}%, "
                           f"avg comp MAPE={avg_c:.1f}%, SGD={sgd_n}, explorations={exp_n}")
                 make_mape_figure(mape_data, os.path.join(out_dir, "mape_over_chunks.png"))
+
+    if gs_tsteps and os.path.exists(gs_tsteps) and "timesteps" in views:
+        found_any = True
+        print(f"Loading Gray-Scott timestep adaptation: {gs_tsteps}")
+        out_dir = args.output_dir or os.path.dirname(os.path.abspath(gs_tsteps))
+        make_timestep_figure(gs_tsteps, os.path.join(out_dir, "timestep_adaptation.png"))
 
     # ── VPIC ──
     if vpic_agg and os.path.exists(vpic_agg):

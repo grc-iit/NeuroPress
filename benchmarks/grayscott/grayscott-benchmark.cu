@@ -940,7 +940,7 @@ int main(int argc, char **argv)
         gpucompress_enable_online_learning();
         gpucompress_set_reinforcement(1, sgd_lr, REINFORCE_MAPE, REINFORCE_MAPE);
         gpucompress_set_exploration(1);
-        gpucompress_set_exploration_threshold(0.15);
+        gpucompress_set_exploration_threshold(0.10);
         gpucompress_set_exploration_k(8);
         hid_t dcpl_rlexp = make_dcpl_auto(L, chunk_z, error_bound);
         rc = run_phase_vol(d_v, d_read, d_count,
@@ -1072,6 +1072,44 @@ int main(int argc, char **argv)
             printf("  %-4d  %-8d  %6.0f  %6.0f   %5.2fx  %7.1f%%  %7.1f%%  %7.1f%%  %3d\n",
                    t, cum_sim_step, write_ms_t, read_ms_t,
                    ratio_t, mape_r, mape_c, mape_d, sgd_t);
+
+            /* Print per-chunk detail at milestone timesteps:
+             * T=0, T=timesteps/4, T=timesteps/2, T=3*timesteps/4, T=last */
+            {
+                bool is_milestone = (t == 0 || t == timesteps / 4 ||
+                                     t == timesteps / 2 || t == (timesteps * 3) / 4 ||
+                                     t == timesteps - 1);
+                if (is_milestone) {
+                    printf("    ── Per-chunk detail for T=%d ──\n", t);
+                    int n_detail = n_hist;
+                    /* Print first 3, last 3, and every stride-th chunk */
+                    int stride = (n_detail > 20) ? n_detail / 10 : 1;
+                    for (int ci = 0; ci < n_detail; ci++) {
+                        bool print_it = (ci < 3 || ci >= n_detail - 3 ||
+                                         ci % stride == 0);
+                        if (!print_it) continue;
+                        gpucompress_chunk_diag_t dd;
+                        if (gpucompress_get_chunk_diag(ci, &dd) != 0) continue;
+                        double dr = 0, dc = 0, ddd = 0;
+                        double den_r = (fabs(dd.actual_ratio) + fabs(dd.predicted_ratio)) / 2.0;
+                        double den_c = (fabs(dd.compression_ms) + fabs(dd.predicted_comp_time)) / 2.0;
+                        double den_d = (fabs(dd.decompression_ms) + fabs(dd.predicted_decomp_time)) / 2.0;
+                        if (den_r > 0) dr = fabs(dd.predicted_ratio - dd.actual_ratio) / den_r * 100.0;
+                        if (den_c > 0) dc = fabs(dd.predicted_comp_time - dd.compression_ms) / den_c * 100.0;
+                        if (den_d > 0) ddd = fabs(dd.predicted_decomp_time - dd.decompression_ms) / den_d * 100.0;
+                        printf("      C%3d  pred_d=%6.3fms  act_d=%5.3fms  sMAPE_D=%5.1f%%"
+                               "  pred_r=%6.1fx  act_r=%6.1fx  sMAPE_R=%5.1f%%%s%s\n",
+                               ci + 1,
+                               (double)dd.predicted_decomp_time,
+                               (double)dd.decompression_ms, ddd,
+                               (double)dd.predicted_ratio,
+                               (double)dd.actual_ratio, dr,
+                               dd.sgd_fired ? " [SGD]" : "",
+                               dd.exploration_triggered ? " [EXP]" : "");
+                    }
+                    printf("    ── end T=%d ──\n", t);
+                }
+            }
 
             if (ts_csv) {
                 fprintf(ts_csv, "%d,%d,%.2f,%.2f,%.4f,%.2f,%.2f,%.2f,%d,%d,%llu,%.1f,%.1f,%d,%d\n",

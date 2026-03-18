@@ -1015,6 +1015,16 @@ extern "C" gpucompress_error_t gpucompress_compress(
          * with the primary correction through shared hidden layers. */
         auto t_sgd_start = std::chrono::steady_clock::now();
         if (error_pct > static_cast<double>(g_reinforce_mape_threshold) && d_stats_ptr) {
+            /* DEBUG: log SGD trigger details when error is large */
+            if (error_pct > 0.50) {
+                int chunk_idx = g_chunk_history_count.load();
+                fprintf(stderr, "[SGD-DEBUG] chunk=%d error_pct=%.1f%% "
+                        "pred_r=%.1f act_r=%.1f pred_ct=%.3f act_ct=%.3f "
+                        "pred_dt=%.3f act_dt=%.3f action=%d\n",
+                        chunk_idx, error_pct * 100.0,
+                        pred_r, actual_ratio, pred_ct, act_ct,
+                        pred_dt, act_dt, nn_action);
+            }
             SGDSample primary_sgd[1];
             primary_sgd[0].action            = explored_samples[0].action;
             primary_sgd[0].actual_ratio      = static_cast<float>(explored_samples[0].ratio);
@@ -1028,6 +1038,10 @@ extern "C" gpucompress_error_t gpucompress_compress(
                         input_size, cfg.error_bound, g_reinforce_lr, ctx,
                         &gn, &gc, &gs) == 0) {
                     sgd_fired = true;
+                    /* DEBUG: log SGD result for large errors */
+                    if (error_pct > 0.50) {
+                        fprintf(stderr, "[SGD-DEBUG]   -> grad_norm=%.4f clipped=%d\n", gn, gc);
+                    }
                 }
             }
         }

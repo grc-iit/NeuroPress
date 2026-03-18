@@ -747,7 +747,7 @@ __global__ void nnSGDKernel(
     if (t == 0) {
         for (int o = 0; o < NN_OUTPUT_DIM; o++) {
             float lv = weights->log_var[o];
-            float precision = expf(-lv);  // exp(-log_var) = 1/σ²
+            float precision = expf(fmaxf(-20.0f, fminf(20.0f, -lv)));  // safe exp(-log_var)
 
             // Use RAW (unclamped) errors for log_var gradient.
             // Clamped errors are all ≤0.5², so UW can't distinguish outputs.
@@ -769,7 +769,7 @@ __global__ void nnSGDKernel(
             weights->log_var[o] = lv;
 
             // Precision weight for scaling CLAMPED error signals: 1/σ = exp(-0.5 * log_var)
-            s_uw[o] = expf(-0.5f * lv);
+            s_uw[o] = expf(fmaxf(-20.0f, fminf(20.0f, -0.5f * lv)));
 
             // Scale clamped errors by the uncertainty weight for backprop
             for (int si = 0; si < num_samples; si++)
@@ -1123,6 +1123,20 @@ __global__ void nnSGDKernel(
         // Step 7: Minimum step to avoid stall
         float step = fmaxf(MIN_STEP, fminf(MAX_STEP, TRUST_K * s_avg_err));
 
+        // DEBUG: print every SGD call to trace NaN progression
+        if (t == 0) {
+            printf("[SGD-KERNEL] call=%d avg_err=%.4f step=%.5f g_norm=%.4f "
+                   "err[0]=%.3f err[1]=%.3f err[2]=%.3f err[3]=%.3f "
+                   "uw[0]=%.3f uw[1]=%.3f uw[2]=%.3f uw[3]=%.3f "
+                   "lv[0]=%.2f lv[1]=%.2f lv[2]=%.2f lv[3]=%.2f\n",
+                   weights->sgd_call_count, s_avg_err, step,
+                   sqrtf(s_reduce[0]) + 1e-8f,
+                   s_d3_raw[0][0], s_d3_raw[0][1], s_d3_raw[0][2], s_d3_raw[0][3],
+                   s_uw[0], s_uw[1], s_uw[2], s_uw[3],
+                   weights->log_var[0], weights->log_var[1],
+                   weights->log_var[2], weights->log_var[3]);
+        }
+
         // Step 9: Anti-flip damping — dot current gradient with EMA (previous direction)
         // If they point in opposite directions, damp the step.
         // Use region 2 (EMA) as the "previous direction" reference.
@@ -1154,7 +1168,30 @@ __global__ void nnSGDKernel(
 
         // Step 6: EMA smoothing — blend current gradient into EMA buffer
         // g_ema = decay * g_ema + (1-decay) * g_current
+        // Sanitize: if current gradient has NaN (from corrupted forward pass),
+        // zero it out to prevent permanent EMA poisoning.
         float ema_new = 1.0f - EMA_DECAY;
+        {
+            // Sanitize region 0 (current gradient) — zero any NaN/Inf entries
+            for (int i = 0; i < NN_INPUT_DIM; i++) {
+                int idx = SGD_OFF_DW1 + t * NN_INPUT_DIM + i;
+                if (!isfinite(d_grad_buffer[idx])) d_grad_buffer[idx] = 0.0f;
+            }
+            if (!isfinite(d_grad_buffer[SGD_OFF_DB1 + t]))
+                d_grad_buffer[SGD_OFF_DB1 + t] = 0.0f;
+            for (int i = 0; i < NN_HIDDEN_DIM; i++) {
+                int idx = SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i;
+                if (!isfinite(d_grad_buffer[idx])) d_grad_buffer[idx] = 0.0f;
+            }
+            if (!isfinite(d_grad_buffer[SGD_OFF_DB2 + t]))
+                d_grad_buffer[SGD_OFF_DB2 + t] = 0.0f;
+            for (int out = 0; out < NN_OUTPUT_DIM; out++) {
+                int idx = SGD_OFF_DW3 + out * NN_HIDDEN_DIM + t;
+                if (!isfinite(d_grad_buffer[idx])) d_grad_buffer[idx] = 0.0f;
+            }
+            if (t < NN_OUTPUT_DIM && !isfinite(d_grad_buffer[SGD_OFF_DB3 + t]))
+                d_grad_buffer[SGD_OFF_DB3 + t] = 0.0f;
+        }
         for (int i = 0; i < NN_INPUT_DIM; i++) {
             int idx = SGD_OFF_DW1 + t * NN_INPUT_DIM + i;
             d_grad_buffer[EMA_REGION + idx] = EMA_DECAY * d_grad_buffer[EMA_REGION + idx]
@@ -1187,27 +1224,46 @@ __global__ void nnSGDKernel(
         }
         __syncthreads();
 
-        // Apply EMA-smoothed gradient with trust-region step size
-        for (int i = 0; i < NN_INPUT_DIM; i++) {
-            weights->w1[t * NN_INPUT_DIM + i] -=
-                step * d_grad_buffer[EMA_REGION + SGD_OFF_DW1 + t * NN_INPUT_DIM + i];
-        }
-        weights->b1[t] -= step * d_grad_buffer[EMA_REGION + SGD_OFF_DB1 + t];
-        for (int i = 0; i < NN_HIDDEN_DIM; i++) {
-            weights->w2[t * NN_HIDDEN_DIM + i] -=
-                step * d_grad_buffer[EMA_REGION + SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i];
-        }
-        weights->b2[t] -= step * d_grad_buffer[EMA_REGION + SGD_OFF_DB2 + t];
-        for (int out = 0; out < NN_OUTPUT_DIM; out++) {
-            weights->w3[out * NN_HIDDEN_DIM + t] -=
-                step * d_grad_buffer[EMA_REGION + SGD_OFF_DW3 + out * NN_HIDDEN_DIM + t];
-        }
-        if (t < NN_OUTPUT_DIM) {
-            weights->b3[t] -= step * d_grad_buffer[EMA_REGION + SGD_OFF_DB3 + t];
-        }
+        // NaN/Inf guard: skip weight update entirely if gradient is corrupted.
+        // This prevents a single bad sample from permanently destroying the network.
+        if (!isfinite(step) || !isfinite(s_reduce[0])) {
+            if (t == 0) weights->sgd_call_count++;
+            total_norm = 0.0f;
+            // Fall through to output — skip weight update
+        } else {
+            // Apply EMA-smoothed gradient with trust-region step size
+            constexpr float W_CLAMP = 10.0f;  // prevent weight explosion
+            for (int i = 0; i < NN_INPUT_DIM; i++) {
+                float w = weights->w1[t * NN_INPUT_DIM + i] -
+                    step * d_grad_buffer[EMA_REGION + SGD_OFF_DW1 + t * NN_INPUT_DIM + i];
+                weights->w1[t * NN_INPUT_DIM + i] = fmaxf(-W_CLAMP, fminf(W_CLAMP, w));
+            }
+            {
+                float b = weights->b1[t] - step * d_grad_buffer[EMA_REGION + SGD_OFF_DB1 + t];
+                weights->b1[t] = fmaxf(-W_CLAMP, fminf(W_CLAMP, b));
+            }
+            for (int i = 0; i < NN_HIDDEN_DIM; i++) {
+                float w = weights->w2[t * NN_HIDDEN_DIM + i] -
+                    step * d_grad_buffer[EMA_REGION + SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i];
+                weights->w2[t * NN_HIDDEN_DIM + i] = fmaxf(-W_CLAMP, fminf(W_CLAMP, w));
+            }
+            {
+                float b = weights->b2[t] - step * d_grad_buffer[EMA_REGION + SGD_OFF_DB2 + t];
+                weights->b2[t] = fmaxf(-W_CLAMP, fminf(W_CLAMP, b));
+            }
+            for (int out = 0; out < NN_OUTPUT_DIM; out++) {
+                float w = weights->w3[out * NN_HIDDEN_DIM + t] -
+                    step * d_grad_buffer[EMA_REGION + SGD_OFF_DW3 + out * NN_HIDDEN_DIM + t];
+                weights->w3[out * NN_HIDDEN_DIM + t] = fmaxf(-W_CLAMP, fminf(W_CLAMP, w));
+            }
+            if (t < NN_OUTPUT_DIM) {
+                float b = weights->b3[t] - step * d_grad_buffer[EMA_REGION + SGD_OFF_DB3 + t];
+                weights->b3[t] = fmaxf(-W_CLAMP, fminf(W_CLAMP, b));
+            }
 
-        // Update call counter for warmup
-        if (t == 0) weights->sgd_call_count++;
+            // Update call counter for warmup
+            if (t == 0) weights->sgd_call_count++;
+        }
 
         total_norm = g_norm;
     }
