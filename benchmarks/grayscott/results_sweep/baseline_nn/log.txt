@@ -1,0 +1,281 @@
+╔═══════════════════════════════════════════════════════════════════════════╗
+║  Gray-Scott VOL Benchmark: No-Comp vs NN+SGD                            ║
+╚═══════════════════════════════════════════════════════════════════════════╝
+
+  Grid     : 640^3 = 262144000 floats (1000.0 MB)
+  Chunks   : 640 x 640 x 20  (32 chunks, 31.2 MB each)
+  Steps    : 10 per timestep
+  Pattern  : F=0.0400  k=0.06075
+  SGD LR   : 0.1000
+  Weights  : neural_net/weights/model.nnwt
+
+NN: Loaded 19076 parameters from neural_net/weights/model.nnwt (74.8 KB on GPU)
+
+── Running Gray-Scott simulation once (10 steps)... 84 ms
+
+── Phase 1: nn (VOL, ALGO_AUTO, inference-only) ────────────
+[nn] H5Dwrite (GPU ptr, VOL)... 484 ms
+[nn] H5Dread (GPU ptr, VOL)... 164 ms
+
+  Chunk   1/32  [cascaded]
+  Metric             Predicted        Actual       MAPE
+  ─────────────────────────────────────────────────
+  ratio              119.005x      71.221x    50.2%
+  comp_time           8.908 ms     12.487 ms    33.5%
+  decomp_time        10.232 ms      1.043 ms   163.0%
+
+  Chunk   2/32  [cascaded]
+  Metric             Predicted        Actual       MAPE
+  ─────────────────────────────────────────────────
+  ratio              119.005x      71.221x    50.2%
+  comp_time           8.908 ms     12.460 ms    33.2%
+  decomp_time        10.232 ms      0.609 ms   177.5%
+
+  Chunk   3/32  [cascaded]
+  Metric             Predicted        Actual       MAPE
+  ─────────────────────────────────────────────────
+  ratio              119.005x      71.221x    50.2%
+  comp_time           8.908 ms      9.258 ms     3.9%
+  decomp_time        10.232 ms      0.594 ms   178.0%
+
+  Chunk   4/32  [cascaded]
+  Metric             Predicted        Actual       MAPE
+  ─────────────────────────────────────────────────
+  ratio              119.005x      71.221x    50.2%
+  comp_time           8.908 ms     11.224 ms    23.0%
+  decomp_time        10.232 ms      0.584 ms   178.4%
+
+  Chunk   5/32  [cascaded]
+  Metric             Predicted        Actual       MAPE
+  ─────────────────────────────────────────────────
+  ratio              119.005x      71.221x    50.2%
+  comp_time           8.908 ms     12.553 ms    34.0%
+  decomp_time        10.232 ms      0.595 ms   178.0%
+
+  Chunk   6/32  [cascaded]
+  Metric             Predicted        Actual       MAPE
+  ─────────────────────────────────────────────────
+  ratio              119.005x      71.221x    50.2%
+  comp_time           8.908 ms     11.238 ms    23.1%
+  decomp_time        10.232 ms      0.591 ms   178.1%
+
+  Chunk   7/32  [cascaded]
+  Metric             Predicted        Actual       MAPE
+  ─────────────────────────────────────────────────
+  ratio              119.005x      71.221x    50.2%
+  comp_time           8.908 ms      9.281 ms     4.1%
+  decomp_time        10.232 ms      0.582 ms   178.5%
+
+  Chunk   8/32  [cascaded]
+  Metric             Predicted        Actual       MAPE
+  ─────────────────────────────────────────────────
+  ratio              119.005x      71.221x    50.2%
+  comp_time           8.908 ms     12.597 ms    34.3%
+  decomp_time        10.232 ms      0.580 ms   178.6%
+
+  Chunk   9/32  [cascaded]
+  Metric             Predicted        Actual       MAPE
+  ─────────────────────────────────────────────────
+  ratio              119.005x      71.221x    50.2%
+  comp_time           8.908 ms      0.706 ms   170.6%
+  decomp_time        10.232 ms      0.578 ms   178.6%
+
+  Chunk  10/32  [cascaded]
+  Metric             Predicted        Actual       MAPE
+  ─────────────────────────────────────────────────
+  ratio              119.005x      71.221x    50.2%
+  comp_time           8.908 ms      0.755 ms   168.7%
+  decomp_time        10.232 ms      0.579 ms   178.6%
+
+  Chunk  11/32  [cascaded]
+  Metric             Predicted        Actual       MAPE
+  ─────────────────────────────────────────────────
+  ratio              119.005x      71.221x    50.2%
+  comp_time           8.908 ms      0.470 ms   180.0%
+  decomp_time        10.232 ms      0.580 ms   178.5%
+
+  Chunk  12/32  [cascaded]
+  Metric             Predicted        Actual       MAPE
+  ─────────────────────────────────────────────────
+  ratio              119.005x      71.221x    50.2%
+  comp_time           8.908 ms      0.313 ms   186.4%
+  decomp_time        10.232 ms      0.583 ms   178.4%
+
+  Chunk  13/32  [cascaded]
+  Metric             Predicted        Actual       MAPE
+  ─────────────────────────────────────────────────
+  ratio              119.005x      71.221x    50.2%
+  comp_time           8.908 ms      0.536 ms   177.3%
+  decomp_time        10.232 ms      0.583 ms   178.4%
+
+  Chunk  14/32  [cascaded]
+  Metric             Predicted        Actual       MAPE
+  ─────────────────────────────────────────────────
+  ratio              119.005x      71.221x    50.2%
+  comp_time           8.908 ms      0.812 ms   166.6%
+  decomp_time        10.232 ms      0.582 ms   178.5%
+
+  Chunk  15/32  [cascaded]
+  Metric             Predicted        Actual       MAPE
+  ─────────────────────────────────────────────────
+  ratio              116.521x      64.862x    57.0%
+  comp_time           8.969 ms      0.536 ms   177.4%
+  decomp_time        10.282 ms      0.588 ms   178.4%
+
+  Chunk  16/32  [cascaded]
+  Metric             Predicted        Actual       MAPE
+  ─────────────────────────────────────────────────
+  ratio              119.005x      71.221x    50.2%
+  comp_time           8.908 ms      0.518 ms   178.0%
+  decomp_time        10.232 ms      0.581 ms   178.5%
+
+  Chunk  17/32  [cascaded]
+  Metric             Predicted        Actual       MAPE
+  ─────────────────────────────────────────────────
+  ratio              116.521x      64.862x    57.0%
+  comp_time           8.969 ms      0.488 ms   179.4%
+  decomp_time        10.282 ms      0.583 ms   178.5%
+
+  Chunk  18/32  [cascaded]
+  Metric             Predicted        Actual       MAPE
+  ─────────────────────────────────────────────────
+  ratio              119.005x      71.221x    50.2%
+  comp_time           8.908 ms      0.395 ms   183.0%
+  decomp_time        10.232 ms      0.577 ms   178.7%
+
+  Chunk  19/32  [cascaded]
+  Metric             Predicted        Actual       MAPE
+  ─────────────────────────────────────────────────
+  ratio              119.005x      71.221x    50.2%
+  comp_time           8.908 ms      0.239 ms   189.5%
+  decomp_time        10.232 ms      0.579 ms   178.6%
+
+  Chunk  20/32  [cascaded]
+  Metric             Predicted        Actual       MAPE
+  ─────────────────────────────────────────────────
+  ratio              119.005x      71.221x    50.2%
+  comp_time           8.908 ms      0.627 ms   173.7%
+  decomp_time        10.232 ms      0.577 ms   178.6%
+
+  Chunk  21/32  [cascaded]
+  Metric             Predicted        Actual       MAPE
+  ─────────────────────────────────────────────────
+  ratio              119.005x      71.221x    50.2%
+  comp_time           8.908 ms      0.809 ms   166.7%
+  decomp_time        10.232 ms      0.576 ms   178.7%
+
+  Chunk  22/32  [cascaded]
+  Metric             Predicted        Actual       MAPE
+  ─────────────────────────────────────────────────
+  ratio              119.005x      71.221x    50.2%
+  comp_time           8.908 ms      0.856 ms   164.9%
+  decomp_time        10.232 ms      0.579 ms   178.6%
+
+  Chunk  23/32  [cascaded]
+  Metric             Predicted        Actual       MAPE
+  ─────────────────────────────────────────────────
+  ratio              119.005x      71.221x    50.2%
+  comp_time           8.908 ms      0.552 ms   176.6%
+  decomp_time        10.232 ms      0.578 ms   178.6%
+
+  Chunk  24/32  [cascaded]
+  Metric             Predicted        Actual       MAPE
+  ─────────────────────────────────────────────────
+  ratio              119.005x      71.221x    50.2%
+  comp_time           8.908 ms      0.649 ms   172.8%
+  decomp_time        10.232 ms      0.583 ms   178.4%
+
+  Chunk  25/32  [cascaded]
+  Metric             Predicted        Actual       MAPE
+  ─────────────────────────────────────────────────
+  ratio              119.005x      71.221x    50.2%
+  comp_time           8.908 ms      0.478 ms   179.6%
+  decomp_time        10.232 ms      0.578 ms   178.6%
+
+  Chunk  26/32  [cascaded]
+  Metric             Predicted        Actual       MAPE
+  ─────────────────────────────────────────────────
+  ratio              119.005x      71.221x    50.2%
+  comp_time           8.908 ms      0.589 ms   175.2%
+  decomp_time        10.232 ms      0.578 ms   178.6%
+
+  Chunk  27/32  [cascaded]
+  Metric             Predicted        Actual       MAPE
+  ─────────────────────────────────────────────────
+  ratio              119.005x      71.221x    50.2%
+  comp_time           8.908 ms      0.694 ms   171.1%
+  decomp_time        10.232 ms      0.588 ms   178.3%
+
+  Chunk  28/32  [cascaded]
+  Metric             Predicted        Actual       MAPE
+  ─────────────────────────────────────────────────
+  ratio              119.005x      71.221x    50.2%
+  comp_time           8.908 ms      1.061 ms   157.4%
+  decomp_time        10.232 ms      0.583 ms   178.4%
+
+  Chunk  29/32  [cascaded]
+  Metric             Predicted        Actual       MAPE
+  ─────────────────────────────────────────────────
+  ratio              119.005x      71.221x    50.2%
+  comp_time           8.908 ms      0.824 ms   166.1%
+  decomp_time        10.232 ms      0.580 ms   178.5%
+
+  Chunk  30/32  [cascaded]
+  Metric             Predicted        Actual       MAPE
+  ─────────────────────────────────────────────────
+  ratio              119.005x      71.221x    50.2%
+  comp_time           8.908 ms      1.148 ms   154.3%
+  decomp_time        10.232 ms      0.591 ms   178.2%
+
+  Chunk  31/32  [cascaded]
+  Metric             Predicted        Actual       MAPE
+  ─────────────────────────────────────────────────
+  ratio              119.005x      71.221x    50.2%
+  comp_time           8.908 ms      0.271 ms   188.2%
+  decomp_time        10.232 ms      0.581 ms   178.5%
+
+  Chunk  32/32  [cascaded]
+  Metric             Predicted        Actual       MAPE
+  ─────────────────────────────────────────────────
+  ratio              119.005x      71.221x    50.2%
+  comp_time           8.908 ms      0.382 ms   183.5%
+  decomp_time        10.232 ms      0.575 ms   178.7%
+
+  MAPE avg:  ratio=50.7%  comp_time=136.8%  decomp_time=178.0%
+[nn] ratio=70.76x  write=2066 MiB/s  read=6102 MiB/s  file=14 MiB  sgd=0 expl=0/32  mismatches=0
+[nn] Overhead breakdown (32 chunks, write=484.1 ms, total GPU-time=145.3 ms):
+  Stats compute:     22.6 ms  (15.5% of GPU-time)
+  NN inference :     16.9 ms  (11.6% of GPU-time)
+  Preprocessing:      0.0 ms  ( 0.0% of GPU-time)
+  Compression  :    105.8 ms  (72.8% of GPU-time)
+  Exploration  :      0.0 ms  ( 0.0% of GPU-time)
+  SGD update   :      0.0 ms  ( 0.0% of GPU-time)
+
+╔═══════════════════════════════════════════════════════════════════════════╗
+║  Gray-Scott VOL Benchmark Summary                                       ║
+║  Grid: 640^3 (1000 MB)  Chunks: 32 x 31.2 MB  Steps: 10               
+║  Pattern: F=0.0400  k=0.06075                                              
+╠══════════════╦══════════╦══════════╦═══════╦══════════╦══════╦═════════════╣
+║  Phase       ║  Sim     ║ Write    ║ Read  ║ Ratio   ║ File ║ Verify      ║
+║              ║  (ms)    ║ (MiB/s)  ║(MiB/s)║         ║(MiB) ║             ║
+╠══════════════╬══════════╬══════════╬═══════╬═════════╬══════╬═════════════╣
+║  nn          ║       84 ║     2066 ║  6102 ║ 70.76x  ║   14 ║ PASS        ║
+╚══════════════╩══════════╩══════════╩═══════╩═════════╩══════╩═════════════╝
+
+  nn             SGD: 0/32  Expl: 0/32  MAPE: ratio=50.7% comp=136.8% decomp=178.0%
+
+╔═════════════════════════════════════════════════════════════════════════════════════════════════╗
+║  GPU-Time Overhead Breakdown (cumulative across chunks, 8 concurrent workers)                  ║
+╠══════════════╦══════════╦══════════╦══════════╦══════════╦══════════╦══════════╦════════════════╣
+║  Phase       ║ Stats    ║ NN Infer ║ Preproc  ║ Compress ║ Explore  ║ SGD      ║ Total GPU-time ║
+╠══════════════╬══════════╬══════════╬══════════╬══════════╬══════════╬══════════╬════════════════╣
+║  nn          ║    23 ms ║    17 ms ║     0 ms ║   106 ms ║     0 ms ║     0 ms ║       145 ms   ║
+╠══════════════╬══════════╬══════════╬══════════╬══════════╬══════════╬══════════╬════════════════╣
+║  (% of GPU)  ║          ║          ║          ║          ║          ║          ║                ║
+║  nn          ║  15.5%   ║  11.6%   ║   0.0%   ║  72.8%   ║   0.0%   ║   0.0%   ║   wall:  484 ms ║
+╚══════════════╩══════════╩══════════╩══════════╩══════════╩══════════╩══════════╩════════════════╝
+
+Aggregate CSV written to: benchmarks/grayscott/results/benchmark_grayscott_vol.csv
+Per-chunk CSV written to: benchmarks/grayscott/results/benchmark_grayscott_vol_chunks.csv
+
+=== Benchmark PASSED ===

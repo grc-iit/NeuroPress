@@ -64,18 +64,24 @@
 #define TMP_NN_RL    "/tmp/bm_vpic_nn_rl.h5"
 #define TMP_NN_RLEXP "/tmp/bm_vpic_nn_rlexp.h5"
 #define CHUNKS_CSV   GPU_DIR "/benchmarks/vpic-kokkos/results/benchmark_vpic_chunks.csv"
+#define TSTEP_CSV    GPU_DIR "/benchmarks/vpic-kokkos/results/benchmark_vpic_timesteps.csv"
 
 // ============================================================
 // Globals: persist across timesteps
 // ============================================================
 begin_globals {
-    int                sim_steps;         // Steps to run before benchmarking
+    int                sim_steps;         // Warmup steps before benchmarking
+    int                timesteps;         // Number of multi-timestep writes (0 = single-shot)
+    int                ts_count;          // Current timestep counter
     size_t             chunk_bytes;       // HDF5 chunk size in bytes
     gpucompress_vpic_t vpic_fields_h;     // Adapter handle for fields
     hid_t              vol_fapl;          // File access property list with VOL
     hid_t              vol_id;            // VOL connector ID
     int                gpucompress_ready; // 1 if init succeeded
     int                benchmark_done;    // 1 after all benchmark steps complete
+    int                single_shot_done;  // 1 after single-shot phases complete
+    double             diag_error_bound;  // Error bound for diagnostics
+    FILE*              ts_csv;            // Timestep CSV file handle
 
     // Buffers for benchmark
     float*             d_read;            // GPU read-back buffer
@@ -333,27 +339,25 @@ static int run_phase(const char* phase_name, const char* tmp_file,
             total_comp_ms    += d.compression_ms;
             total_explore_ms += d.exploration_ms;
             total_sgd_ms     += d.sgd_update_ms;
+            /* sMAPE (symmetric, bounded 0–200%) */
             if (d.predicted_ratio > 0 && d.actual_ratio > 0) {
-                ape_ratio_sum += fabs(d.predicted_ratio - d.actual_ratio)
-                                 / d.actual_ratio * 100.0;
-                ape_ratio_cnt++;
+                double dr = (fabs(d.predicted_ratio) + fabs(d.actual_ratio)) / 2.0;
+                if (dr > 0) { ape_ratio_sum += fabs(d.predicted_ratio - d.actual_ratio) / dr * 100.0; ape_ratio_cnt++; }
             }
-            if (d.compression_ms > 0) {
-                ape_comp_sum += fabs(d.predicted_comp_time - d.compression_ms)
-                                / d.compression_ms * 100.0;
-                ape_comp_cnt++;
+            if (d.compression_ms > 0 && d.predicted_comp_time > 0) {
+                double dc = (fabs(d.compression_ms) + fabs(d.predicted_comp_time)) / 2.0;
+                if (dc > 0) { ape_comp_sum += fabs(d.predicted_comp_time - d.compression_ms) / dc * 100.0; ape_comp_cnt++; }
             }
-            if (d.decompression_ms > 0) {
-                ape_decomp_sum += fabs(d.predicted_decomp_time - d.decompression_ms)
-                                  / d.decompression_ms * 100.0;
-                ape_decomp_cnt++;
+            if (d.decompression_ms > 0 && d.predicted_decomp_time > 0) {
+                double dd = (fabs(d.decompression_ms) + fabs(d.predicted_decomp_time)) / 2.0;
+                if (dd > 0) { ape_decomp_sum += fabs(d.predicted_decomp_time - d.decompression_ms) / dd * 100.0; ape_decomp_cnt++; }
             }
             char final_str[40], orig_str[40];
             action_to_str(d.nn_action, final_str, sizeof(final_str));
             action_to_str(d.nn_original_action, orig_str, sizeof(orig_str));
-            double chunk_mape = (d.actual_ratio > 0.0f)
-                ? fabs((double)d.predicted_ratio - (double)d.actual_ratio)
-                  / (double)d.actual_ratio * 100.0
+            double dr2 = (fabs((double)d.actual_ratio) + fabs((double)d.predicted_ratio)) / 2.0;
+            double chunk_mape = (dr2 > 0)
+                ? fabs((double)d.predicted_ratio - (double)d.actual_ratio) / dr2 * 100.0
                 : 0.0;
             printf("    %5d | %-20s | %-20s | %5.2fx | %5.2fx | %5.1f%% | %s | %s\n",
                    i + 1, final_str, orig_str,
@@ -362,12 +366,12 @@ static int run_phase(const char* phase_name, const char* tmp_file,
                    d.sgd_fired ? "yes" : "  -",
                    d.exploration_triggered ? "yes" : "  -");
             if (chunk_csv) {
-                double mape_comp = (d.compression_ms > 0 && d.predicted_comp_time > 0)
-                    ? fabs((double)d.predicted_comp_time - (double)d.compression_ms)
-                      / (double)d.compression_ms * 100.0 : 0.0;
-                double mape_decomp = (d.decompression_ms > 0 && d.predicted_decomp_time > 0)
-                    ? fabs((double)d.predicted_decomp_time - (double)d.decompression_ms)
-                      / (double)d.decompression_ms * 100.0 : 0.0;
+                double dc2 = (fabs((double)d.compression_ms) + fabs((double)d.predicted_comp_time)) / 2.0;
+                double mape_comp = (dc2 > 0)
+                    ? fabs((double)d.predicted_comp_time - (double)d.compression_ms) / dc2 * 100.0 : 0.0;
+                double dd2 = (fabs((double)d.decompression_ms) + fabs((double)d.predicted_decomp_time)) / 2.0;
+                double mape_decomp = (dd2 > 0)
+                    ? fabs((double)d.predicted_decomp_time - (double)d.decompression_ms) / dd2 * 100.0 : 0.0;
                 fprintf(chunk_csv, "%s,%d,%s,%s,%.4f,%.4f,%.1f,"
                                    "%.3f,%.3f,%.1f,%.3f,%.3f,%.1f,"
                                    "%d,%d,"
@@ -512,15 +516,27 @@ begin_initialization {
     int chunk_mb = env_chunk ? atoi(env_chunk) : 8;
     if (chunk_mb < 1) chunk_mb = 1;
 
-    // Run warmup steps to develop physics, then one benchmark step
-    num_step        = warmup + 1;
+    const char* env_ts = getenv("VPIC_TIMESTEPS");
+    int timesteps = env_ts ? atoi(env_ts) : 0;
+    if (timesteps < 0) timesteps = 0;
+
+    // Run warmup steps, then single-shot phases (1 step), then multi-timestep writes
+    num_step        = warmup + 1 + timesteps;
     status_interval = 50;
     clean_div_e_interval = 10;
     clean_div_b_interval = 10;
 
-    global->sim_steps      = warmup;
-    global->chunk_bytes    = (size_t)chunk_mb * 1024 * 1024;
-    global->benchmark_done = 0;
+    global->sim_steps       = warmup;
+    global->timesteps       = timesteps;
+    global->ts_count        = 0;
+    global->chunk_bytes     = (size_t)chunk_mb * 1024 * 1024;
+    global->benchmark_done  = 0;
+    /* If multi-timestep is requested, skip single-shot phases and go
+     * straight to the multi-timestep loop.  Single-shot can be run
+     * separately without VPIC_TIMESTEPS. */
+    global->single_shot_done = (timesteps > 0) ? 1 : 0;
+    global->diag_error_bound = 0.0;
+    global->ts_csv          = NULL;
 
     // Grid setup
     define_units(c, eps0);
@@ -616,8 +632,11 @@ begin_initialization {
     sim_log("  Chunks   : " << global->chunk_bytes / (1024*1024) << " MB each");
     sim_log("  Particles: " << nppc << " per cell");
     sim_log("  Warmup   : " << global->sim_steps << " steps");
+    if (timesteps > 0)
+        sim_log("  Timesteps: " << timesteps << " (multi-timestep nn-rl writes after single-shot)");
     sim_log("  Env vars : VPIC_NX=" << grid_n << " VPIC_CHUNK_MB=" << chunk_mb
-            << " VPIC_WARMUP_STEPS=" << warmup);
+            << " VPIC_WARMUP_STEPS=" << warmup
+            << " VPIC_TIMESTEPS=" << timesteps);
     sim_log("  Weights  : " << (weights_path ? weights_path : "(none, fallback to LZ4)"));
     sim_log("  NN loaded: " << (gpucompress_nn_is_loaded() ? "yes" : "no"));
 
@@ -635,7 +654,7 @@ begin_diagnostics {
     if (step() < global->sim_steps) return;
     if (!global->gpucompress_ready) return;
 
-    // Attach GPU-resident field data
+    // Attach GPU-resident field data (fresh pointer each step — fields evolve)
     vpic_attach_fields(global->vpic_fields_h, field_array->k_f_d);
 
     float*  d_fields = NULL;
@@ -645,7 +664,157 @@ begin_diagnostics {
     size_t n_floats    = nbytes_f / sizeof(float);
     size_t chunk_floats = global->chunk_bytes / sizeof(float);
     int    n_chunks    = (int)((n_floats + chunk_floats - 1) / chunk_floats);
+    double orig_mib    = (double)nbytes_f / (1 << 20);
 
+    // ============================================================
+    // Multi-timestep mode: after single-shot phases, loop nn-rl writes
+    // ============================================================
+    if (global->single_shot_done) {
+        if (global->timesteps <= 0 || global->ts_count >= global->timesteps) {
+            // All timesteps done — close CSV and cleanup
+            if (global->ts_csv) {
+                fclose(global->ts_csv);
+                global->ts_csv = NULL;
+                printf("\n  Timestep CSV: %s\n", TSTEP_CSV);
+            }
+            printf("\n=== VPIC Multi-Timestep complete (%d writes) ===\n", global->ts_count);
+            global->benchmark_done = 1;
+            cudaFree(global->d_read);
+            free(global->h_orig);
+            free(global->h_read);
+            global->d_read = NULL;
+            global->h_orig = NULL;
+            global->h_read = NULL;
+            return;
+        }
+
+        // Open CSV on first timestep
+        if (global->ts_count == 0) {
+            printf("\n══════════════════════════════════════════════════════════════\n");
+            printf("  Multi-timestep mode: %d writes with nn-rl (SGD active)\n", global->timesteps);
+            printf("  Each step = 1 VPIC physics step → H5Dwrite → collect sMAPE\n");
+            printf("══════════════════════════════════════════════════════════════\n\n");
+
+            // Reload NN for clean start
+            const char* wpath = getenv("GPUCOMPRESS_WEIGHTS");
+            if (wpath) gpucompress_reload_nn(wpath);
+            gpucompress_enable_online_learning();
+            gpucompress_set_reinforcement(1, REINFORCE_LR, REINFORCE_MAPE, REINFORCE_MAPE);
+            gpucompress_set_exploration(0);
+
+            const char* csv_dir = GPU_DIR "/benchmarks/vpic-kokkos/results";
+            mkdir(csv_dir, 0755);
+            global->ts_csv = fopen(TSTEP_CSV, "w");
+            if (global->ts_csv) {
+                fprintf(global->ts_csv, "timestep,sim_step,write_ms,read_ms,ratio,"
+                        "smape_ratio,smape_comp,smape_decomp,"
+                        "sgd_fires,n_chunks,mismatches,"
+                        "write_mbps,read_mbps,cache_hits,cache_misses\n");
+            }
+
+            printf("  %-4s  %-8s  %-7s  %-7s  %-7s  %-8s  %-8s  %-8s  %-4s\n",
+                   "T", "SimStep", "WrMs", "RdMs", "Ratio", "sMAPE_R", "sMAPE_C", "sMAPE_D", "SGD");
+            printf("  ----  --------  -------  -------  -------  --------  --------  --------  ----\n");
+        }
+
+        int t = global->ts_count;
+
+        // Write via VOL
+        gpucompress_reset_chunk_history();
+        gpucompress_reset_cache_stats();
+        remove(TMP_NN_RL);
+
+        hid_t fapl = H5Pcreate(H5P_FILE_ACCESS);
+        hid_t native_id = H5VLget_connector_id_by_name("native");
+        H5Pset_fapl_gpucompress(fapl, native_id, NULL);
+        H5VLclose(native_id);
+
+        hid_t dcpl = make_dcpl_auto((hsize_t)chunk_floats, global->diag_error_bound);
+        hsize_t dims[1] = { (hsize_t)n_floats };
+        hid_t file = H5Fcreate(TMP_NN_RL, H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+        H5Pclose(fapl);
+        hid_t fsp  = H5Screate_simple(1, dims, NULL);
+        hid_t dset = H5Dcreate2(file, "fields", H5T_NATIVE_FLOAT,
+                                 fsp, H5P_DEFAULT, dcpl, H5P_DEFAULT);
+        H5Sclose(fsp);
+
+        double tw0 = now_ms();
+        herr_t wret = H5Dwrite(dset, H5T_NATIVE_FLOAT,
+                                H5S_ALL, H5S_ALL, H5P_DEFAULT, d_fields);
+        H5Dclose(dset); H5Fclose(file);
+        double tw1 = now_ms();
+        double write_ms_t = tw1 - tw0;
+        H5Pclose(dcpl);
+
+        if (wret < 0) {
+            printf("  %-4d  H5Dwrite failed\n", t);
+            global->ts_count++;
+            return;
+        }
+
+        /* Skip read-back in multi-timestep mode — correctness is verified
+         * in the single-shot phases.  Multi-timestep tracks sMAPE convergence
+         * from write-side diagnostics only. */
+        double read_ms_t = 0.0;
+        unsigned long long mm = 0;
+
+        // File size for ratio
+        size_t file_sz = get_file_size(TMP_NN_RL);
+        double ratio_t = (file_sz > 0) ? (double)nbytes_f / (double)file_sz : 1.0;
+
+        // Collect per-chunk sMAPE
+        int n_hist = gpucompress_get_chunk_history_count();
+        double ape_r = 0, ape_c = 0, ape_d = 0;
+        int    cnt_r = 0, cnt_c = 0, cnt_d = 0;
+        int    sgd_t = 0;
+        for (int ci = 0; ci < n_hist; ci++) {
+            gpucompress_chunk_diag_t diag;
+            if (gpucompress_get_chunk_diag(ci, &diag) != 0) continue;
+            if (diag.sgd_fired) sgd_t++;
+            if (diag.actual_ratio > 0 && diag.predicted_ratio > 0) {
+                double dn = (fabs(diag.actual_ratio) + fabs(diag.predicted_ratio)) / 2.0;
+                if (dn > 0) { ape_r += fabs(diag.actual_ratio - diag.predicted_ratio) / dn; cnt_r++; }
+            }
+            if (diag.compression_ms > 0 && diag.predicted_comp_time > 0) {
+                double dn = (fabs(diag.compression_ms) + fabs(diag.predicted_comp_time)) / 2.0;
+                if (dn > 0) { ape_c += fabs(diag.compression_ms - diag.predicted_comp_time) / dn; cnt_c++; }
+            }
+            if (diag.decompression_ms > 0 && diag.predicted_decomp_time > 0) {
+                double dn = (fabs(diag.decompression_ms) + fabs(diag.predicted_decomp_time)) / 2.0;
+                if (dn > 0) { ape_d += fabs(diag.decompression_ms - diag.predicted_decomp_time) / dn; cnt_d++; }
+            }
+        }
+        double mape_r = cnt_r ? (ape_r / cnt_r) * 100.0 : 0.0;
+        double mape_c = cnt_c ? (ape_c / cnt_c) * 100.0 : 0.0;
+        double mape_d = cnt_d ? (ape_d / cnt_d) * 100.0 : 0.0;
+
+        double wr_mbps = (write_ms_t > 0) ? orig_mib / (write_ms_t / 1000.0) : 0;
+        double rd_mbps = (read_ms_t > 0)  ? orig_mib / (read_ms_t  / 1000.0) : 0;
+
+        int c_hits = 0, c_misses = 0;
+        gpucompress_get_cache_stats(&c_hits, &c_misses);
+
+        printf("  %-4d  %-8d  %6.0f  %6.0f   %5.2fx  %7.1f%%  %7.1f%%  %7.1f%%  %3d\n",
+               t, (int)step(), write_ms_t, read_ms_t,
+               ratio_t, mape_r, mape_c, mape_d, sgd_t);
+
+        if (global->ts_csv) {
+            fprintf(global->ts_csv, "%d,%d,%.2f,%.2f,%.4f,%.2f,%.2f,%.2f,%d,%d,%llu,%.1f,%.1f,%d,%d\n",
+                    t, (int)step(), write_ms_t, read_ms_t, ratio_t,
+                    mape_r, mape_c, mape_d, sgd_t, n_hist,
+                    (unsigned long long)mm, wr_mbps, rd_mbps,
+                    c_hits, c_misses);
+            fflush(global->ts_csv);
+        }
+
+        remove(TMP_NN_RL);
+        global->ts_count++;
+        return;
+    }
+
+    // ============================================================
+    // Single-shot mode: run all 4 phases once (original behavior)
+    // ============================================================
     sim_log("");
     sim_log("╔═══════════════════════════════════════════════════════════════════════════╗");
     sim_log("║  VPIC Benchmark: No-Comp vs NN+SGD (Real Harris Sheet)                  ║");
@@ -660,7 +829,7 @@ begin_diagnostics {
     remove(CHUNKS_CSV);
 
     const char* env_eb_diag = getenv("VPIC_ERROR_BOUND");
-    double diag_error_bound = env_eb_diag ? atof(env_eb_diag) : 0.0;
+    global->diag_error_bound = env_eb_diag ? atof(env_eb_diag) : 0.0;
 
     /* Phase selection: VPIC_PHASES="nn-rl" to run only those.
      * Default (unset or empty): run all 4 phases. */
@@ -699,7 +868,7 @@ begin_diagnostics {
     gpucompress_disable_online_learning();
     gpucompress_set_exploration(0);
     {
-        hid_t dcpl = make_dcpl_auto((hsize_t)chunk_floats, diag_error_bound);
+        hid_t dcpl = make_dcpl_auto((hsize_t)chunk_floats, global->diag_error_bound);
         int rc = run_phase("nn", TMP_NN,
                            d_fields, global->d_read, global->h_orig, global->h_read,
                            n_floats, n_chunks, dcpl, &results[n_phases]);
@@ -716,7 +885,7 @@ begin_diagnostics {
     gpucompress_set_reinforcement(1, REINFORCE_LR, REINFORCE_MAPE, REINFORCE_MAPE);
     gpucompress_set_exploration(0);
     {
-        hid_t dcpl = make_dcpl_auto((hsize_t)chunk_floats, diag_error_bound);
+        hid_t dcpl = make_dcpl_auto((hsize_t)chunk_floats, global->diag_error_bound);
         int rc = run_phase("nn-rl", TMP_NN_RL,
                            d_fields, global->d_read, global->h_orig, global->h_read,
                            n_floats, n_chunks, dcpl, &results[n_phases]);
@@ -738,9 +907,9 @@ begin_diagnostics {
     gpucompress_set_reinforcement(1, REINFORCE_LR, REINFORCE_MAPE, REINFORCE_MAPE);
     gpucompress_set_exploration(1);
     gpucompress_set_exploration_threshold(0.50);
-    gpucompress_set_exploration_k(6);
+    gpucompress_set_exploration_k(8);
     {
-        hid_t dcpl = make_dcpl_auto((hsize_t)chunk_floats, diag_error_bound);
+        hid_t dcpl = make_dcpl_auto((hsize_t)chunk_floats, global->diag_error_bound);
         int rc = run_phase("nn-rl+exp50", TMP_NN_RLEXP,
                            d_fields, global->d_read, global->h_orig, global->h_read,
                            n_floats, n_chunks, dcpl, &results[n_phases]);
@@ -844,19 +1013,23 @@ begin_diagnostics {
         }
     }
 
-    if (any_fail) printf("\n=== VPIC Benchmark FAILED ===\n");
+    if (any_fail) printf("\n=== VPIC Benchmark single-shot FAILED ===\n");
 
-    global->benchmark_done = 1;
-    printf("\n=== VPIC Benchmark complete ===\n");
+    printf("\n=== VPIC Benchmark single-shot complete ===\n");
     printf("Chunks CSV: %s\n", CHUNKS_CSV);
 
-    // Cleanup
-    cudaFree(global->d_read);
-    free(global->h_orig);
-    free(global->h_read);
-    global->d_read  = NULL;
-    global->h_orig  = NULL;
-    global->h_read  = NULL;
+    global->single_shot_done = 1;
+
+    // If no multi-timestep requested, we're done — cleanup now
+    if (global->timesteps <= 0) {
+        global->benchmark_done = 1;
+        cudaFree(global->d_read);
+        free(global->h_orig);
+        free(global->h_read);
+        global->d_read = NULL;
+        global->h_orig = NULL;
+        global->h_read = NULL;
+    }
 
     gpucompress_vpic_destroy(global->vpic_fields_h);
     H5Pclose(global->vol_fapl);

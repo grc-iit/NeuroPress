@@ -158,7 +158,7 @@ static std::mutex g_sgd_mutex;
 
 /** Online reinforcement (SGD) state */
 float g_reinforce_lr = 0.01f;
-float g_reinforce_mape_threshold = 0.20f;
+float g_reinforce_mape_threshold = 0.10f;
 
 /** Algorithm names */
 const char* ALGORITHM_NAMES[] = {
@@ -984,9 +984,13 @@ extern "C" gpucompress_error_t gpucompress_compress(
         double error_pct = (actual_cost > 0.0)
             ? std::abs(actual_cost - predicted_cost) / actual_cost : 0.0;
 
-        // Collect explored (action, ratio, comp_time) for reinforcement
+        // Collect explored (action, ratio, comp_time, cost) for reinforcement
+        // cost = w0*ct + w1*dt + w2*ds/(ratio*bw)  — same formula as NN ranking
+        auto compute_explore_cost = [&](double ct, double dt, double r) -> double {
+            return w0 * ct + w1 * dt + ((r > 0.0) ? w2 * ds / (r * bw) : 1e30);
+        };
         struct ExploredResult { int action; double ratio; double comp_time_ms;
-                                double decomp_time_ms; double psnr; };
+                                double decomp_time_ms; double psnr; double cost; };
         std::vector<ExploredResult> explored_samples;
         double primary_psnr = 120.0;
         if (d_quantized && quant_result.isValid()) {
@@ -995,10 +999,37 @@ extern "C" gpucompress_error_t gpucompress_compress(
                 primary_psnr = fmin(20.0 * log10(range / quant_result.error_bound), 120.0);
             }
         }
+        double primary_cost = compute_explore_cost(
+            static_cast<double>(primary_comp_time_ms),
+            static_cast<double>(primary_decomp_time_ms), actual_ratio);
         explored_samples.push_back({nn_action, actual_ratio,
                                     static_cast<double>(primary_comp_time_ms),
                                     static_cast<double>(primary_decomp_time_ms),
-                                    primary_psnr});
+                                    primary_psnr, primary_cost});
+
+        /* ── SGD Phase 1: learn from PRIMARY result immediately ──
+         * Correct the NN's prediction for the action it chose BEFORE
+         * exploration runs.  This prevents exploration samples (which
+         * may be for a completely different algorithm) from interfering
+         * with the primary correction through shared hidden layers. */
+        auto t_sgd_start = std::chrono::steady_clock::now();
+        if (error_pct > static_cast<double>(g_reinforce_mape_threshold) && d_stats_ptr) {
+            SGDSample primary_sgd[1];
+            primary_sgd[0].action            = explored_samples[0].action;
+            primary_sgd[0].actual_ratio      = static_cast<float>(explored_samples[0].ratio);
+            primary_sgd[0].actual_comp_time  = static_cast<float>(explored_samples[0].comp_time_ms);
+            primary_sgd[0].actual_decomp_time= static_cast<float>(explored_samples[0].decomp_time_ms);
+            primary_sgd[0].actual_psnr       = static_cast<float>(explored_samples[0].psnr);
+            {
+                std::lock_guard<std::mutex> sgd_lk(g_sgd_mutex);
+                float gn = 0; int gc = 0, gs = 0;
+                if (gpucompress::runNNSGDCtx(d_stats_ptr, primary_sgd, 1,
+                        input_size, cfg.error_bound, g_reinforce_lr, ctx,
+                        &gn, &gc, &gs) == 0) {
+                    sgd_fired = true;
+                }
+            }
+        }
 
         if (g_exploration_enabled && error_pct > g_exploration_threshold) {
             exploration_triggered = true;
@@ -1024,8 +1055,8 @@ extern "C" gpucompress_error_t gpucompress_compress(
                     is_ood ? "OOD " : "",
                     K);
 
-            // Try top-K alternative configs
-            double best_ratio = actual_ratio;
+            // Try top-K alternative configs — pick winner by cost (not ratio)
+            double best_cost = primary_cost;
 
             for (int i = 1; i <= K && i < 32; i++) {
                 int alt_action = top_actions[i];
@@ -1212,22 +1243,24 @@ extern "C" gpucompress_error_t gpucompress_compress(
                             }
                             skip_roundtrip:
 
+                            double alt_cost = compute_explore_cost(
+                                static_cast<double>(alt_ct_ms), alt_decomp_ms, alt_ratio);
                             explored_samples.push_back({alt_action, alt_ratio,
                                                         static_cast<double>(alt_ct_ms),
-                                                        alt_decomp_ms, alt_psnr});
+                                                        alt_decomp_ms, alt_psnr, alt_cost});
 
                             GC_LOG("[EXPLORE]   alt %d/%d: action%d (%s%s%s) "
-                                    "ratio=%.3f comp=%.2fms%s\n",
+                                    "ratio=%.3f comp=%.2fms cost=%.3f%s\n",
                                     i, K, alt_action,
                                     ALGORITHM_NAMES[alt.algorithm + 1],
                                     alt.shuffle_size > 0 ? "+shuf" : "",
                                     alt.use_quantization ? "+quant" : "",
-                                    alt_ratio, alt_ct_ms,
-                                    (alt_ratio > best_ratio) ? " << NEW BEST" : "");
+                                    alt_ratio, alt_ct_ms, alt_cost,
+                                    (alt_cost < best_cost) ? " << NEW BEST" : "");
 
-                            // Track if this is better than current best
-                            if (alt_ratio > best_ratio) {
-                                best_ratio = alt_ratio;
+                            // Track if this is better than current best (by cost, not ratio)
+                            if (alt_cost < best_cost) {
+                                best_cost = alt_cost;
                                 nn_action = alt_action;  // update so diagnostics & SGD see the real winner
                                 g_last_nn_action.store(alt_action);
                                 diag_compression_ms = alt_ct_ms;
@@ -1309,35 +1342,33 @@ extern "C" gpucompress_error_t gpucompress_compress(
                 std::chrono::steady_clock::now() - t_explore_start).count();
         }
 
-        // Online reinforcement: trigger GPU SGD when cost prediction error exceeds threshold.
-        auto t_sgd_start = std::chrono::steady_clock::now();
-        if (error_pct > static_cast<double>(g_reinforce_mape_threshold) && d_stats_ptr) {
-            // Sort explored samples by ratio (descending) and feed top 3 to GPU SGD.
-            std::sort(explored_samples.begin(), explored_samples.end(),
+        /* ── SGD Phase 2: learn from EXPLORATION results separately ──
+         * Only runs if exploration actually produced alternative samples.
+         * Kept separate from Phase 1 so cascaded and zstd gradients
+         * don't interfere through the shared hidden layers. */
+        if (exploration_triggered && explored_samples.size() > 1 && d_stats_ptr) {
+            std::sort(explored_samples.begin() + 1, explored_samples.end(),
                       [](const ExploredResult& a, const ExploredResult& b) {
-                          return a.ratio > b.ratio;
+                          return a.cost < b.cost;
                       });
-            size_t sgd_limit = std::min(explored_samples.size(), static_cast<size_t>(3));
-
-            SGDSample sgd_samples[NN_MAX_SGD_SAMPLES];
-            for (size_t ei = 0; ei < sgd_limit; ei++) {
-                sgd_samples[ei].action = explored_samples[ei].action;
-                sgd_samples[ei].actual_ratio = static_cast<float>(explored_samples[ei].ratio);
-                sgd_samples[ei].actual_comp_time = static_cast<float>(explored_samples[ei].comp_time_ms);
-                sgd_samples[ei].actual_decomp_time = static_cast<float>(explored_samples[ei].decomp_time_ms);
-                sgd_samples[ei].actual_psnr = static_cast<float>(explored_samples[ei].psnr);
+            SGDSample explore_sgd[NN_MAX_SGD_SAMPLES];
+            int efill = 0;
+            size_t emax = std::min(explored_samples.size(),
+                                    static_cast<size_t>(NN_MAX_SGD_SAMPLES));
+            for (size_t ei = 1; ei < emax; ei++) {
+                explore_sgd[efill].action            = explored_samples[ei].action;
+                explore_sgd[efill].actual_ratio      = static_cast<float>(explored_samples[ei].ratio);
+                explore_sgd[efill].actual_comp_time  = static_cast<float>(explored_samples[ei].comp_time_ms);
+                explore_sgd[efill].actual_decomp_time= static_cast<float>(explored_samples[ei].decomp_time_ms);
+                explore_sgd[efill].actual_psnr       = static_cast<float>(explored_samples[ei].psnr);
+                efill++;
             }
-
-            float sgd_grad_norm = 0.0f;
-            int sgd_clipped = 0, sgd_count = 0;
-            {
+            if (efill > 0) {
                 std::lock_guard<std::mutex> sgd_lk(g_sgd_mutex);
-                if (gpucompress::runNNSGDCtx(d_stats_ptr, sgd_samples,
-                        static_cast<int>(sgd_limit), input_size, cfg.error_bound,
-                        g_reinforce_lr, ctx,
-                        &sgd_grad_norm, &sgd_clipped, &sgd_count) == 0) {
-                    sgd_fired = true;
-                }
+                float gn = 0; int gc = 0, gs = 0;
+                gpucompress::runNNSGDCtx(d_stats_ptr, explore_sgd,
+                    efill, input_size, cfg.error_bound, g_reinforce_lr, ctx,
+                    &gn, &gc, &gs);
             }
         }
         if (sgd_fired) {
@@ -1404,6 +1435,11 @@ extern "C" gpucompress_error_t gpucompress_compress(
             h->actual_ratio          = (compressed_size > 0)
                 ? static_cast<float>(input_size) / static_cast<float>(compressed_size)
                 : 0.0f;
+            /* Always report NN's prediction for its ORIGINAL action.
+             * When exploration switches algorithm, the actual values are
+             * for the winner, but the predicted values remain for the
+             * original — this shows how far off the NN was and whether
+             * SGD Phase 1 is correcting it over time. */
             h->predicted_ratio       = predicted_ratio;
             h->predicted_comp_time   = predicted_comp_time;
             h->predicted_decomp_time = predicted_decomp_time;
@@ -2372,8 +2408,12 @@ skip_nn:
         double error_pct = (actual_cost > 0.0)
             ? std::abs(actual_cost - predicted_cost) / actual_cost : 0.0;
 
+        // cost = w0*ct + w1*dt + w2*ds/(ratio*bw)  — same formula as NN ranking
+        auto compute_explore_cost = [&](double ct, double dt, double r) -> double {
+            return w0 * ct + w1 * dt + ((r > 0.0) ? w2 * ds / (r * bw) : 1e30);
+        };
         struct ExploredResult { int action; double ratio; double comp_time_ms;
-                                double decomp_time_ms; double psnr; };
+                                double decomp_time_ms; double psnr; double cost; };
         std::vector<ExploredResult> explored_samples;
         double primary_psnr = 120.0;
         if (d_quantized && quant_result.isValid()) {
@@ -2382,10 +2422,33 @@ skip_nn:
                 primary_psnr = fmin(20.0 * log10(range / quant_result.error_bound), 120.0);
             }
         }
+        double primary_cost = compute_explore_cost(
+            static_cast<double>(primary_comp_time_ms),
+            static_cast<double>(primary_decomp_time_ms), actual_ratio);
         explored_samples.push_back({nn_action, actual_ratio,
                                     static_cast<double>(primary_comp_time_ms),
                                     static_cast<double>(primary_decomp_time_ms),
-                                    primary_psnr});
+                                    primary_psnr, primary_cost});
+
+        /* ── SGD Phase 1: learn from PRIMARY result immediately ── */
+        auto t_sgd_start = std::chrono::steady_clock::now();
+        if (error_pct > static_cast<double>(g_reinforce_mape_threshold) && d_stats_ptr) {
+            SGDSample primary_sgd[1];
+            primary_sgd[0].action            = explored_samples[0].action;
+            primary_sgd[0].actual_ratio      = static_cast<float>(explored_samples[0].ratio);
+            primary_sgd[0].actual_comp_time  = static_cast<float>(explored_samples[0].comp_time_ms);
+            primary_sgd[0].actual_decomp_time= static_cast<float>(explored_samples[0].decomp_time_ms);
+            primary_sgd[0].actual_psnr       = static_cast<float>(explored_samples[0].psnr);
+            {
+                std::lock_guard<std::mutex> sgd_lk(g_sgd_mutex);
+                float gn = 0; int gc = 0, gs = 0;
+                if (gpucompress::runNNSGDCtx(d_stats_ptr, primary_sgd, 1,
+                        input_size, cfg.error_bound, g_reinforce_lr, ctx,
+                        &gn, &gc, &gs) == 0) {
+                    sgd_fired = true;
+                }
+            }
+        }
 
         if (g_exploration_enabled && error_pct > g_exploration_threshold) {
             exploration_triggered = true;
@@ -2408,11 +2471,11 @@ skip_nn:
                     is_ood ? "OOD " : "",
                     K);
 
-            double best_ratio = actual_ratio;
+            double best_cost = primary_cost;
 
             /* ---- Parallel exploration: K alternatives on K separate streams ----
              * Phase 1: launch all K compressions in parallel.
-             * Phase 2: sync all, read sizes, pick winner by ratio.
+             * Phase 2: sync all, read sizes, pick winner by cost.
              * Phase 3: decompress+verify only the winner (if any). */
 
             constexpr int MAX_EXPLORE_K = 8;
@@ -2542,14 +2605,16 @@ skip_nn:
                         alt_psnr = fmin(20.0 * log10(range / s.quant_result.error_bound), 120.0);
                 }
 
-                explored_samples.push_back({s.action, s.ratio, 0.0, 0.0, alt_psnr});
+                /* GPU path: no per-alt timing, use I/O cost term only */
+                double alt_cost = compute_explore_cost(0.0, 0.0, s.ratio);
+                explored_samples.push_back({s.action, s.ratio, 0.0, 0.0, alt_psnr, alt_cost});
 
-                GC_LOG("[EXPLORE-GPU]   slot %d: action%d ratio=%.3f%s\n",
-                        k, s.action, s.ratio,
-                        (s.ratio > best_ratio) ? " << NEW BEST" : "");
+                GC_LOG("[EXPLORE-GPU]   slot %d: action%d ratio=%.3f cost=%.3f%s\n",
+                        k, s.action, s.ratio, alt_cost,
+                        (alt_cost < best_cost) ? " << NEW BEST" : "");
 
-                if (s.ratio > best_ratio) {
-                    best_ratio = s.ratio;
+                if (alt_cost < best_cost) {
+                    best_cost = alt_cost;
                     nn_action = s.action;
                     g_last_nn_action.store(s.action);
 
@@ -2614,34 +2679,30 @@ skip_nn:
                 std::chrono::steady_clock::now() - t_explore_start).count();
         }
 
-        /* GPU SGD: fire when cost prediction error exceeds threshold */
-        auto t_sgd_start = std::chrono::steady_clock::now();
-        if (error_pct > static_cast<double>(g_reinforce_mape_threshold) && d_stats_ptr) {
-            std::sort(explored_samples.begin(), explored_samples.end(),
+        /* ── SGD Phase 2: learn from EXPLORATION results separately ── */
+        if (exploration_triggered && explored_samples.size() > 1 && d_stats_ptr) {
+            std::sort(explored_samples.begin() + 1, explored_samples.end(),
                       [](const ExploredResult& a, const ExploredResult& b) {
-                          return a.ratio > b.ratio;
+                          return a.cost < b.cost;
                       });
-            size_t sgd_limit = std::min(explored_samples.size(), static_cast<size_t>(3));
-
-            SGDSample sgd_samples[NN_MAX_SGD_SAMPLES];
-            for (size_t ei = 0; ei < sgd_limit; ei++) {
-                sgd_samples[ei].action = explored_samples[ei].action;
-                sgd_samples[ei].actual_ratio = static_cast<float>(explored_samples[ei].ratio);
-                sgd_samples[ei].actual_comp_time = static_cast<float>(explored_samples[ei].comp_time_ms);
-                sgd_samples[ei].actual_decomp_time = static_cast<float>(explored_samples[ei].decomp_time_ms);
-                sgd_samples[ei].actual_psnr = static_cast<float>(explored_samples[ei].psnr);
+            SGDSample explore_sgd[NN_MAX_SGD_SAMPLES];
+            int efill = 0;
+            size_t emax = std::min(explored_samples.size(),
+                                    static_cast<size_t>(NN_MAX_SGD_SAMPLES));
+            for (size_t ei = 1; ei < emax; ei++) {
+                explore_sgd[efill].action            = explored_samples[ei].action;
+                explore_sgd[efill].actual_ratio      = static_cast<float>(explored_samples[ei].ratio);
+                explore_sgd[efill].actual_comp_time  = static_cast<float>(explored_samples[ei].comp_time_ms);
+                explore_sgd[efill].actual_decomp_time= static_cast<float>(explored_samples[ei].decomp_time_ms);
+                explore_sgd[efill].actual_psnr       = static_cast<float>(explored_samples[ei].psnr);
+                efill++;
             }
-
-            float sgd_grad_norm = 0.0f;
-            int sgd_clipped = 0, sgd_count = 0;
-            {
+            if (efill > 0) {
                 std::lock_guard<std::mutex> sgd_lk(g_sgd_mutex);
-                if (gpucompress::runNNSGDCtx(d_stats_ptr, sgd_samples,
-                        static_cast<int>(sgd_limit), input_size, cfg.error_bound,
-                        g_reinforce_lr, ctx,
-                        &sgd_grad_norm, &sgd_clipped, &sgd_count) == 0) {
-                    sgd_fired = true;
-                }
+                float gn = 0; int gc = 0, gs = 0;
+                gpucompress::runNNSGDCtx(d_stats_ptr, explore_sgd,
+                    efill, input_size, cfg.error_bound, g_reinforce_lr, ctx,
+                    &gn, &gc, &gs);
             }
         }
         if (sgd_fired) {
@@ -2708,6 +2769,7 @@ skip_nn:
             h->actual_ratio          = (compressed_size > 0)
                 ? static_cast<float>(input_size) / static_cast<float>(compressed_size)
                 : 0.0f;
+            /* Always report NN's prediction for its ORIGINAL action. */
             h->predicted_ratio       = predicted_ratio;
             h->predicted_comp_time   = predicted_comp_time;
             h->predicted_decomp_time = predicted_decomp_time;

@@ -502,9 +502,10 @@ static void freeFusedInferenceBuffers() {
  * ============================================================ */
 
 // Total gradient buffer size in floats (from nn_weights.h)
-static constexpr int SGD_GRAD_SIZE = NN_SGD_GRAD_SIZE; // 19076 floats = ~76KB
+static constexpr int SGD_GRAD_SIZE = NN_SGD_GRAD_SIZE; // 2 x 19076 floats = ~152KB
+static constexpr int SGD_REGION = NN_SGD_GRAD_REGION;  // 19076 floats per region
 
-// Offsets into gradient buffer
+// Offsets into gradient buffer (region 0 = accumulator, region 1 = per-output workspace)
 static constexpr int SGD_OFF_DW1 = 0;
 static constexpr int SGD_OFF_DB1 = NN_HIDDEN_DIM * NN_INPUT_DIM;                    // 1920
 static constexpr int SGD_OFF_DW2 = SGD_OFF_DB1 + NN_HIDDEN_DIM;                     // 2048
@@ -518,9 +519,10 @@ static constexpr int SGD_OFF_DB3 = SGD_OFF_DW3 + NN_OUTPUT_DIM * NN_HIDDEN_DIM; 
  * Launch: <<<1, 128>>>
  * Thread t (0-127) owns hidden neuron t.
  *
- * Shared memory layout (~3.5KB):
+ * Shared memory layout (~3.6KB):
  *   s_x[15], s_h1[128], s_z1[128], s_h2[128], s_z2[128],
- *   s_y[4], s_d3[4], s_dz2[128], s_reduce[128]
+ *   s_y[4], s_d3[4], s_dz2[128], s_reduce[128],
+ *   s_d3_all[8][4] (cached per-sample errors for per-output backward)
  */
 __global__ void nnSGDKernel(
     NNWeightsGPU* __restrict__ weights,
@@ -545,6 +547,7 @@ __global__ void nnSGDKernel(
     __shared__ float s_d3[NN_OUTPUT_DIM];
     __shared__ float s_dz2[NN_HIDDEN_DIM];
     __shared__ float s_reduce[NN_HIDDEN_DIM];
+    __shared__ float s_d3_all[NN_MAX_SGD_SAMPLES][NN_OUTPUT_DIM];
 
     // Read stats once
     float stat_entropy = static_cast<float>(d_stats->entropy);
@@ -693,144 +696,276 @@ __global__ void nnSGDKernel(
             for (int o = 0; o < NN_OUTPUT_DIM; o++) {
                 s_d3[o] = fmaxf(-SGD_ERROR_DELTA, fminf(s_d3[o], SGD_ERROR_DELTA));
             }
+
+            // Cache per-output errors for Phase 2 per-output backward passes.
+            // Max-abs normalization removed: per-output backprop prevents
+            // cross-output interference at W2/W1 layers.
+            for (int o = 0; o < NN_OUTPUT_DIM; o++) {
+                s_d3_all[si][o] = s_d3[o];
+            }
         }
         __syncthreads();
+    }
 
-        // Layer 3 gradients: thread t handles dw3[out][t] for out=0..3
-        for (int out = 0; out < NN_OUTPUT_DIM; out++) {
-            if (s_d3[out] != 0.0f) {
-                d_grad_buffer[SGD_OFF_DW3 + out * NN_HIDDEN_DIM + t] += s_d3[out] * s_h2[t];
+    // ================================================================
+    // Phase 2: Per-output backward passes through W2/W1
+    //
+    // Each output's error is backpropagated independently through the
+    // shared hidden layers, with per-output gradient clipping.
+    //
+    // Region 0 (d_grad_buffer[0..SGD_REGION-1]) = accumulator for
+    //   clipped weight deltas across all 4 outputs.
+    // Region 1 (d_grad_buffer[SGD_REGION..2*SGD_REGION-1]) = per-output
+    //   workspace, zeroed and reused for each output.
+    //
+    // Weights are updated ONCE at the end from the accumulated deltas,
+    // so forward recomputation always sees the original weights.
+    // ================================================================
+    constexpr float GRAD_CLIP_THRESHOLD = 0.1f;
+    float total_norm = 0.0f;
+
+    // Region 1 workspace offset
+    const int WS = SGD_REGION;
+
+    // Region 0 is already zeroed from the initial gradient zero (lines above).
+    // Phase 1 no longer accumulates W3 gradients, so region 0 is clean.
+    // It will accumulate clipped weight deltas from all 4 outputs.
+
+    for (int target_out = 0; target_out < NN_OUTPUT_DIM; target_out++) {
+
+        // Zero region 1 workspace for this output
+        for (int i = 0; i < NN_INPUT_DIM; i++)
+            d_grad_buffer[WS + SGD_OFF_DW1 + t * NN_INPUT_DIM + i] = 0.0f;
+        d_grad_buffer[WS + SGD_OFF_DB1 + t] = 0.0f;
+        for (int i = 0; i < NN_HIDDEN_DIM; i++)
+            d_grad_buffer[WS + SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i] = 0.0f;
+        d_grad_buffer[WS + SGD_OFF_DB2 + t] = 0.0f;
+        d_grad_buffer[WS + SGD_OFF_DW3 + target_out * NN_HIDDEN_DIM + t] = 0.0f;
+        if (t == 0)
+            d_grad_buffer[WS + SGD_OFF_DB3 + target_out] = 0.0f;
+        __syncthreads();
+
+        for (int si = 0; si < num_samples; si++) {
+            SGDSample sample = samples[si];
+
+            // Recompute forward pass to recover activations
+            if (t == 0) {
+                int algo_idx = sample.action % 8;
+                int quant = (sample.action / 8) % 2;
+                int shuffle = (sample.action / 16) % 2;
+
+                float raw[NN_INPUT_DIM];
+                for (int i = 0; i < 8; i++) raw[i] = (i == algo_idx) ? 1.0f : 0.0f;
+                raw[8] = static_cast<float>(quant);
+                raw[9] = static_cast<float>(shuffle);
+                raw[10] = eb_enc;
+                raw[11] = ds_enc;
+                raw[12] = stat_entropy;
+                raw[13] = stat_mad;
+                raw[14] = stat_deriv;
+
+                for (int i = 0; i < NN_INPUT_DIM; i++) {
+                    float std_val = weights->x_stds[i];
+                    if (std_val < 1e-8f) std_val = 1e-8f;
+                    s_x[i] = (raw[i] - weights->x_means[i]) / std_val;
+                }
             }
+            __syncthreads();
+
+            // Forward L1
+            {
+                float sum = weights->b1[t];
+                for (int i = 0; i < NN_INPUT_DIM; i++)
+                    sum += weights->w1[t * NN_INPUT_DIM + i] * s_x[i];
+                s_z1[t] = sum;
+                s_h1[t] = (sum > 0.0f) ? sum : 0.0f;
+            }
+            __syncthreads();
+
+            // Forward L2
+            {
+                float sum = weights->b2[t];
+                for (int i = 0; i < NN_HIDDEN_DIM; i++)
+                    sum += weights->w2[t * NN_HIDDEN_DIM + i] * s_h1[i];
+                s_z2[t] = sum;
+                s_h2[t] = (sum > 0.0f) ? sum : 0.0f;
+            }
+            __syncthreads();
+
+            // Backward L3→L2: SINGLE output only
+            float error_signal = s_d3_all[si][target_out];
+            {
+                float dh2_t = weights->w3[target_out * NN_HIDDEN_DIM + t] * error_signal;
+                s_dz2[t] = (s_z2[t] > 0.0f) ? dh2_t : 0.0f;
+            }
+            __syncthreads();
+
+            // Accumulate W3 gradient for this output into workspace
+            d_grad_buffer[WS + SGD_OFF_DW3 + target_out * NN_HIDDEN_DIM + t] +=
+                error_signal * s_h2[t];
+            if (t == 0) {
+                d_grad_buffer[WS + SGD_OFF_DB3 + target_out] += error_signal;
+            }
+
+            // Accumulate L2 gradients into workspace
+            for (int i = 0; i < NN_HIDDEN_DIM; i++) {
+                d_grad_buffer[WS + SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i] += s_dz2[t] * s_h1[i];
+            }
+            d_grad_buffer[WS + SGD_OFF_DB2 + t] += s_dz2[t];
+
+            // Backward L2→L1
+            float dz1_t;
+            {
+                float dh1_t = 0.0f;
+                for (int j = 0; j < NN_HIDDEN_DIM; j++)
+                    dh1_t += weights->w2[j * NN_HIDDEN_DIM + t] * s_dz2[j];
+                dz1_t = (s_z1[t] > 0.0f) ? dh1_t : 0.0f;
+            }
+
+            // Accumulate L1 gradients into workspace
+            for (int i = 0; i < NN_INPUT_DIM; i++) {
+                d_grad_buffer[WS + SGD_OFF_DW1 + t * NN_INPUT_DIM + i] += dz1_t * s_x[i];
+            }
+            d_grad_buffer[WS + SGD_OFF_DB1 + t] += dz1_t;
+
+            __syncthreads();
+        }
+
+        // Average this output's gradients over samples and compute norm
+        float inv_n = 1.0f / static_cast<float>(num_samples);
+        float local_norm_sq = 0.0f;
+
+        for (int i = 0; i < NN_INPUT_DIM; i++) {
+            int idx = WS + SGD_OFF_DW1 + t * NN_INPUT_DIM + i;
+            d_grad_buffer[idx] *= inv_n;
+            local_norm_sq += d_grad_buffer[idx] * d_grad_buffer[idx];
+        }
+        {
+            int idx = WS + SGD_OFF_DB1 + t;
+            d_grad_buffer[idx] *= inv_n;
+            local_norm_sq += d_grad_buffer[idx] * d_grad_buffer[idx];
+        }
+        for (int i = 0; i < NN_HIDDEN_DIM; i++) {
+            int idx = WS + SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i;
+            d_grad_buffer[idx] *= inv_n;
+            local_norm_sq += d_grad_buffer[idx] * d_grad_buffer[idx];
+        }
+        {
+            int idx = WS + SGD_OFF_DB2 + t;
+            d_grad_buffer[idx] *= inv_n;
+            local_norm_sq += d_grad_buffer[idx] * d_grad_buffer[idx];
+        }
+
+        // Include W3 gradient for this output (from workspace)
+        {
+            int idx = WS + SGD_OFF_DW3 + target_out * NN_HIDDEN_DIM + t;
+            d_grad_buffer[idx] *= inv_n;
+            local_norm_sq += d_grad_buffer[idx] * d_grad_buffer[idx];
+        }
+        if (t == target_out) {
+            int idx = WS + SGD_OFF_DB3 + target_out;
+            d_grad_buffer[idx] *= inv_n;
+            local_norm_sq += d_grad_buffer[idx] * d_grad_buffer[idx];
+        }
+
+        // Per-output gradient norm reduction
+        s_reduce[t] = local_norm_sq;
+        __syncthreads();
+        for (int s = NN_HIDDEN_DIM / 2; s > 0; s >>= 1) {
+            if (t < s) s_reduce[t] += s_reduce[t + s];
+            __syncthreads();
+        }
+
+        float out_norm = sqrtf(s_reduce[0]);
+        float clip_scale = (out_norm > GRAD_CLIP_THRESHOLD) ? (GRAD_CLIP_THRESHOLD / out_norm) : 1.0f;
+        float lr_out = learning_rate * clip_scale;
+        total_norm += out_norm;
+
+        // Accumulate clipped weight deltas into region 0 (deferred update)
+        for (int i = 0; i < NN_INPUT_DIM; i++) {
+            d_grad_buffer[SGD_OFF_DW1 + t * NN_INPUT_DIM + i] +=
+                lr_out * d_grad_buffer[WS + SGD_OFF_DW1 + t * NN_INPUT_DIM + i];
+        }
+        d_grad_buffer[SGD_OFF_DB1 + t] +=
+            lr_out * d_grad_buffer[WS + SGD_OFF_DB1 + t];
+        for (int i = 0; i < NN_HIDDEN_DIM; i++) {
+            d_grad_buffer[SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i] +=
+                lr_out * d_grad_buffer[WS + SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i];
+        }
+        d_grad_buffer[SGD_OFF_DB2 + t] +=
+            lr_out * d_grad_buffer[WS + SGD_OFF_DB2 + t];
+
+        // W3/b3 for this output
+        d_grad_buffer[SGD_OFF_DW3 + target_out * NN_HIDDEN_DIM + t] +=
+            lr_out * d_grad_buffer[WS + SGD_OFF_DW3 + target_out * NN_HIDDEN_DIM + t];
+        if (t == target_out) {
+            d_grad_buffer[SGD_OFF_DB3 + target_out] +=
+                lr_out * d_grad_buffer[WS + SGD_OFF_DB3 + target_out];
+        }
+
+        __syncthreads();
+    }
+
+    // Final clip: bound the total accumulated delta norm to GRAD_CLIP_THRESHOLD.
+    // Per-output clipping ensures clean gradient directions; this final clip
+    // bounds the total update magnitude so we don't overshoot.
+    {
+        float final_norm_sq = 0.0f;
+        for (int i = 0; i < NN_INPUT_DIM; i++) {
+            float v = d_grad_buffer[SGD_OFF_DW1 + t * NN_INPUT_DIM + i];
+            final_norm_sq += v * v;
+        }
+        final_norm_sq += d_grad_buffer[SGD_OFF_DB1 + t] * d_grad_buffer[SGD_OFF_DB1 + t];
+        for (int i = 0; i < NN_HIDDEN_DIM; i++) {
+            float v = d_grad_buffer[SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i];
+            final_norm_sq += v * v;
+        }
+        final_norm_sq += d_grad_buffer[SGD_OFF_DB2 + t] * d_grad_buffer[SGD_OFF_DB2 + t];
+        for (int out = 0; out < NN_OUTPUT_DIM; out++) {
+            float v = d_grad_buffer[SGD_OFF_DW3 + out * NN_HIDDEN_DIM + t];
+            final_norm_sq += v * v;
         }
         if (t < NN_OUTPUT_DIM) {
-            d_grad_buffer[SGD_OFF_DB3 + t] += s_d3[t];
+            final_norm_sq += d_grad_buffer[SGD_OFF_DB3 + t] * d_grad_buffer[SGD_OFF_DB3 + t];
         }
 
-        // Backward L3→L2: dh2[t] = sum(w3[out][t]*d3[out])
-        {
-            float dh2_t = 0.0f;
-            for (int out = 0; out < NN_OUTPUT_DIM; out++) {
-                dh2_t += weights->w3[out * NN_HIDDEN_DIM + t] * s_d3[out];
-            }
-            // ReLU backward
-            s_dz2[t] = (s_z2[t] > 0.0f) ? dh2_t : 0.0f;
-        }
+        s_reduce[t] = final_norm_sq;
         __syncthreads();
-
-        // Layer 2 gradients
-        for (int i = 0; i < NN_HIDDEN_DIM; i++) {
-            d_grad_buffer[SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i] += s_dz2[t] * s_h1[i];
-        }
-        d_grad_buffer[SGD_OFF_DB2 + t] += s_dz2[t];
-
-        // Backward L2→L1: dh1[t] = sum(w2[j][t]*dz2[j])
-        float dz1_t;
-        {
-            float dh1_t = 0.0f;
-            for (int j = 0; j < NN_HIDDEN_DIM; j++) {
-                dh1_t += weights->w2[j * NN_HIDDEN_DIM + t] * s_dz2[j];
-            }
-            dz1_t = (s_z1[t] > 0.0f) ? dh1_t : 0.0f;
+        for (int s = NN_HIDDEN_DIM / 2; s > 0; s >>= 1) {
+            if (t < s) s_reduce[t] += s_reduce[t + s];
+            __syncthreads();
         }
 
-        // Layer 1 gradients
+        float final_norm = sqrtf(s_reduce[0]);
+        float final_clip = (final_norm > GRAD_CLIP_THRESHOLD)
+            ? (GRAD_CLIP_THRESHOLD / final_norm) : 1.0f;
+
+        // Apply clipped weight deltas
         for (int i = 0; i < NN_INPUT_DIM; i++) {
-            d_grad_buffer[SGD_OFF_DW1 + t * NN_INPUT_DIM + i] += dz1_t * s_x[i];
+            weights->w1[t * NN_INPUT_DIM + i] -=
+                final_clip * d_grad_buffer[SGD_OFF_DW1 + t * NN_INPUT_DIM + i];
         }
-        d_grad_buffer[SGD_OFF_DB1 + t] += dz1_t;
+        weights->b1[t] -= final_clip * d_grad_buffer[SGD_OFF_DB1 + t];
+        for (int i = 0; i < NN_HIDDEN_DIM; i++) {
+            weights->w2[t * NN_HIDDEN_DIM + i] -=
+                final_clip * d_grad_buffer[SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i];
+        }
+        weights->b2[t] -= final_clip * d_grad_buffer[SGD_OFF_DB2 + t];
+        for (int out = 0; out < NN_OUTPUT_DIM; out++) {
+            weights->w3[out * NN_HIDDEN_DIM + t] -=
+                final_clip * d_grad_buffer[SGD_OFF_DW3 + out * NN_HIDDEN_DIM + t];
+        }
+        if (t < NN_OUTPUT_DIM) {
+            weights->b3[t] -= final_clip * d_grad_buffer[SGD_OFF_DB3 + t];
+        }
 
-        __syncthreads();
-    }
-
-    // --- After all samples: average, clip, SGD step ---
-    float inv_n = 1.0f / static_cast<float>(num_samples);
-
-    // Average and compute local norm contribution
-    float local_norm_sq = 0.0f;
-
-    // dw1 owned by thread t
-    for (int i = 0; i < NN_INPUT_DIM; i++) {
-        int idx = SGD_OFF_DW1 + t * NN_INPUT_DIM + i;
-        d_grad_buffer[idx] *= inv_n;
-        local_norm_sq += d_grad_buffer[idx] * d_grad_buffer[idx];
-    }
-    // db1
-    {
-        int idx = SGD_OFF_DB1 + t;
-        d_grad_buffer[idx] *= inv_n;
-        local_norm_sq += d_grad_buffer[idx] * d_grad_buffer[idx];
-    }
-    // dw2
-    for (int i = 0; i < NN_HIDDEN_DIM; i++) {
-        int idx = SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i;
-        d_grad_buffer[idx] *= inv_n;
-        local_norm_sq += d_grad_buffer[idx] * d_grad_buffer[idx];
-    }
-    // db2
-    {
-        int idx = SGD_OFF_DB2 + t;
-        d_grad_buffer[idx] *= inv_n;
-        local_norm_sq += d_grad_buffer[idx] * d_grad_buffer[idx];
-    }
-    // dw3 (thread t owns [out*128+t] for out=0..3)
-    for (int out = 0; out < NN_OUTPUT_DIM; out++) {
-        int idx = SGD_OFF_DW3 + out * NN_HIDDEN_DIM + t;
-        d_grad_buffer[idx] *= inv_n;
-        local_norm_sq += d_grad_buffer[idx] * d_grad_buffer[idx];
-    }
-    // db3 (threads 0-3)
-    if (t < NN_OUTPUT_DIM) {
-        int idx = SGD_OFF_DB3 + t;
-        d_grad_buffer[idx] *= inv_n;
-        local_norm_sq += d_grad_buffer[idx] * d_grad_buffer[idx];
-    }
-
-    // Shared memory reduction for total norm
-    s_reduce[t] = local_norm_sq;
-    __syncthreads();
-    for (int s = NN_HIDDEN_DIM / 2; s > 0; s >>= 1) {
-        if (t < s) s_reduce[t] += s_reduce[t + s];
-        __syncthreads();
-    }
-
-    float norm = sqrtf(s_reduce[0]);
-    // Gradient norm clipping: threshold lowered from 1.0 to 0.1 (Issue #1).
-    // With the original threshold of 1.0, the total weight update norm is
-    // lr * 1.0 = 0.05, which is enough to flip action rankings in a single
-    // step, causing prediction oscillation. A threshold of 0.1 limits the
-    // effective update to lr * 0.1 = 0.005, enabling gradual convergence.
-    constexpr float GRAD_CLIP_THRESHOLD = 0.1f;
-    float clip_scale = (norm > GRAD_CLIP_THRESHOLD) ? (GRAD_CLIP_THRESHOLD / norm) : 1.0f;
-    float lr_scaled = learning_rate * clip_scale;
-
-    // SGD step: update weights in-place
-    // w1
-    for (int i = 0; i < NN_INPUT_DIM; i++) {
-        weights->w1[t * NN_INPUT_DIM + i] -=
-            lr_scaled * d_grad_buffer[SGD_OFF_DW1 + t * NN_INPUT_DIM + i];
-    }
-    weights->b1[t] -= lr_scaled * d_grad_buffer[SGD_OFF_DB1 + t];
-
-    // w2
-    for (int i = 0; i < NN_HIDDEN_DIM; i++) {
-        weights->w2[t * NN_HIDDEN_DIM + i] -=
-            lr_scaled * d_grad_buffer[SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i];
-    }
-    weights->b2[t] -= lr_scaled * d_grad_buffer[SGD_OFF_DB2 + t];
-
-    // w3 (4 outputs, thread t updates its column)
-    for (int out = 0; out < NN_OUTPUT_DIM; out++) {
-        weights->w3[out * NN_HIDDEN_DIM + t] -=
-            lr_scaled * d_grad_buffer[SGD_OFF_DW3 + out * NN_HIDDEN_DIM + t];
-    }
-    if (t < NN_OUTPUT_DIM) {
-        weights->b3[t] -= lr_scaled * d_grad_buffer[SGD_OFF_DB3 + t];
+        total_norm = final_norm;
     }
 
     // Thread 0 writes output
     if (t == 0) {
-        out_result->grad_norm = norm;
-        out_result->was_clipped = (norm > 1.0f) ? 1 : 0;
+        out_result->grad_norm = total_norm;
+        out_result->was_clipped = (total_norm > GRAD_CLIP_THRESHOLD) ? 1 : 0;
         out_result->sample_count = num_samples;
     }
 }
