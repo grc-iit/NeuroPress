@@ -41,7 +41,11 @@ extern std::atomic<bool> g_sgd_ever_fired;
 extern float g_rank_w0;
 extern float g_rank_w1;
 extern float g_rank_w2;
+extern float g_rank_alpha;
 extern float g_measured_bw_bytes_per_ms;
+
+/* Debug flag — defined in gpucompress_api.cpp, set via GPUCOMPRESS_DEBUG_NN=1 */
+extern bool g_debug_nn;
 
 namespace gpucompress {
 
@@ -115,7 +119,7 @@ __device__ static void nnForwardPass(
     float mad_f,        // (float)mad_norm                 — precomputed by caller
     float deriv_f,      // (float)deriv_norm               — precomputed by caller
     double error_bound, // kept for quant-mask check only
-    float data_size_bytes, float w0, float w1, float w2, float bw,
+    float data_size_bytes, float w0, float w1, float w2, float bw, float alpha,
     float* out_rank_val,
     float* out_ratio,
     float* out_comp_time,
@@ -180,10 +184,14 @@ __device__ static void nnForwardPass(
     decomp_time = fmaxf(1e-6f, fminf(decomp_time, 1e6f));
     ratio       = fmaxf(0.1f,  fminf(ratio,        1e5f));
 
-    /* Cost-based ranking: cost = w0*comp_time + w1*decomp_time + w2*data_size/(ratio*bw)
-       Lower cost is better → rank_val = -cost (reduction finds max). */
+    /* Hybrid cost: time + IO + log-ratio reward.
+     *   cost = w0*ct + w1*dt + w2*ds/(ratio*bw) - α*log2(ratio)
+     * The log-ratio term rewards compression effectiveness: each doubling
+     * of ratio reduces cost by α ms, making ratio visible even when IO
+     * is fast.  α=0 reverts to the original speed-only formula. */
     float io_cost = data_size_bytes / (ratio * bw);
-    float cost = w0 * comp_time + w1 * decomp_time + w2 * io_cost;
+    float ratio_reward = alpha * log2f(fmaxf(ratio, 0.1f));
+    float cost = w0 * comp_time + w1 * decomp_time + w2 * io_cost - ratio_reward;
     float rank_val = -cost;
     if (quant == 1 && error_bound <= 0.0) rank_val = -INFINITY;
 
@@ -229,7 +237,7 @@ __global__ void nnInferenceKernel(
     double deriv_norm,
     size_t data_size,
     double error_bound,
-    float w0, float w1, float w2, float bw,
+    float w0, float w1, float w2, float bw, float alpha,
     NNInferenceOutput* __restrict__ out_result,
     int* __restrict__ out_top_actions
 ) {
@@ -255,7 +263,7 @@ __global__ void nnInferenceKernel(
     nnForwardPass(weights, tid,
                   s_enc[0], s_enc[1], s_enc[2], s_enc[3], s_enc[4],
                   error_bound,
-                  static_cast<float>(data_size), w0, w1, w2, bw,
+                  static_cast<float>(data_size), w0, w1, w2, bw, alpha,
                   &rank_val, &ratio, &comp_time, &decomp_time, &psnr);
 
     // ---- Store per-thread predictions for later retrieval ----
@@ -369,9 +377,10 @@ __global__ void nnFusedInferenceKernel(
     const AutoStatsGPU* __restrict__ d_stats,
     size_t data_size,
     double error_bound,
-    float w0, float w1, float w2, float bw,
+    float w0, float w1, float w2, float bw, float alpha,
     NNInferenceOutput* __restrict__ out_result,
-    int* __restrict__ out_top_actions
+    int* __restrict__ out_top_actions,
+    NNDebugPerConfig* __restrict__ out_debug  /* nullable: per-config costs */
 ) {
     int tid = threadIdx.x;
     if (tid >= NN_NUM_CONFIGS) return;
@@ -396,8 +405,17 @@ __global__ void nnFusedInferenceKernel(
     nnForwardPass(weights, tid,
                   s_enc[0], s_enc[1], s_enc[2], s_enc[3], s_enc[4],
                   error_bound,
-                  static_cast<float>(data_size), w0, w1, w2, bw,
+                  static_cast<float>(data_size), w0, w1, w2, bw, alpha,
                   &rank_val, &ratio, &comp_time, &decomp_time, &psnr);
+
+    /* Write per-config debug output (each thread writes its own slot) */
+    if (out_debug) {
+        float io_cost = static_cast<float>(data_size) / (ratio * bw);
+        out_debug[tid].ratio      = ratio;
+        out_debug[tid].comp_time  = comp_time;
+        out_debug[tid].decomp_time = decomp_time;
+        out_debug[tid].cost       = w0 * comp_time + w1 * decomp_time + w2 * io_cost;
+    }
 
     __shared__ float s_ratios[NN_NUM_CONFIGS];
     __shared__ float s_comp_times[NN_NUM_CONFIGS];
@@ -1625,7 +1643,7 @@ int runNNInference(
             d_nn_weights,
             entropy, mad_norm, deriv_norm,
             data_size, error_bound,
-            g_rank_w0, g_rank_w1, g_rank_w2, g_measured_bw_bytes_per_ms,
+            g_rank_w0, g_rank_w1, g_rank_w2, g_measured_bw_bytes_per_ms, g_rank_alpha,
             d_infer_output,
             out_top_actions ? d_infer_top_actions : nullptr
         );
@@ -1696,9 +1714,10 @@ int runNNFusedInference(
             d_nn_weights,
             d_stats,
             data_size, error_bound,
-            g_rank_w0, g_rank_w1, g_rank_w2, g_measured_bw_bytes_per_ms,
+            g_rank_w0, g_rank_w1, g_rank_w2, g_measured_bw_bytes_per_ms, g_rank_alpha,
             d_fused_infer_output,
-            out_top_actions ? d_fused_top_actions : nullptr
+            out_top_actions ? d_fused_top_actions : nullptr,
+            nullptr  /* no debug output in non-ctx path */
         );
 
         err = cudaGetLastError();
@@ -1828,6 +1847,14 @@ int runNNFusedInferenceCtx(
 ) {
     if (d_stats == nullptr || ctx == nullptr) return -1;
 
+    /* Debug: allocate per-config output buffer on first use */
+    NNDebugPerConfig* d_debug = nullptr;
+    static NNDebugPerConfig* s_d_debug = nullptr;
+    if (g_debug_nn) {
+        if (!s_d_debug) cudaMalloc(&s_d_debug, NN_NUM_CONFIGS * sizeof(NNDebugPerConfig));
+        d_debug = s_d_debug;
+    }
+
     cudaError_t err;
     {
         std::lock_guard<std::mutex> lock(g_nn_ptr_mutex);
@@ -1841,9 +1868,10 @@ int runNNFusedInferenceCtx(
             d_nn_weights,
             d_stats,
             data_size, error_bound,
-            g_rank_w0, g_rank_w1, g_rank_w2, g_measured_bw_bytes_per_ms,
+            g_rank_w0, g_rank_w1, g_rank_w2, g_measured_bw_bytes_per_ms, g_rank_alpha,
             ctx->d_fused_infer_output,
-            out_top_actions ? ctx->d_fused_top_actions : nullptr
+            out_top_actions ? ctx->d_fused_top_actions : nullptr,
+            d_debug
         );
 
         err = cudaGetLastError();
@@ -1862,10 +1890,49 @@ int runNNFusedInferenceCtx(
         if (err != cudaSuccess) return -1;
     }
 
+    /* Debug: copy back and print per-config costs */
+    NNDebugPerConfig h_debug[NN_NUM_CONFIGS];
+    if (d_debug) {
+        cudaMemcpyAsync(h_debug, d_debug, NN_NUM_CONFIGS * sizeof(NNDebugPerConfig),
+                         cudaMemcpyDeviceToHost, stream);
+    }
+
     if (nn_stop_event) cudaEventRecord(nn_stop_event, stream);
 
     err = cudaStreamSynchronize(stream);
     if (err != cudaSuccess) return -1;
+
+    /* Debug: print top-10 configs by cost (lowest first) */
+    if (d_debug) {
+        static const char* algo_names[] = {
+            "lz4","snappy","deflate","gdeflate","zstd","ans","cascaded","bitcomp"};
+
+        /* Sort indices by cost ascending */
+        int order[NN_NUM_CONFIGS];
+        for (int i = 0; i < NN_NUM_CONFIGS; i++) order[i] = i;
+        for (int i = 0; i < NN_NUM_CONFIGS - 1; i++)
+            for (int j = i + 1; j < NN_NUM_CONFIGS; j++)
+                if (h_debug[order[j]].cost < h_debug[order[i]].cost)
+                    { int tmp = order[i]; order[i] = order[j]; order[j] = tmp; }
+
+        fprintf(stderr, "[NN-DBG] ---- Cost ranking (w0=%.1f w1=%.1f w2=%.1f bw=%.0f alpha=%.1f) ----\n",
+                g_rank_w0, g_rank_w1, g_rank_w2, g_measured_bw_bytes_per_ms, g_rank_alpha);
+        fprintf(stderr, "[NN-DBG] %4s %-22s %8s %8s %8s %10s\n",
+                "Rank", "Config", "CompT", "DecT", "Ratio", "COST");
+        for (int i = 0; i < 10 && i < NN_NUM_CONFIGS; i++) {
+            int a = order[i];
+            int algo = a % 8, quant = (a/8)%2, shuf = (a/16)%2;
+            char name[32];
+            snprintf(name, sizeof(name), "%s%s%s", algo_names[algo],
+                     shuf ? "+shuf" : "", quant ? "+quant" : "");
+            fprintf(stderr, "[NN-DBG] %4d %-22s %8.3f %8.3f %8.2f %10.3f%s\n",
+                    i + 1, name,
+                    h_debug[a].comp_time, h_debug[a].decomp_time,
+                    h_debug[a].ratio, h_debug[a].cost,
+                    (a == h_result.action) ? "  ← WINNER" : "");
+        }
+        fprintf(stderr, "[NN-DBG] ----\n");
+    }
 
     if (out_action)      *out_action      = h_result.action;
     if (out_ratio)       *out_ratio       = h_result.predicted_ratio;

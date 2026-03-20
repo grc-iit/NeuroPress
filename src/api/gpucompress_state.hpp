@@ -50,6 +50,12 @@ extern std::atomic<int>  g_mgr_cache_misses;
 /* ---- SGD serialization ---- */
 extern std::mutex        g_sgd_mutex;
 
+/* ---- Log-ratio reward (α) ---- */
+extern float g_rank_alpha;  /* ms reward per doubling of ratio (default 5.0) */
+
+/* ---- Debug flags ---- */
+extern bool g_debug_nn;   /* set via GPUCOMPRESS_DEBUG_NN=1 env var */
+
 /* ---- SGD stream/event (also extern'd from nn_gpu.cu) ---- */
 extern cudaStream_t      g_sgd_stream;
 extern cudaEvent_t       g_sgd_done;

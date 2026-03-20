@@ -2,6 +2,7 @@
 build/
 libs/
 *.o
+*.txt
 *.so
 *.a
 *.dylib

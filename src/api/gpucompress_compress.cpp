@@ -148,6 +148,18 @@ gpucompress_error_t gpucompress_infer_gpu(
     if (!d_stats_ptr)
         return GPUCOMPRESS_ERROR_NN_NOT_LOADED;
 
+    /* Debug: dump per-chunk stats so we can verify they differ */
+    if (g_debug_nn) {
+        AutoStatsGPU h_dbg;
+        cudaStreamSynchronize(stream);
+        cudaMemcpy(&h_dbg, d_stats_ptr, sizeof(AutoStatsGPU), cudaMemcpyDeviceToHost);
+        fprintf(stderr, "[NN-DBG] stats: entropy=%.4f  mad_norm=%.6f  deriv_norm=%.6f  "
+                "vmin=%.4e  vmax=%.4e  n=%zu  range=%.4e\n",
+                h_dbg.entropy, h_dbg.mad_normalized, h_dbg.deriv_normalized,
+                h_dbg.vmin, h_dbg.vmax, h_dbg.num_elements,
+                (double)h_dbg.vmax - (double)h_dbg.vmin);
+    }
+
     float pred_ratio = 0.0f, pred_ct = 0.0f, pred_dt = 0.0f, pred_psnr = 0.0f;
     int fused_ood = 0;
 
@@ -165,6 +177,23 @@ gpucompress_error_t gpucompress_infer_gpu(
 
     if (action < 0)
         return GPUCOMPRESS_ERROR_NN_NOT_LOADED;
+
+    /* Debug: dump NN action and top-K ranking */
+    if (g_debug_nn) {
+        const char* algo_names[] = {"lz4","snappy","deflate","gdeflate","zstd","ans","cascaded","bitcomp"};
+        int a = action % 8, q = (action/8)%2, s = (action/16)%2;
+        fprintf(stderr, "[NN-DBG] action=%d (%s%s%s)  pred_ratio=%.2f  pred_ct=%.4f  pred_dt=%.4f\n",
+                action, algo_names[a], s?"+shuf":"", q?"+quant":"",
+                pred_ratio, pred_ct, pred_dt);
+        fprintf(stderr, "[NN-DBG] top-5 actions: ");
+        for (int i = 0; i < 5 && i < 32; i++) {
+            int ta = local_top[i];
+            int ta_a = ta%8, ta_q = (ta/8)%2, ta_s = (ta/16)%2;
+            fprintf(stderr, "%d(%s%s%s) ", ta, algo_names[ta_a],
+                    ta_s?"+S":"", ta_q?"+Q":"");
+        }
+        fprintf(stderr, "\n");
+    }
 
     *out_action = action;
     if (out_predicted_ratio)       *out_predicted_ratio = pred_ratio;

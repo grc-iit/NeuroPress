@@ -1641,6 +1641,11 @@ gpu_aware_chunked_read(H5VL_gpucompress_t *o,
             goto done;
         }
 
+        /* CUDA events for precise decomp timing (matches comp-side event timing) */
+        cudaEvent_t decomp_ev_start = nullptr, decomp_ev_stop = nullptr;
+        cudaEventCreate(&decomp_ev_start);
+        cudaEventCreate(&decomp_ev_stop);
+
         hsize_t num_chunks[32];
         for (int d = 0; d < ndims; d++)
             num_chunks[d] = (dset_dims[d] + chunk_dims[d] - 1) / chunk_dims[d];
@@ -1769,21 +1774,18 @@ gpu_aware_chunked_read(H5VL_gpucompress_t *o,
             { std::lock_guard<std::mutex> lk(free_mtx); free_slots_count++; }
             free_cv.notify_one();
 
-            /* Decompress on GPU — measure wall-clock time.
-             * Pre-decompress sync removed (S2 fix): H→D copy above is
-             * synchronous (vol_memcpy uses cudaMemcpy), so data is
-             * already on GPU. Post-decompress sync kept only for timing. */
+            /* Decompress on GPU — measure with CUDA events for precision
+             * consistent with compression-side timing. */
             size_t decomp_size = chunk_bytes;
-            struct timespec _ts0, _ts1;
-            clock_gettime(CLOCK_MONOTONIC, &_ts0);
+            cudaEventRecord(decomp_ev_start, scatter_stream);
             gpucompress_error_t ce = gpucompress_decompress_gpu(
                 d_compressed, item.comp_sz, dst_ptr, &decomp_size,
                 scatter_stream);
-            cudaStreamSynchronize(scatter_stream);
-            clock_gettime(CLOCK_MONOTONIC, &_ts1);
+            cudaEventRecord(decomp_ev_stop, scatter_stream);
+            cudaEventSynchronize(decomp_ev_stop);
             if (ce != GPUCOMPRESS_SUCCESS) { ret = -1; break; }
-            float _decomp_ms = (float)((_ts1.tv_sec - _ts0.tv_sec) * 1000.0
-                              + (_ts1.tv_nsec - _ts0.tv_nsec) / 1e6);
+            float _decomp_ms = 0.0f;
+            cudaEventElapsedTime(&_decomp_ms, decomp_ev_start, decomp_ev_stop);
             gpucompress_record_chunk_decomp_ms((int)ci, _decomp_ms);
             VOL_TRACE("    gpucompress_decompress_gpu() → %zuB (%.2f ms)", decomp_size, _decomp_ms);
 
@@ -1839,6 +1841,8 @@ done_read:
             pre_thr.join();
         }
 
+        if (decomp_ev_start) cudaEventDestroy(decomp_ev_start);
+        if (decomp_ev_stop)  cudaEventDestroy(decomp_ev_stop);
         if (scatter_stream) cudaStreamDestroy(scatter_stream);
         if (d_dset_dims) free_dim_arrays(d_dset_dims, d_chunk_dims, d_chunk_start);
         cudaFree(d_decompressed);

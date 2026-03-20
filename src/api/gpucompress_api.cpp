@@ -65,6 +65,7 @@ std::atomic<bool> g_sgd_ever_fired{false};
 float g_rank_w0 = 1.0f;                   // weight on compression time
 float g_rank_w1 = 1.0f;                   // weight on decompression time
 float g_rank_w2 = 1.0f;                   // weight on I/O cost (data_size / (ratio * bw))
+float g_rank_alpha = 5.0f;                // log-ratio reward: ms per doubling of ratio
 float g_measured_bw_bytes_per_ms = 1e6f;   // default 1 GB/s = 1e6 bytes/ms
 
 
@@ -95,6 +96,8 @@ std::atomic<int>  g_mgr_cache_hits{0};
 std::atomic<int>  g_mgr_cache_misses{0};
 
 std::mutex        g_sgd_mutex;
+
+bool g_debug_nn = false;
 
 float g_reinforce_lr = 0.01f;
 float g_reinforce_mape_threshold = 0.10f;
@@ -225,6 +228,11 @@ extern "C" gpucompress_error_t gpucompress_init(const char* weights_path) {
             fprintf(stderr, "Warning: Failed to load NN weights from %s\n", weights_path);
         }
     }
+
+    /* Check debug env var */
+    const char* dbg_env = getenv("GPUCOMPRESS_DEBUG_NN");
+    if (dbg_env && (dbg_env[0] == '1' || dbg_env[0] == 'y' || dbg_env[0] == 'Y'))
+        g_debug_nn = true;
 
     g_initialized.store(true);
     return GPUCOMPRESS_SUCCESS;

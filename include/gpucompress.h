@@ -435,6 +435,22 @@ void gpucompress_set_reinforcement(int enable, float learning_rate,
 void gpucompress_set_ranking_weights(float w0, float w1, float w2);
 
 /**
+ * Set the log-ratio reward coefficient (alpha) for cost-based ranking.
+ *
+ * The ranking formula is:
+ *   cost = w0*ct + w1*dt + w2*ds/(ratio*bw) - alpha*log2(ratio)
+ *
+ * Alpha controls how many ms of extra compress time you're willing to pay
+ * per doubling of compression ratio.  Default: 5.0.
+ *   alpha=0  → pure speed (original formula, snappy always wins)
+ *   alpha=5  → balanced (each 2x ratio improvement worth 5ms)
+ *   alpha=15 → strongly favors high-ratio algorithms
+ *
+ * @param alpha  Log-ratio reward in ms per doubling (default 5.0)
+ */
+void gpucompress_set_ratio_reward(float alpha);
+
+/**
  * Override the auto-probed storage bandwidth used in cost-based ranking.
  *
  * @param bw_gbps  Bandwidth in GB/s (e.g. 3.0 for NVMe, 0.2 for HDD)

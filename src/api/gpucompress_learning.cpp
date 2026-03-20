@@ -218,6 +218,10 @@ extern "C" void gpucompress_set_ranking_weights(float w0, float w1, float w2) {
     g_rank_w2 = w2;
 }
 
+extern "C" void gpucompress_set_ratio_reward(float alpha) {
+    g_rank_alpha = (alpha >= 0.0f) ? alpha : 0.0f;
+}
+
 extern "C" void gpucompress_set_bandwidth(float bw_gbps) {
     if (bw_gbps > 0.0f)
         g_measured_bw_bytes_per_ms = bw_gbps * 1e6f;

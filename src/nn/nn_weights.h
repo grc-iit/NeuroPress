@@ -57,6 +57,14 @@ struct NNInferenceOutput {
     int is_ood;
 };
 
+/** Per-config debug output (32 entries, one per thread). */
+struct NNDebugPerConfig {
+    float ratio;
+    float comp_time;
+    float decomp_time;
+    float cost;       /* w0*ct + w1*dt + w2*ds/(ratio*bw) */
+};
+
 /** All neural net weights packed contiguously (mirrors GPU layout). */
 struct NNWeightsGPU {
     // Normalization parameters
