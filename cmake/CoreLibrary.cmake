@@ -13,6 +13,9 @@ set(PREPROCESSING_SOURCES
 
 set(LIB_SOURCES
     src/api/gpucompress_api.cpp
+    src/api/gpucompress_pool.cpp
+    src/api/gpucompress_learning.cpp
+    src/api/gpucompress_compress.cpp
     src/stats/entropy_kernel.cu
     src/nn/nn_gpu.cu
     src/stats/stats_kernel.cu
@@ -27,6 +30,9 @@ set_source_files_properties(
     src/cli/compress.cpp
     src/cli/decompress.cpp
     src/api/gpucompress_api.cpp
+    src/api/gpucompress_pool.cpp
+    src/api/gpucompress_learning.cpp
+    src/api/gpucompress_compress.cpp
     PROPERTIES LANGUAGE CUDA
 )
 

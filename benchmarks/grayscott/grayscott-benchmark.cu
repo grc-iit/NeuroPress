@@ -806,12 +806,15 @@ int main(int argc, char **argv)
 
     /* ── Phase 1: no-comp ──────────────────────────────────────────── */
     if (phase_mask & P_NOCOMP) {
-        printf("\n── Phase %d: no-comp (GPU→Host→HDF5) ────────────────────────\n", n_phases + 1);
+        printf("\n── Phase %d: no-comp (GPU->Host->HDF5) ────────────────────────\n", n_phases + 1);
+        printf("  Writing... "); fflush(stdout);
         gpucompress_disable_online_learning();
         gpucompress_set_exploration(0);
+        double t0 = now_ms();
         rc = run_phase_nocomp(d_v, d_read, d_count,
                                   n_floats, L, chunk_z,
                                   &results[n_phases]);
+        printf("done (%.1fs)\n", (now_ms() - t0) / 1000.0);
         results[n_phases].sim_ms = sim_ms;
         if (rc) any_fail = 1;
         n_phases++;
@@ -820,13 +823,16 @@ int main(int argc, char **argv)
     /* ── Phase 2: nn (VOL, ALGO_AUTO, inference-only) ────────────── */
     if (phase_mask & P_NN) {
         printf("\n── Phase %d: nn (VOL, ALGO_AUTO, inference-only) ────────────\n", n_phases + 1);
+        printf("  Write + Read + Verify... "); fflush(stdout);
         gpucompress_disable_online_learning();
         gpucompress_set_exploration(0);
         hid_t dcpl_nn = make_dcpl_auto(L, chunk_z, error_bound);
+        double t0 = now_ms();
         rc = run_phase_vol(d_v, d_read, d_count,
                            n_floats, L, chunk_z,
                            "nn", TMP_NN, dcpl_nn,
                            &results[n_phases]);
+        printf("done (%.1fs)\n", (now_ms() - t0) / 1000.0);
         results[n_phases].sim_ms = sim_ms;
         H5Pclose(dcpl_nn);
         if (rc) any_fail = 1;
@@ -838,14 +844,17 @@ int main(int argc, char **argv)
     if (phase_mask & P_NNRL) {
         printf("\n── Phase %d: nn-rl (ALGO_AUTO + SGD, MAPE>=%.0f%%, LR=%.4f) ────\n",
                n_phases + 1, REINFORCE_MAPE * 100.0f, sgd_lr);
+        printf("  Write + Read + Verify... "); fflush(stdout);
         gpucompress_enable_online_learning();
         gpucompress_set_reinforcement(1, sgd_lr, REINFORCE_MAPE, REINFORCE_MAPE);
         gpucompress_set_exploration(0);
         hid_t dcpl_rl = make_dcpl_auto(L, chunk_z, error_bound);
+        double t0 = now_ms();
         rc = run_phase_vol(d_v, d_read, d_count,
                            n_floats, L, chunk_z,
                            "nn-rl", TMP_NN_RL, dcpl_rl,
                            &results[n_phases]);
+        printf("done (%.1fs)\n", (now_ms() - t0) / 1000.0);
         results[n_phases].sim_ms = sim_ms;
         H5Pclose(dcpl_rl);
         gpucompress_disable_online_learning();
@@ -860,16 +869,19 @@ int main(int argc, char **argv)
          * not the SGD-modified weights from phase 3. */
         gpucompress_reload_nn(weights_path);
         printf("\n── Phase %d: nn-rl+exp50 (ALGO_AUTO + SGD + expl@MAPE>=20%%, K=4) ─\n", n_phases + 1);
+        printf("  Write + Read + Verify... "); fflush(stdout);
         gpucompress_enable_online_learning();
         gpucompress_set_reinforcement(1, sgd_lr, REINFORCE_MAPE, REINFORCE_MAPE);
         gpucompress_set_exploration(1);
         gpucompress_set_exploration_threshold(0.20);
         gpucompress_set_exploration_k(4);
         hid_t dcpl_rlexp = make_dcpl_auto(L, chunk_z, error_bound);
+        double t0 = now_ms();
         rc = run_phase_vol(d_v, d_read, d_count,
                            n_floats, L, chunk_z,
                            "nn-rl+exp50", TMP_NN_RLEXP, dcpl_rlexp,
                            &results[n_phases]);
+        printf("done (%.1fs)\n", (now_ms() - t0) / 1000.0);
         results[n_phases].sim_ms = sim_ms;
         H5Pclose(dcpl_rlexp);
         gpucompress_disable_online_learning();
@@ -926,7 +938,7 @@ int main(int argc, char **argv)
             printf("  Multi-timestep [%s]: %d writes (SGD=%s, Explore=%s)\n",
                    phase_name, timesteps,
                    do_sgd ? "on" : "off", do_expl ? "on" : "off");
-            printf("  Each timestep: %d sim steps → H5Dwrite → collect MAPE\n", steps);
+            printf("  Each timestep: %d sim steps + H5Dwrite + verify\n", steps);
             printf("══════════════════════════════════════════════════════════════\n\n");
 
             /* Reload NN and re-init simulation to start fresh */
@@ -967,6 +979,17 @@ int main(int argc, char **argv)
 
             for (int t = 0; t < timesteps; t++) {
                 int cum_sim_step = (t + 1) * steps;
+
+                /* ── Progress bar ── */
+                {
+                    int bar_w = 30;
+                    int filled = (t * bar_w) / timesteps;
+                    printf("\r  [");
+                    for (int b = 0; b < bar_w; b++)
+                        putchar(b < filled ? '#' : '.');
+                    printf("] %d/%d    ", t, timesteps);
+                    fflush(stdout);
+                }
 
                 /* Advance simulation by `steps` */
                 gpucompress_grayscott_run(sim, steps);
@@ -1087,6 +1110,7 @@ int main(int argc, char **argv)
                 /* Print summary row every 5 timesteps, first and last */
                 bool print_row = (t % 5 == 0 || t == timesteps - 1);
                 if (print_row) {
+                    printf("\r%80s\r", "");  /* clear progress bar */
                     printf("  %-4d  %-8d  %6.0f  %6.0f   %5.2fx  %7.1f%%  %7.1f%%  %7.1f%%  %7.1f%%  %7.1f%%  %7.1f%%  %3d  %3d\n",
                            t, cum_sim_step, write_ms_t, read_ms_t,
                            ratio_t, mape_r, mape_c, mape_d,
@@ -1168,6 +1192,13 @@ int main(int argc, char **argv)
 
                 remove(TMP_NN_RL);
             } /* end timestep loop */
+
+            /* Final progress bar */
+            {
+                printf("\r  [");
+                for (int b = 0; b < 30; b++) putchar('#');
+                printf("] %d/%d              \n\n", timesteps, timesteps);
+            }
 
             /* Store averaged throughput and final-timestep MAPE in the matching
              * single-shot PhaseResult so the summary table reflects multi-timestep state. */

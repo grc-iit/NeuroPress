@@ -67,15 +67,20 @@ static std::mutex g_nn_ptr_mutex;
 static NNInferenceOutput* d_infer_output = nullptr;   // batched: action+ratio+comp_time+is_ood (16B)
 static int*               d_infer_top_actions = nullptr;
 
-static void allocInferenceBuffers() {
+static bool allocInferenceBuffers() {
     if (d_infer_output == nullptr) {
-        if (cudaMalloc(&d_infer_output, sizeof(NNInferenceOutput)) != cudaSuccess)
-            d_infer_output = nullptr;
+        if (cudaMalloc(&d_infer_output, sizeof(NNInferenceOutput)) != cudaSuccess) {
+            fprintf(stderr, "NN: cudaMalloc failed for inference output\n");
+            return false;
+        }
     }
     if (d_infer_top_actions == nullptr) {
-        if (cudaMalloc(&d_infer_top_actions, NN_NUM_CONFIGS * sizeof(int)) != cudaSuccess)
-            d_infer_top_actions = nullptr;
+        if (cudaMalloc(&d_infer_top_actions, NN_NUM_CONFIGS * sizeof(int)) != cudaSuccess) {
+            fprintf(stderr, "NN: cudaMalloc failed for top actions\n");
+            return false;
+        }
     }
+    return true;
 }
 
 static void freeInferenceBuffers() {
@@ -475,19 +480,20 @@ __global__ void nnFusedInferenceKernel(
 static NNInferenceOutput* d_fused_infer_output = nullptr;
 static int* d_fused_top_actions = nullptr;
 
-static void allocFusedInferenceBuffers() {
+static bool allocFusedInferenceBuffers() {
     if (d_fused_infer_output == nullptr) {
         if (cudaMalloc(&d_fused_infer_output, sizeof(NNInferenceOutput)) != cudaSuccess) {
             fprintf(stderr, "NN: cudaMalloc failed for fused inference output\n");
-            d_fused_infer_output = nullptr;
+            return false;
         }
     }
     if (d_fused_top_actions == nullptr) {
         if (cudaMalloc(&d_fused_top_actions, NN_NUM_CONFIGS * sizeof(int)) != cudaSuccess) {
             fprintf(stderr, "NN: cudaMalloc failed for fused top actions\n");
-            d_fused_top_actions = nullptr;
+            return false;
         }
     }
+    return true;
 }
 
 static void freeFusedInferenceBuffers() {
@@ -894,7 +900,7 @@ __global__ void nnSGDKernel(
                     if (t < s) s_reduce[t] += s_reduce[t + s];
                     __syncthreads();
                 }
-                float norm_o = sqrtf(s_reduce[0]) + 1e-8f;
+                float norm_o = sqrtf(s_reduce[0]) + 1e-6f;
                 if (t < NN_OUTPUT_DIM && t == o)
                     s_pcgrad_dot[o] = fabsf(s_d3_all[si][o]);  // error magnitude for rescaling
                 s_dz2_all[o][t] /= norm_o;    // normalize to unit vector
@@ -1017,7 +1023,7 @@ __global__ void nnSGDKernel(
             __syncthreads();
         }
 
-        float out_norm = sqrtf(s_reduce[0]);
+        float out_norm = sqrtf(s_reduce[0]) + 1e-8f;
         float clip_scale = (out_norm > GRAD_CLIP_THRESHOLD) ? (GRAD_CLIP_THRESHOLD / out_norm) : 1.0f;
         float lr_out = learning_rate * clip_scale;
         total_norm += out_norm;
@@ -1473,8 +1479,10 @@ bool loadNNFromBinary(const char* filepath) {
     }
 
     // Pre-allocate inference output buffers
-    allocInferenceBuffers();
-    allocFusedInferenceBuffers();
+    if (!allocInferenceBuffers() || !allocFusedInferenceBuffers()) {
+        fprintf(stderr, "NN: Failed to allocate inference buffers\n");
+        return false;
+    }
     allocSGDBuffers();
 
     size_t total_params = NN_HIDDEN_DIM * NN_INPUT_DIM + NN_HIDDEN_DIM +
@@ -1598,8 +1606,7 @@ int runNNInference(
 ) {
     // Ensure pre-allocated buffers exist (outside pointer lock)
     if (d_infer_output == nullptr) {
-        allocInferenceBuffers();
-        if (d_infer_output == nullptr) return -1;
+        if (!allocInferenceBuffers()) return -1;
     }
 
     // Lock pointer, launch kernel, then release — prevents use-after-free during reload
@@ -1673,8 +1680,7 @@ int runNNFusedInference(
 
     // Ensure fused buffers exist (outside pointer lock)
     if (d_fused_infer_output == nullptr) {
-        allocFusedInferenceBuffers();
-        if (d_fused_infer_output == nullptr) return -1;
+        if (!allocFusedInferenceBuffers()) return -1;
     }
 
     cudaError_t err;
@@ -2004,6 +2010,7 @@ __global__ void nnBatchedDecompSGDKernel(
     // Accumulate mean gradient across all samples
     float acc_gw = 0.0f;   // accumulated dw3 for thread t
     float acc_gb = 0.0f;   // accumulated db3 (thread 0 only)
+    float acc_abs_err = 0.0f; // accumulated |error| for trust-region (thread 0 only)
     int   valid  = 0;
 
     for (int si = 0; si < num_samples; si++) {
@@ -2079,7 +2086,10 @@ __global__ void nnBatchedDecompSGDKernel(
 
         // Accumulate gradient: dw3[t] += err * h2[t], db3 += err
         acc_gw += s_err * s_h2[t];
-        if (t == 0) acc_gb += s_err;
+        if (t == 0) {
+            acc_gb += s_err;
+            acc_abs_err += fabsf(s_err);
+        }
         valid++;
         __syncthreads();
     }
@@ -2114,16 +2124,7 @@ __global__ void nnBatchedDecompSGDKernel(
     // with a constant step size.
     __shared__ float s_mean_abs_err;
     if (t == 0) {
-        float sum_abs = 0.0f;
-        for (int si = 0; si < num_samples; si++) {
-            const DeferredDecompSample& samp = samples[si];
-            float y_norm = weights->b3[1];
-            for (int i = 0; i < NN_HIDDEN_DIM; i++)
-                y_norm += weights->w3[1 * NN_HIDDEN_DIM + i] * s_h2[i];
-            // Note: s_h2 is from last sample. Use acc_gb as proxy for mean error.
-            sum_abs = fabsf(acc_gb);  // mean error magnitude (in normalized space)
-        }
-        s_mean_abs_err = sum_abs;
+        s_mean_abs_err = acc_abs_err * inv_n;
     }
     __syncthreads();
 

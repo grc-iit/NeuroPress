@@ -339,9 +339,12 @@ AutoStatsGPU* runStatsKernelsNoSync(
     /* Set sentinels via async copy — same stream guarantees ordering */
     static const float h_flt_max = FLT_MAX;
     static const float h_flt_min = -FLT_MAX;
-    cudaMemcpyAsync(&d_stats->vmin, &h_flt_max, sizeof(float), cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(&d_stats->vmax, &h_flt_min, sizeof(float), cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(&d_stats->num_elements, &num_elements, sizeof(size_t), cudaMemcpyHostToDevice, stream);
+    err = cudaMemcpyAsync(&d_stats->vmin, &h_flt_max, sizeof(float), cudaMemcpyHostToDevice, stream);
+    if (err != cudaSuccess) return nullptr;
+    err = cudaMemcpyAsync(&d_stats->vmax, &h_flt_min, sizeof(float), cudaMemcpyHostToDevice, stream);
+    if (err != cudaSuccess) return nullptr;
+    err = cudaMemcpyAsync(&d_stats->num_elements, &num_elements, sizeof(size_t), cudaMemcpyHostToDevice, stream);
+    if (err != cudaSuccess) return nullptr;
 
     int num_blocks = static_cast<int>((num_elements + STATS_BLOCK_SIZE - 1) / STATS_BLOCK_SIZE);
     if (num_blocks > STATS_MAX_BLOCKS) num_blocks = STATS_MAX_BLOCKS;
@@ -397,9 +400,12 @@ AutoStatsGPU* runStatsKernelsNoSync(
 
     static const float h_flt_max = FLT_MAX;
     static const float h_flt_min = -FLT_MAX;
-    cudaMemcpyAsync(&d_stats->vmin, &h_flt_max, sizeof(float), cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(&d_stats->vmax, &h_flt_min, sizeof(float), cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(&d_stats->num_elements, &num_elements, sizeof(size_t), cudaMemcpyHostToDevice, stream);
+    err = cudaMemcpyAsync(&d_stats->vmin, &h_flt_max, sizeof(float), cudaMemcpyHostToDevice, stream);
+    if (err != cudaSuccess) return nullptr;
+    err = cudaMemcpyAsync(&d_stats->vmax, &h_flt_min, sizeof(float), cudaMemcpyHostToDevice, stream);
+    if (err != cudaSuccess) return nullptr;
+    err = cudaMemcpyAsync(&d_stats->num_elements, &num_elements, sizeof(size_t), cudaMemcpyHostToDevice, stream);
+    if (err != cudaSuccess) return nullptr;
 
     int num_blocks = static_cast<int>((num_elements + STATS_BLOCK_SIZE - 1) / STATS_BLOCK_SIZE);
     if (num_blocks > STATS_MAX_BLOCKS) num_blocks = STATS_MAX_BLOCKS;

@@ -395,6 +395,42 @@ target_include_directories(test_c1_exploration_header PRIVATE
 target_link_libraries(test_c1_exploration_header PRIVATE gpucompress CUDA::cudart m)
 set_target_properties(test_c1_exploration_header PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
+add_executable(test_error_handling_fixes tests/regression/test_error_handling_fixes.cu)
+set_source_files_properties(tests/regression/test_error_handling_fixes.cu PROPERTIES LANGUAGE CUDA)
+target_include_directories(test_error_handling_fixes PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_error_handling_fixes PRIVATE gpucompress CUDA::cudart pthread m)
+set_target_properties(test_error_handling_fixes PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+add_executable(test_exploration_preproc tests/regression/test_exploration_preproc.cu)
+set_source_files_properties(tests/regression/test_exploration_preproc.cu PROPERTIES LANGUAGE CUDA)
+target_include_directories(test_exploration_preproc PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_exploration_preproc PRIVATE gpucompress CUDA::cudart m)
+set_target_properties(test_exploration_preproc PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+add_executable(test_nn_preproc_debug tests/regression/test_nn_preproc_debug.cu)
+set_source_files_properties(tests/regression/test_nn_preproc_debug.cu PROPERTIES LANGUAGE CUDA)
+target_include_directories(test_nn_preproc_debug PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_nn_preproc_debug PRIVATE gpucompress CUDA::cudart m)
+set_target_properties(test_nn_preproc_debug PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+add_executable(test_nn_action_diversity tests/regression/test_nn_action_diversity.cu)
+set_source_files_properties(tests/regression/test_nn_action_diversity.cu PROPERTIES LANGUAGE CUDA)
+target_include_directories(test_nn_action_diversity PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_nn_action_diversity PRIVATE gpucompress CUDA::cudart m)
+set_target_properties(test_nn_action_diversity PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
 add_executable(test_h3_auto_global_buffers tests/regression/test_h3_auto_global_buffers.cu)
 set_source_files_properties(tests/regression/test_h3_auto_global_buffers.cu PROPERTIES LANGUAGE CUDA)
 target_include_directories(test_h3_auto_global_buffers PRIVATE

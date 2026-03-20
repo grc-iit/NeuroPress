@@ -1044,12 +1044,14 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
          * nvcc requires no init-bypass for non-trivial types). */
         hsize_t *d_dset_dims = NULL, *d_chunk_dims = NULL, *d_chunk_start = NULL;
         uint8_t* d_comp_w[N_COMP_WORKERS] = {};
+        std::atomic<herr_t>     worker_err{0};
         std::mutex              pool_mtx;
         std::condition_variable pool_cv;
         std::queue<void*>       pool_free;
         auto pool_acquire = [&]() -> void* {
             std::unique_lock<std::mutex> lk(pool_mtx);
-            pool_cv.wait(lk, [&]{ return !pool_free.empty(); });
+            pool_cv.wait(lk, [&]{ return !pool_free.empty() || worker_err.load() != 0; });
+            if (pool_free.empty()) return nullptr;
             void* b = pool_free.front(); pool_free.pop();
             return b;
         };
@@ -1060,7 +1062,6 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
         std::mutex              wq_mtx;
         std::condition_variable wq_full_cv, wq_ready_cv;
         std::queue<WorkItem>    wq;
-        std::atomic<herr_t>     worker_err{0};
         struct IOItem { void *data; size_t sz; hsize_t cs[32]; int nd; };
         std::mutex              io_mtx;
         std::condition_variable io_cv;
@@ -1128,7 +1129,8 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                     while (true) {
                         WorkItem wi;
                         { std::unique_lock<std::mutex> lk(wq_mtx);
-                          wq_ready_cv.wait(lk, [&]{ return !wq.empty(); });
+                          wq_ready_cv.wait(lk, [&]{ return !wq.empty() || worker_err.load() != 0; });
+                          if (wq.empty()) break;  /* woken by error — exit */
                           wi = wq.front(); wq.pop(); }
                         wq_full_cv.notify_one();
                         if (!wi.valid) break;
@@ -1157,18 +1159,28 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                             fprintf(stderr, "gpucompress VOL: worker %d compress failed "
                                     "(err=%d, chunk_sz=%zu)\n", w, (int)ce, wi.sz);
                             worker_err.store((herr_t)-1);
-                            continue;
+                            wq_ready_cv.notify_all();
+                            pool_cv.notify_all();
+                            break;
                         }
 
                         s_chunks_comp++;
 
                         /* Acquire a pool buffer; D→H directly into it (no extra memcpy) */
                         void *hbuf = pool_acquire();
+                        if (!hbuf) {
+                            worker_err.store((herr_t)-1);
+                            wq_ready_cv.notify_all();
+                            pool_cv.notify_all();
+                            break;
+                        }
                         if (cudaMemcpy(hbuf, d_comp_w[w], comp_sz,
                                        cudaMemcpyDeviceToHost) != cudaSuccess) {
                             pool_release(hbuf);
                             worker_err.store((herr_t)-1);
-                            continue;
+                            wq_ready_cv.notify_all();
+                            pool_cv.notify_all();
+                            break;
                         }
 
                         IOItem item;
@@ -1335,15 +1347,23 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                              * Stage 2 worker can reuse them for SGD without recomputing.
                              * infer_ctx->d_stats will be overwritten by the next chunk. */
                             AutoStatsGPU* d_sc = nullptr;
-                            if (cudaMalloc(&d_sc, sizeof(AutoStatsGPU)) == cudaSuccess) {
-                                cudaMemcpyAsync(d_sc, infer_ctx->d_stats, sizeof(AutoStatsGPU),
-                                                cudaMemcpyDeviceToDevice, infer_ctx->stream);
-                                cudaStreamSynchronize(infer_ctx->stream);
-                                wi.d_stats_copy = d_sc;
+                            if (cudaMalloc(&d_sc, sizeof(AutoStatsGPU)) != cudaSuccess) {
+                                fprintf(stderr, "gpucompress VOL: stats copy alloc failed\n");
+                                ret = -1; break;
                             }
+                            cudaError_t sc_err = cudaMemcpyAsync(d_sc, infer_ctx->d_stats, sizeof(AutoStatsGPU),
+                                                                  cudaMemcpyDeviceToDevice, infer_ctx->stream);
+                            if (sc_err != cudaSuccess) {
+                                fprintf(stderr, "gpucompress VOL: stats copy memcpy failed\n");
+                                cudaFree(d_sc); ret = -1; break;
+                            }
+                            sc_err = cudaStreamSynchronize(infer_ctx->stream);
+                            if (sc_err != cudaSuccess) {
+                                fprintf(stderr, "gpucompress VOL: stats copy sync failed\n");
+                                cudaFree(d_sc); ret = -1; break;
+                            }
+                            wi.d_stats_copy = d_sc;
                         }
-                        /* On failure, has_inference stays false → worker falls back
-                         * to full gpucompress_compress_gpu() with its own inference */
                     }
 
                     /* ---- Post WorkItem to bounded work queue ---- */
@@ -1372,7 +1392,8 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                 WorkItem sentinel = {};
                 sentinel.valid = false;
                 { std::unique_lock<std::mutex> lk(wq_mtx);
-                  wq_full_cv.wait(lk, [&]{ return wq.size() < (size_t)(N_COMP_WORKERS * 2); });
+                  wq_full_cv.wait(lk, [&]{ return wq.size() < (size_t)(N_COMP_WORKERS * 2)
+                                                  || worker_err.load() != 0; });
                   wq.push(sentinel); }
                 wq_ready_cv.notify_one();
             }
@@ -1456,19 +1477,17 @@ gpu_fallback_dh_write(H5VL_gpucompress_t *o,
                     "(%zu MiB) and writing via native path (no compression).\n",
                     total_bytes >> 20);
 
-    /* Allocate host staging buffer — prefer pinned for faster DMA */
+    /* Allocate host staging buffer — pinned memory required */
     void *h_tmp  = NULL;
-    int   pinned = (cudaMallocHost(&h_tmp, total_bytes) == cudaSuccess);
-    if (!pinned) {
-        h_tmp = malloc(total_bytes);
-        assert(h_tmp && "VOL fallback-write: host staging buffer allocation failed");
-        if (!h_tmp) return -1;
+    if (cudaMallocHost(&h_tmp, total_bytes) != cudaSuccess) {
+        fprintf(stderr, "gpucompress VOL: pinned host alloc failed (%zu bytes)\n", total_bytes);
+        return -1;
     }
 
     cudaError_t ce = cudaMemcpy(h_tmp, d_buf, total_bytes, cudaMemcpyDeviceToHost);
-    assert(ce == cudaSuccess && "VOL fallback-write: D->H cudaMemcpy failed");
     if (ce != cudaSuccess) {
-        if (pinned) cudaFreeHost(h_tmp); else free(h_tmp);
+        fprintf(stderr, "gpucompress VOL: D→H copy failed: %s\n", cudaGetErrorString(ce));
+        cudaFreeHost(h_tmp);
         return -1;
     }
 
@@ -1478,9 +1497,10 @@ gpu_fallback_dh_write(H5VL_gpucompress_t *o,
     herr_t ret = H5VLdataset_write(1, &under_obj, o->under_vol_id,
                                    &mem_type_id, &mem_space_id, &file_space_id,
                                    dxpl_id, &h_ptr, req);
-    assert(ret >= 0 && "VOL fallback-write: H5VLdataset_write failed");
+    if (ret < 0)
+        fprintf(stderr, "gpucompress VOL: H5VLdataset_write failed in fallback path\n");
 
-    if (pinned) cudaFreeHost(h_tmp); else free(h_tmp);
+    cudaFreeHost(h_tmp);
     return ret;
 }
 
@@ -1532,13 +1552,11 @@ gpu_fallback_hd_read(H5VL_gpucompress_t *o,
                     "H->D copy (%zu MiB).\n",
                     total_bytes >> 20);
 
-    /* Allocate host staging buffer */
+    /* Allocate host staging buffer — pinned memory required */
     void *h_tmp  = NULL;
-    int   pinned = (cudaMallocHost(&h_tmp, total_bytes) == cudaSuccess);
-    if (!pinned) {
-        h_tmp = malloc(total_bytes);
-        assert(h_tmp && "VOL fallback-read: host staging buffer allocation failed");
-        if (!h_tmp) return -1;
+    if (cudaMallocHost(&h_tmp, total_bytes) != cudaSuccess) {
+        fprintf(stderr, "gpucompress VOL: pinned host alloc failed (%zu bytes)\n", total_bytes);
+        return -1;
     }
 
     /* One-shot native read */
@@ -1546,15 +1564,20 @@ gpu_fallback_hd_read(H5VL_gpucompress_t *o,
     herr_t ret = H5VLdataset_read(1, &under_obj, o->under_vol_id,
                                   &mem_type_id, &mem_space_id, &file_space_id,
                                   dxpl_id, &h_tmp, req);
-    assert(ret >= 0 && "VOL fallback-read: H5VLdataset_read failed");
-
-    if (ret >= 0) {
-        cudaError_t ce = cudaMemcpy(d_buf, h_tmp, total_bytes, cudaMemcpyHostToDevice);
-        assert(ce == cudaSuccess && "VOL fallback-read: H→D cudaMemcpy failed");
-        if (ce != cudaSuccess) ret = -1;
+    if (ret < 0) {
+        fprintf(stderr, "gpucompress VOL: H5VLdataset_read failed in fallback path\n");
+        cudaFreeHost(h_tmp);
+        return ret;
     }
 
-    if (pinned) cudaFreeHost(h_tmp); else free(h_tmp);
+    cudaError_t ce = cudaMemcpy(d_buf, h_tmp, total_bytes, cudaMemcpyHostToDevice);
+    if (ce != cudaSuccess) {
+        fprintf(stderr, "gpucompress VOL: H→D copy failed: %s\n", cudaGetErrorString(ce));
+        cudaFreeHost(h_tmp);
+        return -1;
+    }
+
+    cudaFreeHost(h_tmp);
     return ret;
 }
 

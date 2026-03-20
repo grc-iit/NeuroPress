@@ -8,6 +8,7 @@
  */
 
 #include "preprocessing/quantization.cuh"
+#include "api/cuda_check.h"
 #include <cuda_runtime.h>
 #include <cub/cub.cuh>
 #include <cfloat>
@@ -217,9 +218,12 @@ static int compute_data_range_typed(
     if (err != cudaSuccess) { cudaFree(d_temp); return -1; }
 
     T h_min, h_max;
-    cudaMemcpyAsync(&h_min, d_buf_min, sizeof(T), cudaMemcpyDeviceToHost, stream);
-    cudaMemcpyAsync(&h_max, d_buf_max, sizeof(T), cudaMemcpyDeviceToHost, stream);
-    cudaStreamSynchronize(stream);
+    err = cudaMemcpyAsync(&h_min, d_buf_min, sizeof(T), cudaMemcpyDeviceToHost, stream);
+    if (err != cudaSuccess) { cudaFree(d_temp); return -1; }
+    err = cudaMemcpyAsync(&h_max, d_buf_max, sizeof(T), cudaMemcpyDeviceToHost, stream);
+    if (err != cudaSuccess) { cudaFree(d_temp); return -1; }
+    err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess) { cudaFree(d_temp); return -1; }
 
     cudaFree(d_temp);
 
@@ -402,7 +406,7 @@ QuantizationResult quantize_simple(
 
     // Warn if forced INT8 cannot represent the data range
     if (precision == 8 && data_range > 0) {
-        double max_quant = data_range / (2.0 * config.error_bound);
+        double max_quant = data_range / (2.0 * effective_eb);
         if (max_quant > 127.0)
             fprintf(stderr, "gpucompress WARNING: forced INT8 cannot represent data range "
                     "(need %.0f levels, int8 max=127). Error bound may be violated.\n", max_quant);
@@ -551,7 +555,7 @@ QuantizationResult quantize_simple(
 
     // Warn if forced INT8 cannot represent the data range
     if (precision == 8 && data_range > 0) {
-        double max_quant = data_range / (2.0 * config.error_bound);
+        double max_quant = data_range / (2.0 * effective_eb);
         if (max_quant > 127.0)
             fprintf(stderr, "gpucompress WARNING: forced INT8 cannot represent data range "
                     "(need %.0f levels, int8 max=127). Error bound may be violated.\n", max_quant);
@@ -600,7 +604,7 @@ QuantizationResult quantize_simple(
     result.data_min             = data_min;
     result.data_max             = data_max;
     result.scale_factor         = scale;
-    result.error_bound          = config.error_bound;
+    result.error_bound          = effective_eb;
     result.type                 = config.type;
     result.num_elements         = num_elements;
     result.original_element_size = element_size;
