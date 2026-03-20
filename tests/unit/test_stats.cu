@@ -4,7 +4,7 @@
  *   1. Entropy correctness for uniform data (all same byte -> entropy 0)
  *   2. Entropy correctness for high-entropy data (random-like -> near 8.0)
  *   3. Entropy with non-4-aligned size (regression test for histogram Bug 1)
- *   4. calculateEntropyGPU returns -1.0 for null input
+ *   4. computeEntropyForTest returns -1.0 for null input
  *   5. Stats pipeline produces sane output ranges
  *   6. Stats pipeline returns -1 for null input
  */
@@ -19,7 +19,13 @@
 // Declarations from internal.hpp (in gpucompress namespace)
 namespace gpucompress {
 
-double calculateEntropyGPU(const void* d_data, size_t num_bytes, cudaStream_t stream);
+int launchEntropyKernelsAsync(
+    const void* d_data,
+    size_t num_bytes,
+    unsigned int* d_histogram,
+    double* d_entropy_out,
+    cudaStream_t stream
+);
 
 int runStatsOnlyPipeline(
     const void* d_input,
@@ -31,6 +37,29 @@ int runStatsOnlyPipeline(
 );
 
 } // namespace gpucompress
+
+// Test helper: compute entropy using the async kernel + D→H copy
+static double computeEntropyForTest(const void* d_data, size_t num_bytes, cudaStream_t stream) {
+    if (d_data == nullptr) return -1.0;
+    if (num_bytes == 0) return 0.0;
+
+    unsigned int* d_histogram = nullptr;
+    double* d_entropy = nullptr;
+    if (cudaMalloc(&d_histogram, 256 * sizeof(unsigned int)) != cudaSuccess) return -1.0;
+    if (cudaMalloc(&d_entropy, sizeof(double)) != cudaSuccess) {
+        cudaFree(d_histogram); return -1.0;
+    }
+
+    int rc = gpucompress::launchEntropyKernelsAsync(d_data, num_bytes, d_histogram, d_entropy, stream);
+    if (rc != 0) { cudaFree(d_histogram); cudaFree(d_entropy); return -1.0; }
+
+    double entropy;
+    cudaMemcpyAsync(&entropy, d_entropy, sizeof(double), cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+    cudaFree(d_histogram);
+    cudaFree(d_entropy);
+    return entropy;
+}
 
 static int g_pass = 0;
 static int g_fail = 0;
@@ -61,7 +90,7 @@ static void test_entropy_uniform() {
     cudaMalloc(&d_data, N);
     cudaMemcpy(d_data, h_data, N, cudaMemcpyHostToDevice);
 
-    double entropy = gpucompress::calculateEntropyGPU(d_data, N, 0);
+    double entropy = computeEntropyForTest(d_data, N, 0);
     ASSERT(entropy >= 0.0, "entropy should not be negative");
     ASSERT(entropy < 0.01, "uniform data should have ~0 entropy");
 
@@ -86,7 +115,7 @@ static void test_entropy_two_values() {
     cudaMalloc(&d_data, N);
     cudaMemcpy(d_data, h_data, N, cudaMemcpyHostToDevice);
 
-    double entropy = gpucompress::calculateEntropyGPU(d_data, N, 0);
+    double entropy = computeEntropyForTest(d_data, N, 0);
     ASSERT(fabs(entropy - 1.0) < 0.01, "50/50 two-value data should have entropy ~1.0");
 
     free(h_data);
@@ -114,7 +143,7 @@ static void test_entropy_max() {
     cudaMalloc(&d_data, N);
     cudaMemcpy(d_data, h_data, N, cudaMemcpyHostToDevice);
 
-    double entropy = gpucompress::calculateEntropyGPU(d_data, N, 0);
+    double entropy = computeEntropyForTest(d_data, N, 0);
     ASSERT(fabs(entropy - 8.0) < 0.01, "uniform 256-value distribution should have entropy ~8.0");
 
     free(h_data);
@@ -142,7 +171,7 @@ static void test_entropy_non_aligned_size() {
     cudaMalloc(&d_data, N);
     cudaMemcpy(d_data, h_data, N, cudaMemcpyHostToDevice);
 
-    double entropy = gpucompress::calculateEntropyGPU(d_data, N, 0);
+    double entropy = computeEntropyForTest(d_data, N, 0);
     ASSERT(entropy >= 0.0, "entropy should not be negative");
 
     // With 16M+3 bytes: near-uniform distribution
@@ -157,12 +186,12 @@ static void test_entropy_non_aligned_size() {
 }
 
 /* ============================================================
- * Test 5: calculateEntropyGPU returns -1.0 for null input
+ * Test 5: computeEntropyForTest returns -1.0 for null input
  * ============================================================ */
 static void test_entropy_null_input() {
-    TEST("calculateEntropyGPU returns -1.0 for null input");
+    TEST("computeEntropyForTest returns -1.0 for null input");
 
-    double entropy = gpucompress::calculateEntropyGPU(nullptr, 1024, 0);
+    double entropy = computeEntropyForTest(nullptr, 1024, 0);
     ASSERT(entropy < 0.0, "null input should return -1.0");
     ASSERT(fabs(entropy - (-1.0)) < 0.001, "should return exactly -1.0");
 
@@ -170,15 +199,15 @@ static void test_entropy_null_input() {
 }
 
 /* ============================================================
- * Test 6: calculateEntropyGPU returns 0.0 for zero-length input
+ * Test 6: computeEntropyForTest returns 0.0 for zero-length input
  * ============================================================ */
 static void test_entropy_zero_length() {
-    TEST("calculateEntropyGPU returns 0.0 for zero-length input");
+    TEST("computeEntropyForTest returns 0.0 for zero-length input");
 
     void* d_data = nullptr;
     cudaMalloc(&d_data, 16);  // valid pointer, zero length
 
-    double entropy = gpucompress::calculateEntropyGPU(d_data, 0, 0);
+    double entropy = computeEntropyForTest(d_data, 0, 0);
     ASSERT(fabs(entropy) < 0.001, "zero-length should return 0.0");
 
     cudaFree(d_data);

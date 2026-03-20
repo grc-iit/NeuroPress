@@ -180,16 +180,6 @@ inline gpucompress_error_t checkCuda(cudaError_t err) {
  * ============================================================ */
 
 /**
- * Calculate Shannon entropy on GPU.
- *
- * @param d_data    Data buffer (GPU memory)
- * @param num_bytes Size in bytes
- * @param stream    CUDA stream
- * @return Entropy in bits (0.0 to 8.0)
- */
-double calculateEntropyGPU(const void* d_data, size_t num_bytes, cudaStream_t stream);
-
-/**
  * Launch entropy kernels asynchronously without D->H copy.
  *
  * Fire-and-forget variant that writes entropy to a device pointer.
@@ -295,11 +285,6 @@ int runStatsOnlyPipeline(
  */
 AutoStatsGPU* runStatsKernelsNoSync(const void* d_input, size_t input_size, cudaStream_t stream);
 
-/**
- * Get device pointer to pre-allocated stats buffer.
- */
-AutoStatsGPU* getStatsDevicePtr();
-
 /* ============================================================
  * CompContext pool API
  * ============================================================ */
@@ -371,36 +356,6 @@ int runNNSGD(const AutoStatsGPU* d_stats, const SGDSample* samples, int num_samp
  */
 int runBatchedDecompSGD(const DeferredDecompSample* samples, int num_samples,
     float learning_rate, float* out_grad_norm = nullptr);
-
-/**
- * Run the complete ALGO_AUTO statistics + NN inference pipeline on GPU.
- *
- * Same stats computation as runAutoStatsPipeline but uses neural network
- * instead of Q-Table for action selection.
- *
- * @param d_input      Float data already on GPU
- * @param input_size   Size in bytes
- * @param error_bound  Raw error bound value
- * @param stream       CUDA stream
- * @param out_action   [out] Best action index
- * @param out_entropy  [out] Nullable, entropy for stats reporting
- * @param out_mad      [out] Nullable, normalized MAD for stats reporting
- * @param out_deriv    [out] Nullable, normalized derivative for stats reporting
- * @return 0 on success, -1 on error
- */
-int runAutoStatsNNPipeline(
-    const void* d_input,
-    size_t input_size,
-    double error_bound,
-    cudaStream_t stream,
-    int* out_action,
-    double* out_entropy = nullptr,
-    double* out_mad = nullptr,
-    double* out_deriv = nullptr,
-    float* out_predicted_ratio = nullptr,
-    float* out_predicted_comp_time = nullptr,
-    int* out_top_actions = nullptr
-);
 
 /** Get device pointer to current NN weights (read-only). */
 const NNWeightsGPU* getNNWeightsDevicePtr();

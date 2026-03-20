@@ -296,22 +296,6 @@ int launchEntropyKernelsAsync(
     cudaStream_t stream
 );
 
-// From nn_gpu.cu
-bool isNNLoaded();
-int runNNInference(
-    double entropy,
-    double mad_norm,
-    double deriv_norm,
-    size_t data_size,
-    double error_bound,
-    cudaStream_t stream,
-    float* out_predicted_ratio,
-    float* out_predicted_comp_time,
-    float* out_predicted_decomp_time,
-    float* out_predicted_psnr,
-    int* out_top_actions
-);
-
 /* ============================================================
  * No-sync stats path: runs all kernels, returns device pointer.
  * No D→H copy, no sync. Used by fused stats→NN pipeline.
@@ -437,19 +421,12 @@ AutoStatsGPU* runStatsKernelsNoSync(
     return d_stats;
 }
 
-/**
- * Return device pointer to pre-allocated stats buffer.
- */
-AutoStatsGPU* getStatsDevicePtr() {
-    return g_d_stats;
-}
-
 /* ============================================================
- * Internal helper: run stats kernels with D→H copy + sync.
- * Calls runStatsKernelsNoSync() then copies results to host.
+ * Host Pipeline Function (Stats-only mode, no inference).
+ * Runs GPU kernels, copies 24B result to host, syncs.
  * ============================================================ */
 
-static int runStatsKernels(
+int runStatsOnlyPipeline(
     const void* d_input,
     size_t input_size,
     cudaStream_t stream,
@@ -457,6 +434,10 @@ static int runStatsKernels(
     double* out_mad,
     double* out_deriv
 ) {
+    if (out_entropy == nullptr || out_mad == nullptr || out_deriv == nullptr) {
+        return -1;
+    }
+
     AutoStatsGPU* d_stats = runStatsKernelsNoSync(d_input, input_size, stream);
     if (d_stats == nullptr) return -1;
 
@@ -482,74 +463,6 @@ static int runStatsKernels(
     *out_deriv = h_result.deriv_normalized;
 
     return 0;
-}
-
-/* ============================================================
- * Host Pipeline Function (Neural Network mode)
- * ============================================================ */
-
-int runAutoStatsNNPipeline(
-    const void* d_input,
-    size_t input_size,
-    double error_bound,
-    cudaStream_t stream,
-    int* out_action,
-    double* out_entropy,
-    double* out_mad,
-    double* out_deriv,
-    float* out_predicted_ratio,
-    float* out_predicted_comp_time,
-    int* out_top_actions
-) {
-    if (!isNNLoaded()) {
-        return -1;
-    }
-
-    double entropy, mad_norm, deriv_norm;
-    int rc = runStatsKernels(d_input, input_size, stream,
-                             &entropy, &mad_norm, &deriv_norm);
-    if (rc != 0) {
-        return -1;
-    }
-
-    // Run neural network inference
-    int action = runNNInference(
-        entropy, mad_norm, deriv_norm,
-        input_size, error_bound, stream,
-        out_predicted_ratio, out_predicted_comp_time,
-        nullptr, nullptr, out_top_actions
-    );
-    if (action < 0) {
-        return -1;
-    }
-
-    // Write outputs
-    if (out_action) *out_action = action;
-    if (out_entropy) *out_entropy = entropy;
-    if (out_mad) *out_mad = mad_norm;
-    if (out_deriv) *out_deriv = deriv_norm;
-
-    return 0;
-}
-
-/* ============================================================
- * Host Pipeline Function (Stats-only mode, no inference)
- * ============================================================ */
-
-int runStatsOnlyPipeline(
-    const void* d_input,
-    size_t input_size,
-    cudaStream_t stream,
-    double* out_entropy,
-    double* out_mad,
-    double* out_deriv
-) {
-    if (out_entropy == nullptr || out_mad == nullptr || out_deriv == nullptr) {
-        return -1;
-    }
-
-    return runStatsKernels(d_input, input_size, stream,
-                           out_entropy, out_mad, out_deriv);
 }
 
 } // namespace gpucompress
