@@ -418,47 +418,26 @@ void gpucompress_set_reinforcement(int enable, float learning_rate,
  * Cost-Based Ranking Configuration
  *
  * The NN predicts (comp_time, decomp_time, ratio) for 32 configs.
- * The log-space ranking formula is:
- *   cost = α*log(ct + γ*dt) + β*log(ds/(ratio*bw)) - δ*log(ratio)
- *
- * Parameters:
- *   α (alpha)  — weight on compute time
- *   β (beta)   — weight on I/O cost (system-dependent)
- *   γ (gamma)  — decomp vs comp emphasis (γ>1 = read-heavy workload)
- *   δ (delta)  — weight on compression ratio utility
- *   bw         — effective storage bandwidth (auto-probed or user-set)
- *
+ * The ranking formula is:
+ *   cost = w0 * comp_time + w1 * decomp_time + w2 * data_size / (ratio * bw)
  * The config with the lowest cost is selected.
+ *
+ * Default: w0=1, w1=1, w2=1 with auto-probed bandwidth from gpucompress_init().
  * ============================================================ */
 
-/** Cost model optimization mode presets. */
-#define GPUCOMPRESS_COST_SPEED      0  /* α=1 β=0 γ=1 δ=0   — minimize time       */
-#define GPUCOMPRESS_COST_BALANCED   1  /* α=1 β=1 γ=1 δ=0.5 — trade time vs ratio  */
-#define GPUCOMPRESS_COST_RATIO      2  /* α=0.3 β=1 γ=1 δ=1 — maximize compression */
-#define GPUCOMPRESS_COST_THROUGHPUT 3  /* α=1 β=0 γ=1 δ=1   — time per ratio       */
-
 /**
- * Set cost model mode (preset).
+ * Set the cost-based ranking weights for NN algorithm selection.
  *
- * @param mode  One of GPUCOMPRESS_COST_SPEED, _BALANCED, _RATIO, _THROUGHPUT
+ * @param w0  Weight on predicted compression time (ms)
+ * @param w1  Weight on predicted decompression time (ms)
+ * @param w2  Weight on I/O cost: data_size / (ratio * bandwidth)
  */
-void gpucompress_set_cost_mode(int mode);
-
-/**
- * Set cost model parameters directly.
- *
- * @param alpha  Weight on compute time term (default 1.0)
- * @param beta   Weight on I/O cost term (default 1.0)
- * @param gamma  Decomp emphasis: γ>1 favors fast decompression (default 1.0)
- * @param delta  Weight on ratio utility term (default 0.5)
- */
-void gpucompress_set_cost_params(float alpha, float beta, float gamma, float delta);
+void gpucompress_set_ranking_weights(float w0, float w1, float w2);
 
 /**
  * Override the auto-probed storage bandwidth used in cost-based ranking.
- * For multi-backend, compute effective bw: 1/bw_eff = Σ(p_i/bw_i).
  *
- * @param bw_gbps  Effective bandwidth in GB/s (e.g. 3.0 for NVMe, 0.2 for HDD)
+ * @param bw_gbps  Bandwidth in GB/s (e.g. 3.0 for NVMe, 0.2 for HDD)
  */
 void gpucompress_set_bandwidth(float bw_gbps);
 
@@ -474,19 +453,7 @@ void gpucompress_set_bandwidth(float bw_gbps);
 gpucompress_error_t gpucompress_reload_nn(const char* filepath);
 
 /**
- * Save current NN weights from GPU to a caller-provided host buffer.
- * Buffer must be at least gpucompress_nn_weights_size() bytes.
- */
-gpucompress_error_t gpucompress_nn_save_weights(void* host_buffer, size_t buffer_size);
-
-/**
- * Restore NN weights from a caller-provided host buffer to GPU.
- * Buffer must have been previously filled by gpucompress_nn_save_weights().
- */
-gpucompress_error_t gpucompress_nn_restore_weights(const void* host_buffer, size_t buffer_size);
-
-/**
- * Returns the size in bytes needed for gpucompress_nn_save/restore_weights().
+ * Returns the size in bytes of the NN weights structure.
  */
 size_t gpucompress_nn_weights_size(void);
 
@@ -508,12 +475,6 @@ const char* gpucompress_algorithm_name(gpucompress_algorithm_t algorithm);
  * Returns -1 if no NN prediction has been made yet.
  */
 int gpucompress_get_last_nn_action(void);
-
-/**
- * Get the NN's original action before exploration may have changed it.
- * Returns -1 if no NN prediction has been made yet.
- */
-int gpucompress_get_last_nn_original_action(void);
 
 /**
  * Check if Level 2 exploration was triggered during the last ALGO_AUTO compress.

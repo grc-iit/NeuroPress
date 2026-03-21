@@ -15,7 +15,7 @@ struct CompContext;  /* forward declaration — full definition in internal.hpp 
  *   gpucompress_pool.cpp, gpucompress_compress.cpp,
  *   gpucompress_explore.cpp, gpucompress_learning.cpp.
  *
- * The globals with external linkage (g_sgd_stream, g_cost_alpha, etc.)
+ * The globals with external linkage (g_sgd_stream, g_rank_w0, etc.)
  * are also extern'd from nn_gpu.cu — they stay defined in gpucompress_api.cpp. */
 
 /* ---- Library lifecycle ---- */
@@ -50,12 +50,11 @@ extern std::atomic<int>  g_mgr_cache_misses;
 /* ---- SGD serialization ---- */
 extern std::mutex        g_sgd_mutex;
 
-/* ---- Log-space cost model: cost = α*log(ct+γ*dt) + β*log(ds/(ratio*bw)) - δ*log(ratio) ---- */
-extern float g_cost_alpha;   /* weight on compute time (default 1.0) */
-extern float g_cost_beta;    /* weight on I/O cost    (default 1.0) */
-extern float g_cost_gamma;   /* decomp vs comp emphasis (default 1.0) */
-extern float g_cost_delta;   /* weight on ratio utility (default 0.5) */
-extern float g_measured_bw_bytes_per_ms;  /* effective bandwidth (auto-probed) */
+/* ---- Cost ranking weights (also extern'd from nn_gpu.cu) ---- */
+extern float g_rank_w0;
+extern float g_rank_w1;
+extern float g_rank_w2;
+extern float g_measured_bw_bytes_per_ms;
 
 /* ---- Debug flags ---- */
 extern bool g_debug_nn;   /* set via GPUCOMPRESS_DEBUG_NN=1 env var */

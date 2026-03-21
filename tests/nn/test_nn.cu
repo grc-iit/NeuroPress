@@ -23,9 +23,7 @@ namespace gpucompress {
     bool loadNNFromBinary(const char* filepath);
     void cleanupNN();
     bool isNNLoaded();
-    bool isInputOOD(double entropy, double mad, double deriv,
-                    size_t data_size, double error_bound);
-    const NNWeightsGPU* getNNWeightsDevicePtr();
+const NNWeightsGPU* getNNWeightsDevicePtr();
     int runNNInference(
         double entropy, double mad_norm, double deriv_norm,
         size_t data_size, double error_bound, cudaStream_t stream,
@@ -162,17 +160,8 @@ static void test_cleanup_resets_bounds() {
     // Load v2 weights (sets g_has_bounds = true)
     ASSERT(gpucompress::loadNNFromBinary(path), "load should succeed");
 
-    // isInputOOD should work (bounds are set)
-    // With our synthetic bounds [-10, 10], a value of 100 should be OOD
-    bool ood = gpucompress::isInputOOD(100.0, 100.0, 100.0, 1024, 0.001);
-    ASSERT(ood, "extreme values should be OOD with bounds [-10,10]");
-
     // Cleanup
     gpucompress::cleanupNN();
-
-    // After cleanup, isInputOOD should return false (no bounds)
-    ood = gpucompress::isInputOOD(100.0, 100.0, 100.0, 1024, 0.001);
-    ASSERT(!ood, "isInputOOD should return false after cleanup (no bounds)");
 
     remove(path);
     PASS();

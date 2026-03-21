@@ -37,11 +37,10 @@ extern cudaStream_t g_sgd_stream;
 extern cudaEvent_t  g_sgd_done;
 extern std::atomic<bool> g_sgd_ever_fired;
 
-/* Log-space cost model globals — defined in gpucompress_api.cpp */
-extern float g_cost_alpha;
-extern float g_cost_beta;
-extern float g_cost_gamma;
-extern float g_cost_delta;
+/* Cost-based ranking globals — defined in gpucompress_api.cpp */
+extern float g_rank_w0;
+extern float g_rank_w1;
+extern float g_rank_w2;
 extern float g_measured_bw_bytes_per_ms;
 
 /* Debug flag — defined in gpucompress_api.cpp, set via GPUCOMPRESS_DEBUG_NN=1 */
@@ -68,7 +67,7 @@ static std::atomic<bool> g_nn_loaded{false};
 static std::mutex g_nn_ptr_mutex;
 
 /** Pre-allocated inference output buffers (avoids per-call cudaMalloc) */
-static NNInferenceOutput* d_infer_output = nullptr;   // batched: action+ratio+comp_time+is_ood (16B)
+static NNInferenceOutput* d_infer_output = nullptr;
 static int*               d_infer_top_actions = nullptr;
 
 static bool allocInferenceBuffers() {
@@ -92,10 +91,6 @@ static void freeInferenceBuffers() {
     if (d_infer_top_actions) { cudaFree(d_infer_top_actions); d_infer_top_actions = nullptr; }
 }
 
-/** Host-side copy of feature bounds for OOD detection */
-static float g_x_mins[NN_INPUT_DIM];
-static float g_x_maxs[NN_INPUT_DIM];
-static bool g_has_bounds = false;
 
 /* ============================================================
  * Shared forward-pass device function
@@ -119,7 +114,7 @@ __device__ static void nnForwardPass(
     float mad_f,        // (float)mad_norm                 — precomputed by caller
     float deriv_f,      // (float)deriv_norm               — precomputed by caller
     double error_bound, // kept for quant-mask check only
-    float data_size_bytes, float cost_alpha, float cost_beta, float cost_gamma, float cost_delta, float bw,
+    float data_size_bytes, float w0, float w1, float w2, float bw,
     float* out_rank_val,
     float* out_ratio,
     float* out_comp_time,
@@ -184,20 +179,15 @@ __device__ static void nnForwardPass(
     decomp_time = fmaxf(1e-6f, fminf(decomp_time, 1e6f));
     ratio       = fmaxf(0.1f,  fminf(ratio,        1e5f));
 
-    /* Ceil to 5ms increments (min 5ms) — reduces GPU timing jitter noise
-       in cost ranking and MAPE gating. */
-    comp_time   = fmaxf(5.0f, ceilf(comp_time   / 5.0f) * 5.0f);
-    decomp_time = fmaxf(5.0f, ceilf(decomp_time / 5.0f) * 5.0f);
+    /* Policy clamps: ct/dt floor at 5ms, ratio cap at 100x. */
+    comp_time   = fmaxf(5.0f, comp_time);
+    decomp_time = fmaxf(5.0f, decomp_time);
+    ratio       = fminf(100.0f, ratio);
 
-    /* Log-space cost model:
-     *   cost = α*log(ct + γ*dt) + β*log(ds/(ratio*bw)) - δ*log(ratio)
-     * All terms are in log-space → scale-invariant, no unit mismatch.
-     * Lower cost = better config.  rank_val = -cost for argmax selection. */
-    float log_time  = logf(fmaxf(comp_time + cost_gamma * decomp_time, 1e-6f));
-    float io_arg    = data_size_bytes / (fmaxf(ratio, 0.1f) * bw);
-    float log_io    = logf(fmaxf(io_arg, 1e-6f));
-    float log_ratio = logf(fmaxf(ratio, 0.1f));
-    float cost = cost_alpha * log_time + cost_beta * log_io - cost_delta * log_ratio;
+    /* Cost = w0*ct + w1*dt + w2*ds/(ratio*bw).
+       Lower cost is better → rank_val = -cost (reduction finds max). */
+    float io_cost = data_size_bytes / (ratio * bw);
+    float cost = w0 * comp_time + w1 * decomp_time + w2 * io_cost;
     float rank_val = -cost;
     if (quant == 1 && error_bound <= 0.0) rank_val = -INFINITY;
 
@@ -243,7 +233,7 @@ __global__ void nnInferenceKernel(
     double deriv_norm,
     size_t data_size,
     double error_bound,
-    float cost_alpha, float cost_beta, float cost_gamma, float cost_delta, float bw,
+    float w0, float w1, float w2, float bw,
     NNInferenceOutput* __restrict__ out_result,
     int* __restrict__ out_top_actions
 ) {
@@ -269,7 +259,7 @@ __global__ void nnInferenceKernel(
     nnForwardPass(weights, tid,
                   s_enc[0], s_enc[1], s_enc[2], s_enc[3], s_enc[4],
                   error_bound,
-                  static_cast<float>(data_size), cost_alpha, cost_beta, cost_gamma, cost_delta, bw,
+                  static_cast<float>(data_size), w0, w1, w2, bw,
                   &rank_val, &ratio, &comp_time, &decomp_time, &psnr);
 
     // ---- Store per-thread predictions for later retrieval ----
@@ -324,7 +314,6 @@ __global__ void nnInferenceKernel(
             out_result->predicted_comp_time = s_comp_times[my_idx];
             out_result->predicted_decomp_time = s_decomp_times[my_idx];
             out_result->predicted_psnr      = s_psnrs[my_idx];
-            out_result->is_ood              = 0;  // OOD not computed in non-fused path
         }
     } else {
         // Tree reduction (32 → 16 → 8 → 4 → 2 → 1)
@@ -346,7 +335,6 @@ __global__ void nnInferenceKernel(
             out_result->predicted_comp_time = s_comp_times[winner];
             out_result->predicted_decomp_time = s_decomp_times[winner];
             out_result->predicted_psnr      = s_psnrs[winner];
-            out_result->is_ood              = 0;  // OOD not computed in non-fused path
         }
     }
 }
@@ -355,23 +343,6 @@ __global__ void nnInferenceKernel(
  * Fused Inference Kernel (reads stats from device pointer)
  * ============================================================ */
 
-/**
- * OOD detection on the 5 continuous features (indices 10-14).
- * Returns 1 if any feature is >10% outside the training range.
- */
-__device__ static inline int detect_ood(
-    const float s_enc[5], const NNWeightsGPU* __restrict__ weights)
-{
-    for (int i = 0; i < 5; i++) {
-        int idx = 10 + i;
-        float range = weights->x_maxs[idx] - weights->x_mins[idx];
-        float margin = range * 0.10f;
-        if (s_enc[i] < weights->x_mins[idx] - margin ||
-            s_enc[i] > weights->x_maxs[idx] + margin)
-            return 1;
-    }
-    return 0;
-}
 
 /**
  * Fused GPU kernel: same as nnInferenceKernel but reads stats from
@@ -383,7 +354,7 @@ __global__ void nnFusedInferenceKernel(
     const AutoStatsGPU* __restrict__ d_stats,
     size_t data_size,
     double error_bound,
-    float cost_alpha, float cost_beta, float cost_gamma, float cost_delta, float bw,
+    float w0, float w1, float w2, float bw,
     NNInferenceOutput* __restrict__ out_result,
     int* __restrict__ out_top_actions,
     NNDebugPerConfig* __restrict__ out_debug  /* nullable: per-config costs */
@@ -411,19 +382,16 @@ __global__ void nnFusedInferenceKernel(
     nnForwardPass(weights, tid,
                   s_enc[0], s_enc[1], s_enc[2], s_enc[3], s_enc[4],
                   error_bound,
-                  static_cast<float>(data_size), cost_alpha, cost_beta, cost_gamma, cost_delta, bw,
+                  static_cast<float>(data_size), w0, w1, w2, bw,
                   &rank_val, &ratio, &comp_time, &decomp_time, &psnr);
 
     /* Write per-config debug output (each thread writes its own slot) */
     if (out_debug) {
-        float log_t  = logf(fmaxf(comp_time + cost_gamma * decomp_time, 1e-6f));
-        float io_arg = static_cast<float>(data_size) / (fmaxf(ratio, 0.1f) * bw);
-        float log_io = logf(fmaxf(io_arg, 1e-6f));
-        float log_r  = logf(fmaxf(ratio, 0.1f));
+        float io_cost = static_cast<float>(data_size) / (ratio * bw);
         out_debug[tid].ratio      = ratio;
         out_debug[tid].comp_time  = comp_time;
         out_debug[tid].decomp_time = decomp_time;
-        out_debug[tid].cost       = cost_alpha * log_t + cost_beta * log_io - cost_delta * log_r;
+        out_debug[tid].cost       = w0 * comp_time + w1 * decomp_time + w2 * io_cost;
     }
 
     __shared__ float s_ratios[NN_NUM_CONFIGS];
@@ -473,8 +441,6 @@ __global__ void nnFusedInferenceKernel(
             out_result->predicted_comp_time = s_comp_times[winner];
             out_result->predicted_decomp_time = s_decomp_times[winner];
             out_result->predicted_psnr = s_psnrs[winner];
-
-            out_result->is_ood = detect_ood(s_enc, weights);
         }
     } else {
         // Tree reduction
@@ -494,8 +460,6 @@ __global__ void nnFusedInferenceKernel(
             out_result->predicted_comp_time = s_comp_times[winner];
             out_result->predicted_decomp_time = s_decomp_times[winner];
             out_result->predicted_psnr = s_psnrs[winner];
-
-            out_result->is_ood = detect_ood(s_enc, weights);
         }
     }
 }
@@ -1446,18 +1410,12 @@ bool loadNNFromBinary(const char* filepath) {
                     (size_t)file.gcount(), bounds_sz, filepath);
             return false;
         }
-        memcpy(g_x_mins, h_weights.x_mins, sizeof(g_x_mins));
-        memcpy(g_x_maxs, h_weights.x_maxs, sizeof(g_x_maxs));
-        g_has_bounds = true;
     } else {
-        // v1: no bounds, set defaults (no OOD detection)
+        // v1: no bounds, set defaults
         for (int i = 0; i < NN_INPUT_DIM; i++) {
             h_weights.x_mins[i] = -1e30f;
             h_weights.x_maxs[i] = 1e30f;
-            g_x_mins[i] = -1e30f;
-            g_x_maxs[i] = 1e30f;
         }
-        g_has_bounds = false;
     }
 
     // Initialize per-output log-variance to 0.0 (σ²=1, neutral weighting).
@@ -1521,48 +1479,6 @@ bool loadNNFromBinary(const char* filepath) {
     return true;
 }
 
-/**
- * Check if input features are out-of-distribution.
- *
- * Checks the 5 continuous features (indices 10-14: error_bound_enc,
- * data_size_enc, entropy, mad, deriv) against training data bounds
- * with a 10% margin.
- *
- * @return true if any feature is outside bounds (OOD)
- */
-bool isInputOOD(double entropy, double mad, double deriv,
-                size_t data_size, double error_bound) {
-    if (!g_has_bounds) return false;
-
-    // Build raw feature values for continuous features (indices 10-14)
-    // Same encoding as the kernel
-    double eb_clipped = error_bound;
-    if (eb_clipped < 1e-7) eb_clipped = 1e-7;
-    float error_bound_enc = static_cast<float>(log10(eb_clipped));
-
-    double ds = static_cast<double>(data_size);
-    if (ds < 1.0) ds = 1.0;
-    float data_size_enc = static_cast<float>(log2(ds));
-
-    float features[5] = {
-        error_bound_enc,                    // index 10
-        data_size_enc,                      // index 11
-        static_cast<float>(entropy),        // index 12
-        static_cast<float>(mad),            // index 13
-        static_cast<float>(deriv)           // index 14
-    };
-
-    for (int i = 0; i < 5; i++) {
-        int idx = 10 + i;
-        float range = g_x_maxs[idx] - g_x_mins[idx];
-        float margin = range * 0.10f;  // 10% margin
-        if (features[i] < g_x_mins[idx] - margin ||
-            features[i] > g_x_maxs[idx] + margin) {
-            return true;
-        }
-    }
-    return false;
-}
 
 /**
  * Free neural network GPU memory.
@@ -1584,7 +1500,6 @@ void cleanupNN() {
     freeFusedInferenceBuffers();
     freeSGDBuffers();
     freeDecompSGDBuffers();
-    g_has_bounds = false;
 }
 
 /**
@@ -1652,7 +1567,7 @@ int runNNInference(
             d_nn_weights,
             entropy, mad_norm, deriv_norm,
             data_size, error_bound,
-            g_cost_alpha, g_cost_beta, g_cost_gamma, g_cost_delta, g_measured_bw_bytes_per_ms,
+            g_rank_w0, g_rank_w1, g_rank_w2, g_measured_bw_bytes_per_ms,
             d_infer_output,
             out_top_actions ? d_infer_top_actions : nullptr
         );
@@ -1699,7 +1614,6 @@ int runNNFusedInference(
     float* out_comp_time,
     float* out_decomp_time,
     float* out_psnr,
-    int* out_is_ood,
     int* out_top_actions,
     cudaEvent_t nn_stop_event
 ) {
@@ -1723,7 +1637,7 @@ int runNNFusedInference(
             d_nn_weights,
             d_stats,
             data_size, error_bound,
-            g_cost_alpha, g_cost_beta, g_cost_gamma, g_cost_delta, g_measured_bw_bytes_per_ms,
+            g_rank_w0, g_rank_w1, g_rank_w2, g_measured_bw_bytes_per_ms,
             d_fused_infer_output,
             out_top_actions ? d_fused_top_actions : nullptr,
             nullptr  /* no debug output in non-ctx path */
@@ -1756,7 +1670,6 @@ int runNNFusedInference(
     if (out_comp_time)  *out_comp_time  = h_result.predicted_comp_time;
     if (out_decomp_time)*out_decomp_time = h_result.predicted_decomp_time;
     if (out_psnr)       *out_psnr       = h_result.predicted_psnr;
-    if (out_is_ood)     *out_is_ood     = h_result.is_ood;
 
     return h_result.action;
 }
@@ -1850,7 +1763,6 @@ int runNNFusedInferenceCtx(
     float* out_comp_time,
     float* out_decomp_time,
     float* out_psnr,
-    int* out_is_ood,
     int* out_top_actions,
     cudaEvent_t nn_stop_event
 ) {
@@ -1877,7 +1789,7 @@ int runNNFusedInferenceCtx(
             d_nn_weights,
             d_stats,
             data_size, error_bound,
-            g_cost_alpha, g_cost_beta, g_cost_gamma, g_cost_delta, g_measured_bw_bytes_per_ms,
+            g_rank_w0, g_rank_w1, g_rank_w2, g_measured_bw_bytes_per_ms,
             ctx->d_fused_infer_output,
             out_top_actions ? ctx->d_fused_top_actions : nullptr,
             d_debug
@@ -1924,8 +1836,8 @@ int runNNFusedInferenceCtx(
                 if (h_debug[order[j]].cost < h_debug[order[i]].cost)
                     { int tmp = order[i]; order[i] = order[j]; order[j] = tmp; }
 
-        fprintf(stderr, "[NN-DBG] ---- Cost ranking (α=%.2f β=%.2f γ=%.2f δ=%.2f bw=%.0f) ----\n",
-                g_cost_alpha, g_cost_beta, g_cost_gamma, g_cost_delta, g_measured_bw_bytes_per_ms);
+        fprintf(stderr, "[NN-DBG] ---- Cost ranking (w0=%.1f w1=%.1f w2=%.1f bw=%.0f) ----\n",
+                g_rank_w0, g_rank_w1, g_rank_w2, g_measured_bw_bytes_per_ms);
         fprintf(stderr, "[NN-DBG] %4s %-22s %8s %8s %8s %10s\n",
                 "Rank", "Config", "CompT", "DecT", "Ratio", "COST");
         for (int i = 0; i < 10 && i < NN_NUM_CONFIGS; i++) {
@@ -1948,7 +1860,6 @@ int runNNFusedInferenceCtx(
     if (out_comp_time)   *out_comp_time   = h_result.predicted_comp_time;
     if (out_decomp_time) *out_decomp_time = h_result.predicted_decomp_time;
     if (out_psnr)        *out_psnr        = h_result.predicted_psnr;
-    if (out_is_ood)      *out_is_ood      = h_result.is_ood;
 
     return h_result.action;
 }

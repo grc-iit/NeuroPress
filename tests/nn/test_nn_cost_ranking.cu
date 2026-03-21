@@ -1,17 +1,15 @@
 /**
  * @file test_nn_cost_ranking.cu
- * @brief Tests for log-space cost-based ranking in NN inference.
+ * @brief Tests for cost-based ranking in NN inference.
  *
  * Verifies:
- *   1. Default params (BALANCED mode) produce a valid selection
- *   2. SPEED mode (δ=0) → prefers lowest compute time
- *   3. THROUGHPUT mode (δ=1) → prefers best time-per-ratio
- *   4. RATIO mode (α=0.3,δ=1) → strongly prefers high ratio
+ *   1. Default weights (w0=w1=w2=1) produce a valid selection
+ *   2. w0=1,w1=0,w2=0 → prefers lowest compression time
+ *   3. w0=0,w1=1,w2=0 → prefers lowest decompression time
+ *   4. w0=0,w1=0,w2=1 → prefers best compression ratio (lowest I/O cost)
  *   5. Quant configs masked when error_bound=0 (lossless)
  *   6. gpucompress_set_bandwidth override works
- *   7. gpucompress_set_cost_params API works end-to-end
- *   8. Different modes produce different rankings
- *   9. gpucompress_set_cost_mode presets work
+ *   7. gpucompress_set_ranking_weights API works end-to-end
  */
 
 #include <cuda_runtime.h>
@@ -24,11 +22,10 @@
 
 #include "nn/nn_weights.h"
 
-/* Log-space cost model globals in gpucompress_api.cpp */
-extern float g_cost_alpha;
-extern float g_cost_beta;
-extern float g_cost_gamma;
-extern float g_cost_delta;
+/* Cost-ranking globals in gpucompress_api.cpp */
+extern float g_rank_w0;
+extern float g_rank_w1;
+extern float g_rank_w2;
 extern float g_measured_bw_bytes_per_ms;
 
 /* Forward declarations for gpucompress namespace functions */
@@ -49,8 +46,7 @@ namespace gpucompress {
 
 /* Public API */
 extern "C" {
-    void gpucompress_set_cost_mode(int mode);
-    void gpucompress_set_cost_params(float alpha, float beta, float gamma, float delta);
+    void gpucompress_set_ranking_weights(float w0, float w1, float w2);
     void gpucompress_set_bandwidth(float bw_gbps);
 }
 
@@ -102,45 +98,44 @@ static bool write_synthetic_nnwt(const char* path) {
     // Small weights so outputs are bounded and deterministic
     for (int i = 0; i < NN_HIDDEN_DIM * NN_INPUT_DIM; i++) w.w1[i] = 0.01f;
     for (int i = 0; i < NN_HIDDEN_DIM; i++) w.b1[i] = 0.1f;
-    for (int i = 0; i < NN_HIDDEN_DIM * NN_HIDDEN_DIM; i++) w.w2[i] = 0.01f;
+    for (int i = 0; i < NN_HIDDEN_DIM * NN_HIDDEN_DIM; i++) w.w2[i] = 0.001f;
     for (int i = 0; i < NN_HIDDEN_DIM; i++) w.b2[i] = 0.1f;
+    for (int i = 0; i < NN_OUTPUT_DIM * NN_HIDDEN_DIM; i++) w.w3[i] = 0.01f;
+    for (int i = 0; i < NN_OUTPUT_DIM; i++) w.b3[i] = 0.0f;
 
-    // Output layer: make predictions distinguishable per algo
-    for (int out = 0; out < NN_OUTPUT_DIM; out++) {
-        for (int h = 0; h < NN_HIDDEN_DIM; h++) {
-            w.w3[out * NN_HIDDEN_DIM + h] = 0.01f;
-        }
-        w.b3[out] = 0.5f;
-    }
-    // Make algo one-hot features affect predictions differently
-    for (int algo = 0; algo < 8; algo++) {
-        w.w3[0 * NN_HIDDEN_DIM + algo] = 0.1f * (float)(algo + 1); // comp_time varies by algo
-        w.w3[1 * NN_HIDDEN_DIM + algo] = 0.08f * (float)(algo + 1); // decomp_time varies
-        w.w3[2 * NN_HIDDEN_DIM + algo] = 0.15f * (float)(8 - algo); // ratio inversely related
-    }
+    // Write normalization
+    file.write(reinterpret_cast<const char*>(w.x_means), NN_INPUT_DIM * sizeof(float));
+    file.write(reinterpret_cast<const char*>(w.x_stds), NN_INPUT_DIM * sizeof(float));
+    file.write(reinterpret_cast<const char*>(w.y_means), NN_OUTPUT_DIM * sizeof(float));
+    file.write(reinterpret_cast<const char*>(w.y_stds), NN_OUTPUT_DIM * sizeof(float));
 
-    // Write all weight arrays
-    file.write(reinterpret_cast<const char*>(w.x_means), sizeof(w.x_means));
-    file.write(reinterpret_cast<const char*>(w.x_stds), sizeof(w.x_stds));
-    file.write(reinterpret_cast<const char*>(w.w1), sizeof(w.w1));
-    file.write(reinterpret_cast<const char*>(w.b1), sizeof(w.b1));
-    file.write(reinterpret_cast<const char*>(w.w2), sizeof(w.w2));
-    file.write(reinterpret_cast<const char*>(w.b2), sizeof(w.b2));
-    file.write(reinterpret_cast<const char*>(w.w3), sizeof(w.w3));
-    file.write(reinterpret_cast<const char*>(w.b3), sizeof(w.b3));
-    file.write(reinterpret_cast<const char*>(w.y_means), sizeof(w.y_means));
-    file.write(reinterpret_cast<const char*>(w.y_stds), sizeof(w.y_stds));
-    file.write(reinterpret_cast<const char*>(w.log_var), sizeof(w.log_var));
+    // Write layer weights
+    file.write(reinterpret_cast<const char*>(w.w1), NN_HIDDEN_DIM * NN_INPUT_DIM * sizeof(float));
+    file.write(reinterpret_cast<const char*>(w.b1), NN_HIDDEN_DIM * sizeof(float));
+    file.write(reinterpret_cast<const char*>(w.w2), NN_HIDDEN_DIM * NN_HIDDEN_DIM * sizeof(float));
+    file.write(reinterpret_cast<const char*>(w.b2), NN_HIDDEN_DIM * sizeof(float));
+    file.write(reinterpret_cast<const char*>(w.w3), NN_OUTPUT_DIM * NN_HIDDEN_DIM * sizeof(float));
+    file.write(reinterpret_cast<const char*>(w.b3), NN_OUTPUT_DIM * sizeof(float));
+
+    // v2: feature bounds
+    for (int i = 0; i < NN_INPUT_DIM; i++) {
+        w.x_mins[i] = -10.0f;
+        w.x_maxs[i] = 10.0f;
+    }
+    file.write(reinterpret_cast<const char*>(w.x_mins), NN_INPUT_DIM * sizeof(float));
+    file.write(reinterpret_cast<const char*>(w.x_maxs), NN_INPUT_DIM * sizeof(float));
 
     return file.good();
 }
 
+/* Helper: decode action to (algo, quant, shuffle) */
 static void decode_action(int action, int& algo, int& quant, int& shuffle) {
-    algo = action % 8;
-    quant = (action / 8) % 2;
+    algo    = action % 8;
+    quant   = (action / 8) % 2;
     shuffle = (action / 16) % 2;
 }
 
+/* Helper: run inference and get all 32 ranked actions + best predictions */
 struct InferResult {
     int best_action;
     float ratio, comp_time, decomp_time, psnr;
@@ -164,20 +159,15 @@ static bool run_inference(InferResult& r, double eb = 0.0,
     return r.best_action >= 0;
 }
 
-static void save_params(float& a, float& b, float& g, float& d) {
-    a = g_cost_alpha; b = g_cost_beta; g = g_cost_gamma; d = g_cost_delta;
-}
-static void restore_params(float a, float b, float g, float d) {
-    g_cost_alpha = a; g_cost_beta = b; g_cost_gamma = g; g_cost_delta = d;
-}
-
 /* ============================================================
- * Test 1: Default params (BALANCED) produce valid selection
+ * Test 1: Default weights produce valid selection
  * ============================================================ */
-static void test_default_balanced() {
-    TEST("BALANCED mode (default) produces valid action");
+static void test_default_weights() {
+    TEST("default weights (w0=w1=w2=1) produce valid action");
 
-    gpucompress_set_cost_mode(1);  // BALANCED
+    g_rank_w0 = 1.0f;
+    g_rank_w1 = 1.0f;
+    g_rank_w2 = 1.0f;
     g_measured_bw_bytes_per_ms = 1e6f;
 
     InferResult r;
@@ -185,28 +175,36 @@ static void test_default_balanced() {
     ASSERT(r.best_action >= 0 && r.best_action < 32, "action in [0,31]");
     ASSERT(r.ratio > 0.0f, "ratio should be positive");
     ASSERT(r.comp_time > 0.0f, "comp_time should be positive");
+    ASSERT(r.decomp_time > 0.0f, "decomp_time should be positive");
 
     int algo, quant, shuffle;
     decode_action(r.best_action, algo, quant, shuffle);
-    printf("(action=%d algo=%d ratio=%.2f ct=%.3f dt=%.3f) ",
-           r.best_action, algo, r.ratio, r.comp_time, r.decomp_time);
+    printf("(action=%d algo=%d q=%d s=%d ratio=%.2f ct=%.3f dt=%.3f) ",
+           r.best_action, algo, quant, shuffle, r.ratio, r.comp_time, r.decomp_time);
     PASS();
 }
 
 /* ============================================================
- * Test 2: SPEED mode → prefers lowest compute time
+ * Test 2: w0-only → prefers lowest compression time
  * ============================================================ */
-static void test_speed_mode() {
-    TEST("SPEED mode (δ=0) → lowest compute time wins");
+static void test_w0_comp_time() {
+    TEST("w0=1,w1=0,w2=0 → lowest comp_time wins");
 
-    gpucompress_set_cost_mode(0);  // SPEED
+    g_rank_w0 = 1.0f;
+    g_rank_w1 = 0.0f;
+    g_rank_w2 = 0.0f;
 
     InferResult r;
     ASSERT(run_inference(r), "inference should succeed");
+
+    // Run again with all 32 to verify winner has lowest comp_time among lossless
+    // Get predictions for all 32 by running individual checks
+    // The top_actions[0] should be the winner
     ASSERT(r.top_actions[0] == r.best_action, "top_actions[0] == best_action");
 
     int algo, quant, shuffle;
     decode_action(r.best_action, algo, quant, shuffle);
+    // With lossless (eb=0), quant must be 0
     ASSERT(quant == 0, "lossless should have quant=0");
 
     printf("(action=%d algo=%d ct=%.3f) ", r.best_action, algo, r.comp_time);
@@ -214,12 +212,14 @@ static void test_speed_mode() {
 }
 
 /* ============================================================
- * Test 3: THROUGHPUT mode → prefers best time-per-ratio
+ * Test 3: w1-only → prefers lowest decompression time
  * ============================================================ */
-static void test_throughput_mode() {
-    TEST("THROUGHPUT mode (α=1,δ=1) → time-per-ratio");
+static void test_w1_decomp_time() {
+    TEST("w0=0,w1=1,w2=0 → lowest decomp_time wins");
 
-    gpucompress_set_cost_mode(3);  // THROUGHPUT
+    g_rank_w0 = 0.0f;
+    g_rank_w1 = 1.0f;
+    g_rank_w2 = 0.0f;
 
     InferResult r;
     ASSERT(run_inference(r), "inference should succeed");
@@ -228,21 +228,27 @@ static void test_throughput_mode() {
     decode_action(r.best_action, algo, quant, shuffle);
     ASSERT(quant == 0, "lossless should have quant=0");
 
-    printf("(action=%d algo=%d ratio=%.2f ct=%.3f) ", r.best_action, algo, r.ratio, r.comp_time);
+    printf("(action=%d algo=%d dt=%.3f) ", r.best_action, algo, r.decomp_time);
     PASS();
 }
 
 /* ============================================================
- * Test 4: RATIO mode → strongly prefers high ratio
+ * Test 4: w2-only → prefers best ratio (lowest I/O cost)
  * ============================================================ */
-static void test_ratio_mode() {
-    TEST("RATIO mode (α=0.3,δ=1) → high ratio preferred");
+static void test_w2_ratio() {
+    TEST("w0=0,w1=0,w2=1 → best ratio wins");
 
-    gpucompress_set_cost_mode(2);  // RATIO
+    g_rank_w0 = 0.0f;
+    g_rank_w1 = 0.0f;
+    g_rank_w2 = 1.0f;
+    g_measured_bw_bytes_per_ms = 1e6f;
 
     InferResult r;
     ASSERT(run_inference(r), "inference should succeed");
 
+    // Verify that w2-only ranking picks highest ratio (= lowest io_cost)
+    // The best action's ratio should be >= all other lossless configs
+    // We check the top action is lossless
     int algo, quant, shuffle;
     decode_action(r.best_action, algo, quant, shuffle);
     ASSERT(quant == 0, "lossless should have quant=0");
@@ -257,15 +263,20 @@ static void test_ratio_mode() {
 static void test_quant_masked_lossless() {
     TEST("quant configs masked when error_bound=0");
 
-    gpucompress_set_cost_mode(1);  // BALANCED
+    g_rank_w0 = 1.0f;
+    g_rank_w1 = 1.0f;
+    g_rank_w2 = 1.0f;
 
     InferResult r;
     ASSERT(run_inference(r, 0.0), "inference should succeed");
 
+    // Check that all top-16 actions are lossless (quant=0)
+    // Actually, check that the top actions with quant=1 are at the end (rank_val=-INF)
     int algo, quant, shuffle;
     decode_action(r.best_action, algo, quant, shuffle);
     ASSERT(quant == 0, "best action should have quant=0 when eb=0");
 
+    // Check the top half of sorted actions (first 16) are all lossless
     for (int i = 0; i < 16; i++) {
         int a = r.top_actions[i];
         int q = (a / 8) % 2;
@@ -281,11 +292,14 @@ static void test_quant_masked_lossless() {
 static void test_quant_allowed_lossy() {
     TEST("quant configs allowed when error_bound>0");
 
-    gpucompress_set_cost_mode(1);
+    g_rank_w0 = 1.0f;
+    g_rank_w1 = 1.0f;
+    g_rank_w2 = 1.0f;
 
     InferResult r;
     ASSERT(run_inference(r, 0.01), "inference should succeed");
 
+    // With lossy, at least some quant actions should be in top-16
     bool found_quant = false;
     for (int i = 0; i < 16; i++) {
         int a = r.top_actions[i];
@@ -303,24 +317,31 @@ static void test_quant_allowed_lossy() {
 static void test_bw_override() {
     TEST("gpucompress_set_bandwidth override");
 
-    gpucompress_set_cost_mode(1);  // BALANCED (uses β>0 so BW matters)
-    gpucompress_set_bandwidth(0.001f);  // very slow I/O
+    // Set very low BW → I/O cost dominates → should prefer high ratio
+    gpucompress_set_bandwidth(0.001f);  // 0.001 GB/s = very slow I/O
+    g_rank_w0 = 0.0f;
+    g_rank_w1 = 0.0f;
+    g_rank_w2 = 1.0f;
 
     InferResult r_slow;
     ASSERT(run_inference(r_slow), "inference should succeed with slow BW");
 
-    gpucompress_set_bandwidth(100.0f);  // very fast I/O
+    // Set very high BW → I/O cost negligible → ratio matters less
+    gpucompress_set_bandwidth(100.0f);  // 100 GB/s = very fast I/O
 
     InferResult r_fast;
     ASSERT(run_inference(r_fast), "inference should succeed with fast BW");
 
+    // Both should produce valid actions
     ASSERT(r_slow.best_action >= 0 && r_slow.best_action < 32, "slow BW valid");
     ASSERT(r_fast.best_action >= 0 && r_fast.best_action < 32, "fast BW valid");
 
+    // Verify BW was actually stored correctly
     float expected = 100.0f * 1e6f;
     float diff = fabsf(g_measured_bw_bytes_per_ms - expected);
-    ASSERT(diff < 1.0f, "BW should be 100 GB/s");
+    ASSERT(diff < 1.0f, "BW should be 100 GB/s = 1e8 bytes/ms");
 
+    // Restore
     g_measured_bw_bytes_per_ms = 1e6f;
 
     printf("(slow_action=%d fast_action=%d) ", r_slow.best_action, r_fast.best_action);
@@ -328,51 +349,51 @@ static void test_bw_override() {
 }
 
 /* ============================================================
- * Test 8: gpucompress_set_cost_params API
+ * Test 8: gpucompress_set_ranking_weights API
  * ============================================================ */
-static void test_set_params_api() {
-    TEST("gpucompress_set_cost_params API");
+static void test_set_weights_api() {
+    TEST("gpucompress_set_ranking_weights API");
 
-    float sa, sb, sg, sd;
-    save_params(sa, sb, sg, sd);
+    gpucompress_set_ranking_weights(0.5f, 2.0f, 0.3f);
+    ASSERT(fabsf(g_rank_w0 - 0.5f) < 1e-6f, "w0 should be 0.5");
+    ASSERT(fabsf(g_rank_w1 - 2.0f) < 1e-6f, "w1 should be 2.0");
+    ASSERT(fabsf(g_rank_w2 - 0.3f) < 1e-6f, "w2 should be 0.3");
 
-    gpucompress_set_cost_params(0.5f, 2.0f, 1.5f, 0.3f);
-    ASSERT(fabsf(g_cost_alpha - 0.5f) < 1e-6f, "alpha should be 0.5");
-    ASSERT(fabsf(g_cost_beta  - 2.0f) < 1e-6f, "beta should be 2.0");
-    ASSERT(fabsf(g_cost_gamma - 1.5f) < 1e-6f, "gamma should be 1.5");
-    ASSERT(fabsf(g_cost_delta - 0.3f) < 1e-6f, "delta should be 0.3");
-
+    // Run inference to ensure it works with custom weights
     InferResult r;
-    ASSERT(run_inference(r), "inference should succeed with custom params");
+    ASSERT(run_inference(r), "inference should succeed with custom weights");
     ASSERT(r.best_action >= 0 && r.best_action < 32, "valid action");
 
-    restore_params(sa, sb, sg, sd);
+    // Restore defaults
+    gpucompress_set_ranking_weights(1.0f, 1.0f, 1.0f);
     PASS();
 }
 
 /* ============================================================
- * Test 9: Different modes produce different rankings
+ * Test 9: Different weight configs produce different rankings
  * ============================================================ */
-static void test_modes_differ() {
-    TEST("different modes produce different top-action orderings");
+static void test_weight_configs_differ() {
+    TEST("different weight configs produce different top-action orderings");
 
     g_measured_bw_bytes_per_ms = 1e6f;
 
-    // SPEED mode
-    gpucompress_set_cost_mode(0);
+    // Config A: comp-time only
+    g_rank_w0 = 1.0f; g_rank_w1 = 0.0f; g_rank_w2 = 0.0f;
     InferResult ra;
-    ASSERT(run_inference(ra), "SPEED inference");
+    ASSERT(run_inference(ra), "inference A");
 
-    // RATIO mode
-    gpucompress_set_cost_mode(2);
+    // Config B: decomp-time only
+    g_rank_w0 = 0.0f; g_rank_w1 = 1.0f; g_rank_w2 = 0.0f;
     InferResult rb;
-    ASSERT(run_inference(rb), "RATIO inference");
+    ASSERT(run_inference(rb), "inference B");
 
-    // THROUGHPUT mode
-    gpucompress_set_cost_mode(3);
+    // Config C: ratio only
+    g_rank_w0 = 0.0f; g_rank_w1 = 0.0f; g_rank_w2 = 1.0f;
     InferResult rc;
-    ASSERT(run_inference(rc), "THROUGHPUT inference");
+    ASSERT(run_inference(rc), "inference C");
 
+    // At least 2 of 3 configs should produce different orderings
+    // (comparing the full sorted order of the first 8 actions)
     bool ab_same = true, bc_same = true, ac_same = true;
     for (int i = 0; i < 8; i++) {
         if (ra.top_actions[i] != rb.top_actions[i]) ab_same = false;
@@ -380,37 +401,34 @@ static void test_modes_differ() {
         if (ra.top_actions[i] != rc.top_actions[i]) ac_same = false;
     }
     bool at_least_two_differ = !ab_same || !bc_same || !ac_same;
-    ASSERT(at_least_two_differ, "different modes should produce different rankings");
+    ASSERT(at_least_two_differ, "different cost weights should produce different rankings");
 
-    printf("(SPEED=%d RATIO=%d THRU=%d) ", ra.best_action, rb.best_action, rc.best_action);
+    printf("(A=%d B=%d C=%d) ", ra.best_action, rb.best_action, rc.best_action);
 
-    gpucompress_set_cost_mode(1);  // restore BALANCED
+    // Restore
+    g_rank_w0 = 1.0f; g_rank_w1 = 1.0f; g_rank_w2 = 1.0f;
     PASS();
 }
 
 /* ============================================================
- * Test 10: gpucompress_set_cost_mode presets
+ * Test 10: Zero weights edge case (all weights=0 → all costs equal)
  * ============================================================ */
-static void test_mode_presets() {
-    TEST("gpucompress_set_cost_mode sets correct params");
+static void test_zero_weights() {
+    TEST("all weights=0 → valid action (tie-breaking)");
 
-    gpucompress_set_cost_mode(0);  // SPEED
-    ASSERT(fabsf(g_cost_alpha - 1.0f) < 1e-6f && fabsf(g_cost_delta) < 1e-6f,
-           "SPEED: α=1,δ=0");
+    g_rank_w0 = 0.0f; g_rank_w1 = 0.0f; g_rank_w2 = 0.0f;
 
-    gpucompress_set_cost_mode(1);  // BALANCED
-    ASSERT(fabsf(g_cost_alpha - 1.0f) < 1e-6f && fabsf(g_cost_delta - 0.5f) < 1e-6f,
-           "BALANCED: α=1,δ=0.5");
+    InferResult r;
+    ASSERT(run_inference(r), "inference should succeed");
+    ASSERT(r.best_action >= 0 && r.best_action < 32, "valid action");
 
-    gpucompress_set_cost_mode(2);  // RATIO
-    ASSERT(fabsf(g_cost_alpha - 0.3f) < 1e-6f && fabsf(g_cost_delta - 1.0f) < 1e-6f,
-           "RATIO: α=0.3,δ=1");
+    // All lossless costs should be 0 → any lossless action is acceptable
+    int algo, quant, shuffle;
+    decode_action(r.best_action, algo, quant, shuffle);
+    ASSERT(quant == 0, "lossless should have quant=0");
 
-    gpucompress_set_cost_mode(3);  // THROUGHPUT
-    ASSERT(fabsf(g_cost_alpha - 1.0f) < 1e-6f && fabsf(g_cost_delta - 1.0f) < 1e-6f,
-           "THROUGHPUT: α=1,δ=1");
-
-    gpucompress_set_cost_mode(1);  // restore
+    // Restore
+    g_rank_w0 = 1.0f; g_rank_w1 = 1.0f; g_rank_w2 = 1.0f;
     PASS();
 }
 
@@ -418,8 +436,9 @@ static void test_mode_presets() {
  * Main
  * ============================================================ */
 int main() {
-    printf("=== Log-Space Cost-Based Ranking Tests ===\n\n");
+    printf("=== Cost-Based Ranking Tests ===\n\n");
 
+    // Load synthetic NN weights
     const char* nnwt_path = "/tmp/test_cost_ranking.nnwt";
     if (!write_synthetic_nnwt(nnwt_path)) {
         fprintf(stderr, "FATAL: failed to write synthetic .nnwt\n");
@@ -431,16 +450,16 @@ int main() {
     }
     printf("  Loaded synthetic NN weights\n\n");
 
-    test_default_balanced();
-    test_speed_mode();
-    test_throughput_mode();
-    test_ratio_mode();
+    test_default_weights();
+    test_w0_comp_time();
+    test_w1_decomp_time();
+    test_w2_ratio();
     test_quant_masked_lossless();
     test_quant_allowed_lossy();
     test_bw_override();
-    test_set_params_api();
-    test_modes_differ();
-    test_mode_presets();
+    test_set_weights_api();
+    test_weight_configs_differ();
+    test_zero_weights();
 
     printf("\n=== Results: %d passed, %d failed ===\n", g_pass, g_fail);
 

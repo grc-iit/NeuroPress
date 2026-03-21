@@ -61,12 +61,10 @@ cudaEvent_t  g_sgd_done      = nullptr;
 std::atomic<bool> g_sgd_ever_fired{false};
 
 
-/** Log-space cost model: cost = α*log(ct+γ*dt) + β*log(ds/(ratio*bw)) - δ*log(ratio)
- *  Defaults correspond to BALANCED mode. */
-float g_cost_alpha = 1.0f;                // weight on compute time term
-float g_cost_beta  = 1.0f;                // weight on I/O cost term
-float g_cost_gamma = 1.0f;                // decomp vs comp emphasis (1.0 = equal)
-float g_cost_delta = 0.5f;               // weight on ratio utility term
+/** Cost-based ranking weights and measured bandwidth — extern-referenced from nn_gpu.cu */
+float g_rank_w0 = 1.0f;                   // weight on compression time
+float g_rank_w1 = 1.0f;                   // weight on decompression time
+float g_rank_w2 = 1.0f;                   // weight on I/O cost (data_size / (ratio * bw))
 float g_measured_bw_bytes_per_ms = 1e6f;   // default 1 GB/s = 1e6 bytes/ms
 
 

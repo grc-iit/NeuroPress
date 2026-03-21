@@ -87,7 +87,7 @@ static int bruteforce_best(float* d_data, size_t data_bytes, double error_bound,
                            float* out_best_ratio, float* out_best_cost)
 {
     size_t max_comp = gpucompress_max_compressed_size(data_bytes);
-    float ca = 1.0f, cb = 1.0f, cg = 1.0f, cd = 0.5f, bw = 1e6f;
+    float w0 = 1.0f, w1 = 1.0f, w2 = 1.0f, bw = 1e6f;
     float best_cost = 1e30f;
     int best_action = -1;
     *out_best_ratio = 0;
@@ -133,11 +133,8 @@ static int bruteforce_best(float* d_data, size_t data_bytes, double error_bound,
             cudaEventDestroy(t0); cudaEventDestroy(t1);
             cudaFree(d_dec);
 
-            float log_t  = logf(fmaxf(ct + cg * dt, 1e-6f));
-            float io_arg = (float)data_bytes / (fmaxf(ratio, 0.1f) * bw);
-            float log_io = logf(fmaxf(io_arg, 1e-6f));
-            float log_r  = logf(fmaxf(ratio, 0.1f));
-            float cost = ca * log_t + cb * log_io - cd * log_r;
+            float io_cost = (float)data_bytes / (ratio * bw);
+            float cost = w0 * ct + w1 * dt + w2 * io_cost;
 
             if (cost < best_cost) {
                 best_cost = cost;

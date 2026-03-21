@@ -8,7 +8,7 @@
 #include <mutex>
 #include <cstring>
 #include <cstdio>
-#include <cmath>
+#include <algorithm>
 #include <vector>
 
 #include "gpucompress.h"
@@ -50,36 +50,12 @@ extern "C" size_t gpucompress_nn_weights_size(void) {
     return sizeof(NNWeightsGPU);
 }
 
-extern "C" gpucompress_error_t gpucompress_nn_save_weights(void* host_buffer, size_t buffer_size) {
-    if (!host_buffer || buffer_size < sizeof(NNWeightsGPU))
-        return GPUCOMPRESS_ERROR_INVALID_INPUT;
-    const NNWeightsGPU* d_ptr = gpucompress::getNNWeightsDevicePtr();
-    if (!d_ptr) return GPUCOMPRESS_ERROR_NN_NOT_LOADED;
-    cudaError_t err = cudaMemcpy(host_buffer, d_ptr, sizeof(NNWeightsGPU),
-                                  cudaMemcpyDeviceToHost);
-    return (err == cudaSuccess) ? GPUCOMPRESS_SUCCESS : GPUCOMPRESS_ERROR_CUDA_FAILED;
-}
-
-extern "C" gpucompress_error_t gpucompress_nn_restore_weights(const void* host_buffer, size_t buffer_size) {
-    if (!host_buffer || buffer_size < sizeof(NNWeightsGPU))
-        return GPUCOMPRESS_ERROR_INVALID_INPUT;
-    const NNWeightsGPU* d_ptr = gpucompress::getNNWeightsDevicePtr();
-    if (!d_ptr) return GPUCOMPRESS_ERROR_NN_NOT_LOADED;
-    cudaError_t err = cudaMemcpy(const_cast<NNWeightsGPU*>(d_ptr), host_buffer,
-                                  sizeof(NNWeightsGPU), cudaMemcpyHostToDevice);
-    return (err == cudaSuccess) ? GPUCOMPRESS_SUCCESS : GPUCOMPRESS_ERROR_CUDA_FAILED;
-}
-
 /* ============================================================
  * Query Functions
  * ============================================================ */
 
 extern "C" int gpucompress_get_last_nn_action(void) {
     return g_last_nn_action.load();
-}
-
-extern "C" int gpucompress_get_last_nn_original_action(void) {
-    return g_last_nn_original_action.load();
 }
 
 extern "C" int gpucompress_get_last_exploration_triggered(void) {
@@ -121,7 +97,7 @@ extern "C" int gpucompress_get_chunk_diag(int idx, gpucompress_chunk_diag_t *out
 extern "C" void gpucompress_record_chunk_decomp_ms(int idx, float ms) {
     std::lock_guard<std::mutex> lk(g_chunk_history_mutex);
     if (idx >= 0 && idx < g_chunk_history_count.load() && idx < g_chunk_history_cap)
-        g_chunk_history[idx].decompression_ms = std::max(5.0f, std::ceilf(ms / 5.0f) * 5.0f);
+        g_chunk_history[idx].decompression_ms = std::max(5.0f, ms);
 }
 
 /* ============================================================
@@ -213,21 +189,10 @@ extern "C" void gpucompress_set_reinforcement(int /*enable*/, float learning_rat
     if (mape_threshold > 0.0f) g_reinforce_mape_threshold = mape_threshold;
 }
 
-extern "C" void gpucompress_set_cost_mode(int mode) {
-    switch (mode) {
-    case 0: /* SPEED */      g_cost_alpha=1.0f; g_cost_beta=0.0f; g_cost_gamma=1.0f; g_cost_delta=0.0f; break;
-    case 1: /* BALANCED */   g_cost_alpha=1.0f; g_cost_beta=1.0f; g_cost_gamma=1.0f; g_cost_delta=0.5f; break;
-    case 2: /* RATIO */      g_cost_alpha=0.3f; g_cost_beta=1.0f; g_cost_gamma=1.0f; g_cost_delta=1.0f; break;
-    case 3: /* THROUGHPUT */ g_cost_alpha=1.0f; g_cost_beta=0.0f; g_cost_gamma=1.0f; g_cost_delta=1.0f; break;
-    default: break;
-    }
-}
-
-extern "C" void gpucompress_set_cost_params(float alpha, float beta, float gamma, float delta) {
-    if (alpha >= 0.0f) g_cost_alpha = alpha;
-    if (beta  >= 0.0f) g_cost_beta  = beta;
-    if (gamma >  0.0f) g_cost_gamma = gamma;
-    if (delta >= 0.0f) g_cost_delta = delta;
+extern "C" void gpucompress_set_ranking_weights(float w0, float w1, float w2) {
+    g_rank_w0 = w0;
+    g_rank_w1 = w1;
+    g_rank_w2 = w2;
 }
 
 extern "C" void gpucompress_set_bandwidth(float bw_gbps) {

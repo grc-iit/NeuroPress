@@ -161,7 +161,6 @@ gpucompress_error_t gpucompress_infer_gpu(
     }
 
     float pred_ratio = 0.0f, pred_ct = 0.0f, pred_dt = 0.0f, pred_psnr = 0.0f;
-    int fused_ood = 0;
 
     int local_top[32] = {0};
 
@@ -169,7 +168,6 @@ gpucompress_error_t gpucompress_infer_gpu(
     int action = gpucompress::runNNFusedInferenceCtx(
         d_stats_ptr, input_size, cfg.error_bound, stream, ctx,
         &action, &pred_ratio, &pred_ct, &pred_dt, &pred_psnr,
-        g_online_learning_enabled ? &fused_ood : nullptr,
         local_top,
         ctx->nn_stop);
 
@@ -255,9 +253,7 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
     /* NN action → algo + preprocessing */
     int nn_action = action;
     int nn_original_action = action;
-    bool nn_was_used = true;
     bool sgd_fired = false, exploration_triggered = false;
-    bool is_ood = false;
     AutoStatsGPU* d_stats_ptr = nullptr;
     /* Primary algorithm's actual metrics — saved before exploration may overwrite.
      * Used in chunk diagnostics for fair MAPE reporting. */
@@ -399,7 +395,7 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
         cudaEventSynchronize(ctx->t_stop);
         cudaEventElapsedTime(&primary_comp_time_ms, ctx->t_start, ctx->t_stop);
     }
-    diag_compression_ms = std::max(5.0f, std::ceil(primary_comp_time_ms / 5.0f) * 5.0f);
+    diag_compression_ms = std::max(5.0f, primary_comp_time_ms);
 
     size_t compressed_size = compressor->get_compressed_output_size(d_comp_target);
     size_t total_size      = header_size + compressed_size;
@@ -479,36 +475,32 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
 
         double ds = static_cast<double>(input_size);
         double bw = static_cast<double>(g_measured_bw_bytes_per_ms);
-        double ca = static_cast<double>(g_cost_alpha);
-        double cb = static_cast<double>(g_cost_beta);
-        double cg = static_cast<double>(g_cost_gamma);
-        double cd = static_cast<double>(g_cost_delta);
-        // Ceil to 5ms increments (min 5ms) — matches NN kernel quantization
-        auto ceil5 = [](double v) -> double {
-            return std::max(5.0, std::ceil(v / 5.0) * 5.0);
-        };
-        double pred_dt = ceil5(static_cast<double>(predicted_decomp_time));
-        double pred_ct = ceil5(static_cast<double>(predicted_comp_time));
-        double pred_r  = static_cast<double>(predicted_ratio);
-        double act_ct  = ceil5(static_cast<double>(primary_comp_time_ms));
+        double w0 = static_cast<double>(g_rank_w0);
+        double w1 = static_cast<double>(g_rank_w1);
+        double w2 = static_cast<double>(g_rank_w2);
+        /* Policy clamps: ct/dt floor at 5ms, ratio cap at 100x. */
+        double pred_dt = std::max(5.0, static_cast<double>(predicted_decomp_time));
+        double pred_ct = std::max(5.0, static_cast<double>(predicted_comp_time));
+        double pred_r  = std::min(100.0, static_cast<double>(predicted_ratio));
+        double act_ct  = std::max(5.0, static_cast<double>(primary_comp_time_ms));
         double act_dt  = (primary_decomp_time_ms > 0.0f)
-                       ? ceil5(static_cast<double>(primary_decomp_time_ms)) : pred_dt;
+                       ? std::max(5.0, static_cast<double>(primary_decomp_time_ms)) : pred_dt;
+        double act_r   = std::min(100.0, actual_ratio);
 
-        // Log-space cost: α*log(ct+γ*dt) + β*log(ds/(ratio*bw)) - δ*log(ratio)
-        // ct/dt ceiled to 5ms increments inside to match NN kernel quantization.
+        double actual_cost = w0 * act_ct + w1 * act_dt
+                           + ((act_r > 0.0) ? w2 * ds / (act_r * bw) : 0.0);
+        double predicted_cost = w0 * pred_ct + w1 * pred_dt
+                              + ((pred_r > 0.0) ? w2 * ds / (pred_r * bw) : 0.0);
+        double error_pct = (actual_cost > 0.0)
+            ? std::abs(actual_cost - predicted_cost) / actual_cost : 0.0;
+
+        // cost = w0*ct + w1*dt + w2*ds/(ratio*bw) — same formula as NN ranking
+        // Policy clamps applied inside: ct/dt floor 5ms, ratio cap 100x.
         auto compute_cost = [&](double ct, double dt, double r) -> double {
-            double ct5 = std::max(5.0, std::ceil(ct / 5.0) * 5.0);
-            double dt5 = std::max(5.0, std::ceil(dt / 5.0) * 5.0);
-            double log_t  = log(std::max(ct5 + cg * dt5, 1e-6));
-            double io_arg = ds / (std::max(r, 0.1) * bw);
-            double log_io = log(std::max(io_arg, 1e-6));
-            double log_r  = log(std::max(r, 0.1));
-            return ca * log_t + cb * log_io - cd * log_r;
+            double c = std::max(5.0, ct), d = std::max(5.0, dt);
+            double rc = std::min(100.0, r);
+            return w0 * c + w1 * d + ((rc > 0.0) ? w2 * ds / (rc * bw) : 1e30);
         };
-        double actual_cost    = compute_cost(act_ct, act_dt, actual_ratio);
-        double predicted_cost = compute_cost(pred_ct, pred_dt, pred_r);
-        double error_pct = std::abs(actual_cost - predicted_cost)
-                         / (std::abs(actual_cost) + 1e-6);
         struct ExploredResult { int action; double ratio; double comp_time_ms;
                                 double decomp_time_ms; double psnr; double cost; };
         std::vector<ExploredResult> explored_samples;
@@ -889,7 +881,7 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
              * otherwise fall back to final compressed_size. */
             size_t diag_comp_sz = (primary_compressed_size > 0) ? primary_compressed_size : compressed_size;
             h->actual_ratio          = (diag_comp_sz > 0)
-                ? static_cast<float>(input_size) / static_cast<float>(diag_comp_sz)
+                ? std::min(100.0f, static_cast<float>(input_size) / static_cast<float>(diag_comp_sz))
                 : 0.0f;
             h->compression_ms        = diag_compression_ms;
             h->predicted_ratio       = predicted_ratio;

@@ -168,24 +168,21 @@ static void profile_pattern(const char* name, float* d_data, size_t data_bytes,
     printf("══════════════════════════════════════════════════════════════════\n");
 
     size_t max_comp = gpucompress_max_compressed_size(data_bytes);
-    float ca = 1.0f, cb = 1.0f, cg = 1.0f, cd = 0.5f, bw = 1e6f;
+    float w0 = 1.0f, w1 = 1.0f, w2 = 1.0f, bw = 1e6f;
 
     /* Brute-force all 32 */
     ConfigResult results[32];
     for (int a = 0; a < 32; a++)
         results[a] = run_one_config(d_data, data_bytes, a, error_bound, max_comp);
 
-    /* Find actual best (log-space cost model) */
+    /* Find actual best */
     float best_cost = 1e30f;
     int actual_best = -1;
     for (int a = 0; a < 32; a++) {
         if (!results[a].succeeded) continue;
         ConfigResult& r = results[a];
-        float log_t  = logf(fmaxf(r.actual_comp_ms + cg * r.actual_decomp_ms, 1e-6f));
-        float io_arg = (float)data_bytes / (fmaxf(r.actual_ratio, 0.1f) * bw);
-        float log_io = logf(fmaxf(io_arg, 1e-6f));
-        float log_r  = logf(fmaxf(r.actual_ratio, 0.1f));
-        float cost = ca * log_t + cb * log_io - cd * log_r;
+        float io = (float)data_bytes / (r.actual_ratio * bw);
+        float cost = w0 * r.actual_comp_ms + w1 * r.actual_decomp_ms + w2 * io;
         if (cost < best_cost) { best_cost = cost; actual_best = a; }
     }
 
@@ -227,11 +224,8 @@ static void profile_pattern(const char* name, float* d_data, size_t data_bytes,
     for (int a = 0; a < 32; a++) {
         if (!results[a].succeeded) continue;
         ConfigResult& r = results[a];
-        float log_t  = logf(fmaxf(r.actual_comp_ms + cg * r.actual_decomp_ms, 1e-6f));
-        float io_arg = (float)data_bytes / (fmaxf(r.actual_ratio, 0.1f) * bw);
-        float log_io = logf(fmaxf(io_arg, 1e-6f));
-        float log_r  = logf(fmaxf(r.actual_ratio, 0.1f));
-        ranked[n_ranked++] = { a, ca * log_t + cb * log_io - cd * log_r };
+        float io = (float)data_bytes / (r.actual_ratio * bw);
+        ranked[n_ranked++] = { a, w0 * r.actual_comp_ms + w1 * r.actual_decomp_ms + w2 * io };
     }
     /* Sort by cost */
     for (int i = 0; i < n_ranked - 1; i++)
@@ -344,11 +338,8 @@ static void profile_pattern(const char* name, float* d_data, size_t data_bytes,
     for (int a = 0; a < 32; a++) {
         if (!results[a].succeeded) continue;
         ConfigResult& r = results[a];
-        float log_t  = logf(fmaxf(r.actual_comp_ms + cg * r.actual_decomp_ms, 1e-6f));
-        float io_arg = (float)data_bytes / (fmaxf(r.actual_ratio, 0.1f) * bw);
-        float log_io = logf(fmaxf(io_arg, 1e-6f));
-        float log_r  = logf(fmaxf(r.actual_ratio, 0.1f));
-        float cost = ca * log_t + cb * log_io - cd * log_r;
+        float io = (float)data_bytes / (r.actual_ratio * bw);
+        float cost = w0 * r.actual_comp_ms + w1 * r.actual_decomp_ms + w2 * io;
         if ((a / 8) % 2 == 0) { if (cost < best_noq) best_noq = cost; }
         else { if (cost < best_q) best_q = cost; }
         if ((a / 16) % 2 == 0) { if (cost < best_nos) best_nos = cost; }

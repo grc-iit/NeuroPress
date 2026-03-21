@@ -220,14 +220,6 @@ void cleanupNN();
  */
 bool isNNLoaded();
 
-/**
- * Check if input features are out-of-distribution.
- *
- * @return true if any continuous feature is outside training bounds
- */
-bool isInputOOD(double entropy, double mad, double deriv,
-                size_t data_size, double error_bound);
-
 
 /**
  * Run neural network inference to find best compression config.
@@ -321,7 +313,7 @@ int runNNFusedInferenceCtx(const AutoStatsGPU* d_stats, size_t data_size,
     double error_bound, cudaStream_t stream, CompContext* ctx,
     int* out_action, float* out_ratio = nullptr, float* out_comp_time = nullptr,
     float* out_decomp_time = nullptr, float* out_psnr = nullptr,
-    int* out_is_ood = nullptr, int* out_top_actions = nullptr,
+    int* out_top_actions = nullptr,
     cudaEvent_t nn_stop_event = nullptr);
 
 /** ctx overload: launches nnSGDKernel on g_sgd_stream (not ctx->stream),
@@ -338,7 +330,7 @@ int runNNSGDCtx(const AutoStatsGPU* d_stats, const SGDSample* samples,
 int runNNFusedInference(const AutoStatsGPU* d_stats, size_t data_size, double error_bound,
     cudaStream_t stream, int* out_action, float* out_ratio = nullptr,
     float* out_comp_time = nullptr, float* out_decomp_time = nullptr,
-    float* out_psnr = nullptr, int* out_is_ood = nullptr,
+    float* out_psnr = nullptr,
     int* out_top_actions = nullptr, cudaEvent_t nn_stop_event = nullptr);
 
 /**

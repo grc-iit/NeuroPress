@@ -54,7 +54,6 @@ struct NNInferenceOutput {
     float predicted_comp_time;
     float predicted_decomp_time;
     float predicted_psnr;
-    int is_ood;
 };
 
 /** Per-config debug output (32 entries, one per thread). */
@@ -62,7 +61,7 @@ struct NNDebugPerConfig {
     float ratio;
     float comp_time;
     float decomp_time;
-    float cost;       /* α*log(ct+γ*dt) + β*log(ds/(ratio*bw)) - δ*log(ratio) */
+    float cost;       /* w0*ct + w1*dt + w2*ds/(ratio*bw) */
 };
 
 /** All neural net weights packed contiguously (mirrors GPU layout). */
