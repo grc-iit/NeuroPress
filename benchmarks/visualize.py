@@ -331,10 +331,10 @@ def make_summary_figure(source_name, rows, output_path, meta_text=""):
               "Compression Ratio (higher = better)", "Ratio", fmt="%.2fx")
     ax2 = fig.add_subplot(gs[0, 1])
     plot_bars(ax2, phases, [g(r, "write_mibps", "write_mbps") for r in ordered],
-              "Write Throughput", "MiB/s", fmt="%.0f")
+              "End-to-End Write Throughput\n(NN + compress + I/O)", "MiB/s", fmt="%.0f")
     ax3 = fig.add_subplot(gs[1, 0])
     plot_bars(ax3, phases, [g(r, "read_mibps", "read_mbps") for r in ordered],
-              "Read Throughput", "MiB/s", fmt="%.0f")
+              "End-to-End Read Throughput\n(I/O + decompress)", "MiB/s", fmt="%.0f")
     ax4 = fig.add_subplot(gs[1, 1])
     plot_file_sizes(ax4, phases, ordered)
     ax5 = fig.add_subplot(gs[2, 0])
@@ -380,8 +380,9 @@ def make_timestep_figure(ts_csv_path, output_path):
     ]
 
     fig, axes = plt.subplots(3, 1, figsize=(14, 12))
-    fig.suptitle("Online SGD Prediction Accuracy Over Timesteps",
-                 fontsize=14, fontweight="bold", y=0.98)
+    fig.suptitle("NN Prediction Accuracy Over Timesteps\n"
+                 "(per-metric MAPE averaged across all chunks)",
+                 fontsize=14, fontweight="bold", y=0.99)
 
     for ax, (label, mape_key, smape_key) in zip(axes, metric_keys):
         for ph in phases_present:
@@ -407,6 +408,72 @@ def make_timestep_figure(ts_csv_path, output_path):
             ax.spines[spine].set_visible(False)
 
     axes[-1].set_xlabel("Timestep", fontsize=11, fontweight="bold")
+
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {output_path}")
+
+
+def make_sgd_exploration_figure(ts_csv_path, output_path):
+    """Plot SGD fires and exploration triggers per timestep."""
+    rows = parse_csv(ts_csv_path)
+    if not rows:
+        print(f"  No timestep data in {ts_csv_path}, skipping SGD/EXP plot.")
+        return
+
+    by_phase = {}
+    for r in rows:
+        ph = r.get("phase", "nn-rl")
+        by_phase.setdefault(ph, []).append(r)
+
+    phase_order = ["nn", "nn-rl", "nn-rl+exp50"]
+    phase_styles = {
+        "nn":          {"color": "#999999", "ls": ":",  "marker": "s", "lw": 1.5},
+        "nn-rl":       {"color": "#6a9f58", "ls": "-",  "marker": "o", "lw": 2.0},
+        "nn-rl+exp50": {"color": "#c85a5a", "ls": "--", "marker": "D", "lw": 1.8},
+    }
+    phases_present = [p for p in phase_order if p in by_phase]
+
+    fig, (ax_sgd, ax_exp) = plt.subplots(2, 1, figsize=(14, 8))
+    fig.suptitle("SGD & Exploration Firing Over Timesteps\n"
+                 "(per-chunk cost model error triggers: SGD > 10%, Explore > 20%)",
+                 fontsize=14, fontweight="bold", y=0.99)
+
+    for ph in phases_present:
+        ph_rows = by_phase[ph]
+        timesteps = np.array([g(r, "timestep") for r in ph_rows])
+        sgd = np.array([g(r, "sgd_fires") for r in ph_rows])
+        expl = np.array([g(r, "explorations", default=0) for r in ph_rows])
+        sty = phase_styles.get(ph, {"color": "black", "ls": "-", "marker": ".", "lw": 1.5})
+
+        ax_sgd.plot(timesteps, sgd, color=sty["color"], linestyle=sty["ls"],
+                    marker=sty["marker"], markersize=4, linewidth=sty["lw"],
+                    label=PHASE_LABELS.get(ph, ph).replace("\n", " "),
+                    alpha=0.9, zorder=3)
+        if expl.sum() > 0:
+            ax_exp.plot(timesteps, expl, color=sty["color"], linestyle=sty["ls"],
+                        marker=sty["marker"], markersize=4, linewidth=sty["lw"],
+                        label=PHASE_LABELS.get(ph, ph).replace("\n", " "),
+                        alpha=0.9, zorder=3)
+
+    ax_sgd.set_ylabel("SGD Fires\n(chunks per timestep)", fontsize=11, fontweight="bold")
+    ax_sgd.set_title("SGD Weight Updates (chunks where cost_model_error > 10%)", fontsize=11)
+    ax_sgd.grid(axis="y", alpha=0.3, linestyle="--")
+    ax_sgd.tick_params(axis="both", labelsize=9)
+    ax_sgd.legend(fontsize=9, loc="upper right")
+    for spine in ["top", "right"]:
+        ax_sgd.spines[spine].set_visible(False)
+
+    ax_exp.set_ylabel("Explorations\n(chunks per timestep)", fontsize=11, fontweight="bold")
+    ax_exp.set_xlabel("Timestep", fontsize=11, fontweight="bold")
+    ax_exp.set_title("Exploration Triggers (chunks where cost_model_error > 20%)", fontsize=11)
+    ax_exp.grid(axis="y", alpha=0.3, linestyle="--")
+    ax_exp.tick_params(axis="both", labelsize=9)
+    ax_exp.legend(fontsize=9, loc="upper right")
+    for spine in ["top", "right"]:
+        ax_exp.spines[spine].set_visible(False)
 
     fig.tight_layout(rect=[0, 0, 1, 0.96])
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
@@ -869,15 +936,6 @@ def make_milestone_actions_figure(tc_csv_path, output_path, chunk_csv_path=None)
                       interpolation="nearest")
             ax.set_yticks([])
 
-            # Add config label text inside each cell
-            for ci, val in enumerate(strip):
-                if val >= 0 and ci < len(CONFIG_ORDER):
-                    cfg_name = CONFIG_ORDER[int(val)]
-                    short = cfg_name.split("+")[0][:4]  # e.g. "zstd", "bitc"
-                    ax.text(ci, 0, short, ha="center", va="center",
-                            fontsize=6, fontweight="bold", color="white",
-                            path_effects=[plt.matplotlib.patheffects.withStroke(
-                                linewidth=1.5, foreground="black")])
 
             if row == 0:
                 ax.set_title(col_label.replace("\n", " "),
@@ -940,6 +998,8 @@ def main():
     parser.add_argument("--gs-csv", help="Gray-Scott aggregate CSV")
     parser.add_argument("--gs-timesteps-csv", help="Gray-Scott timestep adaptation CSV")
     parser.add_argument("--vpic-csv", help="VPIC aggregate CSV")
+    parser.add_argument("--vpic-dir", help="VPIC results directory (e.g. .../eval_NX156_chunk4mb_ts100/balanced_w1-1-1)")
+    parser.add_argument("--gs-dir", help="Gray-Scott results directory")
     parser.add_argument("--output-dir", help="Output directory (default: alongside CSV)")
     parser.add_argument("--view", action="append", default=None,
                         help=f"Views to generate: {ALL_VIEWS} (default: all)")
@@ -957,10 +1017,23 @@ def main():
             if not args.gs_csv:
                 args.gs_csv = csv_path
 
-    # Auto-detect
-    gs_agg = args.gs_csv or find_csv(DEFAULT_GS_AGG)
-    gs_tsteps = args.gs_timesteps_csv or find_csv(DEFAULT_GS_TIMESTEPS)
-    vpic_agg = args.vpic_csv or find_csv(DEFAULT_VPIC_AGG)
+    # Auto-detect from --vpic-dir / --gs-dir if provided
+    if args.vpic_dir and not args.vpic_csv:
+        d = args.vpic_dir
+        args.vpic_csv = find_csv([os.path.join(d, "benchmark_vpic_deck.csv")])
+    if args.gs_dir and not args.gs_csv:
+        d = args.gs_dir
+        args.gs_csv = find_csv([os.path.join(d, "benchmark_grayscott_vol.csv")])
+        if not args.gs_timesteps_csv:
+            args.gs_timesteps_csv = find_csv([os.path.join(d, "benchmark_grayscott_timesteps.csv")])
+
+    # If only one --*-dir is given, skip auto-detect for the other benchmark
+    only_gs = args.gs_dir and not args.vpic_dir and not args.vpic_csv
+    only_vpic = args.vpic_dir and not args.gs_dir and not args.gs_csv
+
+    gs_agg = args.gs_csv or (None if only_vpic else find_csv(DEFAULT_GS_AGG))
+    gs_tsteps = args.gs_timesteps_csv or (None if only_vpic else find_csv(DEFAULT_GS_TIMESTEPS))
+    vpic_agg = args.vpic_csv or (None if only_gs else find_csv(DEFAULT_VPIC_AGG))
 
     found_any = False
 
@@ -999,6 +1072,7 @@ def main():
         found_any = True
         print(f"Loading Gray-Scott timestep adaptation: {gs_tsteps}")
         make_timestep_figure(gs_tsteps, os.path.join(gs_out_dir, "sgd_accuracy_over_time.png"))
+        make_sgd_exploration_figure(gs_tsteps, os.path.join(gs_out_dir, "sgd_exploration_firing.png"))
 
     # Look for chunk/milestone CSVs alongside the aggregate CSV first, then defaults
     gs_tc = find_csv([os.path.join(gs_out_dir, "benchmark_grayscott_timestep_chunks.csv")]
@@ -1044,20 +1118,27 @@ def main():
             out_dir = args.output_dir or os.path.join(SCRIPT_DIR, "vpic-kokkos", "results")
 
             # Merge multi-timestep phases into VPIC summary
-            _vpic_ts = find_csv(DEFAULT_VPIC_TIMESTEPS)
+            _vpic_ts_search = ([os.path.join(args.vpic_dir, "benchmark_vpic_timesteps.csv")]
+                               if args.vpic_dir else []) + DEFAULT_VPIC_TIMESTEPS
+            _vpic_ts = find_csv(_vpic_ts_search)
             _merge_timestep_phases(rows, _vpic_ts, orig)
 
             make_summary_figure("VPIC Harris Sheet Reconnection", rows,
                                 os.path.join(out_dir, "benchmark_vpic.png"), meta)
 
-    vpic_tsteps = find_csv(DEFAULT_VPIC_TIMESTEPS)
+    _vpic_ts_search = ([os.path.join(args.vpic_dir, "benchmark_vpic_timesteps.csv")]
+                       if args.vpic_dir else []) + ([] if only_gs else DEFAULT_VPIC_TIMESTEPS)
+    vpic_tsteps = find_csv(_vpic_ts_search)
     if vpic_tsteps and os.path.exists(vpic_tsteps) and "timesteps" in views:
         found_any = True
         print(f"Loading VPIC timestep adaptation: {vpic_tsteps}")
         out_dir = args.output_dir or os.path.dirname(os.path.abspath(vpic_tsteps))
         make_timestep_figure(vpic_tsteps, os.path.join(out_dir, "vpic_sgd_accuracy_over_time.png"))
+        make_sgd_exploration_figure(vpic_tsteps, os.path.join(out_dir, "vpic_sgd_exploration_firing.png"))
 
-    vpic_tc = find_csv(DEFAULT_VPIC_TSTEP_CHUNKS)
+    _vpic_tc_search = ([os.path.join(args.vpic_dir, "benchmark_vpic_timestep_chunks.csv")]
+                       if args.vpic_dir else []) + ([] if only_gs else DEFAULT_VPIC_TSTEP_CHUNKS)
+    vpic_tc = find_csv(_vpic_tc_search)
     if vpic_tc and os.path.exists(vpic_tc) and "timesteps" in views:
         found_any = True
         print(f"Loading VPIC per-chunk milestones: {vpic_tc}")
@@ -1068,9 +1149,10 @@ def main():
             print(f"  Warning: VPIC per-chunk milestone plot failed: {e}")
 
     # VPIC: Algorithm evolution (same as Gray-Scott)
-    vpic_chunks = find_csv([os.path.join(
-        args.output_dir or os.path.join(SCRIPT_DIR, "vpic-kokkos", "results"),
-        "benchmark_vpic_chunks.csv")])
+    _vpic_chunks_search = [os.path.join(
+        args.vpic_dir or args.output_dir or os.path.join(SCRIPT_DIR, "vpic-kokkos", "results"),
+        "benchmark_vpic_chunks.csv")]
+    vpic_chunks = find_csv(_vpic_chunks_search)
     if vpic_tc and os.path.exists(vpic_tc) and "actions" in views:
         found_any = True
         print(f"Loading VPIC milestone algorithm evolution: {vpic_tc}")

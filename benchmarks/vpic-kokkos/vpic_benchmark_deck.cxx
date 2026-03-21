@@ -946,6 +946,11 @@ begin_diagnostics {
         hid_t dcpl = make_dcpl_auto((hsize_t)chunk_floats, global->diag_error_bound);
         hsize_t dims[1] = { (hsize_t)n_floats };
 
+        /* Progress to stderr (visible even when stdout is redirected to log) */
+        if (t % 5 == 0 || t == global->timesteps - 1)
+            fprintf(stderr, "\r  [VPIC] Timestep %d/%d (%d%%)  ",
+                    t, global->timesteps, t * 100 / global->timesteps);
+
         for (int pi = 0; pi < n_phases_ts; pi++) {
             const char* phase_name = phases[pi].name;
             int do_sgd  = phases[pi].sgd;
