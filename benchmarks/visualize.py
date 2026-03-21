@@ -527,7 +527,8 @@ def make_timestep_chunks_figure(tc_csv_path, output_path, phase_filter="nn-rl"):
     fig, axes = plt.subplots(n_ts, 3, figsize=(20, 3.2 * n_ts + 2),
                               squeeze=False)
     phase_label = phase_filter if has_phase else "nn-rl"
-    fig.suptitle(f"Predicted vs Actual Per Chunk [{phase_label}]",
+    fig.suptitle(f"NN Predicted vs Actual Metrics Per Chunk at Milestone Timesteps\n"
+                 f"[{phase_label}] (ratio, compression time, decompression time)",
                  fontsize=14, fontweight="bold", y=0.99)
 
     for row_idx, ts in enumerate(timestep_list):
