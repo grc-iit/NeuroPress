@@ -18,6 +18,7 @@ set(LIB_SOURCES
     src/api/gpucompress_compress.cpp
     src/stats/entropy_kernel.cu
     src/nn/nn_gpu.cu
+    src/api/gpucompress_diagnostics.cpp
     src/stats/stats_kernel.cu
     src/gray-scott/gray_scott_gpu.cu
     src/gray-scott/gray_scott_sim.cu

@@ -1518,6 +1518,30 @@ const NNWeightsGPU* getNNWeightsDevicePtr() {
 }
 
 /**
+ * Save a snapshot of the current NN weights from device to host buffer.
+ */
+extern "C" gpucompress_error_t gpucompress_nn_save_snapshot(void* dst) {
+    if (!dst) return GPUCOMPRESS_ERROR_INVALID_INPUT;
+    std::lock_guard<std::mutex> lock(g_nn_ptr_mutex);
+    if (!d_nn_weights) return GPUCOMPRESS_ERROR_INVALID_INPUT;
+    cudaError_t err = cudaMemcpy(dst, d_nn_weights, sizeof(NNWeightsGPU),
+                                  cudaMemcpyDeviceToHost);
+    return (err == cudaSuccess) ? GPUCOMPRESS_SUCCESS : GPUCOMPRESS_ERROR_CUDA_FAILED;
+}
+
+/**
+ * Restore NN weights from a host snapshot buffer to device.
+ */
+extern "C" gpucompress_error_t gpucompress_nn_restore_snapshot(const void* src) {
+    if (!src) return GPUCOMPRESS_ERROR_INVALID_INPUT;
+    std::lock_guard<std::mutex> lock(g_nn_ptr_mutex);
+    if (!d_nn_weights) return GPUCOMPRESS_ERROR_INVALID_INPUT;
+    cudaError_t err = cudaMemcpy(d_nn_weights, src, sizeof(NNWeightsGPU),
+                                  cudaMemcpyHostToDevice);
+    return (err == cudaSuccess) ? GPUCOMPRESS_SUCCESS : GPUCOMPRESS_ERROR_CUDA_FAILED;
+}
+
+/**
  * Run neural network inference to find best compression config.
  *
  * Launches 32 threads (one per config), each runs a full forward pass
@@ -1823,36 +1847,17 @@ int runNNFusedInferenceCtx(
     err = cudaStreamSynchronize(stream);
     if (err != cudaSuccess) return -1;
 
-    /* Debug: print top-10 configs by cost (lowest first) */
     if (d_debug) {
-        static const char* algo_names[] = {
-            "lz4","snappy","deflate","gdeflate","zstd","ans","cascaded","bitcomp"};
-
-        /* Sort indices by cost ascending */
-        int order[NN_NUM_CONFIGS];
-        for (int i = 0; i < NN_NUM_CONFIGS; i++) order[i] = i;
-        for (int i = 0; i < NN_NUM_CONFIGS - 1; i++)
-            for (int j = i + 1; j < NN_NUM_CONFIGS; j++)
-                if (h_debug[order[j]].cost < h_debug[order[i]].cost)
-                    { int tmp = order[i]; order[i] = order[j]; order[j] = tmp; }
-
-        fprintf(stderr, "[NN-DBG] ---- Cost ranking (w0=%.1f w1=%.1f w2=%.1f bw=%.0f) ----\n",
-                g_rank_w0, g_rank_w1, g_rank_w2, g_measured_bw_bytes_per_ms);
-        fprintf(stderr, "[NN-DBG] %4s %-22s %8s %8s %8s %10s\n",
-                "Rank", "Config", "CompT", "DecT", "Ratio", "COST");
-        for (int i = 0; i < 10 && i < NN_NUM_CONFIGS; i++) {
-            int a = order[i];
-            int algo = a % 8, quant = (a/8)%2, shuf = (a/16)%2;
-            char name[32];
-            snprintf(name, sizeof(name), "%s%s%s", algo_names[algo],
-                     shuf ? "+shuf" : "", quant ? "+quant" : "");
-            fprintf(stderr, "[NN-DBG] %4d %-22s %8.3f %8.3f %8.2f %10.3f%s\n",
-                    i + 1, name,
-                    h_debug[a].comp_time, h_debug[a].decomp_time,
-                    h_debug[a].ratio, h_debug[a].cost,
-                    (a == h_result.action) ? "  ← WINNER" : "");
+        float dbg_entropy = -1.0f, dbg_mad = -1.0f, dbg_deriv = -1.0f;
+        if (d_stats) {
+            AutoStatsGPU h_stats;
+            cudaMemcpy(&h_stats, d_stats, sizeof(AutoStatsGPU), cudaMemcpyDeviceToHost);
+            dbg_entropy = (float)h_stats.entropy;
+            dbg_mad     = (float)h_stats.mad_normalized;
+            dbg_deriv   = (float)h_stats.deriv_normalized;
         }
-        fprintf(stderr, "[NN-DBG] ----\n");
+        gpucompress::printNNDebugRanking(h_debug, h_result.action,
+                                          dbg_entropy, dbg_mad, dbg_deriv);
     }
 
     if (out_action)      *out_action      = h_result.action;

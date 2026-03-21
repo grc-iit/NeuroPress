@@ -8,7 +8,6 @@
 #include <mutex>
 #include <cstring>
 #include <cstdio>
-#include <algorithm>
 #include <vector>
 
 #include "gpucompress.h"
@@ -66,39 +65,6 @@ extern "C" int gpucompress_get_last_sgd_fired(void) {
     return g_last_sgd_fired.load();
 }
 
-extern "C" void gpucompress_reset_chunk_history(void) {
-    g_chunk_history_count.store(0);
-}
-
-extern "C" void gpucompress_reset_cache_stats(void) {
-    g_mgr_cache_hits.store(0);
-    g_mgr_cache_misses.store(0);
-}
-
-extern "C" void gpucompress_get_cache_stats(int *hits, int *misses) {
-    if (hits)   *hits   = g_mgr_cache_hits.load();
-    if (misses) *misses = g_mgr_cache_misses.load();
-}
-
-extern "C" int gpucompress_get_chunk_history_count(void) {
-    return g_chunk_history_count.load();
-}
-
-extern "C" int gpucompress_get_chunk_diag(int idx, gpucompress_chunk_diag_t *out) {
-    if (idx < 0 || out == NULL)
-        return -1;
-    std::lock_guard<std::mutex> lk(g_chunk_history_mutex);
-    if (idx >= g_chunk_history_count.load() || idx >= g_chunk_history_cap)
-        return -1;
-    *out = g_chunk_history[idx];
-    return 0;
-}
-
-extern "C" void gpucompress_record_chunk_decomp_ms(int idx, float ms) {
-    std::lock_guard<std::mutex> lk(g_chunk_history_mutex);
-    if (idx >= 0 && idx < g_chunk_history_count.load() && idx < g_chunk_history_cap)
-        g_chunk_history[idx].decompression_ms = std::max(5.0f, ms);
-}
 
 /* ============================================================
  * Batched Decomp SGD

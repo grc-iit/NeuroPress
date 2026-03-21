@@ -457,6 +457,22 @@ gpucompress_error_t gpucompress_reload_nn(const char* filepath);
  */
 size_t gpucompress_nn_weights_size(void);
 
+/**
+ * Save a snapshot of the current NN weights (device → host buffer).
+ *
+ * @param dst  Host buffer of at least gpucompress_nn_weights_size() bytes
+ * @return GPUCOMPRESS_SUCCESS or error code
+ */
+gpucompress_error_t gpucompress_nn_save_snapshot(void* dst);
+
+/**
+ * Restore NN weights from a previously saved snapshot (host → device).
+ *
+ * @param src  Host buffer previously filled by gpucompress_nn_save_snapshot()
+ * @return GPUCOMPRESS_SUCCESS or error code
+ */
+gpucompress_error_t gpucompress_nn_restore_snapshot(const void* src);
+
 /* ============================================================
  * Utility Functions
  * ============================================================ */
@@ -517,6 +533,23 @@ typedef struct {
     /* Filled during read (decompression) — 0 until VOL read completes   */
     float  decompression_ms;     /* actual decompression time (nvCOMP)    */
 
+    /* Cost model diagnostics */
+    float  cost_model_error_pct; /* |actual_cost - predicted_cost| / actual_cost */
+    float  actual_cost;          /* cost of primary config (post-clamp)   */
+    float  predicted_cost;       /* NN-predicted cost (post-clamp)        */
+
+    /* Original config metrics (before exploration replaced it) */
+    float  orig_actual_ratio;      /* original config's measured ratio      */
+    float  orig_comp_ms;           /* original config's measured comp time  */
+    float  orig_cost;              /* original config's computed cost       */
+
+    /* Exploration results (0 if exploration not triggered) */
+    int    explore_n_alternatives; /* number of alternatives tried          */
+    int    explore_alternatives[31]; /* action IDs tried (max 31)           */
+    float  explore_ratios[31];      /* measured ratio per alternative       */
+    float  explore_comp_ms[31];     /* measured comp time per alternative   */
+    float  explore_costs[31];       /* computed cost per alternative        */
+
     /* Deferred decomp SGD — input features saved at write time */
     int    feat_action;          /* action ID (0-31) for input reconstruction */
     float  feat_entropy;         /* Shannon entropy */
@@ -527,9 +560,21 @@ typedef struct {
 } gpucompress_chunk_diag_t;
 
 /**
+ * Flush the internal nvCOMP manager cache (evicts all cached managers).
+ * Call between benchmark phases to ensure each phase starts with a cold cache.
+ */
+void gpucompress_flush_manager_cache(void);
+
+/**
  * Reset the per-chunk diagnostic history (call before H5Dwrite).
  */
 void gpucompress_reset_chunk_history(void);
+
+/**
+ * Set debug context for NN ranking log output (phase name + timestep).
+ * Call before each H5Dwrite to label the debug log entries.
+ */
+void gpucompress_set_debug_context(const char* phase, int timestep);
 
 /**
  * Return the number of chunk diagnostics recorded since the last reset.

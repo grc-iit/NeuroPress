@@ -118,6 +118,21 @@ fail:
     return -1;
 }
 
+void flushCompManagerCache() {
+    std::lock_guard<std::mutex> lk(g_pool_mutex);
+    for (int i = 0; i < N_COMP_CTX; i++) {
+        CompContext& ctx = g_comp_pool[i];
+        if (ctx.stream) cudaStreamSynchronize(ctx.stream);
+        for (int d = 0; d < CompContext::LRU_DEPTH; d++) {
+            delete ctx.comp_mgr[d];
+            ctx.comp_mgr[d]      = nullptr;
+            ctx.comp_mgr_algo[d] = -1;
+            ctx.comp_mgr_tick[d] = 0;
+        }
+        ctx.comp_mgr_clock = 0;
+    }
+}
+
 void destroyCompContextPool() {
     std::lock_guard<std::mutex> lk(g_pool_mutex);
     for (int i = 0; i < N_COMP_CTX; i++) {

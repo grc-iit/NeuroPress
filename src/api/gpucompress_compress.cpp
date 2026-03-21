@@ -148,17 +148,7 @@ gpucompress_error_t gpucompress_infer_gpu(
     if (!d_stats_ptr)
         return GPUCOMPRESS_ERROR_NN_NOT_LOADED;
 
-    /* Debug: dump per-chunk stats so we can verify they differ */
-    if (g_debug_nn) {
-        AutoStatsGPU h_dbg;
-        cudaStreamSynchronize(stream);
-        cudaMemcpy(&h_dbg, d_stats_ptr, sizeof(AutoStatsGPU), cudaMemcpyDeviceToHost);
-        fprintf(stderr, "[NN-DBG] stats: entropy=%.4f  mad_norm=%.6f  deriv_norm=%.6f  "
-                "vmin=%.4e  vmax=%.4e  n=%zu  range=%.4e\n",
-                h_dbg.entropy, h_dbg.mad_normalized, h_dbg.deriv_normalized,
-                h_dbg.vmin, h_dbg.vmax, h_dbg.num_elements,
-                (double)h_dbg.vmax - (double)h_dbg.vmin);
-    }
+
 
     float pred_ratio = 0.0f, pred_ct = 0.0f, pred_dt = 0.0f, pred_psnr = 0.0f;
 
@@ -175,23 +165,6 @@ gpucompress_error_t gpucompress_infer_gpu(
 
     if (action < 0)
         return GPUCOMPRESS_ERROR_NN_NOT_LOADED;
-
-    /* Debug: dump NN action and top-K ranking */
-    if (g_debug_nn) {
-        const char* algo_names[] = {"lz4","snappy","deflate","gdeflate","zstd","ans","cascaded","bitcomp"};
-        int a = action % 8, q = (action/8)%2, s = (action/16)%2;
-        fprintf(stderr, "[NN-DBG] action=%d (%s%s%s)  pred_ratio=%.2f  pred_ct=%.4f  pred_dt=%.4f\n",
-                action, algo_names[a], s?"+shuf":"", q?"+quant":"",
-                pred_ratio, pred_ct, pred_dt);
-        fprintf(stderr, "[NN-DBG] top-5 actions: ");
-        for (int i = 0; i < 5 && i < 32; i++) {
-            int ta = local_top[i];
-            int ta_a = ta%8, ta_q = (ta/8)%2, ta_s = (ta/16)%2;
-            fprintf(stderr, "%d(%s%s%s) ", ta, algo_names[ta_a],
-                    ta_s?"+S":"", ta_q?"+Q":"");
-        }
-        fprintf(stderr, "\n");
-    }
 
     *out_action = action;
     if (out_predicted_ratio)       *out_predicted_ratio = pred_ratio;
@@ -258,6 +231,12 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
     /* Primary algorithm's actual metrics — saved before exploration may overwrite.
      * Used in chunk diagnostics for fair MAPE reporting. */
     size_t primary_compressed_size = 0;
+
+    /* Cost model diagnostics (populated when online learning enabled) */
+    double error_pct = 0.0, actual_cost = 0.0, predicted_cost = 0.0;
+    struct ExploredResult { int action; double ratio; double comp_time_ms;
+                            double decomp_time_ms; double psnr; double cost; };
+    std::vector<ExploredResult> explored_samples;
 
     /* Per-chunk timing breakdown.
      * stage1_nn_ms / stage1_stats_ms are passed from the VOL Stage 1
@@ -487,11 +466,11 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
                        ? std::max(5.0, static_cast<double>(primary_decomp_time_ms)) : pred_dt;
         double act_r   = std::min(100.0, actual_ratio);
 
-        double actual_cost = w0 * act_ct + w1 * act_dt
-                           + ((act_r > 0.0) ? w2 * ds / (act_r * bw) : 0.0);
-        double predicted_cost = w0 * pred_ct + w1 * pred_dt
-                              + ((pred_r > 0.0) ? w2 * ds / (pred_r * bw) : 0.0);
-        double error_pct = (actual_cost > 0.0)
+        actual_cost = w0 * act_ct + w1 * act_dt
+                    + ((act_r > 0.0) ? w2 * ds / (act_r * bw) : 0.0);
+        predicted_cost = w0 * pred_ct + w1 * pred_dt
+                       + ((pred_r > 0.0) ? w2 * ds / (pred_r * bw) : 0.0);
+        error_pct = (actual_cost > 0.0)
             ? std::abs(actual_cost - predicted_cost) / actual_cost : 0.0;
 
         // cost = w0*ct + w1*dt + w2*ds/(ratio*bw) — same formula as NN ranking
@@ -501,9 +480,6 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
             double rc = std::min(100.0, r);
             return w0 * c + w1 * d + ((rc > 0.0) ? w2 * ds / (rc * bw) : 1e30);
         };
-        struct ExploredResult { int action; double ratio; double comp_time_ms;
-                                double decomp_time_ms; double psnr; double cost; };
-        std::vector<ExploredResult> explored_samples;
         double primary_cost = compute_cost(
             static_cast<double>(primary_comp_time_ms),
             (primary_decomp_time_ms > 0.0f) ? static_cast<double>(primary_decomp_time_ms) : pred_dt,
@@ -555,8 +531,7 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
              * Phase 2: sync all, read sizes, pick winner by cost.
              * Phase 3: cleanup per-slot resources. */
 
-            int max_explore = (input_size <= 64 * 1024 * 1024) ? 31 : 8;
-            int actual_K = std::min(K, max_explore);
+            int actual_K = std::min(K, 31);
 
             struct ExploreSlot {
                 int       action;
@@ -851,60 +826,51 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
     g_last_exploration_triggered.store(exploration_triggered ? 1 : 0);
     g_last_sgd_fired.store(sgd_fired ? 1 : 0);
 
-    /* Append to per-chunk history */
+    /* Append to per-chunk diagnostic history */
     {
-        std::lock_guard<std::mutex> lk(g_chunk_history_mutex);
-        int idx = g_chunk_history_count.fetch_add(1);
-        if (idx >= g_chunk_history_cap) {
-            int new_cap = (g_chunk_history_cap == 0) ? 4096 : g_chunk_history_cap * 2;
-            auto* p = static_cast<gpucompress_chunk_diag_t*>(
-                realloc(g_chunk_history, (size_t)new_cap * sizeof(gpucompress_chunk_diag_t)));
-            if (p) { g_chunk_history = p; g_chunk_history_cap = new_cap; }
-        }
-        if (idx < g_chunk_history_cap) {
-            gpucompress_chunk_diag_t *h = &g_chunk_history[idx];
-            h->nn_action             = nn_action;
-            h->nn_original_action    = nn_original_action;
-            h->exploration_triggered = exploration_triggered ? 1 : 0;
-            h->sgd_fired             = sgd_fired ? 1 : 0;
-            h->nn_inference_ms       = diag_nn_inference_ms;
-            h->stats_ms             = diag_stats_ms;
-            h->preprocessing_ms      = diag_preprocessing_ms;
-            h->compression_ms        = diag_compression_ms;
-            h->exploration_ms        = diag_exploration_ms;
-            h->sgd_update_ms         = diag_sgd_ms;
-            /* Use primary algorithm's actual metrics for MAPE (not exploration winner).
-             * actual_ratio/compression_ms reflect the NN's chosen algo so prediction
-             * accuracy is measured fairly. The final output still uses the exploration
-             * winner — only diagnostics use the primary values. */
-            /* Use primary compressed size for ratio if available (before exploration),
-             * otherwise fall back to final compressed_size. */
-            size_t diag_comp_sz = (primary_compressed_size > 0) ? primary_compressed_size : compressed_size;
-            h->actual_ratio          = (diag_comp_sz > 0)
-                ? std::min(100.0f, static_cast<float>(input_size) / static_cast<float>(diag_comp_sz))
-                : 0.0f;
-            h->compression_ms        = diag_compression_ms;
-            h->predicted_ratio       = predicted_ratio;
-            h->predicted_comp_time   = predicted_comp_time;
-            h->predicted_decomp_time = predicted_decomp_time;
-            h->predicted_psnr        = predicted_psnr;
-            h->decompression_ms      = 0.0f;
-            h->feat_action   = nn_original_action;
-            h->feat_eb_enc   = static_cast<float>(log10(fmax(cfg.error_bound, 1e-7)));
-            h->feat_ds_enc   = static_cast<float>(log2(fmax((double)input_size, 1.0)));
-            if (d_stats_ptr) {
-                AutoStatsGPU h_stats;
-                cudaMemcpy(&h_stats, d_stats_ptr, sizeof(AutoStatsGPU), cudaMemcpyDeviceToHost);
-                h->feat_entropy = static_cast<float>(h_stats.entropy);
-                h->feat_mad     = static_cast<float>(h_stats.mad_normalized);
-                h->feat_deriv   = static_cast<float>(h_stats.deriv_normalized);
-            } else {
-                h->feat_entropy = 0.0f;
-                h->feat_mad     = 0.0f;
-                h->feat_deriv   = 0.0f;
-                h->feat_ds_enc  = 0.0f;
+        gpucompress::ChunkDiagInput di = {};
+        di.nn_action = nn_action;
+        di.nn_original_action = nn_original_action;
+        di.exploration_triggered = exploration_triggered;
+        di.sgd_fired = sgd_fired;
+        di.nn_inference_ms = diag_nn_inference_ms;
+        di.stats_ms = diag_stats_ms;
+        di.preprocessing_ms = diag_preprocessing_ms;
+        di.compression_ms = diag_compression_ms;
+        di.exploration_ms = diag_exploration_ms;
+        di.sgd_ms = diag_sgd_ms;
+        di.input_size = input_size;
+        di.primary_compressed_size = primary_compressed_size;
+        di.compressed_size = compressed_size;
+        di.predicted_ratio = predicted_ratio;
+        di.predicted_comp_time = predicted_comp_time;
+        di.predicted_decomp_time = predicted_decomp_time;
+        di.predicted_psnr = predicted_psnr;
+        di.error_bound = cfg.error_bound;
+        di.d_stats_ptr = d_stats_ptr;
+        /* Cost model diagnostics (only valid when online learning enabled) */
+        if (g_online_learning_enabled) {
+            di.cost_model_error_pct = static_cast<float>(error_pct);
+            di.actual_cost = static_cast<float>(actual_cost);
+            di.predicted_cost = static_cast<float>(predicted_cost);
+            /* Original config metrics (explored_samples[0] is the primary) */
+            if (!explored_samples.empty()) {
+                di.orig_actual_ratio = static_cast<float>(explored_samples[0].ratio);
+                di.orig_comp_ms = static_cast<float>(explored_samples[0].comp_time_ms);
+                di.orig_cost = static_cast<float>(explored_samples[0].cost);
+            }
+            /* Exploration alternatives */
+            int n = std::min((int)explored_samples.size() - 1, 31);
+            di.explore_n_alternatives = (n > 0) ? n : 0;
+            for (int i = 0; i < n; i++) {
+                auto& e = explored_samples[i + 1]; /* skip primary at index 0 */
+                di.explore_alternatives[i] = e.action;
+                di.explore_ratios[i] = static_cast<float>(e.ratio);
+                di.explore_comp_ms[i] = static_cast<float>(e.comp_time_ms);
+                di.explore_costs[i] = static_cast<float>(e.cost);
             }
         }
+        gpucompress::recordChunkDiagnostic(di);
     }
 
     if (caller_stream) {

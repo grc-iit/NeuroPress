@@ -128,6 +128,59 @@ def g(row, *keys, default=0.0):
 _PHASE_ALIASES = {"oracle": "exhaustive"}
 
 
+def _avg_all(all_rows, key):
+    """Average a numeric field across all rows."""
+    return sum(g(r, key) for r in all_rows) / len(all_rows)
+
+
+def _merge_timestep_phases(rows, ts_csv_path, orig_mib):
+    """Merge multi-timestep phases into summary using total throughput.
+
+    Throughput = (N_timesteps * orig_mib) / sum(write_ms or read_ms).
+    This is the standard HPC I/O metric: total data / total time.
+    """
+    if not ts_csv_path or not os.path.exists(ts_csv_path):
+        return
+    ts_rows = parse_csv(ts_csv_path)
+    by_phase = {}
+    for r in ts_rows:
+        by_phase.setdefault(r.get("phase", ""), []).append(r)
+    merged = []
+    for ph in ["nn-rl", "nn-rl+exp50"]:
+        if ph not in by_phase:
+            continue
+        ph_rows = by_phase[ph]
+        n_ts = len(ph_rows)
+        total_data_mib = n_ts * orig_mib
+        total_write_s = sum(g(r, "write_ms") for r in ph_rows) / 1000.0
+        total_read_s = sum(g(r, "read_ms") for r in ph_rows) / 1000.0
+        ratio_avg = _avg_all(ph_rows, "ratio")
+        total_sgd = sum(int(g(r, "sgd_fires")) for r in ph_rows)
+        total_expl = sum(int(g(r, "explorations")) for r in ph_rows)
+        total_chunks = sum(int(g(r, "n_chunks")) for r in ph_rows)
+        rows.append({
+            "phase": ph,
+            "ratio": ratio_avg,
+            "write_mibps": total_data_mib / total_write_s if total_write_s > 0 else 0,
+            "read_mibps": total_data_mib / total_read_s if total_read_s > 0 else 0,
+            "orig_mib": orig_mib,
+            "file_mib": orig_mib / max(ratio_avg, 1e-6),
+            "n_chunks": total_chunks,
+            "sgd_fires": total_sgd,
+            "explorations": total_expl,
+            "mismatches": 0,
+            "smape_ratio_pct": _avg_all(ph_rows, "smape_ratio"),
+            "smape_comp_pct": _avg_all(ph_rows, "smape_comp"),
+            "smape_decomp_pct": _avg_all(ph_rows, "smape_decomp"),
+            "mape_ratio_pct": _avg_all(ph_rows, "mape_ratio"),
+            "mape_comp_pct": _avg_all(ph_rows, "mape_comp"),
+            "mape_decomp_pct": _avg_all(ph_rows, "mape_decomp"),
+        })
+        merged.append(ph)
+    if merged:
+        print(f"  Merged multi-timestep phases (total throughput): {merged}")
+
+
 def _ordered(rows):
     """Return rows ordered by PHASE_ORDER."""
     by_phase = {}
@@ -785,19 +838,19 @@ def make_milestone_actions_figure(tc_csv_path, output_path, chunk_csv_path=None)
         for ts in milestones:
             max_chunks = max(max_chunks, len(by_phase_ts[ph].get(ts, [])))
 
+    fig_w = max(12, 5 * n_cols)
+    fig_h = 1.8 * n_milestones + 4
     fig, axes = plt.subplots(n_milestones, n_cols,
-                              figsize=(max(10, 4.5 * n_cols), 1.4 * n_milestones + 3),
+                              figsize=(fig_w, fig_h),
                               squeeze=False)
-    fig.suptitle("NN Configuration Selection Over Time\n"
-                 "(per chunk at milestone timesteps)",
-                 fontsize=14, fontweight="bold", y=0.99)
+    fig.suptitle("NN Algorithm Selection per Chunk Over Time",
+                 fontsize=16, fontweight="bold", y=0.97)
 
     for col, (col_label, col_source) in enumerate(phase_columns):
         for row, ts in enumerate(milestones):
             ax = axes[row, col]
 
             if col_source == "nn_ref":
-                # Static NN inference reference — same strip every row
                 strip = list(nn_ref_strip)
             else:
                 chunk_rows_ts = sorted(
@@ -816,14 +869,33 @@ def make_milestone_actions_figure(tc_csv_path, output_path, chunk_csv_path=None)
                       interpolation="nearest")
             ax.set_yticks([])
 
+            # Add config label text inside each cell
+            for ci, val in enumerate(strip):
+                if val >= 0 and ci < len(CONFIG_ORDER):
+                    cfg_name = CONFIG_ORDER[int(val)]
+                    short = cfg_name.split("+")[0][:4]  # e.g. "zstd", "bitc"
+                    ax.text(ci, 0, short, ha="center", va="center",
+                            fontsize=6, fontweight="bold", color="white",
+                            path_effects=[plt.matplotlib.patheffects.withStroke(
+                                linewidth=1.5, foreground="black")])
+
             if row == 0:
-                ax.set_title(col_label, fontsize=11, fontweight="bold")
+                ax.set_title(col_label.replace("\n", " "),
+                             fontsize=13, fontweight="bold", pad=10)
             if col == 0:
-                ax.set_ylabel(f"T={ts}", fontsize=10, fontweight="bold")
+                ax.set_ylabel(f"T={ts}", fontsize=12, fontweight="bold",
+                              rotation=0, labelpad=35, va="center")
             if row == n_milestones - 1:
-                ax.set_xlabel("Chunk Index", fontsize=9)
+                ax.set_xticks(range(max_chunks))
+                ax.set_xlabel("Chunk Index", fontsize=10)
+                ax.tick_params(axis="x", labelsize=8)
             else:
                 ax.set_xticks([])
+
+            # Clean borders
+            for spine in ax.spines.values():
+                spine.set_linewidth(0.5)
+                spine.set_color("#888888")
 
     # Legend — configs from all sources
     all_legend_rows = list(all_rows)
@@ -834,7 +906,6 @@ def make_milestone_actions_figure(tc_csv_path, output_path, chunk_csv_path=None)
         except Exception:
             pass
     legend_patches = _config_legend_patches_used(all_legend_rows, action_key="action")
-    # Also check action_final key
     lp2 = _config_legend_patches_used(all_legend_rows, action_key="action_final")
     seen = {p.get_label() for p in legend_patches}
     for p in lp2:
@@ -842,13 +913,14 @@ def make_milestone_actions_figure(tc_csv_path, output_path, chunk_csv_path=None)
             legend_patches.append(p)
             seen.add(p.get_label())
 
-    fig.legend(handles=legend_patches, loc="lower center", fontsize=8,
-               ncol=min(len(legend_patches), 8), framealpha=0.9,
-               bbox_to_anchor=(0.5, 0.01))
+    fig.legend(handles=legend_patches, loc="lower center", fontsize=10,
+               ncol=min(len(legend_patches), 6), framealpha=0.95,
+               edgecolor="#cccccc", fancybox=True,
+               bbox_to_anchor=(0.5, 0.005))
 
-    fig.tight_layout(rect=[0, 0.06, 1, 0.95])
+    fig.tight_layout(rect=[0.05, 0.08, 1, 0.93])
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    fig.savefig(output_path, dpi=300, bbox_inches="tight", facecolor="white")
     plt.close(fig)
     print(f"  Saved: {output_path}")
 
@@ -915,6 +987,11 @@ def main():
             chunk_mb = orig / max(n_ch, 1)
             meta = (f"Grid: {L}^3 ({orig:.0f} MiB) | Chunks: {n_ch} x {chunk_mb:.0f} MiB | "
                     f"Steps: {steps} | F={F_val}, k={k_val}")
+
+            # Merge multi-timestep phases (nn-rl, nn-rl+exp50) into summary
+            _ts_csv = gs_tsteps or find_csv(DEFAULT_GS_TIMESTEPS)
+            _merge_timestep_phases(rows, _ts_csv, orig)
+
             make_summary_figure("Gray-Scott Simulation", rows,
                                 os.path.join(gs_out_dir, "benchmark_grayscott.png"), meta)
 
@@ -965,6 +1042,11 @@ def main():
             meta = (f"Dataset: {orig:.0f} MiB | Chunks: {n_ch} x {chunk_mb:.0f} MiB | "
                     f"Source: VPIC Harris Sheet")
             out_dir = args.output_dir or os.path.join(SCRIPT_DIR, "vpic-kokkos", "results")
+
+            # Merge multi-timestep phases into VPIC summary
+            _vpic_ts = find_csv(DEFAULT_VPIC_TIMESTEPS)
+            _merge_timestep_phases(rows, _vpic_ts, orig)
+
             make_summary_figure("VPIC Harris Sheet Reconnection", rows,
                                 os.path.join(out_dir, "benchmark_vpic.png"), meta)
 
@@ -984,6 +1066,20 @@ def main():
             make_timestep_chunks_figure(vpic_tc, os.path.join(out_dir, "vpic_predicted_vs_actual_per_chunk.png"))
         except Exception as e:
             print(f"  Warning: VPIC per-chunk milestone plot failed: {e}")
+
+    # VPIC: Algorithm evolution (same as Gray-Scott)
+    vpic_chunks = find_csv([os.path.join(
+        args.output_dir or os.path.join(SCRIPT_DIR, "vpic-kokkos", "results"),
+        "benchmark_vpic_chunks.csv")])
+    if vpic_tc and os.path.exists(vpic_tc) and "actions" in views:
+        found_any = True
+        print(f"Loading VPIC milestone algorithm evolution: {vpic_tc}")
+        out_dir = args.output_dir or os.path.dirname(os.path.abspath(vpic_tc))
+        try:
+            make_milestone_actions_figure(vpic_tc, os.path.join(out_dir, "vpic_nn_algorithm_evolution.png"),
+                                         chunk_csv_path=vpic_chunks)
+        except Exception as e:
+            print(f"  Warning: VPIC milestone actions plot failed: {e}")
 
     if not found_any:
         print("ERROR: No benchmark CSV files found.")

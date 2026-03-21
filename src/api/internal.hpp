@@ -220,6 +220,40 @@ void cleanupNN();
  */
 bool isNNLoaded();
 
+/**
+ * Print all 32 NN config rankings to stderr (debug output).
+ */
+void printNNDebugRanking(const NNDebugPerConfig* h_debug, int winner_action,
+                         float entropy = -1.0f, float mad = -1.0f, float deriv = -1.0f);
+
+/**
+ * Input struct for recordChunkDiagnostic — avoids long parameter lists.
+ */
+struct ChunkDiagInput {
+    int nn_action, nn_original_action;
+    bool exploration_triggered, sgd_fired;
+    float nn_inference_ms, stats_ms, preprocessing_ms;
+    float compression_ms, exploration_ms, sgd_ms;
+    size_t input_size, primary_compressed_size, compressed_size;
+    float predicted_ratio, predicted_comp_time, predicted_decomp_time, predicted_psnr;
+    double error_bound;
+    const AutoStatsGPU* d_stats_ptr;
+    /* Cost model */
+    float cost_model_error_pct, actual_cost, predicted_cost;
+    /* Original config metrics (before exploration swap) */
+    float orig_actual_ratio, orig_comp_ms, orig_cost;
+    /* Exploration results */
+    int explore_n_alternatives;
+    int explore_alternatives[31];
+    float explore_ratios[31];
+    float explore_comp_ms[31];
+    float explore_costs[31];
+};
+
+/**
+ * Record per-chunk diagnostic entry to history buffer.
+ */
+void recordChunkDiagnostic(const ChunkDiagInput& d);
 
 /**
  * Run neural network inference to find best compression config.
@@ -282,6 +316,7 @@ AutoStatsGPU* runStatsKernelsNoSync(const void* d_input, size_t input_size, cuda
  * ============================================================ */
 
 int          initCompContextPool();
+void         flushCompManagerCache();   ///< evict all cached nvcomp managers (lightweight)
 void         destroyCompContextPool();
 CompContext* acquireCompContext();   ///< blocks until a slot is free
 void         releaseCompContext(CompContext*);
