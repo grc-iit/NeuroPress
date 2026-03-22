@@ -40,36 +40,42 @@ PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 
 PHASE_ORDER = [
     "no-comp",
+    "cpu-zstd",
     "fixed-lz4", "fixed-gdeflate", "fixed-zstd",
     "entropy-heuristic",
+    "best",
     "exhaustive",
     "nn", "nn-rl", "nn-rl+exp50", "nn-rl+exp",
 ]
 
 PHASE_COLORS = {
-    "no-comp":            "#999999",
-    "fixed-lz4":          "#7fbf7f",
-    "fixed-gdeflate":     "#4daf4a",
-    "fixed-zstd":         "#2d7d2d",
-    "entropy-heuristic":  "#b07cc6",
-    "exhaustive":         "#5778a4",
-    "nn":                 "#e49444",
-    "nn-rl":              "#6a9f58",
-    "nn-rl+exp50":        "#c85a5a",
-    "nn-rl+exp":          "#c85a5a",
+    "no-comp":                "#999999",
+    "cpu-zstd":               "#d4a853",
+    "fixed-lz4":              "#7fbf7f",
+    "fixed-gdeflate":         "#4daf4a",
+    "fixed-zstd":             "#2d7d2d",
+    "entropy-heuristic":      "#b07cc6",
+    "best":                   "#5778a4",
+    "exhaustive":             "#5778a4",
+    "nn":                     "#e49444",
+    "nn-rl":                  "#6a9f58",
+    "nn-rl+exp50":            "#c85a5a",
+    "nn-rl+exp":              "#c85a5a",
 }
 
 PHASE_LABELS = {
-    "no-comp":            "No Comp",
-    "fixed-lz4":          "Fixed\nLZ4",
-    "fixed-gdeflate":     "Fixed\nGDeflate",
-    "fixed-zstd":         "Fixed\nZstd",
-    "entropy-heuristic":  "Entropy\nHeuristic",
-    "exhaustive":         "Exhaustive\nSearch",
-    "nn":                 "NN\n(Inference)",
-    "nn-rl":              "NN+SGD",
-    "nn-rl+exp50":        "NN+SGD\n+Explore",
-    "nn-rl+exp":          "NN+SGD\n+Explore",
+    "no-comp":                "No Comp",
+    "cpu-zstd":               "CPU\nZstd",
+    "fixed-lz4":              "Fixed\nLZ4",
+    "fixed-gdeflate":         "Fixed\nGDeflate",
+    "fixed-zstd":             "Fixed\nZstd",
+    "entropy-heuristic":      "Entropy\nHeuristic",
+    "best":                   "Best\n(Exhaustive)",
+    "exhaustive":             "Exhaustive\nSearch",
+    "nn":                     "NN\n(Inference)",
+    "nn-rl":                  "NN+SGD",
+    "nn-rl+exp50":            "NN+SGD\n+Explore",
+    "nn-rl+exp":              "NN+SGD\n+Explore",
 }
 
 # Auto-detection paths
@@ -347,29 +353,42 @@ def make_summary_figure(source_name, rows, output_path, meta_text=""):
     if not phases:
         print(f"  {source_name}: no valid phases, skipping summary.")
         return
-    fig = plt.figure(figsize=(16, 14), facecolor="white")
+    fig = plt.figure(figsize=(16, 10), facecolor="white")
     fig.text(0.5, 0.99, f"GPUCompress Benchmark: {source_name}",
              ha="center", fontsize=14, fontweight="bold", va="top")
     if meta_text:
         fig.text(0.5, 0.965, meta_text, ha="center", fontsize=9,
                  color="#444", va="top", fontfamily="monospace")
-    gs = gridspec.GridSpec(3, 2, hspace=0.45, wspace=0.30,
-                           top=0.92, bottom=0.04, left=0.08, right=0.96)
+    gs = gridspec.GridSpec(2, 2, hspace=0.40, wspace=0.30,
+                           top=0.92, bottom=0.08, left=0.07, right=0.97)
     ax1 = fig.add_subplot(gs[0, 0])
     plot_bars(ax1, phases, [g(r, "ratio") for r in ordered],
               "Compression Ratio (higher = better)", "Ratio", fmt="%.2fx")
     ax2 = fig.add_subplot(gs[0, 1])
     plot_bars(ax2, phases, [g(r, "write_mibps", "write_mbps") for r in ordered],
-              "End-to-End Write Throughput\n(NN + compress + I/O)", "MiB/s", fmt="%.0f")
+              "Write Throughput", "MiB/s", fmt="%.0f")
     ax3 = fig.add_subplot(gs[1, 0])
     plot_bars(ax3, phases, [g(r, "read_mibps", "read_mbps") for r in ordered],
-              "End-to-End Read Throughput\n(I/O + decompress)", "MiB/s", fmt="%.0f")
+              "Read Throughput", "MiB/s", fmt="%.0f")
+
+    # ── Pareto scatter: Ratio vs Write Throughput ──
     ax4 = fig.add_subplot(gs[1, 1])
-    plot_file_sizes(ax4, phases, ordered)
-    ax5 = fig.add_subplot(gs[2, 0])
-    plot_nn_stats(ax5, phases, ordered)
-    ax6 = fig.add_subplot(gs[2, 1])
-    plot_verification(ax6, phases, ordered)
+    for p, r in zip(phases, ordered):
+        ratio = g(r, "ratio")
+        wtp = g(r, "write_mibps", "write_mbps")
+        color = PHASE_COLORS.get(p, "#bdc3c7")
+        label = PHASE_LABELS.get(p, p).replace("\n", " ")
+        ax4.scatter(ratio, wtp, s=120, color=color, edgecolors="black",
+                    linewidth=0.8, zorder=5, label=label)
+        ax4.annotate(label, (ratio, wtp), textcoords="offset points",
+                     xytext=(6, 6), fontsize=8, color="#333")
+    ax4.set_xlabel("Compression Ratio", fontsize=10)
+    ax4.set_ylabel("Write Throughput (MiB/s)", fontsize=10)
+    ax4.set_title("Ratio vs Throughput (Pareto)", fontsize=11, fontweight="bold")
+    ax4.grid(alpha=0.3, linestyle="--", zorder=0)
+    ax4.set_axisbelow(True)
+    for spine in ["top", "right"]:
+        ax4.spines[spine].set_visible(False)
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
@@ -1014,6 +1033,287 @@ def make_milestone_actions_figure(tc_csv_path, output_path, chunk_csv_path=None)
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# View: Multi-Dataset Comparison
+# ═══════════════════════════════════════════════════════════════════════
+
+def make_multi_dataset_figure(all_datasets, output_path):
+    """Bar chart comparing ratio and throughput across all datasets for each phase.
+
+    all_datasets: list of (name, rows) tuples where rows is a list of dicts.
+    """
+    if not all_datasets:
+        return
+    _normalize_rows([r for _, rows in all_datasets for r in rows])
+
+    # Collect all phases present across datasets
+    all_phases_set = set()
+    for _, rows in all_datasets:
+        for r in rows:
+            ph = _PHASE_ALIASES.get(r.get("phase", ""), r.get("phase", ""))
+            all_phases_set.add(ph)
+    phases = [p for p in PHASE_ORDER if p in all_phases_set]
+    if not phases:
+        return
+
+    n_datasets = len(all_datasets)
+    n_phases = len(phases)
+
+    fig, axes = plt.subplots(2, 1, figsize=(max(14, n_phases * 1.5), 10), facecolor="white")
+    fig.suptitle("Multi-Dataset Comparison: GPUCompress Phases", fontsize=14, fontweight="bold")
+
+    x = np.arange(n_phases)
+    width = 0.8 / n_datasets
+
+    for panel, (metric, ylabel, fmt) in enumerate([
+        ("ratio", "Compression Ratio", "%.1f"),
+        ("write_mbps", "Write Throughput (MiB/s)", "%.0f"),
+    ]):
+        ax = axes[panel]
+        for di, (ds_name, rows) in enumerate(all_datasets):
+            by_phase = {}
+            for r in rows:
+                ph = _PHASE_ALIASES.get(r.get("phase", ""), r.get("phase", ""))
+                by_phase[ph] = r
+            vals = [g(by_phase.get(p, {}), metric, f"{metric}ps") for p in phases]
+            offset = (di - n_datasets / 2 + 0.5) * width
+            bars = ax.bar(x + offset, vals, width * 0.9, label=ds_name,
+                          zorder=3, alpha=0.85)
+
+        ax.set_xticks(x)
+        ax.set_xticklabels([PHASE_LABELS.get(p, p) for p in phases], fontsize=8)
+        ax.set_ylabel(ylabel, fontsize=10)
+        ax.legend(fontsize=8, loc="upper right")
+        ax.grid(axis="y", alpha=0.3, linestyle="--", zorder=0)
+        for spine in ["top", "right"]:
+            ax.spines[spine].set_visible(False)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {output_path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# View: Per-Dataset Phase Comparison (which phase wins per dataset)
+# ═══════════════════════════════════════════════════════════════════════
+
+def make_per_dataset_phase_comparison(all_datasets, output_path):
+    """For each dataset, show all phases side by side (ratio + throughput).
+
+    X-axis = datasets, grouped bars = phases.
+    This answers: "for Hurricane Isabel, which phase gives the best ratio?"
+    """
+    if not all_datasets:
+        return
+    _normalize_rows([r for _, rows in all_datasets for r in rows])
+
+    # Collect all phases
+    all_phases_set = set()
+    for _, rows in all_datasets:
+        for r in rows:
+            ph = _PHASE_ALIASES.get(r.get("phase", ""), r.get("phase", ""))
+            all_phases_set.add(ph)
+    phases = [p for p in PHASE_ORDER if p in all_phases_set]
+    if not phases:
+        return
+
+    n_datasets = len(all_datasets)
+    n_phases = len(phases)
+
+    fig, axes = plt.subplots(2, 1, figsize=(max(14, n_datasets * 3), 12), facecolor="white")
+    fig.suptitle("Phase Comparison per Dataset", fontsize=14, fontweight="bold")
+
+    x = np.arange(n_datasets)
+    width = 0.8 / n_phases
+
+    for panel, (metric, ylabel) in enumerate([
+        ("ratio", "Compression Ratio (higher = better)"),
+        ("write_mbps", "Write Throughput MiB/s (higher = better)"),
+    ]):
+        ax = axes[panel]
+        for pi, phase in enumerate(phases):
+            vals = []
+            for ds_name, rows in all_datasets:
+                by_phase = {}
+                for r in rows:
+                    ph = _PHASE_ALIASES.get(r.get("phase", ""), r.get("phase", ""))
+                    by_phase[ph] = r
+                vals.append(g(by_phase.get(phase, {}), metric, f"{metric}ps"))
+
+            offset = (pi - n_phases / 2 + 0.5) * width
+            color = PHASE_COLORS.get(phase, "#bdc3c7")
+            label = PHASE_LABELS.get(phase, phase).replace("\n", " ")
+            bars = ax.bar(x + offset, vals, width * 0.9, label=label,
+                          color=color, edgecolor="black", linewidth=0.3,
+                          zorder=3, alpha=0.85)
+
+            # Annotate the best value per dataset
+            for i, v in enumerate(vals):
+                if v > 0 and n_phases <= 8:  # only annotate if not too many phases
+                    ax.text(x[i] + offset, v, f"{v:.1f}", ha="center", va="bottom",
+                            fontsize=6, rotation=90)
+
+        ax.set_xticks(x)
+        ax.set_xticklabels([name for name, _ in all_datasets], fontsize=10)
+        ax.set_ylabel(ylabel, fontsize=10)
+        ax.legend(fontsize=7, loc="upper right", ncol=3)
+        ax.grid(axis="y", alpha=0.3, linestyle="--", zorder=0)
+        for spine in ["top", "right"]:
+            ax.spines[spine].set_visible(False)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {output_path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# View: Latency Breakdown Stacked Bar
+# ═══════════════════════════════════════════════════════════════════════
+
+def make_latency_breakdown_figure(rows, output_path, source_name=""):
+    """Stacked bar showing stats/NN/preproc/compress time per phase."""
+    _normalize_rows(rows)
+    phases, ordered = _ordered(rows)
+    # Only show phases that have timing breakdown data
+    valid = [(p, r) for p, r in zip(phases, ordered)
+             if g(r, "comp_ms") > 0 or g(r, "nn_ms") > 0]
+    if not valid:
+        return
+
+    phases_v = [p for p, _ in valid]
+    rows_v = [r for _, r in valid]
+
+    components = [
+        ("stats_ms",   "Stats Kernel",  "#4daf4a"),
+        ("nn_ms",      "NN Inference",  "#e49444"),
+        ("preproc_ms", "Preprocessing", "#b07cc6"),
+        ("comp_ms",    "Compression",   "#377eb8"),
+        ("explore_ms", "Exploration",   "#c85a5a"),
+        ("sgd_ms",     "SGD Update",    "#ff7f00"),
+    ]
+
+    fig, ax = plt.subplots(figsize=(max(10, len(phases_v) * 1.5), 6), facecolor="white")
+    x = np.arange(len(phases_v))
+    bottom = np.zeros(len(phases_v))
+
+    for key, label, color in components:
+        vals = np.array([g(r, key) for r in rows_v])
+        if np.sum(vals) > 0:
+            ax.bar(x, vals, bottom=bottom, label=label, color=color,
+                   edgecolor="black", linewidth=0.3, width=0.6, zorder=3)
+            bottom += vals
+
+    # Annotate total on top
+    for i, total in enumerate(bottom):
+        if total > 0:
+            ax.text(i, total, f"{total:.1f}ms", ha="center", va="bottom",
+                    fontsize=8, fontweight="bold")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([PHASE_LABELS.get(p, p) for p in phases_v], fontsize=9)
+    ax.set_ylabel("Time (ms)", fontsize=10)
+    title = "Latency Breakdown per Phase"
+    if source_name:
+        title += f" — {source_name}"
+    ax.set_title(title, fontsize=11, fontweight="bold")
+    ax.legend(fontsize=8, loc="upper right")
+    ax.grid(axis="y", alpha=0.3, linestyle="--", zorder=0)
+    for spine in ["top", "right"]:
+        ax.spines[spine].set_visible(False)
+
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {output_path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# View: Algorithm Selection Frequency Histogram
+# ═══════════════════════════════════════════════════════════════════════
+
+_ALGO_NAMES = ["lz4", "snappy", "deflate", "gdeflate",
+               "zstd", "ans", "cascaded", "bitcomp"]
+
+
+def _decode_action(action_id):
+    """Decode action ID to (algo_name, has_shuffle, has_quant) string."""
+    algo = int(action_id) % 8
+    quant = (int(action_id) // 8) % 2
+    shuf = (int(action_id) // 16) % 2
+    name = _ALGO_NAMES[algo] if 0 <= algo < 8 else f"unk{algo}"
+    if shuf:
+        name += "+shuf"
+    if quant:
+        name += "+quant"
+    return name
+
+
+def make_algorithm_histogram(chunk_csv_paths, output_path):
+    """Histogram of algorithm selection frequency across datasets.
+
+    chunk_csv_paths: list of (dataset_name, csv_path) tuples.
+    Only includes nn/nn-rl/entropy-heuristic phases (phases that select).
+    """
+    from collections import Counter
+
+    all_counts = {}  # dataset_name -> Counter of action strings
+
+    for ds_name, csv_path in chunk_csv_paths:
+        if not os.path.exists(csv_path):
+            continue
+        rows = parse_csv(csv_path)
+        counter = Counter()
+        for r in rows:
+            phase = r.get("phase", "")
+            if phase not in ("nn", "nn-rl", "nn-rl+exp50", "entropy-heuristic", "best"):
+                continue
+            action = r.get("action", r.get("nn_action", -1))
+            if action is not None and float(action) >= 0:
+                counter[_decode_action(action)] += 1
+        if counter:
+            all_counts[ds_name] = counter
+
+    if not all_counts:
+        return
+
+    # Collect all action names
+    all_actions = sorted(set(a for c in all_counts.values() for a in c))
+    n_actions = len(all_actions)
+    n_datasets = len(all_counts)
+
+    fig, ax = plt.subplots(figsize=(max(10, n_actions * 0.8), 6), facecolor="white")
+    x = np.arange(n_actions)
+    width = 0.8 / n_datasets
+
+    ds_names = list(all_counts.keys())
+    for di, ds_name in enumerate(ds_names):
+        vals = [all_counts[ds_name].get(a, 0) for a in all_actions]
+        total = sum(vals) or 1
+        pcts = [v / total * 100 for v in vals]
+        offset = (di - n_datasets / 2 + 0.5) * width
+        ax.bar(x + offset, pcts, width * 0.9, label=ds_name, zorder=3, alpha=0.85)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(all_actions, fontsize=8, rotation=45, ha="right")
+    ax.set_ylabel("Selection Frequency (%)", fontsize=10)
+    ax.set_title("Algorithm Selection Distribution (NN phases)", fontsize=11, fontweight="bold")
+    ax.legend(fontsize=8, loc="upper right")
+    ax.grid(axis="y", alpha=0.3, linestyle="--", zorder=0)
+    for spine in ["top", "right"]:
+        ax.spines[spine].set_visible(False)
+
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {output_path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -1052,9 +1352,10 @@ def main():
     if args.vpic_dir and not args.vpic_csv:
         d = args.vpic_dir
         args.vpic_csv = find_csv([os.path.join(d, "benchmark_vpic_deck.csv")])
-    if args.gs_dir and not args.gs_csv:
+    if args.gs_dir:
         d = args.gs_dir
-        args.gs_csv = find_csv([os.path.join(d, "benchmark_grayscott_vol.csv")])
+        if not args.gs_csv:
+            args.gs_csv = find_csv([os.path.join(d, "benchmark_grayscott_vol.csv")])
         if not args.gs_timesteps_csv:
             args.gs_timesteps_csv = find_csv([os.path.join(d, "benchmark_grayscott_timesteps.csv")])
 
@@ -1196,13 +1497,37 @@ def main():
 
     # ── SDRBench datasets ──
     sdrbench_dir = args.sdrbench_dir or os.path.join(SCRIPT_DIR, "sdrbench", "results")
+
+    # Load CPU zstd baseline if available (inject into per-dataset rows)
+    cpu_zstd_by_dataset = {}
+    for cpu_csv_path in [os.path.join(sdrbench_dir, "cpu_zstd_baseline.csv"),
+                          os.path.join(SCRIPT_DIR, "sdrbench", "results", "cpu_zstd_baseline.csv")]:
+        if os.path.exists(cpu_csv_path):
+            print(f"Loading CPU zstd baseline: {cpu_csv_path}")
+            for r in parse_csv(cpu_csv_path):
+                ds = r.get("dataset", "")
+                cpu_zstd_by_dataset[ds] = {
+                    "phase": "cpu-zstd",
+                    "ratio": g(r, "ratio"),
+                    "write_mbps": g(r, "comp_mbps"),
+                    "read_mbps": g(r, "decomp_mbps"),
+                    "write_ms": 0, "read_ms": 0,
+                    "orig_bytes": g(r, "orig_bytes_total"),
+                    "file_bytes": g(r, "comp_bytes_total"),
+                    "mismatches": 0, "n_chunks": int(g(r, "n_chunks_total")),
+                    "write_ms_std": g(r, "comp_mbps_std"),
+                    "read_ms_std": g(r, "decomp_mbps_std"),
+                    "n_runs": int(g(r, "n_runs")),
+                }
+            break
+
     if os.path.isdir(sdrbench_dir) and "summary" in views:
         import glob as _glob
         sdr_csvs = sorted(_glob.glob(os.path.join(sdrbench_dir, "benchmark_*.csv")))
-        # Exclude chunk/timestep CSVs
+        # Exclude chunk/timestep/cpu_zstd CSVs
         sdr_csvs = [c for c in sdr_csvs
                      if "_chunks" not in c and "_timesteps" not in c
-                     and "_timestep_" not in c]
+                     and "_timestep_" not in c and "cpu_zstd" not in c]
         for sdr_csv in sdr_csvs:
             found_any = True
             print(f"Loading SDRBench: {sdr_csv}")
@@ -1216,6 +1541,21 @@ def main():
             n_ch = int(g(r0, "n_chunks"))
             chunk_mb = orig_mib / max(n_ch, 1)
             meta = f"Dataset: {dataset_name} ({orig_mib:.0f} MiB) | Chunks: {n_ch} x {chunk_mb:.0f} MiB"
+
+            # Inject CPU zstd baseline if available for this dataset
+            _CPU_DATASET_ALIASES = {
+                "hurricane_isabel": ["100x500x500", "hurricane", "isabel"],
+                "nyx": ["nyx", "exasky"],
+                "cesm_atm": ["cesm", "atm", "1800x3600"],
+            }
+            matched_cpu = False
+            for cpu_ds_key, cpu_row in cpu_zstd_by_dataset.items():
+                aliases = _CPU_DATASET_ALIASES.get(cpu_ds_key, [cpu_ds_key])
+                dn_low = dataset_name.lower()
+                if any(a in dn_low for a in aliases):
+                    rows.append(dict(cpu_row))
+                    matched_cpu = True
+                    break
 
             # Merge multi-field phases if timestep CSV exists
             ts_csv = os.path.join(sdrbench_dir, f"benchmark_{dataset_name}_timesteps.csv")
@@ -1234,6 +1574,74 @@ def main():
         print(f"  {sdrbench_dir}/benchmark_*.csv")
         print("\nRun benchmarks first, or specify paths explicitly.")
         sys.exit(1)
+
+    # ── Multi-dataset comparison figure ──
+    # Collect all summary data loaded above into a single comparison
+    all_datasets_for_comparison = []
+
+    if gs_agg and os.path.exists(gs_agg):
+        rows = parse_csv(gs_agg)
+        if rows:
+            all_datasets_for_comparison.append(("Gray-Scott", rows))
+    if vpic_agg and os.path.exists(vpic_agg):
+        rows = parse_csv(vpic_agg)
+        if rows:
+            all_datasets_for_comparison.append(("VPIC", rows))
+    if os.path.isdir(sdrbench_dir):
+        import glob as _glob2
+        for sdr_csv in sorted(_glob2.glob(os.path.join(sdrbench_dir, "benchmark_*.csv"))):
+            if "_chunks" in sdr_csv or "_timesteps" in sdr_csv or "_timestep_" in sdr_csv:
+                continue
+            rows = parse_csv(sdr_csv)
+            if rows:
+                ds = rows[0].get("dataset", os.path.basename(sdr_csv).replace("benchmark_", "").replace(".csv", ""))
+                # Inject CPU zstd for multi-dataset comparison too
+                ds_low = ds.lower()
+                for cpu_ds_key, cpu_row in cpu_zstd_by_dataset.items():
+                    aliases = _CPU_DATASET_ALIASES.get(cpu_ds_key, [cpu_ds_key])
+                    if any(a in ds_low for a in aliases):
+                        rows.append(dict(cpu_row))
+                        break
+                all_datasets_for_comparison.append((ds, rows))
+
+    if len(all_datasets_for_comparison) >= 2 and "summary" in views:
+        out_dir = args.output_dir or os.path.join(SCRIPT_DIR, "results")
+        os.makedirs(out_dir, exist_ok=True)
+        print(f"Generating multi-dataset comparison ({len(all_datasets_for_comparison)} datasets)")
+        make_multi_dataset_figure(all_datasets_for_comparison,
+                                  os.path.join(out_dir, "multi_dataset_comparison.png"))
+        make_per_dataset_phase_comparison(all_datasets_for_comparison,
+                                          os.path.join(out_dir, "per_dataset_phase_comparison.png"))
+
+    # ── Latency breakdown (from Gray-Scott which has per-component timing) ──
+    if gs_agg and os.path.exists(gs_agg) and "summary" in views:
+        rows = parse_csv(gs_agg)
+        if any(g(r, "comp_ms") > 0 or g(r, "nn_ms") > 0 for r in rows):
+            print("Generating latency breakdown figure")
+            make_latency_breakdown_figure(rows,
+                os.path.join(gs_out_dir, "latency_breakdown.png"), "Gray-Scott")
+
+    # ── Algorithm selection histogram (from chunk CSVs) ──
+    chunk_csv_paths = []
+    gs_chunks_path = find_csv([os.path.join(gs_out_dir, "benchmark_grayscott_vol_chunks.csv")]
+                               + DEFAULT_GS_CHUNKS)
+    if gs_chunks_path and os.path.exists(gs_chunks_path):
+        chunk_csv_paths.append(("Gray-Scott", gs_chunks_path))
+
+    if os.path.isdir(sdrbench_dir):
+        import glob as _glob3
+        for sdr_csv in sorted(_glob3.glob(os.path.join(sdrbench_dir, "benchmark_*_chunks.csv"))):
+            if "_timestep_" in sdr_csv:
+                continue
+            ds = os.path.basename(sdr_csv).replace("benchmark_", "").replace("_chunks.csv", "")
+            chunk_csv_paths.append((ds, sdr_csv))
+
+    if chunk_csv_paths and "summary" in views:
+        out_dir = args.output_dir or os.path.join(SCRIPT_DIR, "results")
+        os.makedirs(out_dir, exist_ok=True)
+        print(f"Generating algorithm histogram ({len(chunk_csv_paths)} datasets)")
+        make_algorithm_histogram(chunk_csv_paths,
+                                 os.path.join(out_dir, "algorithm_selection_histogram.png"))
 
     print("\nDone.")
 

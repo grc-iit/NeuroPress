@@ -491,7 +491,7 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
 
         /* ── SGD Phase 1: learn from PRIMARY result immediately ── */
         auto t_sgd_start = std::chrono::steady_clock::now();
-        if (error_pct > static_cast<double>(g_reinforce_mape_threshold) && d_stats_ptr) {
+        if (error_pct > static_cast<double>(g_reinforce_mape_threshold) && d_stats_ptr && !g_best_mode.load()) {
             SGDSample primary_sgd[1];
             primary_sgd[0].action            = explored_samples[0].action;
             primary_sgd[0].actual_ratio      = static_cast<float>(explored_samples[0].ratio);
@@ -515,7 +515,7 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
             }
         }
 
-        if (g_exploration_enabled && error_pct > g_exploration_threshold && top_actions) {
+        if (g_exploration_enabled && (g_best_mode.load() || error_pct > g_exploration_threshold) && top_actions) {
             exploration_triggered = true;
             int K;
             if (g_exploration_k_override > 0) {
@@ -764,7 +764,7 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
         }
 
         /* ── SGD Phase 2: learn from EXPLORATION results separately ── */
-        if (exploration_triggered && explored_samples.size() > 1 && d_stats_ptr) {
+        if (exploration_triggered && explored_samples.size() > 1 && d_stats_ptr && !g_best_mode.load()) {
             std::sort(explored_samples.begin() + 1, explored_samples.end(),
                       [](const ExploredResult& a, const ExploredResult& b) {
                           return a.cost < b.cost;

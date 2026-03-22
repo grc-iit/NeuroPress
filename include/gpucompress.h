@@ -388,6 +388,25 @@ int gpucompress_online_learning_enabled(void);
  */
 void gpucompress_set_exploration(int enable);
 
+/**
+ * Enable/disable "best" (exhaustive search) mode.
+ * When enabled, every chunk is explored with K=31 alternatives
+ * unconditionally, regardless of prediction error or exploration threshold.
+ * This evaluates all 32 algorithm-parameter configurations per chunk and
+ * selects the one with the lowest cost-model score, providing a ceiling
+ * on the selection accuracy achievable within GPUCompress's config space.
+ * ~32x slower than normal operation. SGD is disabled to avoid weight contamination.
+ *
+ * @param enable 1 to enable, 0 to disable
+ */
+void gpucompress_set_best_mode(int enable);
+
+/**
+ * Check if "best" (exhaustive search) mode is enabled.
+ * @return 1 if enabled, 0 otherwise
+ */
+int gpucompress_best_mode_enabled(void);
+
 /* ============================================================
  * Active Learning API (backward-compatible convenience)
  * ============================================================ */

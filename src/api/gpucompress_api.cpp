@@ -97,6 +97,7 @@ std::atomic<int>  g_mgr_cache_misses{0};
 std::mutex        g_sgd_mutex;
 
 std::atomic<int> g_selection_mode{GPUCOMPRESS_SELECT_NN};
+std::atomic<bool> g_best_mode{false};
 
 bool g_debug_nn = false;
 
@@ -252,6 +253,7 @@ extern "C" void gpucompress_cleanup(void) {
         g_online_learning_enabled = false;
         g_exploration_enabled = false;
         g_selection_mode.store(GPUCOMPRESS_SELECT_NN);
+        g_best_mode.store(false);
         gpucompress_nn_cleanup_impl();
         gpucompress_free_stats_workspace();
         gpucompress::destroyCompContextPool();

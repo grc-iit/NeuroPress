@@ -115,6 +115,39 @@ extern "C" gpucompress_selection_mode_t gpucompress_get_selection_mode(void) {
 }
 
 /* ============================================================
+ * Best (Exhaustive Search) Mode
+ * ============================================================ */
+
+static float s_saved_w0 = 1.0f, s_saved_w1 = 1.0f, s_saved_w2 = 1.0f;
+
+extern "C" void gpucompress_set_best_mode(int enable) {
+    g_best_mode.store(enable != 0);
+    if (enable) {
+        /* Force exploration on every chunk with all alternatives */
+        g_exploration_enabled = true;
+        g_exploration_k_override = 31;
+        /* Save current weights and force ratio-only selection */
+        s_saved_w0 = g_rank_w0;
+        s_saved_w1 = g_rank_w1;
+        s_saved_w2 = g_rank_w2;
+        g_rank_w0 = 0.0f;
+        g_rank_w1 = 0.0f;
+        g_rank_w2 = 1.0f;
+    } else {
+        /* Restore defaults */
+        g_exploration_enabled = false;
+        g_exploration_k_override = -1;
+        g_rank_w0 = s_saved_w0;
+        g_rank_w1 = s_saved_w1;
+        g_rank_w2 = s_saved_w2;
+    }
+}
+
+extern "C" int gpucompress_best_mode_enabled(void) {
+    return g_best_mode.load() ? 1 : 0;
+}
+
+/* ============================================================
  * Online Learning Controls
  * ============================================================ */
 

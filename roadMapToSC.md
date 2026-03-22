@@ -9,7 +9,7 @@
 > **Path to Weak Accept:** ~1-2 weeks of benchmark runs (infrastructure is ready).
 > **Path to Solid Accept:** + oracle baseline + policy evaluation + external compressors.
 >
-> **Progress (as of 2026-03-22):** 6 of 15 action items complete (steps 1, 2, 6, 9, 10, 15).
+> **Progress (as of 2026-03-22):** 7 of 15 action items complete (steps 1, 2, 6, 7-partial, 9, 10, 15).
 > All benchmark infrastructure built, tested, and smoke-tested on GPU node:
 > - 8-phase pipeline (no-comp, fixed-lz4/gdeflate/zstd, entropy-heuristic, nn, nn-rl, nn-rl+exp50)
 > - 5 datasets (Gray-Scott, VPIC, Hurricane Isabel, Nyx, CESM-ATM)
@@ -106,8 +106,8 @@ Lossless (IMPLEMENTED ✅):
   - fixed-zstd      (always zstd via nvCOMP — ratio extreme)
   - entropy-heuristic (rule-based selector — is the NN better than thresholds?)
 
-Lossless (TODO):
-  - CPU zstd        (the "just use the CPU" sanity check)
+Lossless (IMPLEMENTED ✅):
+  - CPU zstd        (the "just use the CPU" sanity check) — run_cpu_zstd_baseline.sh
 
 Lossy (TODO — at matching error bounds):
   - cuSZ            (GPU-native SZ)
@@ -119,6 +119,7 @@ Lossy (TODO — at matching error bounds):
 
 | Method | Ratio | Comp GB/s | Decomp GB/s | NN Overhead | Status |
 |--------|-------|-----------|-------------|-------------|--------|
+| cpu-zstd | — | — | — | N/A | **IMPLEMENTED** |
 | fixed-lz4 | — | — | — | N/A | **IMPLEMENTED** |
 | fixed-gdeflate | — | — | — | N/A | **IMPLEMENTED** |
 | fixed-zstd | — | — | — | N/A | **IMPLEMENTED** |
@@ -384,6 +385,7 @@ into the middle third of chunks. Clarify in the paper or provide a separate pure
 | VPIC JIT build fixes | **DONE** | GPU_DIR fallback, sim_log macro, HDF5 rpath, link flags |
 | Multi-field summary fix | **DONE** | nn-rl/nn-rl+exp50 ratio/MAPE now populated in summary CSV |
 | Smoke tests all passing | **DONE** | Gray-Scott (L=128) ✅, SDRBench (3×3=9 runs) ✅, VPIC (NX=64, 3 configs) ✅ |
+| CPU zstd external baseline | **DONE** | `run_cpu_zstd_baseline.sh` — chunked compression matching GPU chunk size, CLI args, multi-run std dev |
 
 ---
 
@@ -404,8 +406,8 @@ into the middle third of chunks. Clarify in the paper or provide a separate pure
 | # | Action | Effort | Deliverable |
 |---|--------|--------|-------------|
 | 6 | ~~Add `fixed-zstd` and `fixed-lz4` phases to benchmark~~ | ~~Half day~~ | ~~Baseline comparison~~ | **DONE** ✅ — `fixed-lz4`, `fixed-gdeflate`, `fixed-zstd` phases added to all 3 benchmark drivers. Uses `make_dcpl_fixed()` with explicit algorithm. Needs GPU node to build. |
-| 7 | Install cuSZ, add as baseline phase | 1-2 days | GPU compressor comparison |
-| 8 | Implement exhaustive oracle (K=31) | 1 day | Oracle + NN regret numbers |
+| 7 | ~~Add external compressor baselines~~ | ~~1-2 days~~ | ~~External comparison~~ | **PARTIALLY DONE** ✅ — CPU zstd baseline script implemented (`run_cpu_zstd_baseline.sh`, chunked to match GPU benchmark). cuSZ/ZFP still TODO. |
+| 8 | ~~Implement exhaustive search (K=31)~~ | ~~1 day~~ | ~~Regret numbers~~ | **DONE** ✅ — `best` phase added to all 3 drivers via `gpucompress_set_best_mode()`. Bypasses error check, forces K=31 exploration on every chunk, disables SGD. Not in default phase mask (32x slower). Run with `--phase best`. |
 | 9 | ~~Implement entropy-heuristic baseline~~ | ~~2 hours~~ | ~~Rule-based comparison~~ | **DONE** ✅ — `src/selection/heuristic.cu`, new `GPUCOMPRESS_SELECT_HEURISTIC` mode, integrated into all 3 benchmark drivers. Needs GPU node to build. |
 | 10 | ~~Run 4-policy comparison on all datasets~~ | ~~Half day~~ | ~~Policy mode table~~ | **DONE** ✅ — 3 cost model configs (balanced, ratio-only, speed-only) integrated into all 3 eval scripts. Smoke-test data collected. Full-scale `--runs 5` pending. |
 
@@ -468,6 +470,7 @@ into the middle third of chunks. Clarify in the paper or provide a separate pure
 | Dataset auto-download | `scripts/install_dependencies.sh` | **ADDED** — Step 4/4 downloads + extracts SDRBench |
 | Entropy-heuristic baseline | `src/selection/heuristic.cu` | **ADDED** — rule-based selector, integrated into all benchmarks |
 | Fixed-algo baselines | `make_dcpl_fixed()` in benchmarks | **ADDED** — fixed-lz4, fixed-gdeflate, fixed-zstd phases |
+| CPU zstd baseline | `benchmarks/sdrbench/run_cpu_zstd_baseline.sh` | **ADDED** — chunked CPU compression, CLI args (`--chunk-mb`, `--level`, `--runs`) |
 
 ---
 
@@ -479,7 +482,7 @@ These are the questions SC reviewers *will* ask. Each must have a clear answer i
 |---|----------|-----------------|
 | 1 | *"Does this generalize beyond Gray-Scott?"* | **SMOKE-TESTED** ✅ — 5 datasets benchmarked (GS, VPIC, Hurricane, Nyx, CESM). Full-scale `--runs 5` pending. |
 | 2 | *"Is it better than just always using zstd?"* | **SMOKE-TESTED** ✅ — fixed-lz4/gdeflate/zstd baselines run on all datasets. Full-scale pending. |
-| 3 | *"Is it better than SZ3/ZFP?"* | External compressor comparison — TODO |
+| 3 | *"Is it better than SZ3/ZFP?"* | CPU zstd **IMPLEMENTED**. cuSZ/ZFP still TODO (lossy only). |
 | 4 | *"How close to optimal is the NN?"* | Exhaustive oracle — TODO (P1, deprioritized per SC reviewer) |
 | 5 | *"Does the NN beat a simple heuristic?"* | **SMOKE-TESTED** ✅ — entropy-heuristic phase run on all datasets. Full-scale pending. |
 | 6 | *"What happens on completely new data?"* | Cold-start visible in smoke data (MAPE 457-1761% on first chunks). Full convergence curve needs TIMESTEPS=100. |

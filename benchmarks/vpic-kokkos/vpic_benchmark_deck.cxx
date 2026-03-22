@@ -62,7 +62,7 @@
 #define H5Z_FILTER_GPUCOMPRESS    305
 #define H5Z_GPUCOMPRESS_CD_NELMTS 5
 
-#define N_PHASES 8
+#define N_PHASES 12
 
 #define TMP_NOCOMP    "/tmp/bm_vpic_nocomp.h5"
 #define TMP_FIX_LZ4   "/tmp/bm_vpic_fix_lz4.h5"
@@ -269,7 +269,8 @@ static hid_t make_dcpl_nocomp(hsize_t chunk_floats)
     return dcpl;
 }
 
-static hid_t make_dcpl_fixed(hsize_t chunk_floats, gpucompress_algorithm_t algo)
+static hid_t make_dcpl_fixed(hsize_t chunk_floats, gpucompress_algorithm_t algo,
+                              unsigned int preproc = 0)
 {
     hsize_t cdims[1] = { chunk_floats };
     hid_t dcpl = H5Pcreate(H5P_DATASET_CREATE);
@@ -277,7 +278,7 @@ static hid_t make_dcpl_fixed(hsize_t chunk_floats, gpucompress_algorithm_t algo)
 
     unsigned int cd[H5Z_GPUCOMPRESS_CD_NELMTS];
     cd[0] = (unsigned int)algo;
-    cd[1] = 0; /* no preprocessing */
+    cd[1] = preproc;
     cd[2] = 0;
     cd[3] = 0; cd[4] = 0; /* error_bound = 0.0 */
     H5Pset_filter(dcpl, H5Z_FILTER_GPUCOMPRESS,
@@ -900,6 +901,7 @@ begin_diagnostics {
             remove(TMP_FIX_GDEFL);
             remove(TMP_FIX_ZSTD);
             remove(TMP_HEUR);
+            remove("/tmp/bm_vpic_best.h5");
             remove(TMP_NN);
             remove(TMP_NN_RL);
             remove(TMP_NN_RLEXP);
@@ -1289,17 +1291,18 @@ begin_diagnostics {
     }
     }
 
-    // ── Phases 2-4: fixed-algo baselines ──────────────────────────
+    // ── Phases: fixed-algo baselines ──
     {
         struct FixedAlgoPhase {
             const char *name;
             const char *tmp_file;
             gpucompress_algorithm_t algo;
+            unsigned int preproc;
         };
         FixedAlgoPhase fixed_phases[] = {
-            { "fixed-lz4",      TMP_FIX_LZ4,   GPUCOMPRESS_ALGO_LZ4 },
-            { "fixed-gdeflate", TMP_FIX_GDEFL,  GPUCOMPRESS_ALGO_GDEFLATE },
-            { "fixed-zstd",     TMP_FIX_ZSTD,   GPUCOMPRESS_ALGO_ZSTD },
+            { "fixed-lz4",           TMP_FIX_LZ4,                    GPUCOMPRESS_ALGO_LZ4,      0 },
+            { "fixed-gdeflate",      TMP_FIX_GDEFL,                  GPUCOMPRESS_ALGO_GDEFLATE, 0 },
+            { "fixed-zstd",          TMP_FIX_ZSTD,                   GPUCOMPRESS_ALGO_ZSTD,     0 },
         };
         for (int fi = 0; fi < 3; fi++) {
             if (!phase_enabled(fixed_phases[fi].name)) continue;
@@ -1310,7 +1313,7 @@ begin_diagnostics {
             gpucompress_disable_online_learning();
             gpucompress_set_exploration(0);
             {
-                hid_t dcpl = make_dcpl_fixed((hsize_t)chunk_floats, fixed_phases[fi].algo);
+                hid_t dcpl = make_dcpl_fixed((hsize_t)chunk_floats, fixed_phases[fi].algo, fixed_phases[fi].preproc);
                 PhaseResult runs_buf[32];
                 int eff = global->n_runs;
                 for (int run = 0; run < eff; run++) {
@@ -1361,9 +1364,29 @@ begin_diagnostics {
     }
     }
 
-    // ── Phase 3: nn (inference-only) ──────────────────────────────
+    // ── Phase: best (exhaustive, 32 configs/chunk) ────────────────
+    // Only run when explicitly requested (32x slower than normal phases)
+    if (phase_enabled("best")) {
+    sim_log("── best (exhaustive, 32 configs/chunk) ────────────────────");
+    gpucompress_disable_online_learning();
+    gpucompress_set_exploration(1);
+    gpucompress_set_best_mode(1);
+    {
+        hid_t dcpl = make_dcpl_auto((hsize_t)chunk_floats, global->diag_error_bound);
+        int rc = run_phase("best", "/tmp/bm_vpic_best.h5",
+                           d_fields, global->d_read, global->h_orig, global->h_read,
+                           n_floats, n_chunks, dcpl, &results[n_phases]);
+        results[n_phases].n_runs = 1;
+        H5Pclose(dcpl);
+        gpucompress_set_best_mode(0);
+        if (rc) any_fail = 1;
+        n_phases++;
+    }
+    }
+
+    // ── Phase: nn (inference-only) ──────────────────────────────
     if (phase_enabled("nn-only") || (phase_enabled("nn") && !env_phases)) {
-    sim_log("── Phase 6/8: nn (VOL, ALGO_AUTO, inference-only) ───────────");
+    sim_log("── nn (VOL, ALGO_AUTO, inference-only) ───────────────────");
     gpucompress_disable_online_learning();
     gpucompress_set_exploration(0);
     {
@@ -1521,6 +1544,7 @@ begin_diagnostics {
         remove(TMP_FIX_GDEFL);
         remove(TMP_FIX_ZSTD);
         remove(TMP_HEUR);
+        remove("/tmp/bm_vpic_best.h5");
         remove(TMP_NN);
         remove(TMP_NN_RL);
         remove(TMP_NN_RLEXP);

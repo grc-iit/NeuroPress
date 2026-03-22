@@ -300,8 +300,9 @@ static hid_t make_dcpl_auto(int L, int chunk_z, double eb = 0.0)
     return dcpl;
 }
 
-/* 3D chunked DCPL for a fixed algorithm (no NN, no preprocessing) */
-static hid_t make_dcpl_fixed(int L, int chunk_z, gpucompress_algorithm_t algo)
+/* 3D chunked DCPL for a fixed algorithm with optional preprocessing */
+static hid_t make_dcpl_fixed(int L, int chunk_z, gpucompress_algorithm_t algo,
+                              unsigned int preproc = 0)
 {
     hsize_t cdims[3] = { (hsize_t)L, (hsize_t)L, (hsize_t)chunk_z };
     hid_t dcpl = H5Pcreate(H5P_DATASET_CREATE);
@@ -309,7 +310,7 @@ static hid_t make_dcpl_fixed(int L, int chunk_z, gpucompress_algorithm_t algo)
 
     unsigned int cd[H5Z_GPUCOMPRESS_CD_NELMTS];
     cd[0] = (unsigned int)algo;
-    cd[1] = 0; /* no preprocessing */
+    cd[1] = preproc;
     cd[2] = 0;
     cd[3] = 0; cd[4] = 0; /* error_bound = 0.0 */
     H5Pset_filter(dcpl, H5Z_FILTER_GPUCOMPRESS,
@@ -1014,8 +1015,8 @@ int main(int argc, char **argv)
     int inject_patterns = 0; /* --inject-patterns: overwrite middle chunks with contrasting data */
 
     /* Phase selection: bit flags */
-    enum { P_NOCOMP = 1, P_FIX_LZ4 = 2, P_FIX_GDEFL = 4, P_FIX_ZSTD = 8,
-           P_HEUR = 16, P_NN = 32, P_NNRL = 64, P_NNRLEXP = 128 };
+    enum { P_NOCOMP = 0x001, P_FIX_LZ4 = 0x002, P_FIX_GDEFL = 0x004, P_FIX_ZSTD = 0x008,
+           P_HEUR = 0x010, P_BEST = 0x020, P_NN = 0x040, P_NNRL = 0x080, P_NNRLEXP = 0x100 };
     unsigned int phase_mask = 0;  /* 0 = run all */
 
     /* Parse args */
@@ -1054,17 +1055,18 @@ int main(int argc, char **argv)
             out_dir_override = argv[++i];
         } else if (strcmp(argv[i], "--phase") == 0 && i + 1 < argc) {
             const char *p = argv[++i];
-            if      (strcmp(p, "no-comp") == 0)        phase_mask |= P_NOCOMP;
-            else if (strcmp(p, "fixed-lz4") == 0)     phase_mask |= P_FIX_LZ4;
-            else if (strcmp(p, "fixed-gdeflate") == 0) phase_mask |= P_FIX_GDEFL;
-            else if (strcmp(p, "fixed-zstd") == 0)    phase_mask |= P_FIX_ZSTD;
-            else if (strcmp(p, "entropy-heuristic") == 0) phase_mask |= P_HEUR;
-            else if (strcmp(p, "nn") == 0)            phase_mask |= P_NN;
-            else if (strcmp(p, "nn-rl") == 0)         phase_mask |= P_NNRL;
-            else if (strcmp(p, "nn-rl+exp50") == 0)   phase_mask |= P_NNRLEXP;
+            if      (strcmp(p, "no-comp") == 0)              phase_mask |= P_NOCOMP;
+            else if (strcmp(p, "fixed-lz4") == 0)           phase_mask |= P_FIX_LZ4;
+            else if (strcmp(p, "fixed-gdeflate") == 0)       phase_mask |= P_FIX_GDEFL;
+            else if (strcmp(p, "fixed-zstd") == 0)          phase_mask |= P_FIX_ZSTD;
+            else if (strcmp(p, "entropy-heuristic") == 0)   phase_mask |= P_HEUR;
+            else if (strcmp(p, "best") == 0)                phase_mask |= P_BEST;
+            else if (strcmp(p, "nn") == 0)                  phase_mask |= P_NN;
+            else if (strcmp(p, "nn-rl") == 0)               phase_mask |= P_NNRL;
+            else if (strcmp(p, "nn-rl+exp50") == 0)         phase_mask |= P_NNRLEXP;
             else { fprintf(stderr, "Unknown phase: %s\n"
                            "  Valid: no-comp, fixed-lz4, fixed-gdeflate, fixed-zstd,\n"
-                           "         entropy-heuristic, nn, nn-rl, nn-rl+exp50\n", p);
+                           "         entropy-heuristic, best, nn, nn-rl, nn-rl+exp50\n", p);
                    return 1; }
         } else if (strcmp(argv[i], "--verbose-chunks") == 0) {
             verbose_chunks = 1;
@@ -1083,12 +1085,13 @@ int main(int argc, char **argv)
                 "  --w0/w1/w2  Cost model weights (default 1/1/1)\n"
                 "              w0=comp_time, w1=decomp_time, w2=IO_cost\n"
                 "              e.g. --w0 0 --w1 0 --w2 1  (ratio-only ranking)\n"
-                "  Phases: no-comp, entropy-heuristic, nn, nn-rl, nn-rl+exp50\n"
+                "  Phases: no-comp, fixed-lz4, fixed-gdeflate, fixed-zstd,\n"
+                "         entropy-heuristic, best, nn, nn-rl, nn-rl+exp50\n"
                 "  Use --phase multiple times to select specific phases.\n", argv[0]);
         return 1;
     }
     if (phase_mask == 0) phase_mask = P_NOCOMP | P_FIX_LZ4 | P_FIX_GDEFL | P_FIX_ZSTD
-                                    | P_HEUR | P_NN | P_NNRL | P_NNRLEXP;
+                                    | P_HEUR | P_BEST | P_NN | P_NNRL | P_NNRLEXP;
 
     /* Compute chunk_z from chunk_mb if not explicitly set */
     if (chunk_z <= 0 && chunk_mb > 0) {
@@ -1194,7 +1197,7 @@ int main(int argc, char **argv)
         inject_contrasting_patterns(d_v, L, chunk_z);
     }
 
-    PhaseResult results[8];
+    PhaseResult results[12];
     int n_phases = 0;
     int any_fail = 0;
 
@@ -1227,17 +1230,18 @@ int main(int argc, char **argv)
         n_phases++;
     }
 
-    /* ── Phases 2-4: fixed-algo baselines ────────────────────────── */
+    /* ── Phases: fixed-algo baselines ── */
     struct FixedAlgoPhase {
         unsigned int mask;
         const char *name;
         const char *tmp_file;
         gpucompress_algorithm_t algo;
+        unsigned int preproc;
     };
     FixedAlgoPhase fixed_phases[] = {
-        { P_FIX_LZ4,   "fixed-lz4",      TMP_FIX_LZ4,   GPUCOMPRESS_ALGO_LZ4 },
-        { P_FIX_GDEFL, "fixed-gdeflate",  TMP_FIX_GDEFL, GPUCOMPRESS_ALGO_GDEFLATE },
-        { P_FIX_ZSTD,  "fixed-zstd",      TMP_FIX_ZSTD,  GPUCOMPRESS_ALGO_ZSTD },
+        { P_FIX_LZ4,      "fixed-lz4",           TMP_FIX_LZ4,             GPUCOMPRESS_ALGO_LZ4,      0 },
+        { P_FIX_GDEFL,    "fixed-gdeflate",       TMP_FIX_GDEFL,           GPUCOMPRESS_ALGO_GDEFLATE, 0 },
+        { P_FIX_ZSTD,     "fixed-zstd",           TMP_FIX_ZSTD,            GPUCOMPRESS_ALGO_ZSTD,     0 },
     };
     for (int fi = 0; fi < 3; fi++) {
         if (!(phase_mask & fixed_phases[fi].mask)) continue;
@@ -1245,7 +1249,7 @@ int main(int argc, char **argv)
                n_phases + 1, fixed_phases[fi].name);
         gpucompress_disable_online_learning();
         gpucompress_set_exploration(0);
-        hid_t dcpl_f = make_dcpl_fixed(L, chunk_z, fixed_phases[fi].algo);
+        hid_t dcpl_f = make_dcpl_fixed(L, chunk_z, fixed_phases[fi].algo, fixed_phases[fi].preproc);
         PhaseResult runs_buf[32];
         int eff_runs = (n_runs > 32) ? 32 : n_runs;
         for (int run = 0; run < eff_runs; run++) {
@@ -1303,7 +1307,35 @@ int main(int argc, char **argv)
         n_phases++;
     }
 
-    /* ── Phase 3: nn (VOL, ALGO_AUTO, inference-only) ────────────── */
+    /* ── Phase: best (exhaustive search, all 32 configs per chunk) ── */
+    if (phase_mask & P_BEST) {
+        printf("\n── Phase %d: best (exhaustive, 32 configs/chunk) ────────────\n", n_phases + 1);
+        gpucompress_disable_online_learning();
+        gpucompress_set_exploration(1);
+        gpucompress_set_best_mode(1);
+        hid_t dcpl_b = make_dcpl_auto(L, chunk_z, error_bound);
+        PhaseResult runs_buf[32];
+        int eff_runs = 1;  /* deterministic, no need for multiple runs */
+        for (int run = 0; run < eff_runs; run++) {
+            printf("  Write + Read + Verify... "); fflush(stdout);
+            double t0 = now_ms();
+            rc = run_phase_vol(d_v, d_read, d_count,
+                               n_floats, L, chunk_z,
+                               "best", "/tmp/bm_gs_best.h5", dcpl_b,
+                               &runs_buf[run]);
+            printf("done (%.1fs)\n", (now_ms() - t0) / 1000.0);
+            runs_buf[run].sim_ms = sim_ms;
+            if (rc) any_fail = 1;
+        }
+        results[n_phases] = runs_buf[0];
+        results[n_phases].n_runs = 1;
+        H5Pclose(dcpl_b);
+        write_chunk_csv("best", n_chunks);
+        gpucompress_set_best_mode(0);
+        n_phases++;
+    }
+
+    /* ── Phase: nn (VOL, ALGO_AUTO, inference-only) ────────────── */
     if (phase_mask & P_NN) {
         printf("\n── Phase %d: nn (VOL, ALGO_AUTO, inference-only) ────────────\n", n_phases + 1);
         gpucompress_disable_online_learning();
@@ -1750,6 +1782,7 @@ int main(int argc, char **argv)
     remove(TMP_FIX_GDEFL);
     remove(TMP_FIX_ZSTD);
     remove(TMP_HEUR);
+    remove("/tmp/bm_gs_best.h5");
     remove(TMP_NN);
     remove(TMP_NN_RL);
     remove(TMP_NN_RLEXP);

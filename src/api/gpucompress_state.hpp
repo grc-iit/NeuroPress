@@ -58,6 +58,7 @@ extern float g_measured_bw_bytes_per_ms;
 
 /* ---- Algorithm selection mode ---- */
 extern std::atomic<int> g_selection_mode;  /* gpucompress_selection_mode_t */
+extern std::atomic<bool> g_best_mode; /* exhaustive search: explore all 32 configs per chunk */
 
 /* ---- Debug flags ---- */
 extern bool g_debug_nn;   /* set via GPUCOMPRESS_DEBUG_NN=1 env var */
