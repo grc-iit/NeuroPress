@@ -331,6 +331,34 @@ gpucompress_error_t gpucompress_load_nn(const char* filepath);
 int gpucompress_nn_is_loaded(void);
 
 /* ============================================================
+ * Algorithm Selection Mode API
+ * ============================================================ */
+
+/**
+ * Selection mode for per-chunk algorithm choice.
+ */
+typedef enum {
+    GPUCOMPRESS_SELECT_NN         = 0,  /**< Neural network inference (default) */
+    GPUCOMPRESS_SELECT_HEURISTIC  = 1   /**< Entropy-based heuristic rules */
+} gpucompress_selection_mode_t;
+
+/**
+ * Set the algorithm selection mode.
+ * In NN mode (default), the neural network picks the best algorithm per chunk.
+ * In heuristic mode, a simple entropy-threshold rule selects the algorithm.
+ *
+ * @param mode  Selection mode
+ */
+void gpucompress_set_selection_mode(gpucompress_selection_mode_t mode);
+
+/**
+ * Get the current algorithm selection mode.
+ *
+ * @return Current selection mode
+ */
+gpucompress_selection_mode_t gpucompress_get_selection_mode(void);
+
+/* ============================================================
  * Online Learning API
  * ============================================================ */
 

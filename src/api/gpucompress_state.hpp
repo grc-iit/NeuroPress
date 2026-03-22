@@ -56,6 +56,9 @@ extern float g_rank_w1;
 extern float g_rank_w2;
 extern float g_measured_bw_bytes_per_ms;
 
+/* ---- Algorithm selection mode ---- */
+extern std::atomic<int> g_selection_mode;  /* gpucompress_selection_mode_t */
+
 /* ---- Debug flags ---- */
 extern bool g_debug_nn;   /* set via GPUCOMPRESS_DEBUG_NN=1 env var */
 

@@ -22,11 +22,12 @@
 set +e  # Don't exit on error
 
 # ── Configuration ──
-L=400                   # Grid size: L^3 * 4 bytes (~244 MB for L=400)
-CHUNK_MB=4              # Chunk size in MB
-TIMESTEPS=100           # Number of multi-timestep writes
-RUNS=1                  # Single-shot repetitions
-DEBUG_NN=1              # 1=print NN rankings, 0=quiet
+# Override with env vars: L=128 TIMESTEPS=5 bash benchmarks/grayscott/run_gs_eval.sh
+L=${L:-400}                   # Grid size: L^3 * 4 bytes (~244 MB for L=400)
+CHUNK_MB=${CHUNK_MB:-4}       # Chunk size in MB
+TIMESTEPS=${TIMESTEPS:-100}   # Number of multi-timestep writes
+RUNS=${RUNS:-1}               # Single-shot repetitions
+DEBUG_NN=${DEBUG_NN:-1}       # 1=print NN rankings, 0=quiet
 
 # ── Paths ──
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

@@ -38,6 +38,8 @@
 
 /* Internal API: split-phase inference + CompContext pool */
 #include "api/internal.hpp"
+#include "api/gpucompress_state.hpp"
+#include "selection/heuristic.h"
 
 /* gpucompress HDF5 filter ID (must match H5Zgpucompress.h) */
 #define H5Z_FILTER_GPUCOMPRESS 305
@@ -1323,46 +1325,78 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
 
                     /* ---- Sequential inference: run stats+NN on main thread ----
                      * Each chunk sees the latest SGD-updated weights because
-                     * runNNFusedInferenceCtx waits on g_sgd_done before reading. */
+                     * runNNFusedInferenceCtx waits on g_sgd_done before reading.
+                     *
+                     * In heuristic mode, we skip the NN and use entropy-based
+                     * rules instead — stats kernel still runs for entropy. */
                     if (use_seq_inference && wi.src && wi.sz > 0) {
-                        int infer_action = -1;
-                        float infer_ratio = 0, infer_ct = 0, infer_dt = 0, infer_psnr = 0;
-                        int infer_top[32] = {0};
-                        gpucompress_error_t ie = gpucompress_infer_gpu(
-                            wi.src, wi.sz, &cfg, nullptr, infer_ctx,
-                            &infer_action, &infer_ratio, &infer_ct, &infer_dt, &infer_psnr,
-                            infer_top);
-                        if (ie == GPUCOMPRESS_SUCCESS && infer_action >= 0) {
-                            wi.has_inference      = true;
-                            wi.action             = infer_action;
-                            wi.predicted_ratio    = infer_ratio;
-                            wi.predicted_comp_time = infer_ct;
-                            wi.predicted_decomp_time = infer_dt;
-                            wi.predicted_psnr     = infer_psnr;
-                            memcpy(wi.top_actions, infer_top, sizeof(infer_top));
-                            /* Capture Stage 1 timing from infer_ctx CUDA events */
-                            cudaEventElapsedTime(&wi.infer_nn_ms, infer_ctx->nn_start, infer_ctx->nn_stop);
-                            cudaEventElapsedTime(&wi.infer_stats_ms, infer_ctx->stats_start, infer_ctx->stats_stop);
-                            /* Copy stats from infer_ctx to a per-chunk buffer so
-                             * Stage 2 worker can reuse them for SGD without recomputing.
-                             * infer_ctx->d_stats will be overwritten by the next chunk. */
-                            AutoStatsGPU* d_sc = nullptr;
-                            if (cudaMalloc(&d_sc, sizeof(AutoStatsGPU)) != cudaSuccess) {
-                                fprintf(stderr, "gpucompress VOL: stats copy alloc failed\n");
-                                ret = -1; break;
+                        bool use_heuristic = (g_selection_mode.load() == GPUCOMPRESS_SELECT_HEURISTIC);
+
+                        if (use_heuristic) {
+                            /* Heuristic path: run stats only, pick action from entropy */
+                            double h_entropy = 0, h_mad = 0, h_deriv = 0;
+                            cudaEventRecord(infer_ctx->stats_start, infer_ctx->stream);
+                            int src = gpucompress::runStatsOnlyPipeline(
+                                wi.src, wi.sz, infer_ctx->stream,
+                                &h_entropy, &h_mad, &h_deriv);
+                            cudaEventRecord(infer_ctx->stats_stop, infer_ctx->stream);
+
+                            if (src != 0) {
+                                fprintf(stderr, "gpucompress VOL: heuristic stats pipeline failed\n");
+                            } else if (src == 0) {
+                                wi.has_inference      = true;
+                                wi.action             = heuristic_select_action(h_entropy);
+                                wi.predicted_ratio    = 0.0f;  /* no prediction */
+                                wi.predicted_comp_time = 0.0f;
+                                wi.predicted_decomp_time = 0.0f;
+                                wi.predicted_psnr     = 0.0f;
+                                memset(wi.top_actions, 0, sizeof(wi.top_actions));
+                                wi.infer_nn_ms    = 0.0f;
+                                cudaEventElapsedTime(&wi.infer_stats_ms,
+                                    infer_ctx->stats_start, infer_ctx->stats_stop);
+                                wi.d_stats_copy   = nullptr;  /* no SGD in heuristic mode */
                             }
-                            cudaError_t sc_err = cudaMemcpyAsync(d_sc, infer_ctx->d_stats, sizeof(AutoStatsGPU),
-                                                                  cudaMemcpyDeviceToDevice, infer_ctx->stream);
-                            if (sc_err != cudaSuccess) {
-                                fprintf(stderr, "gpucompress VOL: stats copy memcpy failed\n");
-                                cudaFree(d_sc); ret = -1; break;
+                        } else {
+                            /* NN path: full stats + inference */
+                            int infer_action = -1;
+                            float infer_ratio = 0, infer_ct = 0, infer_dt = 0, infer_psnr = 0;
+                            int infer_top[32] = {0};
+                            gpucompress_error_t ie = gpucompress_infer_gpu(
+                                wi.src, wi.sz, &cfg, nullptr, infer_ctx,
+                                &infer_action, &infer_ratio, &infer_ct, &infer_dt, &infer_psnr,
+                                infer_top);
+                            if (ie == GPUCOMPRESS_SUCCESS && infer_action >= 0) {
+                                wi.has_inference      = true;
+                                wi.action             = infer_action;
+                                wi.predicted_ratio    = infer_ratio;
+                                wi.predicted_comp_time = infer_ct;
+                                wi.predicted_decomp_time = infer_dt;
+                                wi.predicted_psnr     = infer_psnr;
+                                memcpy(wi.top_actions, infer_top, sizeof(infer_top));
+                                /* Capture Stage 1 timing from infer_ctx CUDA events */
+                                cudaEventElapsedTime(&wi.infer_nn_ms, infer_ctx->nn_start, infer_ctx->nn_stop);
+                                cudaEventElapsedTime(&wi.infer_stats_ms, infer_ctx->stats_start, infer_ctx->stats_stop);
+                                /* Copy stats from infer_ctx to a per-chunk buffer so
+                                 * Stage 2 worker can reuse them for SGD without recomputing.
+                                 * infer_ctx->d_stats will be overwritten by the next chunk. */
+                                AutoStatsGPU* d_sc = nullptr;
+                                if (cudaMalloc(&d_sc, sizeof(AutoStatsGPU)) != cudaSuccess) {
+                                    fprintf(stderr, "gpucompress VOL: stats copy alloc failed\n");
+                                    ret = -1; break;
+                                }
+                                cudaError_t sc_err = cudaMemcpyAsync(d_sc, infer_ctx->d_stats, sizeof(AutoStatsGPU),
+                                                                      cudaMemcpyDeviceToDevice, infer_ctx->stream);
+                                if (sc_err != cudaSuccess) {
+                                    fprintf(stderr, "gpucompress VOL: stats copy memcpy failed\n");
+                                    cudaFree(d_sc); ret = -1; break;
+                                }
+                                sc_err = cudaStreamSynchronize(infer_ctx->stream);
+                                if (sc_err != cudaSuccess) {
+                                    fprintf(stderr, "gpucompress VOL: stats copy sync failed\n");
+                                    cudaFree(d_sc); ret = -1; break;
+                                }
+                                wi.d_stats_copy = d_sc;
                             }
-                            sc_err = cudaStreamSynchronize(infer_ctx->stream);
-                            if (sc_err != cudaSuccess) {
-                                fprintf(stderr, "gpucompress VOL: stats copy sync failed\n");
-                                cudaFree(d_sc); ret = -1; break;
-                            }
-                            wi.d_stats_copy = d_sc;
                         }
                     }
 

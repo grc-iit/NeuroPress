@@ -20,6 +20,7 @@ set(LIB_SOURCES
     src/nn/nn_gpu.cu
     src/api/gpucompress_diagnostics.cpp
     src/stats/stats_kernel.cu
+    src/selection/heuristic.cu
     src/gray-scott/gray_scott_gpu.cu
     src/gray-scott/gray_scott_sim.cu
     src/vpic/vpic_adapter.cu

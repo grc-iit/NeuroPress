@@ -6,6 +6,7 @@
 #   1. nvcomp 5.1.0       -> /tmp/include, /tmp/lib
 #   2. HDF5 2.0.0         -> /tmp/hdf5-install  (for VOL connector)
 #   3. Builds the project -> build/
+#   4. SDRBench datasets  -> data/sdrbench/  (for SC benchmarks)
 #
 # Run with: ./scripts/install_dependencies.sh
 #
@@ -50,6 +51,15 @@ NVCOMP_URL="https://developer.download.nvidia.com/compute/nvcomp/redist/nvcomp/l
 HDF5_VERSION="2.0.0"
 HDF5_INSTALL_DIR="/tmp/hdf5-install"
 HDF5_URL="https://github.com/HDFGroup/hdf5/releases/download/${HDF5_VERSION}/hdf5-${HDF5_VERSION}.tar.gz"
+
+# SDRBench datasets for SC benchmark evaluation
+SDRBENCH_DIR="${_PROJECT_DIR}/data/sdrbench"
+SDRBENCH_BASE_URL="https://g-8d6b0.fd635.8443.data.globus.org/ds131.2/Data-Reduction-Repo/raw-data"
+declare -A SDRBENCH_DATASETS=(
+    ["hurricane_isabel"]="Hurricane-ISABEL/SDRBENCH-Hurricane-ISABEL-100x500x500.tar.gz"
+    ["nyx"]="EXASKY/NYX/SDRBENCH-EXASKY-NYX-512x512x512.tar.gz"
+    ["cesm_atm"]="CESM-ATM/SDRBENCH-CESM-ATM-cleared-1800x3600.tar.gz"
+)
 
 # Default CUDA architecture (sm_80 = Ampere A100).
 # Override: CUDA_ARCH=90 ./scripts/install_dependencies.sh
@@ -124,7 +134,7 @@ echo_info "Target CUDA architecture: sm_${CUDA_ARCH}"
 # Download and install nvcomp
 # ============================================================================
 
-echo_info "=== Step 1/3: Installing nvcomp ${NVCOMP_VERSION} ==="
+echo_info "=== Step 1/4: Installing nvcomp ${NVCOMP_VERSION} ==="
 
 # Create install directories
 mkdir -p "${NVCOMP_INSTALL_DIR}/include"
@@ -167,7 +177,7 @@ fi
 # Download, build, and install HDF5 2.0.0
 # ============================================================================
 
-echo_info "=== Step 2/3: Building HDF5 ${HDF5_VERSION} (for VOL connector) ==="
+echo_info "=== Step 2/4: Building HDF5 ${HDF5_VERSION} (for VOL connector) ==="
 
 HDF5_ARCHIVE="/tmp/hdf5-${HDF5_VERSION}.tar.gz"
 HDF5_SRC_DIR="/tmp/hdf5-${HDF5_VERSION}"
@@ -227,7 +237,7 @@ fi
 # Build project
 # ============================================================================
 
-echo_info "=== Step 3/3: Building GPUCompress ==="
+echo_info "=== Step 3/4: Building GPUCompress ==="
 
 cd "${_PROJECT_DIR}"
 rm -rf build
@@ -247,6 +257,37 @@ cmake .. \
     ${CMAKE_EXTRA_ARGS}
 
 make -j$(nproc)
+
+# ============================================================================
+# Download SDRBench datasets
+# ============================================================================
+
+echo_info "=== Step 4/4: Downloading SDRBench datasets ==="
+
+mkdir -p "${SDRBENCH_DIR}"
+
+for dataset in "${!SDRBENCH_DATASETS[@]}"; do
+    DATASET_DIR="${SDRBENCH_DIR}/${dataset}"
+    ARCHIVE="${SDRBENCH_DIR}/${dataset}.tar.gz"
+    URL="${SDRBENCH_BASE_URL}/${SDRBENCH_DATASETS[$dataset]}"
+
+    if [[ -d "${DATASET_DIR}" ]] && [[ -n "$(ls -A "${DATASET_DIR}" 2>/dev/null)" ]]; then
+        echo_info "  ${dataset} already exists, skipping"
+        continue
+    fi
+
+    echo_info "  Downloading ${dataset}..."
+    if curl -L -o "${ARCHIVE}" "${URL}" 2>/dev/null; then
+        mkdir -p "${DATASET_DIR}"
+        tar xzf "${ARCHIVE}" -C "${DATASET_DIR}"
+        rm -f "${ARCHIVE}"
+        echo_info "  ${dataset} ... OK"
+    else
+        echo_warn "  ${dataset} download failed (non-critical, can retry later)"
+    fi
+done
+
+echo_info "SDRBench datasets installed at ${SDRBENCH_DIR}"
 
 # ============================================================================
 # Verify build
@@ -281,6 +322,7 @@ if [[ "$FAIL" -eq 0 ]]; then
     echo "Dependencies installed:"
     echo "  - nvcomp ${NVCOMP_VERSION}       -> /tmp/include, /tmp/lib"
     echo "  - HDF5 ${HDF5_VERSION}           -> ${HDF5_INSTALL_DIR}"
+    echo "  - SDRBench datasets    -> ${SDRBENCH_DIR}"
     echo ""
     echo "Built targets:"
     echo "  - build/gpu_compress             (CLI compression)"

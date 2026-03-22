@@ -22,19 +22,23 @@
 set +e  # Don't exit on error — VPIC cleanup may segfault after benchmark completes
 
 # ── Configuration ──
-NX=156                  # Grid size: (NX+2)^3 * 16 * 4 bytes (~253 MB for NX=156)
-CHUNK_MB=4              # Chunk size in MB
-TIMESTEPS=100           # Number of multi-timestep writes
-RUNS=1                  # Single-shot repetitions
-WARMUP_STEPS=100        # VPIC physics warmup steps
-DEBUG_NN=1              # 1=print NN rankings, 0=quiet
+# Override with env vars: NX=64 TIMESTEPS=5 bash benchmarks/vpic-kokkos/run_vpic_eval.sh
+NX=${NX:-156}                  # Grid size: (NX+2)^3 * 16 * 4 bytes (~253 MB for NX=156)
+CHUNK_MB=${CHUNK_MB:-4}        # Chunk size in MB
+TIMESTEPS=${TIMESTEPS:-100}    # Number of multi-timestep writes
+RUNS=${RUNS:-1}                # Single-shot repetitions
+WARMUP_STEPS=${WARMUP_STEPS:-100}  # VPIC physics warmup steps
+DEBUG_NN=${DEBUG_NN:-1}        # 1=print NN rankings, 0=quiet
 
 # ── Paths ──
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 GPU_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 WEIGHTS="$GPU_DIR/neural_net/weights/model.nnwt"
-MPIRUN="/opt/nvidia/hpc_sdk/Linux_x86_64/25.3/comm_libs/11.8/hpcx/hpcx-2.14/ompi/bin/mpirun"
 VPIC_BIN="$SCRIPT_DIR/vpic_benchmark_deck.Linux"
+VPIC_DECK="$SCRIPT_DIR/vpic_benchmark_deck.cxx"
+
+# LD_LIBRARY_PATH: our HDF5 must come first to avoid conflict with system HDF5
+VPIC_LD_PATH="/tmp/hdf5-install/lib:$GPU_DIR/build:/tmp/lib:/opt/cray/libfabric/1.22.0/lib64:/opt/cray/pe/lib64"
 
 # ── Eval directory ──
 EVAL_NAME="eval_NX${NX}_chunk${CHUNK_MB}mb_ts${TIMESTEPS}"
@@ -95,6 +99,7 @@ for cfg_line in "${CONFIGS[@]}"; do
 
     # Run benchmark in background so we can show progress
     RUN_START=$(date +%s)
+    LD_LIBRARY_PATH="$VPIC_LD_PATH" \
     GPUCOMPRESS_DEBUG_NN=$DEBUG_NN \
     GPUCOMPRESS_WEIGHTS="$WEIGHTS" \
     VPIC_NX=$NX \
@@ -105,7 +110,7 @@ for cfg_line in "${CONFIGS[@]}"; do
     VPIC_W0=$W0 \
     VPIC_W1=$W1 \
     VPIC_W2=$W2 \
-    "$MPIRUN" -np 1 "$VPIC_BIN" > "$LOG_FILE" 2>&1 &
+    "$VPIC_BIN" "$VPIC_DECK" > "$LOG_FILE" 2>&1 &
     PID=$!
 
     # Simple progress: just show elapsed time

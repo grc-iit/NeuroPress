@@ -91,8 +91,12 @@
 #define REINFORCE_LR        0.1f
 #define REINFORCE_MAPE      0.10f
 
-#define TMP_NOCOMP   "/tmp/bm_gs_nocomp.h5"
-#define TMP_NN       "/tmp/bm_gs_nn.h5"
+#define TMP_NOCOMP    "/tmp/bm_gs_nocomp.h5"
+#define TMP_FIX_LZ4   "/tmp/bm_gs_fix_lz4.h5"
+#define TMP_FIX_GDEFL "/tmp/bm_gs_fix_gdefl.h5"
+#define TMP_FIX_ZSTD  "/tmp/bm_gs_fix_zstd.h5"
+#define TMP_HEUR      "/tmp/bm_gs_heur.h5"
+#define TMP_NN        "/tmp/bm_gs_nn.h5"
 #define TMP_NN_RL    "/tmp/bm_gs_nn_rl.h5"
 #define TMP_NN_RLEXP "/tmp/bm_gs_nn_rlexp.h5"
 
@@ -291,6 +295,23 @@ static hid_t make_dcpl_auto(int L, int chunk_z, double eb = 0.0)
     cd[1] = 0;
     cd[2] = 0;
     pack_double_cd(eb, &cd[3], &cd[4]);
+    H5Pset_filter(dcpl, H5Z_FILTER_GPUCOMPRESS,
+                  H5Z_FLAG_OPTIONAL, H5Z_GPUCOMPRESS_CD_NELMTS, cd);
+    return dcpl;
+}
+
+/* 3D chunked DCPL for a fixed algorithm (no NN, no preprocessing) */
+static hid_t make_dcpl_fixed(int L, int chunk_z, gpucompress_algorithm_t algo)
+{
+    hsize_t cdims[3] = { (hsize_t)L, (hsize_t)L, (hsize_t)chunk_z };
+    hid_t dcpl = H5Pcreate(H5P_DATASET_CREATE);
+    H5Pset_chunk(dcpl, 3, cdims);
+
+    unsigned int cd[H5Z_GPUCOMPRESS_CD_NELMTS];
+    cd[0] = (unsigned int)algo;
+    cd[1] = 0; /* no preprocessing */
+    cd[2] = 0;
+    cd[3] = 0; cd[4] = 0; /* error_bound = 0.0 */
     H5Pset_filter(dcpl, H5Z_FILTER_GPUCOMPRESS,
                   H5Z_FLAG_OPTIONAL, H5Z_GPUCOMPRESS_CD_NELMTS, cd);
     return dcpl;
@@ -993,7 +1014,8 @@ int main(int argc, char **argv)
     int inject_patterns = 0; /* --inject-patterns: overwrite middle chunks with contrasting data */
 
     /* Phase selection: bit flags */
-    enum { P_NOCOMP = 1, P_NN = 4, P_NNRL = 8, P_NNRLEXP = 16 };
+    enum { P_NOCOMP = 1, P_FIX_LZ4 = 2, P_FIX_GDEFL = 4, P_FIX_ZSTD = 8,
+           P_HEUR = 16, P_NN = 32, P_NNRL = 64, P_NNRLEXP = 128 };
     unsigned int phase_mask = 0;  /* 0 = run all */
 
     /* Parse args */
@@ -1032,12 +1054,17 @@ int main(int argc, char **argv)
             out_dir_override = argv[++i];
         } else if (strcmp(argv[i], "--phase") == 0 && i + 1 < argc) {
             const char *p = argv[++i];
-            if      (strcmp(p, "no-comp") == 0)      phase_mask |= P_NOCOMP;
+            if      (strcmp(p, "no-comp") == 0)        phase_mask |= P_NOCOMP;
+            else if (strcmp(p, "fixed-lz4") == 0)     phase_mask |= P_FIX_LZ4;
+            else if (strcmp(p, "fixed-gdeflate") == 0) phase_mask |= P_FIX_GDEFL;
+            else if (strcmp(p, "fixed-zstd") == 0)    phase_mask |= P_FIX_ZSTD;
+            else if (strcmp(p, "entropy-heuristic") == 0) phase_mask |= P_HEUR;
             else if (strcmp(p, "nn") == 0)            phase_mask |= P_NN;
             else if (strcmp(p, "nn-rl") == 0)         phase_mask |= P_NNRL;
             else if (strcmp(p, "nn-rl+exp50") == 0)   phase_mask |= P_NNRLEXP;
             else { fprintf(stderr, "Unknown phase: %s\n"
-                           "  Valid: no-comp, nn, nn-rl, nn-rl+exp50\n", p);
+                           "  Valid: no-comp, fixed-lz4, fixed-gdeflate, fixed-zstd,\n"
+                           "         entropy-heuristic, nn, nn-rl, nn-rl+exp50\n", p);
                    return 1; }
         } else if (strcmp(argv[i], "--verbose-chunks") == 0) {
             verbose_chunks = 1;
@@ -1056,11 +1083,12 @@ int main(int argc, char **argv)
                 "  --w0/w1/w2  Cost model weights (default 1/1/1)\n"
                 "              w0=comp_time, w1=decomp_time, w2=IO_cost\n"
                 "              e.g. --w0 0 --w1 0 --w2 1  (ratio-only ranking)\n"
-                "  Phases: no-comp, nn, nn-rl, nn-rl+exp50\n"
+                "  Phases: no-comp, entropy-heuristic, nn, nn-rl, nn-rl+exp50\n"
                 "  Use --phase multiple times to select specific phases.\n", argv[0]);
         return 1;
     }
-    if (phase_mask == 0) phase_mask = P_NOCOMP | P_NN | P_NNRL | P_NNRLEXP;
+    if (phase_mask == 0) phase_mask = P_NOCOMP | P_FIX_LZ4 | P_FIX_GDEFL | P_FIX_ZSTD
+                                    | P_HEUR | P_NN | P_NNRL | P_NNRLEXP;
 
     /* Compute chunk_z from chunk_mb if not explicitly set */
     if (chunk_z <= 0 && chunk_mb > 0) {
@@ -1166,7 +1194,7 @@ int main(int argc, char **argv)
         inject_contrasting_patterns(d_v, L, chunk_z);
     }
 
-    PhaseResult results[4];
+    PhaseResult results[8];
     int n_phases = 0;
     int any_fail = 0;
 
@@ -1199,7 +1227,83 @@ int main(int argc, char **argv)
         n_phases++;
     }
 
-    /* ── Phase 2: nn (VOL, ALGO_AUTO, inference-only) ────────────── */
+    /* ── Phases 2-4: fixed-algo baselines ────────────────────────── */
+    struct FixedAlgoPhase {
+        unsigned int mask;
+        const char *name;
+        const char *tmp_file;
+        gpucompress_algorithm_t algo;
+    };
+    FixedAlgoPhase fixed_phases[] = {
+        { P_FIX_LZ4,   "fixed-lz4",      TMP_FIX_LZ4,   GPUCOMPRESS_ALGO_LZ4 },
+        { P_FIX_GDEFL, "fixed-gdeflate",  TMP_FIX_GDEFL, GPUCOMPRESS_ALGO_GDEFLATE },
+        { P_FIX_ZSTD,  "fixed-zstd",      TMP_FIX_ZSTD,  GPUCOMPRESS_ALGO_ZSTD },
+    };
+    for (int fi = 0; fi < 3; fi++) {
+        if (!(phase_mask & fixed_phases[fi].mask)) continue;
+        printf("\n── Phase %d: %s ─────────────────────────────────────\n",
+               n_phases + 1, fixed_phases[fi].name);
+        gpucompress_disable_online_learning();
+        gpucompress_set_exploration(0);
+        hid_t dcpl_f = make_dcpl_fixed(L, chunk_z, fixed_phases[fi].algo);
+        PhaseResult runs_buf[32];
+        int eff_runs = (n_runs > 32) ? 32 : n_runs;
+        for (int run = 0; run < eff_runs; run++) {
+            if (eff_runs > 1) printf("  Run %d/%d... ", run + 1, eff_runs);
+            else printf("  Write + Read + Verify... ");
+            fflush(stdout);
+            double t0 = now_ms();
+            rc = run_phase_vol(d_v, d_read, d_count,
+                               n_floats, L, chunk_z,
+                               fixed_phases[fi].name, fixed_phases[fi].tmp_file,
+                               dcpl_f, &runs_buf[run]);
+            printf("done (%.1fs)\n", (now_ms() - t0) / 1000.0);
+            runs_buf[run].sim_ms = sim_ms;
+            if (rc) any_fail = 1;
+        }
+        if (eff_runs > 1)
+            merge_phase_results(runs_buf, eff_runs, &results[n_phases]);
+        else
+            results[n_phases] = runs_buf[0];
+        results[n_phases].n_runs = eff_runs;
+        H5Pclose(dcpl_f);
+        n_phases++;
+    }
+
+    /* ── Phase 5: entropy-heuristic (VOL, rule-based selector) ───── */
+    if (phase_mask & P_HEUR) {
+        printf("\n── Phase %d: entropy-heuristic (VOL, rule-based) ────────────\n", n_phases + 1);
+        gpucompress_disable_online_learning();
+        gpucompress_set_exploration(0);
+        gpucompress_set_selection_mode(GPUCOMPRESS_SELECT_HEURISTIC);
+        hid_t dcpl_h = make_dcpl_auto(L, chunk_z, error_bound);
+        PhaseResult runs_buf[32];
+        int eff_runs = (n_runs > 32) ? 32 : n_runs;
+        for (int run = 0; run < eff_runs; run++) {
+            if (eff_runs > 1) printf("  Run %d/%d... ", run + 1, eff_runs);
+            else printf("  Write + Read + Verify... ");
+            fflush(stdout);
+            double t0 = now_ms();
+            rc = run_phase_vol(d_v, d_read, d_count,
+                               n_floats, L, chunk_z,
+                               "entropy-heuristic", TMP_HEUR, dcpl_h,
+                               &runs_buf[run]);
+            printf("done (%.1fs)\n", (now_ms() - t0) / 1000.0);
+            runs_buf[run].sim_ms = sim_ms;
+            if (rc) any_fail = 1;
+        }
+        if (eff_runs > 1)
+            merge_phase_results(runs_buf, eff_runs, &results[n_phases]);
+        else
+            results[n_phases] = runs_buf[0];
+        results[n_phases].n_runs = eff_runs;
+        H5Pclose(dcpl_h);
+        write_chunk_csv("entropy-heuristic", n_chunks);
+        gpucompress_set_selection_mode(GPUCOMPRESS_SELECT_NN);  /* restore */
+        n_phases++;
+    }
+
+    /* ── Phase 3: nn (VOL, ALGO_AUTO, inference-only) ────────────── */
     if (phase_mask & P_NN) {
         printf("\n── Phase %d: nn (VOL, ALGO_AUTO, inference-only) ────────────\n", n_phases + 1);
         gpucompress_disable_online_learning();
@@ -1642,6 +1746,10 @@ int main(int argc, char **argv)
     gpucompress_cleanup();
 
     remove(TMP_NOCOMP);
+    remove(TMP_FIX_LZ4);
+    remove(TMP_FIX_GDEFL);
+    remove(TMP_FIX_ZSTD);
+    remove(TMP_HEUR);
     remove(TMP_NN);
     remove(TMP_NN_RL);
     remove(TMP_NN_RLEXP);

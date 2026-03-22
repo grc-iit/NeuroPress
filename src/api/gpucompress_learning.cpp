@@ -103,6 +103,18 @@ extern "C" void gpucompress_batched_decomp_sgd(void) {
 }
 
 /* ============================================================
+ * Algorithm Selection Mode
+ * ============================================================ */
+
+extern "C" void gpucompress_set_selection_mode(gpucompress_selection_mode_t mode) {
+    g_selection_mode.store(static_cast<int>(mode));
+}
+
+extern "C" gpucompress_selection_mode_t gpucompress_get_selection_mode(void) {
+    return static_cast<gpucompress_selection_mode_t>(g_selection_mode.load());
+}
+
+/* ============================================================
  * Online Learning Controls
  * ============================================================ */
 

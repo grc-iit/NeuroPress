@@ -38,24 +38,38 @@ import numpy as np
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 
-PHASE_ORDER = ["no-comp", "exhaustive", "nn", "nn-rl", "nn-rl+exp50", "nn-rl+exp"]
+PHASE_ORDER = [
+    "no-comp",
+    "fixed-lz4", "fixed-gdeflate", "fixed-zstd",
+    "entropy-heuristic",
+    "exhaustive",
+    "nn", "nn-rl", "nn-rl+exp50", "nn-rl+exp",
+]
 
 PHASE_COLORS = {
-    "no-comp":     "#999999",
-    "exhaustive":  "#5778a4",
-    "nn":          "#e49444",
-    "nn-rl":       "#6a9f58",
-    "nn-rl+exp50": "#c85a5a",
-    "nn-rl+exp":   "#c85a5a",
+    "no-comp":            "#999999",
+    "fixed-lz4":          "#7fbf7f",
+    "fixed-gdeflate":     "#4daf4a",
+    "fixed-zstd":         "#2d7d2d",
+    "entropy-heuristic":  "#b07cc6",
+    "exhaustive":         "#5778a4",
+    "nn":                 "#e49444",
+    "nn-rl":              "#6a9f58",
+    "nn-rl+exp50":        "#c85a5a",
+    "nn-rl+exp":          "#c85a5a",
 }
 
 PHASE_LABELS = {
-    "no-comp":     "No Comp",
-    "exhaustive":  "Exhaustive\nSearch",
-    "nn":          "NN\n(Inference)",
-    "nn-rl":       "NN+SGD",
-    "nn-rl+exp50": "NN+SGD\n+Explore",
-    "nn-rl+exp":   "NN+SGD\n+Explore",
+    "no-comp":            "No Comp",
+    "fixed-lz4":          "Fixed\nLZ4",
+    "fixed-gdeflate":     "Fixed\nGDeflate",
+    "fixed-zstd":         "Fixed\nZstd",
+    "entropy-heuristic":  "Entropy\nHeuristic",
+    "exhaustive":         "Exhaustive\nSearch",
+    "nn":                 "NN\n(Inference)",
+    "nn-rl":              "NN+SGD",
+    "nn-rl+exp50":        "NN+SGD\n+Explore",
+    "nn-rl+exp":          "NN+SGD\n+Explore",
 }
 
 # Auto-detection paths
@@ -125,6 +139,20 @@ def g(row, *keys, default=0.0):
     return default
 
 
+def _normalize_rows(rows):
+    """Ensure rows have orig_mib/file_mib (convert from bytes if needed)."""
+    for r in rows:
+        if "orig_mib" not in r and "orig_mb" not in r and "orig_bytes" in r:
+            r["orig_mib"] = r["orig_bytes"] / (1024 * 1024)
+        if "file_mib" not in r and "file_mb" not in r and "file_bytes" in r:
+            r["file_mib"] = r["file_bytes"] / (1024 * 1024)
+        if "write_mibps" not in r and "write_mbps" in r:
+            r["write_mibps"] = r["write_mbps"]
+        if "read_mibps" not in r and "read_mbps" in r:
+            r["read_mibps"] = r["read_mbps"]
+    return rows
+
+
 _PHASE_ALIASES = {"oracle": "exhaustive"}
 
 
@@ -183,6 +211,7 @@ def _merge_timestep_phases(rows, ts_csv_path, orig_mib):
 
 def _ordered(rows):
     """Return rows ordered by PHASE_ORDER."""
+    _normalize_rows(rows)
     by_phase = {}
     for r in rows:
         phase = _PHASE_ALIASES.get(r["phase"], r["phase"])
@@ -1001,6 +1030,7 @@ def main():
     parser.add_argument("--vpic-csv", help="VPIC aggregate CSV")
     parser.add_argument("--vpic-dir", help="VPIC results directory (e.g. .../eval_NX156_chunk4mb_ts100/balanced_w1-1-1)")
     parser.add_argument("--gs-dir", help="Gray-Scott results directory")
+    parser.add_argument("--sdrbench-dir", help="SDRBench results directory (contains benchmark_*.csv)")
     parser.add_argument("--output-dir", help="Output directory (default: alongside CSV)")
     parser.add_argument("--view", action="append", default=None,
                         help=f"Views to generate: {ALL_VIEWS} (default: all)")
@@ -1164,11 +1194,44 @@ def main():
         except Exception as e:
             print(f"  Warning: VPIC milestone actions plot failed: {e}")
 
+    # ── SDRBench datasets ──
+    sdrbench_dir = args.sdrbench_dir or os.path.join(SCRIPT_DIR, "sdrbench", "results")
+    if os.path.isdir(sdrbench_dir) and "summary" in views:
+        import glob as _glob
+        sdr_csvs = sorted(_glob.glob(os.path.join(sdrbench_dir, "benchmark_*.csv")))
+        # Exclude chunk/timestep CSVs
+        sdr_csvs = [c for c in sdr_csvs
+                     if "_chunks" not in c and "_timesteps" not in c
+                     and "_timestep_" not in c]
+        for sdr_csv in sdr_csvs:
+            found_any = True
+            print(f"Loading SDRBench: {sdr_csv}")
+            rows = parse_csv(sdr_csv)
+            if not rows:
+                continue
+            r0 = rows[0]
+            dataset_name = r0.get("dataset", os.path.basename(sdr_csv).replace("benchmark_", "").replace(".csv", ""))
+            orig_bytes = g(r0, "orig_bytes")
+            orig_mib = orig_bytes / (1024 * 1024) if orig_bytes > 1024 else orig_bytes
+            n_ch = int(g(r0, "n_chunks"))
+            chunk_mb = orig_mib / max(n_ch, 1)
+            meta = f"Dataset: {dataset_name} ({orig_mib:.0f} MiB) | Chunks: {n_ch} x {chunk_mb:.0f} MiB"
+
+            # Merge multi-field phases if timestep CSV exists
+            ts_csv = os.path.join(sdrbench_dir, f"benchmark_{dataset_name}_timesteps.csv")
+            if os.path.exists(ts_csv):
+                _merge_timestep_phases(rows, ts_csv, orig_mib)
+
+            out_name = f"benchmark_{dataset_name}.png"
+            make_summary_figure(f"SDRBench: {dataset_name}", rows,
+                                os.path.join(sdrbench_dir, out_name), meta)
+
     if not found_any:
         print("ERROR: No benchmark CSV files found.")
         print("Expected locations:")
         for p in DEFAULT_GS_AGG + DEFAULT_VPIC_AGG:
             print(f"  {p}")
+        print(f"  {sdrbench_dir}/benchmark_*.csv")
         print("\nRun benchmarks first, or specify paths explicitly.")
         sys.exit(1)
 

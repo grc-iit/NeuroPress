@@ -15,6 +15,7 @@ cmake_install.cmake
 Makefile
 
 # Data / model artifacts
+data/
 *.bin
 *.nnwt
 *.pt
