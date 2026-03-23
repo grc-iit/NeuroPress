@@ -233,9 +233,6 @@ def _merge_timestep_phases(rows, ts_csv_path, orig_mib):
             "sgd_fires": total_sgd,
             "explorations": total_expl,
             "mismatches": 0,
-            "smape_ratio_pct": _avg_all(ph_rows, "smape_ratio"),
-            "smape_comp_pct": _avg_all(ph_rows, "smape_comp"),
-            "smape_decomp_pct": _avg_all(ph_rows, "smape_decomp"),
             "mape_ratio_pct": _avg_all(ph_rows, "mape_ratio"),
             "mape_comp_pct": _avg_all(ph_rows, "mape_comp"),
             "mape_decomp_pct": _avg_all(ph_rows, "mape_decomp"),
@@ -503,9 +500,9 @@ def make_timestep_figure(ts_csv_path, output_path):
     phases_present = [p for p in phase_order if p in by_phase]
 
     metric_keys = [
-        ("Compression Ratio",  "mape_ratio",  "smape_ratio"),
-        ("Compression Time",   "mape_comp",   "smape_comp"),
-        ("Decompression Time", "mape_decomp", "smape_decomp"),
+        ("Compression Ratio",  "mape_ratio"),
+        ("Compression Time",   "mape_comp"),
+        ("Decompression Time", "mape_decomp"),
     ]
 
     fig, axes = plt.subplots(3, 1, figsize=(14, 10))
@@ -514,13 +511,11 @@ def make_timestep_figure(ts_csv_path, output_path):
                  "(per-metric MAPE averaged across all chunks)",
                  fontsize=14, fontweight="bold", y=0.99)
 
-    for ax, (label, mape_key, smape_key) in zip(axes, metric_keys):
+    for ax, (label, mape_key) in zip(axes, metric_keys):
         for ph in phases_present:
             ph_rows = by_phase[ph]
             timesteps = np.array([g(r, "timestep", "field_idx") for r in ph_rows])
-            mape = np.array([g(r, mape_key, default=-1) for r in ph_rows])
-            if mape[0] < 0:
-                mape = np.array([g(r, smape_key) for r in ph_rows])
+            mape = np.array([g(r, mape_key) for r in ph_rows])
             clipped = np.clip(mape, 0, 200)
 
             sty = phase_styles.get(ph, {"color": "black", "ls": "-", "marker": ".", "lw": 2.0})
@@ -1518,9 +1513,7 @@ def make_cross_dataset_convergence_figure(ts_csv_paths, dataset_names, output_pa
         if not rl_rows:
             rl_rows = rows  # fallback for old CSV without phase column
         timesteps = np.array([g(r, "timestep") for r in rl_rows])
-        mape = np.array([g(r, "mape_ratio", default=-1) for r in rl_rows])
-        if mape[0] < 0:
-            mape = np.array([g(r, "smape_ratio") for r in rl_rows])
+        mape = np.array([g(r, "mape_ratio") for r in rl_rows])
         clipped = np.clip(mape, 0, 300)
         color = dataset_colors[i % len(dataset_colors)]
         ls = dataset_linestyles[i % len(dataset_linestyles)]
