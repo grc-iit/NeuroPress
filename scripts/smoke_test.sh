@@ -1,10 +1,8 @@
 #!/bin/bash
 # ============================================================
-# Smoke Test: Run all benchmark drivers with all phases
-# (including best/exhaustive) on small configs.
+# Smoke Test: Run all benchmark drivers with all phases on small configs.
 #
-# Runs Gray-Scott, SDRBench (Hurricane, Nyx, CESM-ATM), CPU zstd,
-# and VPIC. All phases including best are in the default mask.
+# Runs Gray-Scott, SDRBench (Hurricane, Nyx, CESM-ATM), and VPIC.
 #
 # Usage:
 #   bash scripts/smoke_test.sh
@@ -59,7 +57,7 @@ run_test() {
     fi
 }
 
-# ── 1. Gray-Scott: all phases including best ──
+# ── 1. Gray-Scott: all phases ──
 run_test "Gray-Scott (all phases, L=128, ts=5)" \
     "benchmarks/grayscott/results/smoke_L128/gs_smoke.log" \
     "$GS_BIN" "$WEIGHTS" \
@@ -108,17 +106,7 @@ else
     SKIP=$((SKIP + 1))
 fi
 
-# ── 5. CPU zstd baseline ──
-if command -v zstd &>/dev/null && [ -d "$GPU_DIR/data/sdrbench" ]; then
-    run_test "CPU zstd baseline (all SDRBench datasets)" \
-        "benchmarks/sdrbench/results/smoke/cpu_zstd_smoke.log" \
-        bash benchmarks/sdrbench/run_cpu_zstd_baseline.sh --runs 1
-else
-    echo "  SKIP CPU zstd — zstd not found or data missing"
-    SKIP=$((SKIP + 1))
-fi
-
-# ── 6. VPIC ──
+# ── 5. VPIC ──
 if [ -f "$VPIC_BIN" ] && [ -f /tmp/hdf5-install/lib/libhdf5.so ]; then
     # Only restore JIT wrapper if the binary is not already a valid ELF executable
     # (build_vpic_benchmark.sh produces a pre-linked binary that should not be overwritten)
@@ -154,7 +142,7 @@ else
     SKIP=$((SKIP + 1))
 fi
 
-# ── 7. Generate plots ──
+# ── 6. Generate plots ──
 echo ""
 echo "════════════════════════════════════════════════════════════"
 echo "  Generating plots"

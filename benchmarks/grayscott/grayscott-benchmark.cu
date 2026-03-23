@@ -95,7 +95,6 @@
 #define TMP_FIX_LZ4   "/tmp/bm_gs_fix_lz4.h5"
 #define TMP_FIX_GDEFL "/tmp/bm_gs_fix_gdefl.h5"
 #define TMP_FIX_ZSTD  "/tmp/bm_gs_fix_zstd.h5"
-#define TMP_HEUR      "/tmp/bm_gs_heur.h5"
 #define TMP_NN        "/tmp/bm_gs_nn.h5"
 #define TMP_NN_RL    "/tmp/bm_gs_nn_rl.h5"
 #define TMP_NN_RLEXP "/tmp/bm_gs_nn_rlexp.h5"
@@ -1016,7 +1015,7 @@ int main(int argc, char **argv)
 
     /* Phase selection: bit flags */
     enum { P_NOCOMP = 0x001, P_FIX_LZ4 = 0x002, P_FIX_GDEFL = 0x004, P_FIX_ZSTD = 0x008,
-           P_HEUR = 0x010, P_BEST = 0x020, P_NN = 0x040, P_NNRL = 0x080, P_NNRLEXP = 0x100 };
+           P_NN = 0x040, P_NNRL = 0x080, P_NNRLEXP = 0x100 };
     unsigned int phase_mask = 0;  /* 0 = run all */
 
     /* Parse args */
@@ -1059,14 +1058,12 @@ int main(int argc, char **argv)
             else if (strcmp(p, "fixed-lz4") == 0)           phase_mask |= P_FIX_LZ4;
             else if (strcmp(p, "fixed-gdeflate") == 0)       phase_mask |= P_FIX_GDEFL;
             else if (strcmp(p, "fixed-zstd") == 0)          phase_mask |= P_FIX_ZSTD;
-            else if (strcmp(p, "entropy-heuristic") == 0)   phase_mask |= P_HEUR;
-            else if (strcmp(p, "best") == 0)                phase_mask |= P_BEST;
             else if (strcmp(p, "nn") == 0)                  phase_mask |= P_NN;
             else if (strcmp(p, "nn-rl") == 0)               phase_mask |= P_NNRL;
             else if (strcmp(p, "nn-rl+exp50") == 0)         phase_mask |= P_NNRLEXP;
             else { fprintf(stderr, "Unknown phase: %s\n"
                            "  Valid: no-comp, fixed-lz4, fixed-gdeflate, fixed-zstd,\n"
-                           "         entropy-heuristic, best, nn, nn-rl, nn-rl+exp50\n", p);
+                           "         nn, nn-rl, nn-rl+exp50\n", p);
                    return 1; }
         } else if (strcmp(argv[i], "--verbose-chunks") == 0) {
             verbose_chunks = 1;
@@ -1086,12 +1083,12 @@ int main(int argc, char **argv)
                 "              w0=comp_time, w1=decomp_time, w2=IO_cost\n"
                 "              e.g. --w0 0 --w1 0 --w2 1  (ratio-only ranking)\n"
                 "  Phases: no-comp, fixed-lz4, fixed-gdeflate, fixed-zstd,\n"
-                "         entropy-heuristic, best, nn, nn-rl, nn-rl+exp50\n"
+                "         nn, nn-rl, nn-rl+exp50\n"
                 "  Use --phase multiple times to select specific phases.\n", argv[0]);
         return 1;
     }
     if (phase_mask == 0) phase_mask = P_NOCOMP | P_FIX_LZ4 | P_FIX_GDEFL | P_FIX_ZSTD
-                                    | P_HEUR | P_BEST | P_NN | P_NNRL | P_NNRLEXP;
+                                    | P_NN | P_NNRL | P_NNRLEXP;
 
     /* Compute chunk_z from chunk_mb if not explicitly set */
     if (chunk_z <= 0 && chunk_mb > 0) {
@@ -1271,67 +1268,6 @@ int main(int argc, char **argv)
             results[n_phases] = runs_buf[0];
         results[n_phases].n_runs = eff_runs;
         H5Pclose(dcpl_f);
-        n_phases++;
-    }
-
-    /* ── Phase 5: entropy-heuristic (VOL, rule-based selector) ───── */
-    if (phase_mask & P_HEUR) {
-        printf("\n── Phase %d: entropy-heuristic (VOL, rule-based) ────────────\n", n_phases + 1);
-        gpucompress_disable_online_learning();
-        gpucompress_set_exploration(0);
-        gpucompress_set_selection_mode(GPUCOMPRESS_SELECT_HEURISTIC);
-        hid_t dcpl_h = make_dcpl_auto(L, chunk_z, error_bound);
-        PhaseResult runs_buf[32];
-        int eff_runs = (n_runs > 32) ? 32 : n_runs;
-        for (int run = 0; run < eff_runs; run++) {
-            if (eff_runs > 1) printf("  Run %d/%d... ", run + 1, eff_runs);
-            else printf("  Write + Read + Verify... ");
-            fflush(stdout);
-            double t0 = now_ms();
-            rc = run_phase_vol(d_v, d_read, d_count,
-                               n_floats, L, chunk_z,
-                               "entropy-heuristic", TMP_HEUR, dcpl_h,
-                               &runs_buf[run]);
-            printf("done (%.1fs)\n", (now_ms() - t0) / 1000.0);
-            runs_buf[run].sim_ms = sim_ms;
-            if (rc) any_fail = 1;
-        }
-        if (eff_runs > 1)
-            merge_phase_results(runs_buf, eff_runs, &results[n_phases]);
-        else
-            results[n_phases] = runs_buf[0];
-        results[n_phases].n_runs = eff_runs;
-        H5Pclose(dcpl_h);
-        write_chunk_csv("entropy-heuristic", n_chunks);
-        gpucompress_set_selection_mode(GPUCOMPRESS_SELECT_NN);  /* restore */
-        n_phases++;
-    }
-
-    /* ── Phase: best (exhaustive search, all 32 configs per chunk) ── */
-    if (phase_mask & P_BEST) {
-        printf("\n── Phase %d: best (exhaustive, 32 configs/chunk) ────────────\n", n_phases + 1);
-        gpucompress_disable_online_learning();
-        gpucompress_set_exploration(1);
-        gpucompress_set_best_mode(1);
-        hid_t dcpl_b = make_dcpl_auto(L, chunk_z, error_bound);
-        PhaseResult runs_buf[32];
-        int eff_runs = 1;  /* deterministic, no need for multiple runs */
-        for (int run = 0; run < eff_runs; run++) {
-            printf("  Write + Read + Verify... "); fflush(stdout);
-            double t0 = now_ms();
-            rc = run_phase_vol(d_v, d_read, d_count,
-                               n_floats, L, chunk_z,
-                               "best", "/tmp/bm_gs_best.h5", dcpl_b,
-                               &runs_buf[run]);
-            printf("done (%.1fs)\n", (now_ms() - t0) / 1000.0);
-            runs_buf[run].sim_ms = sim_ms;
-            if (rc) any_fail = 1;
-        }
-        results[n_phases] = runs_buf[0];
-        results[n_phases].n_runs = 1;
-        H5Pclose(dcpl_b);
-        write_chunk_csv("best", n_chunks);
-        gpucompress_set_best_mode(0);
         n_phases++;
     }
 
@@ -1781,8 +1717,6 @@ int main(int argc, char **argv)
     remove(TMP_FIX_LZ4);
     remove(TMP_FIX_GDEFL);
     remove(TMP_FIX_ZSTD);
-    remove(TMP_HEUR);
-    remove("/tmp/bm_gs_best.h5");
     remove(TMP_NN);
     remove(TMP_NN_RL);
     remove(TMP_NN_RLEXP);

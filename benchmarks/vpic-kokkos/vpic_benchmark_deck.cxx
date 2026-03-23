@@ -62,13 +62,12 @@
 #define H5Z_FILTER_GPUCOMPRESS    305
 #define H5Z_GPUCOMPRESS_CD_NELMTS 5
 
-#define N_PHASES 12
+#define N_PHASES 10
 
 #define TMP_NOCOMP    "/tmp/bm_vpic_nocomp.h5"
 #define TMP_FIX_LZ4   "/tmp/bm_vpic_fix_lz4.h5"
 #define TMP_FIX_GDEFL "/tmp/bm_vpic_fix_gdefl.h5"
 #define TMP_FIX_ZSTD  "/tmp/bm_vpic_fix_zstd.h5"
-#define TMP_HEUR      "/tmp/bm_vpic_heur.h5"
 #define TMP_NN        "/tmp/bm_vpic_nn.h5"
 #define TMP_NN_RL    "/tmp/bm_vpic_nn_rl.h5"
 #define TMP_NN_RLEXP "/tmp/bm_vpic_nn_rlexp.h5"
@@ -900,8 +899,6 @@ begin_diagnostics {
             remove(TMP_FIX_LZ4);
             remove(TMP_FIX_GDEFL);
             remove(TMP_FIX_ZSTD);
-            remove(TMP_HEUR);
-            remove("/tmp/bm_vpic_best.h5");
             remove(TMP_NN);
             remove(TMP_NN_RL);
             remove(TMP_NN_RLEXP);
@@ -1250,7 +1247,7 @@ begin_diagnostics {
     global->diag_error_bound = env_eb_diag ? atof(env_eb_diag) : 0.0;
 
     /* Phase selection: VPIC_PHASES="nn-rl" to run only those.
-     * Default (unset or empty): run all 4 phases. */
+     * Default (unset or empty): run all phases. */
     const char* env_phases = getenv("VPIC_PHASES");
     auto phase_enabled = [&](const char* name) -> bool {
         if (!env_phases || env_phases[0] == '\0') return true;  /* all */
@@ -1266,7 +1263,7 @@ begin_diagnostics {
 
     // ── Phase 1: no-comp ──────────────────────────────────────────
     if (phase_enabled("no-comp")) {
-    sim_log("── Phase 1/8: no-comp (GPU→Host→HDF5, VOL-2 fallback) ────────");
+    sim_log("── Phase 1: no-comp (GPU→Host→HDF5, VOL-2 fallback) ────────");
     gpucompress_disable_online_learning();
     gpucompress_set_exploration(0);
     {
@@ -1307,7 +1304,7 @@ begin_diagnostics {
         for (int fi = 0; fi < 3; fi++) {
             if (!phase_enabled(fixed_phases[fi].name)) continue;
             { char _msg[128]; snprintf(_msg, sizeof(_msg),
-              "── Phase %d/8: %s ────────────────────────────",
+              "── Phase %d: %s ────────────────────────────",
               n_phases + 1, fixed_phases[fi].name);
               sim_log(_msg); }
             gpucompress_disable_online_learning();
@@ -1333,55 +1330,6 @@ begin_diagnostics {
                 n_phases++;
             }
         }
-    }
-
-    // ── Phase 5: entropy-heuristic (rule-based selector) ──────────
-    if (phase_enabled("entropy-heuristic")) {
-    sim_log("── Phase 5/8: entropy-heuristic (VOL, rule-based) ──────────");
-    gpucompress_disable_online_learning();
-    gpucompress_set_exploration(0);
-    gpucompress_set_selection_mode(GPUCOMPRESS_SELECT_HEURISTIC);
-    {
-        hid_t dcpl = make_dcpl_auto((hsize_t)chunk_floats, global->diag_error_bound);
-        PhaseResult runs_buf[32];
-        int eff = global->n_runs;
-        for (int run = 0; run < eff; run++) {
-            if (eff > 1) printf("  Run %d/%d... ", run + 1, eff);
-            fflush(stdout);
-            int rc = run_phase("entropy-heuristic", TMP_HEUR,
-                               d_fields, global->d_read, global->h_orig, global->h_read,
-                               n_floats, n_chunks, dcpl, &runs_buf[run]);
-            if (rc) any_fail = 1;
-        }
-        if (eff > 1)
-            merge_phase_results(runs_buf, eff, &results[n_phases]);
-        else
-            results[n_phases] = runs_buf[0];
-        results[n_phases].n_runs = eff;
-        H5Pclose(dcpl);
-        gpucompress_set_selection_mode(GPUCOMPRESS_SELECT_NN);  /* restore */
-        n_phases++;
-    }
-    }
-
-    // ── Phase: best (exhaustive, 32 configs/chunk) ────────────────
-    // Only run when explicitly requested (32x slower than normal phases)
-    if (phase_enabled("best")) {
-    sim_log("── best (exhaustive, 32 configs/chunk) ────────────────────");
-    gpucompress_disable_online_learning();
-    gpucompress_set_exploration(1);
-    gpucompress_set_best_mode(1);
-    {
-        hid_t dcpl = make_dcpl_auto((hsize_t)chunk_floats, global->diag_error_bound);
-        int rc = run_phase("best", "/tmp/bm_vpic_best.h5",
-                           d_fields, global->d_read, global->h_orig, global->h_read,
-                           n_floats, n_chunks, dcpl, &results[n_phases]);
-        results[n_phases].n_runs = 1;
-        H5Pclose(dcpl);
-        gpucompress_set_best_mode(0);
-        if (rc) any_fail = 1;
-        n_phases++;
-    }
     }
 
     // ── Phase: nn (inference-only) ──────────────────────────────
@@ -1543,8 +1491,6 @@ begin_diagnostics {
         remove(TMP_FIX_LZ4);
         remove(TMP_FIX_GDEFL);
         remove(TMP_FIX_ZSTD);
-        remove(TMP_HEUR);
-        remove("/tmp/bm_vpic_best.h5");
         remove(TMP_NN);
         remove(TMP_NN_RL);
         remove(TMP_NN_RLEXP);

@@ -31,7 +31,7 @@
  *   --chunk-mb N     Chunk size in MB (default 4)
  *   --runs N         Repeat single-shot phases N times (mean +/- std)
  *   --phase <name>   Run only specified phase(s). Repeat for multiple.
- *                    Valid: no-comp, fixed-lz4, fixed-gdeflate, fixed-zstd, entropy-heuristic, best, nn, nn-rl, nn-rl+exp50
+ *                    Valid: no-comp, fixed-lz4, fixed-gdeflate, fixed-zstd, nn, nn-rl, nn-rl+exp50
  *   --out-dir DIR    Output directory for CSVs (default: benchmarks/sdrbench/results)
  *   --w0/w1/w2 F     Cost model weights (default 1/1/1)
  *
@@ -73,7 +73,6 @@
 #define TMP_FIX_LZ4   "/tmp/bm_generic_fix_lz4.h5"
 #define TMP_FIX_GDEFL "/tmp/bm_generic_fix_gdefl.h5"
 #define TMP_FIX_ZSTD  "/tmp/bm_generic_fix_zstd.h5"
-#define TMP_HEUR      "/tmp/bm_generic_heur.h5"
 #define TMP_NN        "/tmp/bm_generic_nn.h5"
 #define TMP_NN_RL     "/tmp/bm_generic_nn_rl.h5"
 #define TMP_NN_RLEXP  "/tmp/bm_generic_nn_rlexp.h5"
@@ -87,8 +86,6 @@
 #define P_FIX_LZ4     0x002
 #define P_FIX_GDEFL   0x004
 #define P_FIX_ZSTD    0x008
-#define P_HEUR        0x010
-#define P_BEST        0x020
 #define P_NN          0x040
 #define P_NNRL        0x080
 #define P_NNRLEXP     0x100
@@ -668,6 +665,74 @@ static void merge_phase_results(PhaseResult *runs, int n, PhaseResult *out)
 }
 
 /* ============================================================
+ * Multi-field averaging for single-shot phases.
+ * Runs a VOL phase on every field and averages the results,
+ * so single-shot and multi-timestep phases are comparable.
+ * ============================================================ */
+
+typedef int (*run_phase_fn)(float *d_data, float *d_read,
+                            unsigned long long *d_count,
+                            size_t n_floats, int ndims,
+                            const hsize_t *dims, const hsize_t *chunk_dims,
+                            const char *phase_name, const char *tmp_file,
+                            hid_t dcpl, PhaseResult *r);
+
+typedef int (*run_phase_nocomp_fn)(float *d_data, float *d_read,
+                                   unsigned long long *d_count,
+                                   size_t n_floats, int ndims,
+                                   const hsize_t *dims, const hsize_t *chunk_dims,
+                                   PhaseResult *r);
+
+static void run_phase_all_fields(
+    run_phase_fn fn, float *d_data, float *d_read,
+    unsigned long long *d_count, size_t n_floats, size_t total_bytes,
+    int ndims, const hsize_t *dims, const hsize_t *chunk_dims,
+    const char *phase_name, const char *tmp_file, hid_t dcpl,
+    char fields[][MAX_PATH_LEN], int n_fields,
+    PhaseResult *out, int *any_fail)
+{
+    double sum_ratio = 0, sum_write_ms = 0, sum_read_ms = 0;
+    size_t sum_file_bytes = 0;
+    int count = 0;
+
+    for (int fi = 0; fi < n_fields; fi++) {
+        if (load_field_to_gpu(fields[fi], d_data, total_bytes)) {
+            printf("  field %d: SKIP (load failed)\n", fi);
+            continue;
+        }
+
+        PhaseResult fr;
+        int rc = fn(d_data, d_read, d_count, n_floats, ndims, dims,
+                    chunk_dims, phase_name, tmp_file, dcpl, &fr);
+        if (rc) *any_fail = 1;
+
+        const char *fname = strrchr(fields[fi], '/');
+        fname = fname ? fname + 1 : fields[fi];
+        printf("  field %d/%d: %-30s ratio=%.2fx  write=%.0f MiB/s\n",
+               fi + 1, n_fields, fname, fr.ratio, fr.write_mbps);
+
+        sum_ratio      += fr.ratio;
+        sum_write_ms   += fr.write_ms;
+        sum_read_ms    += fr.read_ms;
+        sum_file_bytes += fr.file_bytes;
+        count++;
+    }
+
+    if (count > 0) {
+        *out = {};
+        snprintf(out->phase, sizeof(out->phase), "%s", phase_name);
+        out->ratio      = sum_ratio / count;
+        out->write_ms   = sum_write_ms / count;
+        out->read_ms    = sum_read_ms / count;
+        out->file_bytes = sum_file_bytes / count;
+        out->orig_bytes = total_bytes;
+        out->write_mbps = (double)total_bytes / (1 << 20) / (out->write_ms / 1000.0);
+        out->read_mbps  = (double)total_bytes / (1 << 20) / (out->read_ms / 1000.0);
+        out->n_runs     = count;
+    }
+}
+
+/* ============================================================
  * Write summary CSV
  * ============================================================ */
 
@@ -779,6 +844,7 @@ int main(int argc, char **argv)
     const char *data_dir     = NULL;
     const char *ext          = DEFAULT_EXT;
     const char *out_dir_override = NULL;
+    const char *name_override = NULL;
     int dims[3] = {0, 0, 0};
     int ndims = 0;
     int chunk_mb = DEFAULT_CHUNK_MB;
@@ -813,8 +879,6 @@ int main(int argc, char **argv)
             else if (strcmp(argv[i], "fixed-lz4") == 0) phase_mask |= P_FIX_LZ4;
             else if (strcmp(argv[i], "fixed-gdeflate") == 0) phase_mask |= P_FIX_GDEFL;
             else if (strcmp(argv[i], "fixed-zstd") == 0) phase_mask |= P_FIX_ZSTD;
-            else if (strcmp(argv[i], "entropy-heuristic") == 0) phase_mask |= P_HEUR;
-            else if (strcmp(argv[i], "best") == 0) phase_mask |= P_BEST;
             else if (strcmp(argv[i], "nn") == 0) phase_mask |= P_NN;
             else if (strcmp(argv[i], "nn-rl") == 0) phase_mask |= P_NNRL;
             else if (strcmp(argv[i], "nn-rl+exp50") == 0) phase_mask |= P_NNRLEXP;
@@ -830,6 +894,8 @@ int main(int argc, char **argv)
             sgd_lr = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--error-bound") == 0 && i + 1 < argc) {
             error_bound = atof(argv[++i]);
+        } else if (strcmp(argv[i], "--name") == 0 && i + 1 < argc) {
+            name_override = argv[++i];
         }
     }
 
@@ -846,11 +912,12 @@ int main(int argc, char **argv)
             "  --ext EXT          File extension filter (default: %s)\n"
             "  --chunk-mb N       Chunk size in MB (default: %d)\n"
             "  --runs N           Repeat single-shot phases N times\n"
-            "  --phase <name>     Run specific phase(s): no-comp, fixed-lz4, fixed-gdeflate, fixed-zstd, entropy-heuristic, best, nn, nn-rl, nn-rl+exp50\n"
+            "  --phase <name>     Run specific phase(s): no-comp, fixed-lz4, fixed-gdeflate, fixed-zstd, nn, nn-rl, nn-rl+exp50\n"
             "  --out-dir DIR      Output directory (default: %s)\n"
             "  --w0/w1/w2 F       Cost model weights\n"
             "  --lr F             SGD learning rate (default: %.2f)\n"
-            "  --error-bound F    Error bound for lossy (default: 0.0 = lossless)\n\n"
+            "  --error-bound F    Error bound for lossy (default: 0.0 = lossless)\n"
+            "  --name NAME        Dataset name for CSV filenames (default: auto from data-dir)\n\n"
             "Examples:\n"
             "  %s model.nnwt --data-dir data/sdrbench/nyx/SDRBENCH-EXASKY-NYX-512x512x512 "
             "--dims 512,512,512 --ext .f32\n"
@@ -862,7 +929,7 @@ int main(int argc, char **argv)
     }
 
     if (phase_mask == 0) phase_mask = P_NOCOMP | P_FIX_LZ4 | P_FIX_GDEFL | P_FIX_ZSTD
-                                    | P_HEUR | P_BEST | P_NN | P_NNRL | P_NNRLEXP;
+                                    | P_NN | P_NNRL | P_NNRLEXP;
 
     /* ── Discover field files ── */
     static char fields[MAX_FIELDS][MAX_PATH_LEN];
@@ -908,9 +975,37 @@ int main(int argc, char **argv)
     double dataset_mb = (double)total_bytes / (1 << 20);
     double cmb = (double)(slice_floats * last_chunk * sizeof(float)) / (1024.0 * 1024.0);
 
-    /* ── Extract dataset name from data_dir ── */
-    const char *dataset_name = strrchr(data_dir, '/');
-    dataset_name = dataset_name ? dataset_name + 1 : data_dir;
+    /* ── Extract dataset name from --name override or data_dir ── */
+    const char *dataset_name;
+    if (name_override) {
+        dataset_name = name_override;
+    } else {
+        dataset_name = strrchr(data_dir, '/');
+        dataset_name = dataset_name ? dataset_name + 1 : data_dir;
+        /* If leaf is purely digits and separators (e.g. "100x500x500"),
+           use the parent directory name instead for readability. */
+        bool leaf_is_dims = true;
+        for (const char *p = dataset_name; *p; p++) {
+            if (!(*p >= '0' && *p <= '9') && *p != 'x' && *p != 'X') {
+                leaf_is_dims = false;
+                break;
+            }
+        }
+        if (leaf_is_dims && dataset_name > data_dir) {
+            /* Walk back to find parent directory name */
+            const char *end = dataset_name - 1; /* points to '/' before leaf */
+            const char *start = end - 1;
+            while (start > data_dir && *start != '/') start--;
+            if (*start == '/') start++;
+            static char parent_name[256];
+            int len = (int)(end - start);
+            if (len > 0 && len < 255) {
+                memcpy(parent_name, start, len);
+                parent_name[len] = '\0';
+                dataset_name = parent_name;
+            }
+        }
+    }
 
     /* ── Print banner ── */
     printf("╔═══════════════════════════════════════════════════════════════════════════╗\n");
@@ -1028,75 +1123,34 @@ int main(int argc, char **argv)
             gpucompress_disable_online_learning();
             gpucompress_set_exploration(0);
             hid_t dcpl_f = make_dcpl_fixed(ndims, chunk_dims, fixed_phases[fi].algo, fixed_phases[fi].preproc);
-            PhaseResult runs_buf[32];
-            int eff_runs = (n_runs > 32) ? 32 : n_runs;
-            for (int run = 0; run < eff_runs; run++) {
-                if (eff_runs > 1) printf("  Run %d/%d\n", run + 1, eff_runs);
-                int rc = run_phase_vol(d_data, d_read, d_count,
-                                       n_floats, ndims, h5_dims, chunk_dims,
-                                       fixed_phases[fi].name, fixed_phases[fi].tmp_file,
-                                       dcpl_f, &runs_buf[run]);
-                if (rc) any_fail = 1;
+            if (n_fields > 1) {
+                /* Run on all fields and average for fair comparison */
+                run_phase_all_fields(run_phase_vol, d_data, d_read, d_count,
+                    n_floats, total_bytes, ndims, h5_dims, chunk_dims,
+                    fixed_phases[fi].name, fixed_phases[fi].tmp_file, dcpl_f,
+                    fields, n_fields,
+                    &results[n_phases], &any_fail);
+            } else {
+                PhaseResult runs_buf[32];
+                int eff_runs = (n_runs > 32) ? 32 : n_runs;
+                for (int run = 0; run < eff_runs; run++) {
+                    if (eff_runs > 1) printf("  Run %d/%d\n", run + 1, eff_runs);
+                    int rc = run_phase_vol(d_data, d_read, d_count,
+                                           n_floats, ndims, h5_dims, chunk_dims,
+                                           fixed_phases[fi].name, fixed_phases[fi].tmp_file,
+                                           dcpl_f, &runs_buf[run]);
+                    if (rc) any_fail = 1;
+                }
+                if (eff_runs > 1)
+                    merge_phase_results(runs_buf, eff_runs, &results[n_phases]);
+                else
+                    results[n_phases] = runs_buf[0];
+                results[n_phases].n_runs = eff_runs;
             }
-            if (eff_runs > 1)
-                merge_phase_results(runs_buf, eff_runs, &results[n_phases]);
-            else
-                results[n_phases] = runs_buf[0];
-            results[n_phases].n_runs = eff_runs;
-        results[n_phases].n_chunks = n_chunks;
+            results[n_phases].n_chunks = n_chunks;
             H5Pclose(dcpl_f);
             n_phases++;
         }
-    }
-
-    /* ── Phase 5: entropy-heuristic ── */
-    if (phase_mask & P_HEUR) {
-        printf("\n── Phase %d: entropy-heuristic ───────────────────────────────\n", n_phases + 1);
-        gpucompress_disable_online_learning();
-        gpucompress_set_exploration(0);
-        gpucompress_set_selection_mode(GPUCOMPRESS_SELECT_HEURISTIC);
-        hid_t dcpl_h = make_dcpl_auto(h5_dims, ndims, chunk_dims, error_bound);
-        PhaseResult runs_buf[32];
-        int eff_runs = (n_runs > 32) ? 32 : n_runs;
-        for (int run = 0; run < eff_runs; run++) {
-            if (eff_runs > 1) printf("  Run %d/%d\n", run + 1, eff_runs);
-            int rc = run_phase_vol(d_data, d_read, d_count,
-                                   n_floats, ndims, h5_dims, chunk_dims,
-                                   "entropy-heuristic", TMP_HEUR, dcpl_h, &runs_buf[run]);
-            if (rc) any_fail = 1;
-        }
-        if (eff_runs > 1)
-            merge_phase_results(runs_buf, eff_runs, &results[n_phases]);
-        else
-            results[n_phases] = runs_buf[0];
-        results[n_phases].n_runs = eff_runs;
-        results[n_phases].n_chunks = n_chunks;
-        H5Pclose(dcpl_h);
-        write_chunk_csv("entropy-heuristic");
-        gpucompress_set_selection_mode(GPUCOMPRESS_SELECT_NN);  /* restore */
-        n_phases++;
-    }
-
-    /* ── Phase: best (exhaustive, 32 configs/chunk) ── */
-    if (phase_mask & P_BEST) {
-        printf("\n── Phase %d: best (exhaustive, 32 configs/chunk) ────────────\n", n_phases + 1);
-        gpucompress_disable_online_learning();
-        gpucompress_set_exploration(1);
-        gpucompress_set_best_mode(1);
-        hid_t dcpl_b = make_dcpl_auto(h5_dims, ndims, chunk_dims, error_bound);
-        printf("  Write + Read + Verify... "); fflush(stdout);
-        PhaseResult best_r;
-        int rc = run_phase_vol(d_data, d_read, d_count,
-                               n_floats, ndims, h5_dims, chunk_dims,
-                               "best", "/tmp/bm_generic_best.h5", dcpl_b, &best_r);
-        if (rc) any_fail = 1;
-        results[n_phases] = best_r;
-        results[n_phases].n_runs = 1;
-        results[n_phases].n_chunks = n_chunks;
-        H5Pclose(dcpl_b);
-        write_chunk_csv("best");
-        gpucompress_set_best_mode(0);
-        n_phases++;
     }
 
     /* ── Phase: nn ── */
@@ -1105,20 +1159,28 @@ int main(int argc, char **argv)
         gpucompress_disable_online_learning();
         gpucompress_set_exploration(0);
         hid_t dcpl_nn = make_dcpl_auto(h5_dims, ndims, chunk_dims, error_bound);
-        PhaseResult runs_buf[32];
-        int eff_runs = (n_runs > 32) ? 32 : n_runs;
-        for (int run = 0; run < eff_runs; run++) {
-            if (eff_runs > 1) printf("  Run %d/%d\n", run + 1, eff_runs);
-            int rc = run_phase_vol(d_data, d_read, d_count,
-                                   n_floats, ndims, h5_dims, chunk_dims,
-                                   "nn", TMP_NN, dcpl_nn, &runs_buf[run]);
-            if (rc) any_fail = 1;
+        if (n_fields > 1) {
+            run_phase_all_fields(run_phase_vol, d_data, d_read, d_count,
+                n_floats, total_bytes, ndims, h5_dims, chunk_dims,
+                "nn", TMP_NN, dcpl_nn,
+                fields, n_fields,
+                &results[n_phases], &any_fail);
+        } else {
+            PhaseResult runs_buf[32];
+            int eff_runs = (n_runs > 32) ? 32 : n_runs;
+            for (int run = 0; run < eff_runs; run++) {
+                if (eff_runs > 1) printf("  Run %d/%d\n", run + 1, eff_runs);
+                int rc = run_phase_vol(d_data, d_read, d_count,
+                                       n_floats, ndims, h5_dims, chunk_dims,
+                                       "nn", TMP_NN, dcpl_nn, &runs_buf[run]);
+                if (rc) any_fail = 1;
+            }
+            if (eff_runs > 1)
+                merge_phase_results(runs_buf, eff_runs, &results[n_phases]);
+            else
+                results[n_phases] = runs_buf[0];
+            results[n_phases].n_runs = eff_runs;
         }
-        if (eff_runs > 1)
-            merge_phase_results(runs_buf, eff_runs, &results[n_phases]);
-        else
-            results[n_phases] = runs_buf[0];
-        results[n_phases].n_runs = eff_runs;
         results[n_phases].n_chunks = n_chunks;
         H5Pclose(dcpl_nn);
         write_chunk_csv("nn");
@@ -1320,8 +1382,6 @@ int main(int argc, char **argv)
     remove(TMP_FIX_LZ4);
     remove(TMP_FIX_GDEFL);
     remove(TMP_FIX_ZSTD);
-    remove(TMP_HEUR);
-    remove("/tmp/bm_generic_best.h5");
     remove(TMP_NN);
     remove(TMP_NN_RL);
     remove(TMP_NN_RLEXP);

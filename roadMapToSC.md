@@ -7,11 +7,11 @@
 > The evaluation does not yet support the generality claims the work implicitly makes.
 >
 > **Path to Weak Accept:** ~1-2 weeks of benchmark runs (infrastructure is ready).
-> **Path to Solid Accept:** + oracle baseline + policy evaluation + external compressors.
+> **Path to Solid Accept:** + policy evaluation + external compressors (cuSZ, ZFP).
 >
-> **Progress (as of 2026-03-22):** 7 of 15 action items complete (steps 1, 2, 6, 7-partial, 9, 10, 15).
+> **Progress (as of 2026-03-23):** 8 of 15 action items resolved (steps 1, 2, 6, 10, 13 DONE; 7, 8, 9 DESCOPED/REMOVED).
 > All benchmark infrastructure built, tested, and smoke-tested on GPU node:
-> - 8-phase pipeline (no-comp, fixed-lz4/gdeflate/zstd, entropy-heuristic, nn, nn-rl, nn-rl+exp50)
+> - 7-phase pipeline (no-comp, fixed-lz4/gdeflate/zstd, nn, nn-rl, nn-rl+exp50)
 > - 5 datasets (Gray-Scott, VPIC, Hurricane Isabel, Nyx, CESM-ATM)
 > - 3 benchmark drivers with 3 cost model configs each
 > - Visualizer updated for all phases + SDRBench auto-detection
@@ -19,6 +19,12 @@
 > - SDRBench full eval complete (3 datasets × 3 configs = 9 runs, all passed)
 > - VPIC smoke eval complete (NX=64, 3 configs, all passed)
 > - Gray-Scott smoke eval complete (L=128, 3 configs, all passed)
+> - Removed entropy-heuristic, best/oracle, and cpu-zstd phases (see Resolved Issues)
+> - Fixed multi-field averaging in SDRBench (single-shot phases now run all fields)
+> - Fixed SDRBench dataset naming (auto-detects parent dir, added --name flag)
+> - Fixed VPIC smoke test (binary overwrite bug, exit detection, hardcoded path)
+> - Visualizer: improved titles, domain info, policy subtitles, distinct color scheme
+> - Created project README.md
 >
 > **Remaining:** Full-scale runs with `--runs 5` on production grid sizes.
 
@@ -46,9 +52,9 @@ These are genuine strengths — lead with them in the paper.
 - **Online SGD convergence.** MAPE drops from ~700% to ~10-20% within 20 timesteps on VPIC.
   This is the paper's strongest empirical result and should be the lead figure.
 
-- **8-phase ablation structure.** `no-comp` / `fixed-lz4` / `fixed-gdeflate` / `fixed-zstd` /
-  `entropy-heuristic` / `nn` / `nn-rl` / `nn-rl+exp50` — comprehensive comparison covering
-  fixed baselines, rule-based selection, and learned selection with online adaptation.
+- **7-phase ablation structure.** `no-comp` / `fixed-lz4` / `fixed-gdeflate` / `fixed-zstd` /
+  `nn` / `nn-rl` / `nn-rl+exp50` — comprehensive comparison covering
+  fixed baselines and learned selection with online adaptation.
 
 - **HDF5 VOL connector.** 3,500+ lines of production-quality integration. Closes the gap between
   standalone benchmark and real in-situ coupling. Genuine differentiator vs. prior work.
@@ -95,7 +101,7 @@ Download automated via `scripts/install_dependencies.sh` (Step 4/4).
 
 | Problem | Zero comparison vs SZ3, ZFP, cuSZ, MGARD, or LibPressio |
 |---------|----------------------------------------------------------|
-| **Risk** | The 4-phase comparison is entirely self-referential. Reviewer question: *"For VPIC at 1.73x ratio, how does this compare to ZFP at the same throughput?"* — the paper has no answer. |
+| **Risk** | The comparison is still internal to nvCOMP. Reviewer question: *"For VPIC at 1.73x ratio, how does this compare to ZFP at the same throughput?"* — the paper has no answer. |
 
 **Required baselines:**
 
@@ -104,10 +110,6 @@ Lossless (IMPLEMENTED ✅):
   - fixed-lz4       (always lz4 via nvCOMP — speed extreme)
   - fixed-gdeflate  (always gdeflate — GPU-optimized middle ground)
   - fixed-zstd      (always zstd via nvCOMP — ratio extreme)
-  - entropy-heuristic (rule-based selector — is the NN better than thresholds?)
-
-Lossless (IMPLEMENTED ✅):
-  - CPU zstd        (the "just use the CPU" sanity check) — run_cpu_zstd_baseline.sh
 
 Lossy (TODO — at matching error bounds):
   - cuSZ            (GPU-native SZ)
@@ -119,13 +121,12 @@ Lossy (TODO — at matching error bounds):
 
 | Method | Ratio | Comp GB/s | Decomp GB/s | NN Overhead | Status |
 |--------|-------|-----------|-------------|-------------|--------|
-| cpu-zstd | — | — | — | N/A | **IMPLEMENTED** |
 | fixed-lz4 | — | — | — | N/A | **IMPLEMENTED** |
 | fixed-gdeflate | — | — | — | N/A | **IMPLEMENTED** |
 | fixed-zstd | — | — | — | N/A | **IMPLEMENTED** |
-| entropy-heuristic | — | — | — | N/A (stats only) | **IMPLEMENTED** |
 | GPUCompress (nn) | — | — | — | ~0.22 ms | Existing |
 | GPUCompress (nn-rl) | — | — | — | ~0.22 ms | Existing |
+| GPUCompress (nn-rl+exp50) | — | — | — | ~0.22 ms | Existing |
 | cuSZ | — | — | — | N/A | TODO |
 | ZFP | — | — | — | N/A | TODO |
 
@@ -137,7 +138,7 @@ Lossy (TODO — at matching error bounds):
 
 | Problem | ~~`benchmark_vpic_deck.csv` only has 2 of 5 phases~~ |
 |---------|------------------------------------------------------|
-| **Progress** | Smoke test (NX=64, 3 configs) passed with all 8 phases + multi-timestep. Full-scale run (NX=156, `--runs 5`) still needed. |
+| **Progress** | Smoke test (NX=64, 3 configs) passed with all 7 phases + multi-timestep. Full-scale run (NX=156, `--runs 5`) still needed. |
 
 **Remaining:** Run `NX=156 TIMESTEPS=100 RUNS=5 bash benchmarks/vpic-kokkos/run_vpic_eval.sh`
 
@@ -163,43 +164,35 @@ Lossy (TODO — at matching error bounds):
 
 ## 3. Important Gaps — P1 (Reviewers Will Raise)
 
-### 3.1 Exhaustive Oracle Baseline
+### 3.1 Exhaustive Oracle Baseline — **REMOVED**
 
-| Problem | `visualize.py` references an `exhaustive` phase but no results exist |
-|---------|----------------------------------------------------------------------|
-| **Risk** | Cannot answer: *"How close is the NN to the optimal selection?"* |
+~~| Problem | `visualize.py` references an `exhaustive` phase but no results exist |~~
 
-The oracle tries all 32 configurations per chunk and picks the best *measured* (not predicted) one.
-This bounds the NN's maximum possible improvement and is the most fundamental comparison.
+**Previously implemented** as `best` phase (`gpucompress_set_best_mode()`, K=31 exploration on every chunk).
+**Removed (2026-03-23):** The `best` phase was 32x slower than any other phase (tries all configs
+per chunk), making it impractical for production-scale runs. It also complicated the benchmark
+infrastructure disproportionately to its value.
 
-**Implementation:** Set exploration `K=31` to try all configs. Add as a named phase.
-Compute **NN regret:** `(oracle_ratio - nn_ratio) / oracle_ratio`.
-
-**Target headline:** *"Median regret <5% with NN overhead of <0.5 ms per chunk"*
-
-**Effort:** 1 day
+**Alternative:** The NN regret can still be estimated post-hoc from per-chunk CSV data
+by comparing the NN's selected algorithm against the best-performing algorithm observed
+across the fixed-algo baselines (LZ4, GDeflate, Zstd). This provides a lower bound on
+oracle performance without the 32x slowdown.
 
 ---
 
-### 3.2 Heuristic Baseline — **RESOLVED** ✅
+### 3.2 Heuristic Baseline — **REMOVED**
 
 ~~| Problem | No comparison against a simple rule-based selector |~~
 
-**Implemented:** `entropy-heuristic` phase using entropy thresholds:
+**Previously implemented** as `entropy-heuristic` phase (`src/selection/heuristic.cu`,
+`GPUCOMPRESS_SELECT_HEURISTIC` API mode) using entropy thresholds (< 3.5 → zstd,
+3.5-5.5 → gdeflate, > 5.5 → lz4).
 
-```
-entropy < 3.5  →  zstd
-3.5 - 5.5      →  gdeflate
-> 5.5          →  lz4
-```
-
-- Core: `src/selection/heuristic.cu` + `GPUCOMPRESS_SELECT_HEURISTIC` API mode
-- Integrated into all 3 benchmark drivers (Gray-Scott, VPIC, SDRBench)
-- Runs as Phase 5 (between fixed-algo baselines and nn) in the 8-phase benchmark
-- No preprocessing (shuffle/quant) applied — NN's advantage is partly in knowing when these help
-- Code reviewed by 3 specialized agents; all issues fixed
-
-**Effort:** ~~2 hours~~ **DONE**
+**Removed (2026-03-23):** The heuristic was removed from all 3 benchmark drivers and the
+visualizer. The heuristic source code still exists in `src/selection/heuristic.cu` and can
+be re-enabled if reviewers specifically request it. The rationale: the 3 fixed-algo baselines
+(fixed-lz4, fixed-gdeflate, fixed-zstd) already provide strong comparison points, and the
+heuristic's contribution was marginal relative to the complexity it added to the evaluation.
 
 ---
 
@@ -374,18 +367,23 @@ into the middle third of chunks. Clarify in the paper or provide a separate pure
 | Isolated compression throughput | **DONE** | `comp_gbps` and `decomp_gbps` fields added with full timing breakdown |
 | `--runs N` infrastructure | **DONE** | Multi-run with mean +/- std, NN weights reloaded per run |
 | no-comp baseline caveat | **DONE** | Documented as "uncompressed through same VOL stack" |
-| Entropy-heuristic baseline | **DONE** | `src/selection/heuristic.cu` + `GPUCOMPRESS_SELECT_HEURISTIC` mode, integrated into all 3 benchmarks |
+| Entropy-heuristic baseline | **REMOVED** | Was `src/selection/heuristic.cu` + `GPUCOMPRESS_SELECT_HEURISTIC` mode. Removed from all 3 benchmark drivers (2026-03-23). Source code retained. |
 | SDRBench dataset download | **DONE** | Hurricane Isabel, Nyx, CESM-ATM downloaded; automated in `install_dependencies.sh` |
 | Generic benchmark loader | **DONE** | `benchmarks/sdrbench/generic-benchmark.cu` + `run_sdrbench_eval.sh` |
 | Fixed-algo baselines | **DONE** | `fixed-lz4`, `fixed-gdeflate`, `fixed-zstd` phases via `make_dcpl_fixed()` in all 3 benchmarks |
-| 8-phase benchmark pipeline | **DONE** | All benchmarks verified correct by 3 rounds of agent code review |
-| Visualizer updated for 8 phases | **DONE** | New phases in PHASE_ORDER/COLORS/LABELS + SDRBench auto-detection |
+| 7-phase benchmark pipeline | **DONE** | Streamlined from 8 phases: removed entropy-heuristic and best/oracle (2026-03-23) |
+| Visualizer updated for 7 phases | **DONE** | Distinct color scheme (blue for fixed, warm for NN), domain-info titles, policy subtitles |
 | Policy mode configs in eval scripts | **DONE** | All 3 scripts run balanced/ratio-only/speed-only configs |
 | Env var overrides for eval scripts | **DONE** | `L=128 TIMESTEPS=5 bash run_gs_eval.sh` for quick testing |
 | VPIC JIT build fixes | **DONE** | GPU_DIR fallback, sim_log macro, HDF5 rpath, link flags |
 | Multi-field summary fix | **DONE** | nn-rl/nn-rl+exp50 ratio/MAPE now populated in summary CSV |
 | Smoke tests all passing | **DONE** | Gray-Scott (L=128) ✅, SDRBench (3×3=9 runs) ✅, VPIC (NX=64, 3 configs) ✅ |
-| CPU zstd external baseline | **DONE** | `run_cpu_zstd_baseline.sh` — chunked compression matching GPU chunk size, CLI args, multi-run std dev |
+| CPU zstd external baseline | **REMOVED** | Was `run_cpu_zstd_baseline.sh`. Script deleted (2026-03-23), removed from visualizer and smoke test. |
+| Multi-field averaging fix | **DONE** | SDRBench single-shot phases (fixed-*, nn) now run on ALL fields when n_fields > 1, averaging results. Previously only ran on first field, creating unfair comparison with multi-timestep phases. |
+| SDRBench dataset naming | **DONE** | Auto-detects parent directory name when leaf is dimension-only (e.g., "100x500x500" -> "hurricane_isabel"). Added `--name` override flag. |
+| VPIC smoke test fixes | **DONE** | Fixed binary overwrite bug (don't copy JIT wrapper over pre-built ELF), fixed exit detection ("normal exit" instead of "single-shot complete"), fixed hardcoded path. |
+| Best/oracle phase | **REMOVED** | Was `gpucompress_set_best_mode()` with K=31 exploration. Removed from all 3 benchmark drivers (2026-03-23) due to 32x slowdown. Post-hoc analysis from fixed-algo CSVs is the alternative. |
+| Project README | **DONE** | Created `README.md` for the repository. |
 
 ---
 
@@ -397,18 +395,18 @@ into the middle third of chunks. Clarify in the paper or provide a separate pure
 |---|--------|--------|-------------|
 | 1 | ~~Download SDRBench datasets (Hurricane, Nyx, ~~Miranda~~, CESM)~~ | ~~1 day~~ | ~~Raw data on disk~~ | **DONE** ✅ — 3 datasets downloaded, Miranda skipped (float64), automated in `install_dependencies.sh` |
 | 2 | ~~Write generic binary-to-GPU loader (~50 LOC)~~ | ~~1 day~~ | ~~`generic-benchmark.cu`~~ | **DONE** ✅ — `benchmarks/sdrbench/generic-benchmark.cu` + `run_sdrbench_eval.sh` + CMake target added. Needs GPU node to build. |
-| 3 | Run full 8-phase VPIC benchmark with `--runs 5` (NX=156) | Overnight | Complete `benchmark_vpic_deck.csv` | **SMOKE-TESTED** ✅ (NX=64, runs=1). Full-scale run pending. |
-| 4 | Run Gray-Scott benchmark with `--runs 5` (L=400) | Overnight | Updated CSVs with error bars | **SMOKE-TESTED** ✅ (L=128, ts=5). Full-scale run pending. |
-| 5 | Run all SDRBench datasets through 8-phase benchmark | 2 days | 3 new dataset CSVs | **SMOKE-TESTED** ✅ (runs=1, 3 configs × 3 datasets = 9 runs all passed). Full-scale `--runs 5` pending. |
+| 3 | Run full 7-phase VPIC benchmark with `--runs 5` (NX=156) | Overnight | Complete `benchmark_vpic_deck.csv` | **SMOKE-TESTED** ✅ (NX=64, runs=1). Full-scale pending. |
+| 4 | Run Gray-Scott benchmark with `--runs 5` (L=400) | Overnight | Updated CSVs with error bars | **SMOKE-TESTED** ✅ (L=128, ts=5). Full-scale pending. |
+| 5 | Run all SDRBench datasets through 7-phase benchmark | 2 days | 3 new dataset CSVs | **SMOKE-TESTED** ✅ (runs=1, 3×3=9 runs passed). Full-scale `--runs 5` pending. |
 
 ### Week 2 — Baselines & Comparisons (P0 + P1)
 
 | # | Action | Effort | Deliverable |
 |---|--------|--------|-------------|
 | 6 | ~~Add `fixed-zstd` and `fixed-lz4` phases to benchmark~~ | ~~Half day~~ | ~~Baseline comparison~~ | **DONE** ✅ — `fixed-lz4`, `fixed-gdeflate`, `fixed-zstd` phases added to all 3 benchmark drivers. Uses `make_dcpl_fixed()` with explicit algorithm. Needs GPU node to build. |
-| 7 | ~~Add external compressor baselines~~ | ~~1-2 days~~ | ~~External comparison~~ | **PARTIALLY DONE** ✅ — CPU zstd baseline script implemented (`run_cpu_zstd_baseline.sh`, chunked to match GPU benchmark). cuSZ/ZFP still TODO. |
-| 8 | ~~Implement exhaustive search (K=31)~~ | ~~1 day~~ | ~~Regret numbers~~ | **DONE** ✅ — `best` phase added to all 3 drivers via `gpucompress_set_best_mode()`. Bypasses error check, forces K=31 exploration on every chunk, disables SGD. Not in default phase mask (32x slower). Run with `--phase best`. |
-| 9 | ~~Implement entropy-heuristic baseline~~ | ~~2 hours~~ | ~~Rule-based comparison~~ | **DONE** ✅ — `src/selection/heuristic.cu`, new `GPUCOMPRESS_SELECT_HEURISTIC` mode, integrated into all 3 benchmark drivers. Needs GPU node to build. |
+| 7 | ~~Add external compressor baselines~~ | ~~1-2 days~~ | ~~External comparison~~ | **DESCOPED** — CPU zstd baseline removed (2026-03-23). cuSZ/ZFP still TODO for lossy comparison. |
+| 8 | ~~Implement exhaustive search (K=31)~~ | ~~1 day~~ | ~~Regret numbers~~ | **REMOVED** — `best` phase was implemented but removed (2026-03-23) due to 32x slowdown. Post-hoc analysis from fixed-algo CSVs is the alternative. |
+| 9 | ~~Implement entropy-heuristic baseline~~ | ~~2 hours~~ | ~~Rule-based comparison~~ | **REMOVED** — Was implemented and working but removed from benchmarks (2026-03-23). Source code retained in `src/selection/heuristic.cu`. |
 | 10 | ~~Run 4-policy comparison on all datasets~~ | ~~Half day~~ | ~~Policy mode table~~ | **DONE** ✅ — 3 cost model configs (balanced, ratio-only, speed-only) integrated into all 3 eval scripts. Smoke-test data collected. Full-scale `--runs 5` pending. |
 
 ### Week 3 — Analysis & Polish (P1 + P2)
@@ -417,9 +415,9 @@ into the middle third of chunks. Clarify in the paper or provide a separate pure
 |---|--------|--------|-------------|
 | 11 | Run 5-fold CV, document model training data | 1 day | Model characterization |
 | 12 | Lossy error-bound sweep on 1-2 datasets | 2 days | Rate-distortion curves |
-| 13 | Generate ablation figures (latency breakdown, convergence) | 1 day | Publication figures |
-| 14 | Algorithm frequency histogram across all datasets | Half day | Diversity analysis |
-| 15 | ~~Update `visualize.py` for new baselines + datasets~~ | ~~1 day~~ | ~~Final multi-panel figures~~ | **DONE** ✅ — Added 4 new phases to PHASE_ORDER/COLORS/LABELS, added `--sdrbench-dir` auto-detection for SDRBench CSVs |
+| 13 | ~~Update `visualize.py` for new baselines + datasets~~ | ~~1 day~~ | ~~Final multi-panel figures~~ | **DONE** ✅ — 7 phases in PHASE_ORDER/COLORS/LABELS, distinct blue/warm color scheme, domain-info titles, policy subtitles, SDRBench auto-detection |
+| 14 | Generate ablation figures (latency breakdown, convergence) | 1 day | Publication figures |
+| 15 | Algorithm frequency histogram across all datasets | Half day | Diversity analysis |
 
 ---
 
@@ -445,9 +443,9 @@ into the middle third of chunks. Clarify in the paper or provide a separate pure
 ### Lead figures (in order):
 
 1. **VPIC multi-timestep convergence** — MAPE dropping over 20 timesteps (the money plot)
-2. **8-phase comparison bar chart** — all phases across 5 datasets (visualizer ready)
+2. **7-phase comparison bar chart** — all phases across 5 datasets (visualizer ready)
 3. **Algorithm selection diversity** — heatmap of which algorithm was chosen per chunk over time
-4. **Comparison table** — GPUCompress vs fixed-algo vs heuristic across datasets (data exists, needs full-scale runs)
+4. **Comparison table** — GPUCompress (nn/nn-rl/nn-rl+exp50) vs fixed-algo across datasets (data exists, needs full-scale runs)
 5. **Latency breakdown** — stacked bar showing NN overhead is <5% of total compression time
 6. **Policy mode comparison** — same data, 3 configs (balanced/ratio/speed), different algorithm distributions (data exists from smoke tests)
 
@@ -457,7 +455,7 @@ into the middle third of chunks. Clarify in the paper or provide a separate pure
 
 | Asset | Location | Status |
 |-------|----------|--------|
-| VPIC benchmark (8-phase) | `benchmarks/vpic-kokkos/` | **SMOKE-TESTED** — all phases + 3 cost configs working |
+| VPIC benchmark (7-phase) | `benchmarks/vpic-kokkos/` | **SMOKE-TESTED** — 7 phases + 3 cost configs, exit detection fixed |
 | VPIC data adapter | `src/vpic/vpic_adapter.cu` | Implemented |
 | Per-chunk diagnostics | `gpucompress_diagnostics.cpp` | Full timing + prediction data |
 | Multi-panel visualization | `benchmarks/visualize.py` | 45 KB, publication-quality |
@@ -468,9 +466,8 @@ into the middle third of chunks. Clarify in the paper or provide a separate pure
 | Synthetic data generation | `syntheticGeneration/generator.py` | Available for controlled experiments |
 | SDRBench datasets | `data/sdrbench/` | **DOWNLOADED** — Hurricane Isabel, Nyx, CESM-ATM |
 | Dataset auto-download | `scripts/install_dependencies.sh` | **ADDED** — Step 4/4 downloads + extracts SDRBench |
-| Entropy-heuristic baseline | `src/selection/heuristic.cu` | **ADDED** — rule-based selector, integrated into all benchmarks |
-| Fixed-algo baselines | `make_dcpl_fixed()` in benchmarks | **ADDED** — fixed-lz4, fixed-gdeflate, fixed-zstd phases |
-| CPU zstd baseline | `benchmarks/sdrbench/run_cpu_zstd_baseline.sh` | **ADDED** — chunked CPU compression, CLI args (`--chunk-mb`, `--level`, `--runs`) |
+| Entropy-heuristic baseline | `src/selection/heuristic.cu` | **RETAINED** — source code exists but removed from benchmark drivers (2026-03-23) |
+| Fixed-algo baselines | `make_dcpl_fixed()` in benchmarks | **ACTIVE** — fixed-lz4, fixed-gdeflate, fixed-zstd phases in all 3 drivers |
 
 ---
 
@@ -482,9 +479,9 @@ These are the questions SC reviewers *will* ask. Each must have a clear answer i
 |---|----------|-----------------|
 | 1 | *"Does this generalize beyond Gray-Scott?"* | **SMOKE-TESTED** ✅ — 5 datasets benchmarked (GS, VPIC, Hurricane, Nyx, CESM). Full-scale `--runs 5` pending. |
 | 2 | *"Is it better than just always using zstd?"* | **SMOKE-TESTED** ✅ — fixed-lz4/gdeflate/zstd baselines run on all datasets. Full-scale pending. |
-| 3 | *"Is it better than SZ3/ZFP?"* | CPU zstd **IMPLEMENTED**. cuSZ/ZFP still TODO (lossy only). |
-| 4 | *"How close to optimal is the NN?"* | Exhaustive oracle — TODO (P1, deprioritized per SC reviewer) |
-| 5 | *"Does the NN beat a simple heuristic?"* | **SMOKE-TESTED** ✅ — entropy-heuristic phase run on all datasets. Full-scale pending. |
+| 3 | *"Is it better than SZ3/ZFP?"* | cuSZ/ZFP still TODO (lossy comparison). CPU zstd baseline removed — focus on GPU-vs-GPU comparison. |
+| 4 | *"How close to optimal is the NN?"* | Post-hoc analysis from fixed-algo CSVs (compare NN selection against best-of-3 fixed baselines per chunk). Exhaustive oracle removed due to 32x overhead. |
+| 5 | *"Does the NN beat a simple heuristic?"* | **Reframed:** The 3 fixed-algo baselines (always-LZ4, always-GDeflate, always-Zstd) serve as the "simple strategy" comparison. If NN selects better than any single fixed algorithm, the adaptive approach is justified. Entropy-heuristic phase removed from benchmarks but source code retained. |
 | 6 | *"What happens on completely new data?"* | Cold-start visible in smoke data (MAPE 457-1761% on first chunks). Full convergence curve needs TIMESTEPS=100. |
 | 7 | *"What was the model trained on?"* | Training data disclosure — TODO |
 | 8 | *"Do the policy modes actually work?"* | **SMOKE-TESTED** ✅ — 3 cost model configs run on all datasets. Full-scale pending. |

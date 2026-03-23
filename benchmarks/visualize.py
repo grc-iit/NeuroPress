@@ -40,38 +40,26 @@ PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 
 PHASE_ORDER = [
     "no-comp",
-    "cpu-zstd",
     "fixed-lz4", "fixed-gdeflate", "fixed-zstd",
-    "entropy-heuristic",
-    "best",
-    "exhaustive",
     "nn", "nn-rl", "nn-rl+exp50", "nn-rl+exp",
 ]
 
 PHASE_COLORS = {
-    "no-comp":                "#999999",
-    "cpu-zstd":               "#d4a853",
-    "fixed-lz4":              "#7fbf7f",
-    "fixed-gdeflate":         "#4daf4a",
-    "fixed-zstd":             "#2d7d2d",
-    "entropy-heuristic":      "#b07cc6",
-    "best":                   "#5778a4",
-    "exhaustive":             "#5778a4",
-    "nn":                     "#e49444",
-    "nn-rl":                  "#6a9f58",
-    "nn-rl+exp50":            "#c85a5a",
-    "nn-rl+exp":              "#c85a5a",
+    "no-comp":                "#999999",   # grey
+    "fixed-lz4":              "#5dade2",   # light blue
+    "fixed-gdeflate":         "#2e86c1",   # medium blue
+    "fixed-zstd":             "#1a5276",   # dark blue
+    "nn":                     "#e49444",   # orange
+    "nn-rl":                  "#8e44ad",   # purple
+    "nn-rl+exp50":            "#c0392b",   # red
+    "nn-rl+exp":              "#c0392b",   # red
 }
 
 PHASE_LABELS = {
     "no-comp":                "No Comp",
-    "cpu-zstd":               "CPU\nZstd",
     "fixed-lz4":              "Fixed\nLZ4",
     "fixed-gdeflate":         "Fixed\nGDeflate",
     "fixed-zstd":             "Fixed\nZstd",
-    "entropy-heuristic":      "Entropy\nHeuristic",
-    "best":                   "Best\n(Exhaustive)",
-    "exhaustive":             "Exhaustive\nSearch",
     "nn":                     "NN\n(Inference)",
     "nn-rl":                  "NN+SGD",
     "nn-rl+exp50":            "NN+SGD\n+Explore",
@@ -159,7 +147,7 @@ def _normalize_rows(rows):
     return rows
 
 
-_PHASE_ALIASES = {"oracle": "exhaustive"}
+_PHASE_ALIASES = {}
 
 
 def _avg_all(all_rows, key):
@@ -366,10 +354,10 @@ def make_summary_figure(source_name, rows, output_path, meta_text=""):
               "Compression Ratio (higher = better)", "Ratio", fmt="%.2fx")
     ax2 = fig.add_subplot(gs[0, 1])
     plot_bars(ax2, phases, [g(r, "write_mibps", "write_mbps") for r in ordered],
-              "Write Throughput", "MiB/s", fmt="%.0f")
+              "End-to-End Write Throughput (full pipeline)", "MiB/s", fmt="%.0f")
     ax3 = fig.add_subplot(gs[1, 0])
     plot_bars(ax3, phases, [g(r, "read_mibps", "read_mbps") for r in ordered],
-              "Read Throughput", "MiB/s", fmt="%.0f")
+              "End-to-End Read Throughput (full pipeline)", "MiB/s", fmt="%.0f")
 
     # ── Pareto scatter: Ratio vs Write Throughput ──
     ax4 = fig.add_subplot(gs[1, 1])
@@ -1256,7 +1244,7 @@ def make_algorithm_histogram(chunk_csv_paths, output_path):
     """Histogram of algorithm selection frequency across datasets.
 
     chunk_csv_paths: list of (dataset_name, csv_path) tuples.
-    Only includes nn/nn-rl/entropy-heuristic phases (phases that select).
+    Only includes nn/nn-rl phases (phases that select).
     """
     from collections import Counter
 
@@ -1269,7 +1257,7 @@ def make_algorithm_histogram(chunk_csv_paths, output_path):
         counter = Counter()
         for r in rows:
             phase = r.get("phase", "")
-            if phase not in ("nn", "nn-rl", "nn-rl+exp50", "entropy-heuristic", "best"):
+            if phase not in ("nn", "nn-rl", "nn-rl+exp50"):
                 continue
             action = r.get("action", r.get("nn_action", -1))
             if action is not None and float(action) >= 0:
@@ -1498,36 +1486,13 @@ def main():
     # ── SDRBench datasets ──
     sdrbench_dir = args.sdrbench_dir or os.path.join(SCRIPT_DIR, "sdrbench", "results")
 
-    # Load CPU zstd baseline if available (inject into per-dataset rows)
-    cpu_zstd_by_dataset = {}
-    for cpu_csv_path in [os.path.join(sdrbench_dir, "cpu_zstd_baseline.csv"),
-                          os.path.join(SCRIPT_DIR, "sdrbench", "results", "cpu_zstd_baseline.csv")]:
-        if os.path.exists(cpu_csv_path):
-            print(f"Loading CPU zstd baseline: {cpu_csv_path}")
-            for r in parse_csv(cpu_csv_path):
-                ds = r.get("dataset", "")
-                cpu_zstd_by_dataset[ds] = {
-                    "phase": "cpu-zstd",
-                    "ratio": g(r, "ratio"),
-                    "write_mbps": g(r, "comp_mbps"),
-                    "read_mbps": g(r, "decomp_mbps"),
-                    "write_ms": 0, "read_ms": 0,
-                    "orig_bytes": g(r, "orig_bytes_total"),
-                    "file_bytes": g(r, "comp_bytes_total"),
-                    "mismatches": 0, "n_chunks": int(g(r, "n_chunks_total")),
-                    "write_ms_std": g(r, "comp_mbps_std"),
-                    "read_ms_std": g(r, "decomp_mbps_std"),
-                    "n_runs": int(g(r, "n_runs")),
-                }
-            break
-
     if os.path.isdir(sdrbench_dir) and "summary" in views:
         import glob as _glob
         sdr_csvs = sorted(_glob.glob(os.path.join(sdrbench_dir, "benchmark_*.csv")))
-        # Exclude chunk/timestep/cpu_zstd CSVs
+        # Exclude chunk/timestep CSVs
         sdr_csvs = [c for c in sdr_csvs
                      if "_chunks" not in c and "_timesteps" not in c
-                     and "_timestep_" not in c and "cpu_zstd" not in c]
+                     and "_timestep_" not in c]
         for sdr_csv in sdr_csvs:
             found_any = True
             print(f"Loading SDRBench: {sdr_csv}")
@@ -1540,22 +1505,18 @@ def main():
             orig_mib = orig_bytes / (1024 * 1024) if orig_bytes > 1024 else orig_bytes
             n_ch = int(g(r0, "n_chunks"))
             chunk_mb = orig_mib / max(n_ch, 1)
+            n_runs = int(g(r0, "n_runs")) if g(r0, "n_runs") else 1
             meta = f"Dataset: {dataset_name} ({orig_mib:.0f} MiB) | Chunks: {n_ch} x {chunk_mb:.0f} MiB"
-
-            # Inject CPU zstd baseline if available for this dataset
-            _CPU_DATASET_ALIASES = {
-                "hurricane_isabel": ["100x500x500", "hurricane", "isabel"],
-                "nyx": ["nyx", "exasky"],
-                "cesm_atm": ["cesm", "atm", "1800x3600"],
-            }
-            matched_cpu = False
-            for cpu_ds_key, cpu_row in cpu_zstd_by_dataset.items():
-                aliases = _CPU_DATASET_ALIASES.get(cpu_ds_key, [cpu_ds_key])
-                dn_low = dataset_name.lower()
-                if any(a in dn_low for a in aliases):
-                    rows.append(dict(cpu_row))
-                    matched_cpu = True
-                    break
+            # Infer cost model policy from directory name
+            dir_lower = sdrbench_dir.lower()
+            if "ratio_only" in dir_lower or "w0-0-1" in dir_lower:
+                meta += " | Policy: ratio-only (w0=0, w1=0, w2=1)"
+            elif "speed_only" in dir_lower or "w1-1-0" in dir_lower:
+                meta += " | Policy: speed-only (w0=1, w1=1, w2=0)"
+            elif "balanced" in dir_lower or "w1-1-1" in dir_lower:
+                meta += " | Policy: balanced (w0=1, w1=1, w2=1)"
+            if n_runs > 1:
+                meta += f" | Runs: {n_runs}"
 
             # Merge multi-field phases if timestep CSV exists
             ts_csv = os.path.join(sdrbench_dir, f"benchmark_{dataset_name}_timesteps.csv")
@@ -1563,7 +1524,13 @@ def main():
                 _merge_timestep_phases(rows, ts_csv, orig_mib)
 
             out_name = f"benchmark_{dataset_name}.png"
-            make_summary_figure(f"SDRBench: {dataset_name}", rows,
+            _DATASET_TITLES = {
+                "hurricane_isabel": "Hurricane Isabel (Climate, 100x500x500)",
+                "nyx": "Nyx Cosmology (512x512x512)",
+                "cesm_atm": "CESM-ATM Atmosphere (1800x3600)",
+            }
+            display_name = _DATASET_TITLES.get(dataset_name, dataset_name)
+            make_summary_figure(f"SDRBench: {display_name}", rows,
                                 os.path.join(sdrbench_dir, out_name), meta)
 
     if not found_any:
@@ -1595,13 +1562,6 @@ def main():
             rows = parse_csv(sdr_csv)
             if rows:
                 ds = rows[0].get("dataset", os.path.basename(sdr_csv).replace("benchmark_", "").replace(".csv", ""))
-                # Inject CPU zstd for multi-dataset comparison too
-                ds_low = ds.lower()
-                for cpu_ds_key, cpu_row in cpu_zstd_by_dataset.items():
-                    aliases = _CPU_DATASET_ALIASES.get(cpu_ds_key, [cpu_ds_key])
-                    if any(a in ds_low for a in aliases):
-                        rows.append(dict(cpu_row))
-                        break
                 all_datasets_for_comparison.append((ds, rows))
 
     if len(all_datasets_for_comparison) >= 2 and "summary" in views:
