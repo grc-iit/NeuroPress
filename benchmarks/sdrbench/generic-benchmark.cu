@@ -1228,6 +1228,9 @@ int main(int argc, char **argv)
         gpucompress_set_exploration(0);
         if (n_fields > 1) {
             /* Run on all fields and average for fair comparison */
+            const int MAX_F = 256;
+            double *f_wr = (double*)calloc(MAX_F, sizeof(double));
+            double *f_rd = (double*)calloc(MAX_F, sizeof(double));
             double sum_wr = 0, sum_rd = 0, sum_rat = 0;
             size_t sum_fb = 0;
             int count = 0;
@@ -1240,6 +1243,10 @@ int main(int argc, char **argv)
                 sum_rd += fr.read_ms;
                 sum_rat += fr.ratio;
                 sum_fb += fr.file_bytes;
+                if (count < MAX_F) {
+                    f_wr[count] = fr.write_ms;
+                    f_rd[count] = fr.read_ms;
+                }
                 count++;
                 const char *fname = strrchr(fields[fi], '/');
                 fname = fname ? fname + 1 : fields[fi];
@@ -1258,7 +1265,18 @@ int main(int argc, char **argv)
                 results[n_phases].read_mbps = (double)total_bytes / (1 << 20) / (results[n_phases].read_ms / 1000.0);
                 results[n_phases].n_runs = count;
                 results[n_phases].n_chunks = n_chunks;
+                /* Compute std-dev across fields (sample std, n-1) */
+                int n = (count < MAX_F) ? count : MAX_F;
+                double var_w = 0, var_r = 0;
+                for (int i = 0; i < n; i++) {
+                    var_w += (f_wr[i] - results[n_phases].write_ms) * (f_wr[i] - results[n_phases].write_ms);
+                    var_r += (f_rd[i] - results[n_phases].read_ms)  * (f_rd[i] - results[n_phases].read_ms);
+                }
+                double denom = (n > 1) ? (n - 1) : 1;
+                results[n_phases].write_ms_std = sqrt(var_w / denom);
+                results[n_phases].read_ms_std  = sqrt(var_r / denom);
             }
+            free(f_wr); free(f_rd);
         } else {
             PhaseResult runs_buf[32];
             int eff_runs = (n_runs > 32) ? 32 : n_runs;
@@ -1504,27 +1522,24 @@ int main(int argc, char **argv)
                 double write_ms_t = tw1 - tw0;
                 double read_ms_t = tr1 - tr0;
 
-                if (fi >= WARMUP_SKIP) {
-                    sum_write_ms += write_ms_t;
-                    sum_read_ms  += read_ms_t;
-                    sum_ratio    += ratio_t;
-                    sum_file_sz  += (double)file_sz;
-                    last_file_sz  = file_sz;
-                    n_steady++;
-                }
-
                 /* Collect MAPE for this field */
                 PhaseResult field_r;
                 memset(&field_r, 0, sizeof(field_r));
                 collect_chunk_metrics(&field_r);
 
                 if (fi >= WARMUP_SKIP) {
+                    sum_write_ms += write_ms_t;
+                    sum_read_ms  += read_ms_t;
+                    sum_ratio    += ratio_t;
+                    sum_file_sz  += (double)file_sz;
+                    last_file_sz  = file_sz;
                     if (n_steady < MAX_F) {
                         f_write_ms[n_steady] = write_ms_t;
                         f_read_ms[n_steady]  = read_ms_t;
                         f_cgbps[n_steady]    = field_r.comp_gbps;
                         f_dgbps[n_steady]    = field_r.decomp_gbps;
                     }
+                    n_steady++;
                     sum_mape_r += field_r.mape_ratio_pct;
                     sum_mape_c += field_r.mape_comp_pct;
                     sum_mape_d += field_r.mape_decomp_pct;
@@ -1630,7 +1645,7 @@ int main(int argc, char **argv)
             snprintf(pr->phase, sizeof(pr->phase), "%s", phase_name);
             pr->orig_bytes = total_bytes;
             pr->n_chunks = n_chunks;
-            pr->n_runs = 1;
+            pr->n_runs = n_steady;
             if (n_steady > 0) {
                 pr->write_ms = sum_write_ms / n_steady;
                 pr->read_ms  = sum_read_ms / n_steady;
