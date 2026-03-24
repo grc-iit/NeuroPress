@@ -186,6 +186,14 @@ def _normalize_rows(rows):
             r["write_mibps"] = r["write_mbps"]
         if "read_mibps" not in r and "read_mbps" in r:
             r["read_mibps"] = r["read_mbps"]
+        if "dataset" not in r and "source" in r:
+            r["dataset"] = r["source"]
+        if "mape_ratio" not in r and "mape_ratio_pct" in r:
+            r["mape_ratio"] = r["mape_ratio_pct"]
+        if "mape_comp" not in r and "mape_comp_pct" in r:
+            r["mape_comp"] = r["mape_comp_pct"]
+        if "mape_decomp" not in r and "mape_decomp_pct" in r:
+            r["mape_decomp"] = r["mape_decomp_pct"]
     return rows
 
 
