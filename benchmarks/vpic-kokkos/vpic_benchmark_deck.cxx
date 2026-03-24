@@ -10,13 +10,14 @@
  *   VPIC simulation (GPU) → field_array->k_f_d → H5Dwrite(d_ptr) → VOL →
  *   GPU compress → HDF5 file → H5Dread(d_ptr) → GPU decompress → bitwise verify
  *
- * Single-shot phases (run once):
+ * Single-shot phases (run once at timestep 0):
  *   1. no-comp      : H5Dwrite via VOL (no compression, baseline)
- *   2. nn           : H5Dwrite via VOL (ALGO_AUTO, inference-only)
+ *   2. fixed-*      : H5Dwrite via VOL (fixed algorithm baselines)
  *
- * Multi-timestep phases (require VPIC_TIMESTEPS env var):
- *   3. nn-rl        : ALGO_AUTO + online SGD (learning curve over N writes)
- *   4. nn-rl+exp50  : ALGO_AUTO + online SGD + exploration (K=31)
+ * Multi-timestep phases (run across all timesteps for fair comparison):
+ *   3. nn           : ALGO_AUTO, inference-only (frozen weights)
+ *   4. nn-rl        : ALGO_AUTO + online SGD (learning curve over N writes)
+ *   5. nn-rl+exp50  : ALGO_AUTO + online SGD + exploration
  *
  * BUILD:
  *   See benchmarks/vpic-kokkos/build_vpic_benchmark.sh
@@ -952,7 +953,7 @@ begin_diagnostics {
     double orig_mib    = (double)nbytes_f / (1 << 20);
 
     // ============================================================
-    // Multi-timestep mode: 3 phases per timestep (apple-to-apple on same data)
+    // Multi-timestep mode: all phases per timestep (apple-to-apple on same data)
     // ============================================================
     if (global->single_shot_done) {
         if (global->timesteps <= 0 || global->ts_count >= global->timesteps) {
@@ -972,14 +973,22 @@ begin_diagnostics {
                 global->ranking_csv = NULL;
                 printf("  Ranking quality CSV: %s\n", RANKING_CSV);
             }
-            printf("\n=== VPIC Multi-Timestep complete (%d timesteps x %d phases) ===\n",
-                   global->ts_count, 3);
+            printf("\n=== VPIC Multi-Timestep complete (%d timesteps x 10 phases) ===\n",
+                   global->ts_count);
 
             /* Append nn-rl and nn-rl+exp50 steady-state averages to aggregate CSV.
              * Read from timestep CSV, skip warmup (first 5 timesteps), average the rest. */
             {
-                FILE* agg = fopen(AGG_CSV, "a");  /* append to existing single-shot CSV */
+                FILE* agg = fopen(AGG_CSV, "w");
                 if (agg && global->ts_csv == NULL) {
+                    fprintf(agg, "source,phase,n_runs,write_ms,write_ms_std,read_ms,read_ms_std,"
+                                 "file_mib,orig_mib,ratio,"
+                                 "write_mibps,read_mibps,mismatches,sgd_fires,explorations,n_chunks,"
+                                 "nn_ms,stats_ms,preproc_ms,comp_ms,decomp_ms,explore_ms,sgd_ms,"
+                                 "comp_gbps,decomp_gbps,"
+                                 "mape_ratio_pct,mape_comp_pct,mape_decomp_pct,"
+                                 "mae_ratio,mae_comp_ms,mae_decomp_ms,r2_ratio,"
+                                 "comp_gbps_std,decomp_gbps_std\n");
                     /* Parse timestep CSV to compute steady-state averages per phase */
                     FILE* ts = fopen(TSTEP_CSV, "r");
                     if (ts) {
@@ -997,8 +1006,13 @@ begin_diagnostics {
                             double sum_mae_r, sum_mae_c, sum_mae_d, sum_r2;
                             int    count;
                         };
-                        PhaseAccum pa[3] = {};
-                        const char* pnames[3] = {"nn", "nn-rl", "nn-rl+exp50"};
+                        const int N_AGG_PHASES = 10;
+                        PhaseAccum pa[N_AGG_PHASES] = {};
+                        const char* pnames[N_AGG_PHASES] = {
+                            "no-comp", "fixed-lz4", "fixed-gdeflate", "fixed-zstd",
+                            "fixed-lz4+shuf", "fixed-gdeflate+shuf", "fixed-zstd+shuf",
+                            "nn", "nn-rl", "nn-rl+exp50"
+                        };
                         const int WARMUP = 0;
 
                         while (fgets(line, sizeof(line), ts)) {
@@ -1017,7 +1031,7 @@ begin_diagnostics {
                                        &t_stats, &t_nn, &t_pre, &t_comp, &t_dec, &t_expl, &t_sgd,
                                        &t_mae_r, &t_mae_c, &t_mae_d, &t_r2);
                             if (nf >= 12 && ts_idx >= WARMUP) {
-                                for (int pi = 0; pi < 3; pi++) {
+                                for (int pi = 0; pi < N_AGG_PHASES; pi++) {
                                     if (strcmp(ph, pnames[pi]) == 0) {
                                         pa[pi].sum_write += wr;
                                         pa[pi].sum_read  += rd;
@@ -1055,8 +1069,8 @@ begin_diagnostics {
                         }
                         fclose(ts);
 
-                        /* Write averaged results for nn-rl and nn-rl+exp50 (skip nn, already in single-shot) */
-                        for (int pi = 1; pi < 3; pi++) {
+                        /* Write averaged results for all phases */
+                        for (int pi = 0; pi < N_AGG_PHASES; pi++) {
                             if (pa[pi].count <= 0) continue;
                             int n = pa[pi].count;
                             double avg_wr = pa[pi].sum_write / n;
@@ -1189,20 +1203,33 @@ begin_diagnostics {
 
         int t = global->ts_count;
 
-        /* Phase configs: name, sgd_enabled, exploration_enabled */
+        /* Phase configs for multi-timestep loop.
+         * All phases run on every timestep for fair comparison.
+         * algo=0 means ALGO_AUTO (NN-based), algo>0 means fixed algorithm.
+         * nn_weight_idx: 0=nn, 1=nn-rl, 2=nn-rl+exp50, -1=no NN weights */
         struct TsPhase {
             const char *name;
+            const char *tmp_file;
             int sgd;
             int explore;
+            int nn_weight_idx;          /* -1 for non-NN phases */
+            gpucompress_algorithm_t algo; /* 0=AUTO, >0=fixed */
+            unsigned int preproc;
         };
         TsPhase phases[] = {
-            { "nn",          0, 0 },
-            { "nn-rl",       1, 0 },
-            { "nn-rl+exp50", 1, 1 },
+            { "no-comp",           TMP_NOCOMP,    0, 0, -1, (gpucompress_algorithm_t)0, 0 },
+            { "fixed-lz4",         TMP_FIX_LZ4,   0, 0, -1, GPUCOMPRESS_ALGO_LZ4,      0 },
+            { "fixed-gdeflate",    TMP_FIX_GDEFL,  0, 0, -1, GPUCOMPRESS_ALGO_GDEFLATE, 0 },
+            { "fixed-zstd",        TMP_FIX_ZSTD,   0, 0, -1, GPUCOMPRESS_ALGO_ZSTD,     0 },
+            { "fixed-lz4+shuf",    TMP_FIX_LZ4_S,  0, 0, -1, GPUCOMPRESS_ALGO_LZ4,      GPUCOMPRESS_PREPROC_SHUFFLE_4 },
+            { "fixed-gdeflate+shuf",TMP_FIX_GDEFL_S,0, 0, -1, GPUCOMPRESS_ALGO_GDEFLATE, GPUCOMPRESS_PREPROC_SHUFFLE_4 },
+            { "fixed-zstd+shuf",   TMP_FIX_ZSTD_S, 0, 0, -1, GPUCOMPRESS_ALGO_ZSTD,     GPUCOMPRESS_PREPROC_SHUFFLE_4 },
+            { "nn",                TMP_NN,         0, 0,  0, (gpucompress_algorithm_t)0, 0 },
+            { "nn-rl",             TMP_NN_RL,      1, 0,  1, (gpucompress_algorithm_t)0, 0 },
+            { "nn-rl+exp50",       TMP_NN_RLEXP,   1, 1,  2, (gpucompress_algorithm_t)0, 0 },
         };
-        int n_phases_ts = 3;
+        int n_phases_ts = 10;
 
-        hid_t dcpl = make_dcpl_auto((hsize_t)chunk_floats, global->diag_error_bound);
         hsize_t dims[1] = { (hsize_t)n_floats };
 
         /* Progress to stderr (visible even when stdout is redirected to log) */
@@ -1214,13 +1241,15 @@ begin_diagnostics {
             const char* phase_name = phases[pi].name;
             int do_sgd  = phases[pi].sgd;
             int do_expl = phases[pi].explore;
+            int wt_idx  = phases[pi].nn_weight_idx;
+            bool is_nn  = (phases[pi].algo == GPUCOMPRESS_ALGO_AUTO && strcmp(phase_name, "no-comp") != 0);
 
             /* Flush nvCOMP manager cache so each phase starts cold (no cache bias) */
             gpucompress_flush_manager_cache();
 
             /* Restore this phase's own weight snapshot so phases evolve independently */
-            if (global->nn_weights[pi])
-                gpucompress_nn_restore_snapshot(global->nn_weights[pi]);
+            if (is_nn && wt_idx >= 0 && global->nn_weights[wt_idx])
+                gpucompress_nn_restore_snapshot(global->nn_weights[wt_idx]);
 
             if (do_sgd) {
                 gpucompress_enable_online_learning();
@@ -1233,6 +1262,16 @@ begin_diagnostics {
             if (do_expl) {
                 gpucompress_set_exploration_threshold(0.20);
                 gpucompress_set_exploration_k(4);
+            }
+
+            /* Build DCPL for this phase */
+            hid_t dcpl;
+            if (strcmp(phase_name, "no-comp") == 0) {
+                dcpl = make_dcpl_nocomp((hsize_t)chunk_floats);
+            } else if (phases[pi].algo != GPUCOMPRESS_ALGO_AUTO) {
+                dcpl = make_dcpl_fixed((hsize_t)chunk_floats, phases[pi].algo, phases[pi].preproc);
+            } else {
+                dcpl = make_dcpl_auto((hsize_t)chunk_floats, global->diag_error_bound);
             }
 
             /* Print header on first timestep for each phase */
@@ -1249,14 +1288,14 @@ begin_diagnostics {
             /* Write via VOL */
             gpucompress_reset_chunk_history();
             gpucompress_set_debug_context(phase_name, t);
-            remove(TMP_NN_RL);
+            remove(phases[pi].tmp_file);
 
             hid_t fapl = H5Pcreate(H5P_FILE_ACCESS);
             hid_t nid = H5VLget_connector_id_by_name("native");
             H5Pset_fapl_gpucompress(fapl, nid, NULL);
             H5VLclose(nid);
 
-            hid_t file = H5Fcreate(TMP_NN_RL, H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+            hid_t file = H5Fcreate(phases[pi].tmp_file, H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
             H5Pclose(fapl);
             hid_t fsp  = H5Screate_simple(1, dims, NULL);
             hid_t dset = H5Dcreate2(file, "fields", H5T_NATIVE_FLOAT,
@@ -1277,14 +1316,14 @@ begin_diagnostics {
             }
 
             /* Drop page cache so read-back measures real I/O, not cached data */
-            drop_pagecache(TMP_NN_RL);
+            drop_pagecache(phases[pi].tmp_file);
 
             /* Read back + verify */
             fapl = H5Pcreate(H5P_FILE_ACCESS);
             nid = H5VLget_connector_id_by_name("native");
             H5Pset_fapl_gpucompress(fapl, nid, NULL);
             H5VLclose(nid);
-            file = H5Fopen(TMP_NN_RL, H5F_ACC_RDONLY, fapl);
+            file = H5Fopen(phases[pi].tmp_file, H5F_ACC_RDONLY, fapl);
             H5Pclose(fapl);
             dset = H5Dopen2(file, "fields", H5P_DEFAULT);
 
@@ -1299,7 +1338,7 @@ begin_diagnostics {
                                                   global->h_orig, global->h_read, n_floats);
 
             /* File size for ratio */
-            size_t file_sz = get_file_size(TMP_NN_RL);
+            size_t file_sz = get_file_size(phases[pi].tmp_file);
             double ratio_t = (file_sz > 0) ? (double)nbytes_f / (double)file_sz : 1.0;
 
             /* Collect per-chunk MAPE, timing breakdown, MAE/R² */
@@ -1477,279 +1516,24 @@ begin_diagnostics {
             }
 
             /* Save this phase's updated weights for next timestep */
-            if (global->nn_weights[pi])
-                gpucompress_nn_save_snapshot(global->nn_weights[pi]);
+            if (is_nn && wt_idx >= 0 && global->nn_weights[wt_idx])
+                gpucompress_nn_save_snapshot(global->nn_weights[wt_idx]);
 
-            remove(TMP_NN_RL);
+            H5Pclose(dcpl);
+            remove(phases[pi].tmp_file);
         } /* end phase loop */
 
-        H5Pclose(dcpl);
         global->ts_count++;
         return;
     }
 
     // ============================================================
-    // Single-shot mode: run all 4 phases once (original behavior)
+    // All phases run in the multi-timestep loop above.
+    // The aggregate CSV is generated from the timestep CSV at completion.
     // ============================================================
-    sim_log("");
-    sim_log("╔═══════════════════════════════════════════════════════════════════════════╗");
-    sim_log("║  VPIC Benchmark: No-Comp vs NN+SGD (Real Harris Sheet)                  ║");
-    sim_log("╚═══════════════════════════════════════════════════════════════════════════╝");
-    sim_log("");
-    sim_log("  Step " << step() << ": field data on GPU, " << nbytes_f / (1024*1024)
-            << " MB, " << n_chunks << " chunks of "
-            << global->chunk_bytes / (1024*1024) << " MB");
-    sim_log("");
 
-    // Truncate per-chunk CSV for fresh run
-    remove(CHUNKS_CSV);
-
-    const char* env_eb_diag = getenv("VPIC_ERROR_BOUND");
-    global->diag_error_bound = env_eb_diag ? atof(env_eb_diag) : 0.0;
-
-    /* Phase selection: VPIC_PHASES="nn-rl" to run only those.
-     * Default (unset or empty): run all phases. */
-    const char* env_phases = getenv("VPIC_PHASES");
-    auto phase_enabled = [&](const char* name) -> bool {
-        if (!env_phases || env_phases[0] == '\0') return true;  /* all */
-        return strstr(env_phases, name) != NULL;
-    };
-
-    if (env_phases && env_phases[0])
-        sim_log("  Phase filter: " << env_phases);
-
-    PhaseResult results[N_PHASES];
-    int n_phases = 0;
-    int any_fail = 0;
-
-    // ── Single-shot phases ──────────────────────────────────────────
-    // KNOWN LIMITATION: Single-shot phases compress ONE snapshot only.
-    // Unlike Gray-Scott and SDRBench, which run single-shot phases across
-    // all timesteps/fields and average for fair comparison, VPIC cannot
-    // restart the simulation for each phase because the simulation state
-    // is managed by VPIC's main loop, not by our benchmark code.
-    // Multi-timestep phases (nn-rl, nn-rl+exp50) DO run across all timesteps.
-    // ──────────────────────────────────────────────────────────────────
-
-    // ── Phase 1: no-comp ──────────────────────────────────────────
-    if (phase_enabled("no-comp")) {
-    sim_log("── Phase 1: no-comp (GPU→Host→HDF5, VOL-2 fallback) ────────");
-    gpucompress_disable_online_learning();
-    gpucompress_set_exploration(0);
-    {
-        hid_t dcpl = make_dcpl_nocomp((hsize_t)chunk_floats);
-        PhaseResult runs_buf[32];
-        int eff = global->n_runs;
-        for (int run = 0; run < eff; run++) {
-            if (eff > 1) printf("  Run %d/%d... ", run + 1, eff);
-            fflush(stdout);
-            int rc = run_phase("no-comp", TMP_NOCOMP,
-                               d_fields, global->d_read, global->h_orig, global->h_read,
-                               n_floats, n_chunks, dcpl, &runs_buf[run]);
-            if (rc) any_fail = 1;
-        }
-        if (eff > 1)
-            merge_phase_results(runs_buf, eff, &results[n_phases]);
-        else
-            results[n_phases] = runs_buf[0];
-        results[n_phases].n_runs = eff;
-        H5Pclose(dcpl);
-        n_phases++;
-    }
-    }
-
-    // ── Phases: fixed-algo baselines ──
-    {
-        struct FixedAlgoPhase {
-            const char *name;
-            const char *tmp_file;
-            gpucompress_algorithm_t algo;
-            unsigned int preproc;
-        };
-        FixedAlgoPhase fixed_phases[] = {
-            { "fixed-lz4",           TMP_FIX_LZ4,                    GPUCOMPRESS_ALGO_LZ4,      0 },
-            { "fixed-gdeflate",      TMP_FIX_GDEFL,                  GPUCOMPRESS_ALGO_GDEFLATE, 0 },
-            { "fixed-zstd",          TMP_FIX_ZSTD,                   GPUCOMPRESS_ALGO_ZSTD,     0 },
-            { "fixed-lz4+shuf",      TMP_FIX_LZ4_S,                  GPUCOMPRESS_ALGO_LZ4,      GPUCOMPRESS_PREPROC_SHUFFLE_4 },
-            { "fixed-gdeflate+shuf", TMP_FIX_GDEFL_S,                GPUCOMPRESS_ALGO_GDEFLATE, GPUCOMPRESS_PREPROC_SHUFFLE_4 },
-            { "fixed-zstd+shuf",     TMP_FIX_ZSTD_S,                 GPUCOMPRESS_ALGO_ZSTD,     GPUCOMPRESS_PREPROC_SHUFFLE_4 },
-        };
-        for (int fi = 0; fi < 6; fi++) {
-            if (!phase_enabled(fixed_phases[fi].name)) continue;
-            { char _msg[128]; snprintf(_msg, sizeof(_msg),
-              "── Phase %d: %s ────────────────────────────",
-              n_phases + 1, fixed_phases[fi].name);
-              sim_log(_msg); }
-            gpucompress_disable_online_learning();
-            gpucompress_set_exploration(0);
-            {
-                hid_t dcpl = make_dcpl_fixed((hsize_t)chunk_floats, fixed_phases[fi].algo, fixed_phases[fi].preproc);
-                PhaseResult runs_buf[32];
-                int eff = global->n_runs;
-                for (int run = 0; run < eff; run++) {
-                    if (eff > 1) printf("  Run %d/%d... ", run + 1, eff);
-                    fflush(stdout);
-                    int rc = run_phase(fixed_phases[fi].name, fixed_phases[fi].tmp_file,
-                                       d_fields, global->d_read, global->h_orig, global->h_read,
-                                       n_floats, n_chunks, dcpl, &runs_buf[run]);
-                    if (rc) any_fail = 1;
-                }
-                if (eff > 1)
-                    merge_phase_results(runs_buf, eff, &results[n_phases]);
-                else
-                    results[n_phases] = runs_buf[0];
-                results[n_phases].n_runs = eff;
-                H5Pclose(dcpl);
-                n_phases++;
-            }
-        }
-    }
-
-    // ── Phase: nn (inference-only) ──────────────────────────────
-    if (phase_enabled("nn-only") || (phase_enabled("nn") && !env_phases)) {
-    sim_log("── nn (VOL, ALGO_AUTO, inference-only) ───────────────────");
-    gpucompress_disable_online_learning();
-    gpucompress_set_exploration(0);
-    {
-        hid_t dcpl = make_dcpl_auto((hsize_t)chunk_floats, global->diag_error_bound);
-        PhaseResult runs_buf[32];
-        int eff = global->n_runs;
-        for (int run = 0; run < eff; run++) {
-            if (eff > 1) printf("  Run %d/%d... ", run + 1, eff);
-            fflush(stdout);
-            int rc = run_phase("nn", TMP_NN,
-                               d_fields, global->d_read, global->h_orig, global->h_read,
-                               n_floats, n_chunks, dcpl, &runs_buf[run]);
-            if (rc) any_fail = 1;
-        }
-        if (eff > 1)
-            merge_phase_results(runs_buf, eff, &results[n_phases]);
-        else
-            results[n_phases] = runs_buf[0];
-        results[n_phases].n_runs = eff;
-        H5Pclose(dcpl);
-        n_phases++;
-    }
-    }
-
-    // nn-rl and nn-rl+exp50 run only in multi-timestep mode (--timesteps N)
-
-    // ── Summary table ─────────────────────────────────────────────
-    sim_log("");
-    printf("\n╔══════════════╦══════════╦══════════╦═══════╦══════════╦═════════════╗\n");
-    printf("║  Phase       ║ Write    ║ Read     ║ Ratio ║ File MiB ║ Verify      ║\n");
-    printf("║              ║ (MiB/s)  ║ (MiB/s)  ║       ║          ║             ║\n");
-    printf("╠══════════════╬══════════╬══════════╬═══════╬══════════╬═════════════╣\n");
-    for (int i = 0; i < n_phases; i++) {
-        PhaseResult* rr = &results[i];
-        const char* verdict = (rr->mismatches == 0) ? "PASS" : "FAIL";
-        printf("║  %-12s║ %8.0f ║ %8.0f ║ %5.2fx ║ %8.0f ║ %-11s ║\n",
-               rr->phase, rr->write_mbps, rr->read_mbps,
-               rr->ratio, (double)rr->file_bytes / (1 << 20), verdict);
-    }
-    printf("╚══════════════╩══════════╩══════════╩═══════╩══════════╩═════════════╝\n");
-
-    for (int i = 0; i < n_phases; i++) {
-        if (strncmp(results[i].phase, "nn", 2) == 0 && results[i].n_chunks > 0) {
-            printf("\n  %-14s SGD: %d/%d  Expl: %d/%d\n",
-                   results[i].phase,
-                   results[i].sgd_fires,   results[i].n_chunks,
-                   results[i].explorations, results[i].n_chunks);
-            printf("                 MAPE: ratio=%.1f%% comp=%.1f%% decomp=%.1f%%\n",
-                   results[i].mape_ratio_pct, results[i].mape_comp_pct, results[i].mape_decomp_pct);
-            printf("                 MAE:  ratio=%.4f comp=%.4fms decomp=%.4fms  R²=%.4f\n",
-                   results[i].mae_ratio, results[i].mae_comp_ms, results[i].mae_decomp_ms, results[i].r2_ratio);
-        }
-    }
-
-    // GPU-time overhead breakdown for NN phases
-    {
-        bool has_nn = false;
-        for (int i = 0; i < n_phases; i++)
-            if (strncmp(results[i].phase, "nn", 2) == 0) { has_nn = true; break; }
-
-        if (has_nn) {
-            printf("\n╔═════════════════════════════════════════════════════════════════════════════════════════════════╗\n");
-            printf("║  GPU-Time Overhead Breakdown (cumulative across chunks, 8 concurrent workers)                  ║\n");
-            printf("╠══════════════╦══════════╦══════════╦══════════╦══════════╦══════════╦══════════╦════════════════╣\n");
-            printf("║  Phase       ║ Stats    ║ NN Infer ║ Preproc  ║ Compress ║ Explore  ║ SGD      ║ Total GPU-time ║\n");
-            printf("╠══════════════╬══════════╬══════════╬══════════╬══════════╬══════════╬══════════╬════════════════╣\n");
-            for (int i = 0; i < n_phases; i++) {
-                if (strncmp(results[i].phase, "nn", 2) != 0) continue;
-                PhaseResult* rr = &results[i];
-                double total_gpu = rr->stats_ms + rr->nn_ms + rr->preproc_ms + rr->comp_ms
-                                 + rr->explore_ms + rr->sgd_ms;
-                printf("║  %-12s║ %5.0f ms ║ %5.0f ms ║ %5.0f ms ║ %5.0f ms ║ %5.0f ms ║ %5.0f ms ║   %7.0f ms   ║\n",
-                       rr->phase, rr->stats_ms, rr->nn_ms, rr->preproc_ms, rr->comp_ms,
-                       rr->explore_ms, rr->sgd_ms, total_gpu);
-            }
-            printf("╠══════════════╬══════════╬══════════╬══════════╬══════════╬══════════╬══════════╬════════════════╣\n");
-            printf("║  (%% of GPU)  ║          ║          ║          ║          ║          ║          ║                ║\n");
-            for (int i = 0; i < n_phases; i++) {
-                if (strncmp(results[i].phase, "nn", 2) != 0) continue;
-                PhaseResult* rr = &results[i];
-                double total_gpu = rr->stats_ms + rr->nn_ms + rr->preproc_ms + rr->comp_ms
-                                 + rr->explore_ms + rr->sgd_ms;
-                if (total_gpu <= 0) total_gpu = 1.0;
-                printf("║  %-12s║ %5.1f%%   ║ %5.1f%%   ║ %5.1f%%   ║ %5.1f%%   ║ %5.1f%%   ║ %5.1f%%   ║   wall: %4.0f ms ║\n",
-                       rr->phase,
-                       100.0 * rr->stats_ms / total_gpu,
-                       100.0 * rr->nn_ms / total_gpu,
-                       100.0 * rr->preproc_ms / total_gpu,
-                       100.0 * rr->comp_ms / total_gpu,
-                       100.0 * rr->explore_ms / total_gpu,
-                       100.0 * rr->sgd_ms / total_gpu,
-                       rr->write_ms);
-            }
-            printf("╚══════════════╩══════════╩══════════╩══════════╩══════════╩══════════╩══════════╩════════════════╝\n");
-        }
-    }
-
-    // Write summary CSV
-    {
-        FILE* csv = fopen(AGG_CSV, "w");
-        if (csv) {
-            fprintf(csv, "source,phase,n_runs,write_ms,write_ms_std,read_ms,read_ms_std,"
-                         "file_mib,orig_mib,ratio,"
-                         "write_mibps,read_mibps,mismatches,sgd_fires,explorations,n_chunks,"
-                         "nn_ms,stats_ms,preproc_ms,comp_ms,decomp_ms,explore_ms,sgd_ms,"
-                         "comp_gbps,decomp_gbps,"
-                         "mape_ratio_pct,mape_comp_pct,mape_decomp_pct,"
-                         "mae_ratio,mae_comp_ms,mae_decomp_ms,r2_ratio,"
-                         "comp_gbps_std,decomp_gbps_std\n");
-            for (int i = 0; i < n_phases; i++) {
-                PhaseResult* rr = &results[i];
-                fprintf(csv, "vpic,%s,%d,%.2f,%.2f,%.2f,%.2f,"
-                             "%.2f,%.2f,%.4f,"
-                             "%.1f,%.1f,%llu,%d,%d,%d,"
-                             "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,"
-                             "%.4f,%.4f,"
-                             "%.2f,%.2f,%.2f,"
-                             "%.4f,%.4f,%.4f,%.4f,"
-                             "%.4f,%.4f\n",
-                        rr->phase, rr->n_runs,
-                        rr->write_ms, rr->write_ms_std,
-                        rr->read_ms, rr->read_ms_std,
-                        (double)rr->file_bytes / (1 << 20),
-                        (double)rr->orig_bytes / (1 << 20), rr->ratio,
-                        rr->write_mbps, rr->read_mbps,
-                        rr->mismatches, rr->sgd_fires, rr->explorations, rr->n_chunks,
-                        rr->nn_ms, rr->stats_ms, rr->preproc_ms,
-                        rr->comp_ms, rr->decomp_ms, rr->explore_ms, rr->sgd_ms,
-                        rr->comp_gbps, rr->decomp_gbps,
-                        rr->mape_ratio_pct, rr->mape_comp_pct, rr->mape_decomp_pct,
-                        rr->mae_ratio, rr->mae_comp_ms, rr->mae_decomp_ms, rr->r2_ratio,
-                        rr->comp_gbps_std, rr->decomp_gbps_std);
-            }
-            fclose(csv);
-        }
-    }
-
-    if (any_fail) printf("\n=== VPIC Benchmark single-shot FAILED ===\n");
-
-    printf("\n=== VPIC Benchmark single-shot complete ===\n");
-    printf("Chunks CSV: %s\n", CHUNKS_CSV);
-
+    // Summary and aggregate CSV are generated from the timestep CSV
+    // at the end of the multi-timestep loop (see PhaseAccum above).
     global->single_shot_done = 1;
 
     // If no multi-timestep requested, we're done — cleanup now
