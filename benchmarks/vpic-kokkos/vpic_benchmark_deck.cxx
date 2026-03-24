@@ -66,10 +66,11 @@ struct RankingMilestoneResult {
 extern "C" int vpic_run_ranking_profiler(
     const void* d_data, size_t total_bytes, size_t chunk_bytes,
     double error_bound, float w0, float w1, float w2, float bw_bytes_per_ms,
-    int n_repeats, FILE* csv, const char* phase_name, int timestep,
-    int total_timesteps, RankingMilestoneResult* out);
+    int n_repeats, FILE* csv, FILE* costs_csv, const char* phase_name,
+    int timestep, RankingMilestoneResult* out);
 extern "C" int vpic_is_ranking_milestone(int t, int total);
 extern "C" void vpic_write_ranking_csv_header(FILE* csv);
+extern "C" void vpic_write_ranking_costs_csv_header(FILE* csv);
 extern "C" float gpucompress_get_bandwidth_bytes_per_ms(void);
 
 // ============================================================
@@ -102,6 +103,7 @@ static char CHUNKS_CSV[600];
 static char TSTEP_CSV[600];
 static char TSTEP_CHUNKS_CSV[600];
 static char RANKING_CSV[600];
+static char RANKING_COSTS_CSV[600];
 static char AGG_CSV[600];
 
 static void init_csv_paths() {
@@ -121,6 +123,8 @@ static void init_csv_paths() {
              "%s/benchmark_vpic_deck_timestep_chunks.csv", RESULTS_DIR);
     snprintf(RANKING_CSV, sizeof(RANKING_CSV),
              "%s/benchmark_vpic_deck_ranking.csv", RESULTS_DIR);
+    snprintf(RANKING_COSTS_CSV, sizeof(RANKING_COSTS_CSV),
+             "%s/benchmark_vpic_deck_ranking_costs.csv", RESULTS_DIR);
     snprintf(AGG_CSV, sizeof(AGG_CSV),
              "%s/benchmark_vpic_deck.csv", RESULTS_DIR);
 }
@@ -160,6 +164,7 @@ begin_globals {
 
     // Ranking quality profiler
     FILE*              ranking_csv;       // Kendall tau ranking CSV
+    FILE*              ranking_costs_csv; // Per-config predicted vs actual costs
     float              rank_w0, rank_w1, rank_w2;  // Cost model weights for profiler
 };
 
@@ -975,6 +980,11 @@ begin_diagnostics {
                 global->ranking_csv = NULL;
                 printf("  Ranking quality CSV: %s\n", RANKING_CSV);
             }
+            if (global->ranking_costs_csv) {
+                fclose(global->ranking_costs_csv);
+                global->ranking_costs_csv = NULL;
+                printf("  Ranking costs CSV: %s\n", RANKING_COSTS_CSV);
+            }
             printf("\n=== VPIC Multi-Timestep complete (%d timesteps x 12 phases) ===\n",
                    global->ts_count);
 
@@ -1187,6 +1197,9 @@ begin_diagnostics {
             global->ranking_csv = fopen(RANKING_CSV, "w");
             if (global->ranking_csv)
                 vpic_write_ranking_csv_header(global->ranking_csv);
+            global->ranking_costs_csv = fopen(RANKING_COSTS_CSV, "w");
+            if (global->ranking_costs_csv)
+                vpic_write_ranking_costs_csv_header(global->ranking_costs_csv);
 
             /* Reload NN and allocate per-phase weight snapshots so that
              * nn-rl and nn-rl+exp50 start from identical pretrained weights
@@ -1505,15 +1518,15 @@ begin_diagnostics {
             }
 
             /* Kendall τ ranking quality at milestones */
-            if (global->ranking_csv && vpic_is_ranking_milestone(t, global->timesteps)) {
+            if (is_nn && global->ranking_csv && vpic_is_ranking_milestone(t, global->timesteps)) {
                 float bw = gpucompress_get_bandwidth_bytes_per_ms();
                 RankingMilestoneResult tau_result = {};
                 vpic_run_ranking_profiler(
                     d_fields, n_floats * sizeof(float), global->chunk_bytes,
                     global->diag_error_bound,
                     global->rank_w0, global->rank_w1, global->rank_w2, bw,
-                    3, global->ranking_csv, phase_name, t,
-                    global->timesteps, &tau_result);
+                    3, global->ranking_csv, global->ranking_costs_csv,
+                    phase_name, t, &tau_result);
                 printf("    [τ] T=%d: τ=%.3f  top1=%.0f%%  regret=%.3fx  (%.0fms)\n",
                        t, tau_result.mean_tau,
                        tau_result.top1_accuracy * 100.0,

@@ -28,7 +28,7 @@ CHUNK_MB=${CHUNK_MB:-4}        # Chunk size in MB
 TIMESTEPS=${TIMESTEPS:-100}    # Number of multi-timestep writes
 RUNS=${RUNS:-3}                # Single-shot repetitions (3 for error bars)
 WARMUP_STEPS=${WARMUP_STEPS:-100}  # VPIC physics warmup steps
-DEBUG_NN=${DEBUG_NN:-1}        # 1=print NN rankings, 0=quiet
+DEBUG_NN=${DEBUG_NN:-0}        # 1=print NN debug per-chunk, 0=quiet (default off)
 
 # ── Paths ──
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

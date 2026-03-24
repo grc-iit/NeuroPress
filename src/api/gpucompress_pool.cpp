@@ -57,6 +57,8 @@ static void destroyCompContextSlot(CompContext& ctx) {
                                    ctx.d_fused_infer_output = nullptr; }
     if (ctx.d_fused_top_actions) { cudaFree(ctx.d_fused_top_actions);
                                    ctx.d_fused_top_actions = nullptr; }
+    if (ctx.d_fused_costs)      { cudaFree(ctx.d_fused_costs);
+                                   ctx.d_fused_costs = nullptr; }
     if (ctx.d_sgd_grad_buffer)   { cudaFree(ctx.d_sgd_grad_buffer);
                                    ctx.d_sgd_grad_buffer = nullptr; }
     if (ctx.d_sgd_output)        { cudaFree(ctx.d_sgd_output); ctx.d_sgd_output = nullptr; }
@@ -93,6 +95,8 @@ int initCompContextPool() {
                        sizeof(NNInferenceOutput)) != cudaSuccess) goto fail;
         if (cudaMalloc(&ctx.d_fused_top_actions,
                        NN_NUM_CONFIGS * sizeof(int)) != cudaSuccess) goto fail;
+        if (cudaMalloc(&ctx.d_fused_costs,
+                       NN_NUM_CONFIGS * sizeof(float)) != cudaSuccess) goto fail;
 
         if (cudaMalloc(&ctx.d_sgd_grad_buffer,
                        NN_SGD_GRAD_SIZE * sizeof(float)) != cudaSuccess) goto fail;

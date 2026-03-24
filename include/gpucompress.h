@@ -617,6 +617,7 @@ typedef struct {
     /* NN predicted ranking (sorted by predicted cost, best first) */
     int    predicted_ranking[32]; /* action IDs sorted by predicted cost   */
     int    predicted_ranking_count; /* valid entries (0 if non-AUTO path)  */
+    float  predicted_costs[32];  /* per-config predicted cost (indexed by action ID) */
 } gpucompress_chunk_diag_t;
 
 /**

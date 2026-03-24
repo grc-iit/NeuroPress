@@ -56,19 +56,22 @@ PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 
 PHASE_ORDER = [
     "no-comp",
-    "fixed-lz4", "fixed-gdeflate", "fixed-zstd",
-    "fixed-lz4+shuf", "fixed-gdeflate+shuf", "fixed-zstd+shuf",
+    "fixed-lz4", "fixed-snappy", "fixed-deflate",
+    "fixed-gdeflate", "fixed-zstd",
+    "fixed-ans", "fixed-cascaded", "fixed-bitcomp",
     "nn", "nn-rl", "nn-rl+exp50",
 ]
 
 PHASE_COLORS = {
     "no-comp":                "#7f8c8d",   # muted grey
     "fixed-lz4":              "#3498db",   # blue
+    "fixed-snappy":           "#5dade2",   # light blue
+    "fixed-deflate":          "#2e86c1",   # medium blue
     "fixed-gdeflate":         "#2980b9",   # darker blue
     "fixed-zstd":             "#1a5276",   # dark blue
-    "fixed-lz4+shuf":         "#85c1e9",   # light blue
-    "fixed-gdeflate+shuf":    "#5dade2",   # medium light blue
-    "fixed-zstd+shuf":        "#2471a3",   # medium dark blue
+    "fixed-ans":              "#148f77",   # teal
+    "fixed-cascaded":         "#1abc9c",   # turquoise
+    "fixed-bitcomp":          "#0e6655",   # dark teal
     "nn":                     "#e67e22",   # orange
     "nn-rl":                  "#8e44ad",   # purple
     "nn-rl+exp50":            "#c0392b",   # red
@@ -78,11 +81,13 @@ PHASE_COLORS = {
 PHASE_HATCHES = {
     "no-comp":                "",
     "fixed-lz4":              "",
+    "fixed-snappy":           "",
+    "fixed-deflate":          "",
     "fixed-gdeflate":         "",
     "fixed-zstd":             "",
-    "fixed-lz4+shuf":         "//",
-    "fixed-gdeflate+shuf":    "//",
-    "fixed-zstd+shuf":        "//",
+    "fixed-ans":              "",
+    "fixed-cascaded":         "",
+    "fixed-bitcomp":          "",
     "nn":                     "",
     "nn-rl":                  "\\\\",
     "nn-rl+exp50":            "xx",
@@ -98,11 +103,13 @@ PHASE_LINESTYLES = {
 PHASE_LABELS = {
     "no-comp":                "No Comp",
     "fixed-lz4":              "Fixed\nLZ4",
+    "fixed-snappy":           "Fixed\nSnappy",
+    "fixed-deflate":          "Fixed\nDeflate",
     "fixed-gdeflate":         "Fixed\nGDeflate",
     "fixed-zstd":             "Fixed\nZstd",
-    "fixed-lz4+shuf":         "Fixed\nLZ4+Shuf",
-    "fixed-gdeflate+shuf":    "Fixed\nGDefl+Shuf",
-    "fixed-zstd+shuf":        "Fixed\nZstd+Shuf",
+    "fixed-ans":              "Fixed\nANS",
+    "fixed-cascaded":         "Fixed\nCascaded",
+    "fixed-bitcomp":          "Fixed\nBitcomp",
     "nn":                     "NN\n(Inference)",
     "nn-rl":                  "NN+SGD",
     "nn-rl+exp50":            "NN+SGD\n+Explore",

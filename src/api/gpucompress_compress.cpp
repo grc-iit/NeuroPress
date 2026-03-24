@@ -57,7 +57,7 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
             action += 16;
         return gpucompress_compress_with_action_gpu(
             d_input, input_size, d_output, output_size, &cfg, stats, stream_arg,
-            action, 0.0f, 0.0f, 0.0f, 0.0f, nullptr, 0.0f, 0.0f, nullptr);
+            action, 0.0f, 0.0f, 0.0f, 0.0f, nullptr, nullptr, 0.0f, 0.0f, nullptr);
     }
 
     /* ---- ALGO_AUTO + NN: acquire context, run inference, delegate ----
@@ -72,11 +72,12 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
     int action = -1;
     float pred_ratio = 0.0f, pred_ct = 0.0f, pred_dt = 0.0f, pred_psnr = 0.0f;
     int top_actions[32] = {};
+    float predicted_costs[32] = {};
 
     gpucompress_error_t ie = gpucompress_infer_gpu(
         d_input, input_size, &cfg, stats, infer_ctx,
         &action, &pred_ratio, &pred_ct, &pred_dt, &pred_psnr,
-        top_actions);
+        top_actions, predicted_costs);
 
     if (ie != GPUCOMPRESS_SUCCESS || action < 0) {
         fprintf(stderr, "gpucompress ERROR: ALGO_AUTO requested but NN inference failed "
@@ -102,7 +103,7 @@ extern "C" gpucompress_error_t gpucompress_compress_gpu(
     return gpucompress_compress_with_action_gpu(
         d_input, input_size, d_output, output_size, &cfg, stats, stream_arg,
         action, pred_ratio, pred_ct, pred_dt, pred_psnr,
-        top_actions, nn_ms, stats_ms, d_precomputed_stats);
+        top_actions, predicted_costs, nn_ms, stats_ms, d_precomputed_stats);
 }
 
 /* ============================================================
@@ -118,7 +119,8 @@ gpucompress_error_t gpucompress_infer_gpu(
     float* out_predicted_comp_time,
     float* out_predicted_decomp_time,
     float* out_predicted_psnr,
-    int* out_top_actions)
+    int* out_top_actions,
+    float* out_predicted_costs)
 {
     if (!g_initialized.load()) return GPUCOMPRESS_ERROR_NOT_INITIALIZED;
     if (!d_input || !out_action) return GPUCOMPRESS_ERROR_INVALID_INPUT;
@@ -153,12 +155,13 @@ gpucompress_error_t gpucompress_infer_gpu(
     float pred_ratio = 0.0f, pred_ct = 0.0f, pred_dt = 0.0f, pred_psnr = 0.0f;
 
     int local_top[32] = {0};
+    float local_costs[32] = {0};
 
     cudaEventRecord(ctx->nn_start, stream);
     int action = gpucompress::runNNFusedInferenceCtx(
         d_stats_ptr, input_size, cfg.error_bound, stream, ctx,
         &action, &pred_ratio, &pred_ct, &pred_dt, &pred_psnr,
-        local_top,
+        local_top, local_costs,
         ctx->nn_stop);
 
     /* runNNFusedInferenceCtx does internal cudaStreamSynchronize */
@@ -172,6 +175,7 @@ gpucompress_error_t gpucompress_infer_gpu(
     if (out_predicted_decomp_time) *out_predicted_decomp_time = pred_dt;
     if (out_predicted_psnr)        *out_predicted_psnr = pred_psnr;
     if (out_top_actions)           memcpy(out_top_actions, local_top, sizeof(local_top));
+    if (out_predicted_costs)       memcpy(out_predicted_costs, local_costs, sizeof(local_costs));
 
     if (stats != nullptr) {
         stats->entropy_bits = 0.0;
@@ -202,6 +206,7 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
     float predicted_decomp_time,
     float predicted_psnr,
     const int* top_actions,
+    const float* predicted_costs,
     float stage1_nn_ms,
     float stage1_stats_ms,
     AutoStatsGPU* d_precomputed_stats)
@@ -881,9 +886,10 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
                 di.explore_costs[i] = static_cast<float>(e.cost);
             }
         }
-        /* NN predicted ranking (all 32 configs sorted by predicted cost) */
+        /* NN predicted ranking and costs (all 32 configs) */
         di.top_actions = top_actions;
         di.top_actions_count = top_actions ? 32 : 0;
+        di.predicted_costs = predicted_costs;
         gpucompress::recordChunkDiagnostic(di);
     }
 

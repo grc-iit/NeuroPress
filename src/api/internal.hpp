@@ -41,9 +41,10 @@ struct CompContext {
     AutoStatsGPU*  d_stats;
     unsigned int*  d_histogram;
 
-    /* Fused inference buffers (144 B) */
+    /* Fused inference buffers */
     NNInferenceOutput* d_fused_infer_output;
     int*               d_fused_top_actions;
+    float*             d_fused_costs;       /* 32 per-config predicted costs */
 
     /* SGD buffers (~75 KB) */
     float*      d_sgd_grad_buffer;
@@ -248,9 +249,10 @@ struct ChunkDiagInput {
     float explore_ratios[31];
     float explore_comp_ms[31];
     float explore_costs[31];
-    /* NN predicted ranking (all 32 configs sorted by predicted cost) */
-    const int* top_actions;  /* nullptr if non-AUTO path */
-    int top_actions_count;   /* 32 if AUTO, 0 otherwise */
+    /* NN predicted ranking and costs (all 32 configs) */
+    const int* top_actions;       /* nullptr if non-AUTO path */
+    int top_actions_count;        /* 32 if AUTO, 0 otherwise */
+    const float* predicted_costs; /* nullptr if non-AUTO path, indexed by action ID */
 };
 
 /**
@@ -351,7 +353,7 @@ int runNNFusedInferenceCtx(const AutoStatsGPU* d_stats, size_t data_size,
     double error_bound, cudaStream_t stream, CompContext* ctx,
     int* out_action, float* out_ratio = nullptr, float* out_comp_time = nullptr,
     float* out_decomp_time = nullptr, float* out_psnr = nullptr,
-    int* out_top_actions = nullptr,
+    int* out_top_actions = nullptr, float* out_predicted_costs = nullptr,
     cudaEvent_t nn_stop_event = nullptr);
 
 /** ctx overload: launches nnSGDKernel on g_sgd_stream (not ctx->stream),
@@ -423,7 +425,8 @@ gpucompress_error_t gpucompress_infer_gpu(
     float* out_predicted_comp_time,
     float* out_predicted_decomp_time,
     float* out_predicted_psnr,
-    int* out_top_actions = nullptr);
+    int* out_top_actions = nullptr,
+    float* out_predicted_costs = nullptr);
 
 /**
  * Phase B: preprocess + compress + exploration + SGD.
@@ -456,6 +459,7 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
     float predicted_decomp_time,
     float predicted_psnr,
     const int* top_actions = nullptr,
+    const float* predicted_costs = nullptr,
     float stage1_nn_ms = 0.0f,
     float stage1_stats_ms = 0.0f,
     AutoStatsGPU* d_precomputed_stats = nullptr);

@@ -159,13 +159,15 @@ void recordChunkDiagnostic(const ChunkDiagInput& d)
             h->explore_costs[i]        = d.explore_costs[i];
         }
 
-        /* NN predicted ranking (all configs sorted by predicted cost) */
+        /* NN predicted ranking and per-config costs */
         h->predicted_ranking_count = d.top_actions_count;
         if (d.top_actions && d.top_actions_count > 0) {
             int nc = std::min(d.top_actions_count, 32);
             for (int i = 0; i < nc; i++)
                 h->predicted_ranking[i] = d.top_actions[i];
         }
+        if (d.predicted_costs)
+            memcpy(h->predicted_costs, d.predicted_costs, 32 * sizeof(float));
 
         /* Features for deferred decomp SGD */
         h->feat_action   = d.nn_original_action;
@@ -179,8 +181,10 @@ void recordChunkDiagnostic(const ChunkDiagInput& d)
             h->feat_deriv   = static_cast<float>(h_stats.deriv_normalized);
         }
 
-        /* Debug: print per-chunk predicted vs actual summary */
-        if (g_debug_nn) {
+        /* Debug: print per-chunk predicted vs actual summary.
+         * Skip non-AUTO compressions (predicted_ratio==0) to suppress noise
+         * from Kendall tau profiler and fixed-algo phases. */
+        if (g_debug_nn && h->predicted_ratio > 0.0f) {
             char final_str[40], orig_str[40];
             action_str(d.nn_action, final_str, sizeof(final_str));
             action_str(d.nn_original_action, orig_str, sizeof(orig_str));

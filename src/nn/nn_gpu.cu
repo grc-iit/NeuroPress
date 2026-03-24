@@ -357,7 +357,8 @@ __global__ void nnFusedInferenceKernel(
     float w0, float w1, float w2, float bw,
     NNInferenceOutput* __restrict__ out_result,
     int* __restrict__ out_top_actions,
-    NNDebugPerConfig* __restrict__ out_debug  /* nullable: per-config costs */
+    NNDebugPerConfig* __restrict__ out_debug,  /* nullable: per-config debug */
+    float* __restrict__ out_costs              /* nullable: per-config predicted costs */
 ) {
     int tid = threadIdx.x;
     if (tid >= NN_NUM_CONFIGS) return;
@@ -393,6 +394,11 @@ __global__ void nnFusedInferenceKernel(
         out_debug[tid].decomp_time = decomp_time;
         out_debug[tid].cost       = w0 * comp_time + w1 * decomp_time + w2 * io_cost;
     }
+
+    /* Write per-config predicted cost (always, not debug-only).
+     * rank_val = -cost for valid configs, -INFINITY for masked configs. */
+    if (out_costs)
+        out_costs[tid] = (rank_val == -INFINITY) ? INFINITY : -rank_val;
 
     __shared__ float s_ratios[NN_NUM_CONFIGS];
     __shared__ float s_comp_times[NN_NUM_CONFIGS];
@@ -1664,7 +1670,8 @@ int runNNFusedInference(
             g_rank_w0, g_rank_w1, g_rank_w2, g_measured_bw_bytes_per_ms,
             d_fused_infer_output,
             out_top_actions ? d_fused_top_actions : nullptr,
-            nullptr  /* no debug output in non-ctx path */
+            nullptr,  /* no debug output in non-ctx path */
+            nullptr   /* no costs output in non-ctx path */
         );
 
         err = cudaGetLastError();
@@ -1788,6 +1795,7 @@ int runNNFusedInferenceCtx(
     float* out_decomp_time,
     float* out_psnr,
     int* out_top_actions,
+    float* out_predicted_costs,
     cudaEvent_t nn_stop_event
 ) {
     if (d_stats == nullptr || ctx == nullptr) return -1;
@@ -1816,7 +1824,8 @@ int runNNFusedInferenceCtx(
             g_rank_w0, g_rank_w1, g_rank_w2, g_measured_bw_bytes_per_ms,
             ctx->d_fused_infer_output,
             out_top_actions ? ctx->d_fused_top_actions : nullptr,
-            d_debug
+            d_debug,
+            out_predicted_costs ? ctx->d_fused_costs : nullptr
         );
 
         err = cudaGetLastError();
@@ -1831,6 +1840,14 @@ int runNNFusedInferenceCtx(
     if (out_top_actions) {
         err = cudaMemcpyAsync(out_top_actions, ctx->d_fused_top_actions,
                                NN_NUM_CONFIGS * sizeof(int),
+                               cudaMemcpyDeviceToHost, stream);
+        if (err != cudaSuccess) return -1;
+    }
+
+    /* Copy per-config predicted costs to host */
+    if (out_predicted_costs) {
+        err = cudaMemcpyAsync(out_predicted_costs, ctx->d_fused_costs,
+                               NN_NUM_CONFIGS * sizeof(float),
                                cudaMemcpyDeviceToHost, stream);
         if (err != cudaSuccess) return -1;
     }

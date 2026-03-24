@@ -106,6 +106,22 @@ static inline bool is_ranking_milestone(int t, int total) {
 }
 
 /* ════════════════════════════════════════════════════════════════
+ * Action name helper
+ * ════════════════════════════════════════════════════════════════ */
+
+static inline const char* action_name_str(int action_id) {
+    static const char* algo_names[] = {
+        "lz4","snappy","deflate","gdeflate","zstd","ans","cascaded","bitcomp"};
+    static char buf[32];
+    int algo = action_id % 8;
+    int quant = (action_id / 8) % 2;
+    int shuf  = (action_id / 16) % 2;
+    snprintf(buf, sizeof(buf), "%s%s%s", algo_names[algo],
+             shuf ? "+shuf" : "", quant ? "+quant" : "");
+    return buf;
+}
+
+/* ════════════════════════════════════════════════════════════════
  * Config profiling result (per config per chunk)
  * ════════════════════════════════════════════════════════════════ */
 
@@ -129,6 +145,7 @@ static int run_ranking_profiler(
     float w0, float w1, float w2, float bw_bytes_per_ms,
     int n_repeats,
     FILE* csv,
+    FILE* costs_csv,
     const char* phase_name,
     int timestep,
     RankingMilestoneResult* out)
@@ -346,6 +363,55 @@ static int run_ranking_profiler(
     }
     fflush(csv);
 
+    /* ── 7b. Write per-config costs CSV (predicted vs actual side-by-side) ── */
+    if (costs_csv) {
+        for (int ci = 0; ci < n_chunks; ci++) {
+            /* Build predicted ranking for this chunk (filtered to active configs) */
+            int pred_ranking[32];
+            int pred_count = 0;
+            if (ci < n_hist && diags[ci].predicted_ranking_count > 0) {
+                for (int i = 0; i < diags[ci].predicted_ranking_count && pred_count < n_active; i++) {
+                    int act = diags[ci].predicted_ranking[i];
+                    int quant = (act / 8) % 2;
+                    if (error_bound <= 0.0 && quant) continue;
+                    pred_ranking[pred_count++] = act;
+                }
+            }
+
+            /* Sort configs by actual cost for this chunk */
+            std::vector<int> aorder(n_active);
+            for (int i = 0; i < n_active; i++) aorder[i] = i;
+            std::sort(aorder.begin(), aorder.end(),
+                      [&](int a, int b) { return results[ci][a].cost < results[ci][b].cost; });
+
+            for (int ai = 0; ai < n_active; ai++) {
+                int act = active_actions[ai];
+
+                /* Find predicted rank */
+                int pred_rank = n_active;
+                for (int r = 0; r < pred_count; r++)
+                    if (pred_ranking[r] == act) { pred_rank = r; break; }
+
+                /* Find actual rank */
+                int actual_rank = n_active;
+                for (int r = 0; r < n_active; r++)
+                    if (results[ci][aorder[r]].action_id == act) { actual_rank = r; break; }
+
+                /* Get predicted cost (indexed by action ID) */
+                float pred_cost = (ci < n_hist) ? diags[ci].predicted_costs[act] : 0.0f;
+                /* Handle INFINITY for CSV output */
+                if (pred_cost == INFINITY || pred_cost != pred_cost) pred_cost = 99999.0f;
+
+                fprintf(costs_csv, "%s,%d,%d,%d,%s,%.4f,%.4f,%.4f,%.3f,%.3f,%d,%d\n",
+                        phase_name, timestep, ci, act, action_name_str(act),
+                        pred_cost, results[ci][ai].cost,
+                        results[ci][ai].ratio, results[ci][ai].comp_ms, results[ci][ai].decomp_ms,
+                        pred_rank, actual_rank);
+            }
+        }
+        fflush(costs_csv);
+    }
+
     /* ── 8. Aggregate ── */
     if (out) {
         out->timestep = timestep;
@@ -384,4 +450,12 @@ static inline void write_ranking_csv_header(FILE* csv) {
                  "predicted_best,actual_best,"
                  "predicted_best_cost,actual_best_cost,"
                  "profiling_ms\n");
+}
+
+static inline void write_ranking_costs_csv_header(FILE* csv) {
+    if (!csv) return;
+    fprintf(csv, "phase,timestep,chunk,action,algo_name,"
+                 "predicted_cost,actual_cost,"
+                 "actual_ratio,actual_comp_ms,actual_decomp_ms,"
+                 "predicted_rank,actual_rank\n");
 }

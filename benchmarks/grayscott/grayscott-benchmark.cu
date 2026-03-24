@@ -116,6 +116,7 @@ static char OUT_CHUNKS[512];
 static char OUT_TSTEP[512];
 static char OUT_TSTEP_CHUNKS[512];
 static char OUT_RANKING[512];
+static char OUT_RANKING_COSTS[512];
 
 /* HDF5 filter ID */
 #define H5Z_FILTER_GPUCOMPRESS    305
@@ -1147,6 +1148,7 @@ int main(int argc, char **argv)
         snprintf(OUT_TSTEP, sizeof(OUT_TSTEP), "%s/benchmark_grayscott_timesteps.csv", od);
         snprintf(OUT_TSTEP_CHUNKS, sizeof(OUT_TSTEP_CHUNKS), "%s/benchmark_grayscott_timestep_chunks.csv", od);
         snprintf(OUT_RANKING, sizeof(OUT_RANKING), "%s/benchmark_grayscott_ranking.csv", od);
+        snprintf(OUT_RANKING_COSTS, sizeof(OUT_RANKING_COSTS), "%s/benchmark_grayscott_ranking_costs.csv", od);
     }
 
     /* Create output directory (recursive) and clear stale chunks CSV */
@@ -1514,10 +1516,13 @@ int main(int argc, char **argv)
             fprintf(tc_csv, ",feat_entropy,feat_mad,feat_deriv\n");
         }
 
-        /* Open ranking quality CSV (shared across phases) */
+        /* Open ranking quality CSVs (shared across phases) */
         FILE *ranking_csv = fopen(OUT_RANKING, "w");
         if (ranking_csv)
             write_ranking_csv_header(ranking_csv);
+        FILE *ranking_costs_csv = fopen(OUT_RANKING_COSTS, "w");
+        if (ranking_costs_csv)
+            write_ranking_costs_csv_header(ranking_costs_csv);
 
         for (int pi = 0; pi < n_ts_phases; pi++) {
             const char *phase_name = ts_phases[pi].name;
@@ -1854,7 +1859,8 @@ int main(int argc, char **argv)
                     run_ranking_profiler(
                         d_v, gs_total_bytes, gs_chunk_bytes,
                         error_bound, rank_w0, rank_w1, rank_w2, bw,
-                        3, ranking_csv, phase_name, t, &tau_result);
+                        3, ranking_csv, ranking_costs_csv,
+                        phase_name, t, &tau_result);
                     printf("    [τ] T=%d: τ=%.3f  top1=%.0f%%  regret=%.3fx  (%.0fms)\n",
                            t, tau_result.mean_tau,
                            tau_result.top1_accuracy * 100.0,
@@ -1940,6 +1946,10 @@ int main(int argc, char **argv)
         if (ranking_csv) {
             fclose(ranking_csv);
             printf("  Ranking quality CSV: %s\n", OUT_RANKING);
+        }
+        if (ranking_costs_csv) {
+            fclose(ranking_costs_csv);
+            printf("  Ranking costs CSV: %s\n", OUT_RANKING_COSTS);
         }
 
         gpucompress_disable_online_learning();

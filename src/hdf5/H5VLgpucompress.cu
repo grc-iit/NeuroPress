@@ -1061,6 +1061,7 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
             float          predicted_decomp_time;
             float          predicted_psnr;
             int            top_actions[32];
+            float          predicted_costs[32];
             /* Timing from Stage 1 inference (ms) */
             float          infer_nn_ms;
             float          infer_stats_ms;
@@ -1181,7 +1182,7 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                                 wi.src, wi.sz, d_comp_w[w], &comp_sz, &cfg, &wstats, NULL,
                                 wi.action, wi.predicted_ratio, wi.predicted_comp_time,
                                 wi.predicted_decomp_time, wi.predicted_psnr,
-                                wi.top_actions,
+                                wi.top_actions, wi.predicted_costs,
                                 wi.infer_nn_ms, wi.infer_stats_ms,
                                 wi.d_stats_copy);
                         } else {
@@ -1393,6 +1394,7 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                                 wi.predicted_decomp_time = 0.0f;
                                 wi.predicted_psnr     = 0.0f;
                                 memset(wi.top_actions, 0, sizeof(wi.top_actions));
+                                memset(wi.predicted_costs, 0, sizeof(wi.predicted_costs));
                                 wi.infer_nn_ms    = 0.0f;
                                 cudaEventElapsedTime(&wi.infer_stats_ms,
                                     infer_ctx->stats_start, infer_ctx->stats_stop);
@@ -1403,10 +1405,11 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                             int infer_action = -1;
                             float infer_ratio = 0, infer_ct = 0, infer_dt = 0, infer_psnr = 0;
                             int infer_top[32] = {0};
+                            float infer_costs[32] = {0};
                             gpucompress_error_t ie = gpucompress_infer_gpu(
                                 wi.src, wi.sz, &cfg, nullptr, infer_ctx,
                                 &infer_action, &infer_ratio, &infer_ct, &infer_dt, &infer_psnr,
-                                infer_top);
+                                infer_top, infer_costs);
                             if (ie == GPUCOMPRESS_SUCCESS && infer_action >= 0) {
                                 wi.has_inference      = true;
                                 wi.action             = infer_action;
@@ -1415,6 +1418,7 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                                 wi.predicted_decomp_time = infer_dt;
                                 wi.predicted_psnr     = infer_psnr;
                                 memcpy(wi.top_actions, infer_top, sizeof(infer_top));
+                                memcpy(wi.predicted_costs, infer_costs, sizeof(infer_costs));
                                 /* Capture Stage 1 timing from infer_ctx CUDA events */
                                 cudaEventElapsedTime(&wi.infer_nn_ms, infer_ctx->nn_start, infer_ctx->nn_stop);
                                 cudaEventElapsedTime(&wi.infer_stats_ms, infer_ctx->stats_start, infer_ctx->stats_stop);
