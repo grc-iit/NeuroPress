@@ -1376,13 +1376,26 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                         bool use_heuristic = (g_selection_mode.load() == GPUCOMPRESS_SELECT_HEURISTIC);
 
                         if (use_heuristic) {
-                            /* Heuristic path: run stats only, pick action from entropy */
+                            /* Heuristic path: run stats only, pick action from entropy.
+                             * Use runStatsKernelsNoSync + manual D→H so stats_stop
+                             * records before the sync (pure GPU time, not wall-clock). */
                             double h_entropy = 0, h_mad = 0, h_deriv = 0;
                             cudaEventRecord(infer_ctx->stats_start, infer_ctx->stream);
-                            int src = gpucompress::runStatsOnlyPipeline(
-                                wi.src, wi.sz, infer_ctx->stream,
-                                &h_entropy, &h_mad, &h_deriv);
+                            AutoStatsGPU* d_heur = gpucompress::runStatsKernelsNoSync(
+                                wi.src, wi.sz, infer_ctx->stream, infer_ctx);
                             cudaEventRecord(infer_ctx->stats_stop, infer_ctx->stream);
+                            int src = -1;
+                            if (d_heur) {
+                                struct { double e, m, d; } h_r;
+                                cudaError_t ce = cudaMemcpyAsync(&h_r, &d_heur->entropy,
+                                    sizeof(h_r), cudaMemcpyDeviceToHost, infer_ctx->stream);
+                                if (ce == cudaSuccess)
+                                    ce = cudaStreamSynchronize(infer_ctx->stream);
+                                if (ce == cudaSuccess) {
+                                    h_entropy = h_r.e; h_mad = h_r.m; h_deriv = h_r.d;
+                                    src = 0;
+                                }
+                            }
 
                             if (src != 0) {
                                 fprintf(stderr, "gpucompress VOL: heuristic stats pipeline failed\n");

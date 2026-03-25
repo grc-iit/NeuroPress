@@ -166,6 +166,9 @@ begin_globals {
     FILE*              ranking_csv;       // Kendall tau ranking CSV
     FILE*              ranking_costs_csv; // Per-config predicted vs actual costs
     float              rank_w0, rank_w1, rank_w2;  // Cost model weights for profiler
+
+    // Phase exclusion: VPIC_EXCLUDE="lz4,no-comp,zstd" skips matching phases
+    char               exclude_list[512]; // comma-separated substrings to exclude
 };
 
 // ============================================================
@@ -176,6 +179,25 @@ static double now_ms(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+
+// ============================================================
+// Helper: check if a phase name is excluded
+// ============================================================
+static bool is_phase_excluded(const char* phase_name, const char* exclude_list) {
+    if (!exclude_list || !exclude_list[0]) return false;
+    char buf[512];
+    strncpy(buf, exclude_list, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    char* tok = strtok(buf, ",");
+    while (tok) {
+        /* Trim leading spaces */
+        while (*tok == ' ') tok++;
+        /* Match: phase "fixed-lz4" excluded by "lz4" */
+        if (strstr(phase_name, tok)) return true;
+        tok = strtok(NULL, ",");
+    }
+    return false;
 }
 
 // ============================================================
@@ -808,6 +830,15 @@ begin_initialization {
      * then multi-timestep loop if requested.  Matches Gray-Scott behavior. */
     global->single_shot_done = 0;
     global->diag_error_bound = 0.0;
+
+    /* Phase exclusion: VPIC_EXCLUDE="lz4,no-comp,zstd" */
+    const char* env_exclude = getenv("VPIC_EXCLUDE");
+    if (env_exclude && env_exclude[0]) {
+        strncpy(global->exclude_list, env_exclude, sizeof(global->exclude_list) - 1);
+        global->exclude_list[sizeof(global->exclude_list) - 1] = '\0';
+    } else {
+        global->exclude_list[0] = '\0';
+    }
     global->ts_csv          = NULL;
     global->tc_csv          = NULL;
     global->nn_weights[0]   = NULL;
@@ -926,6 +957,8 @@ begin_initialization {
     sim_log("  NN loaded: " << (gpucompress_nn_is_loaded() ? "yes" : "no"));
     sim_log("  Cost w0/w1/w2: " << rank_w0 << " / " << rank_w1 << " / " << rank_w2);
     sim_log("  SGD LR: " << reinforce_lr << "  MAPE threshold: " << reinforce_mape);
+    if (global->exclude_list[0])
+        sim_log("  Exclude: " << global->exclude_list);
     if (n_runs > 1)
         sim_log("  Runs   : " << n_runs << " (single-shot phases repeated for error bars)");
 
@@ -1258,6 +1291,14 @@ begin_diagnostics {
 
         for (int pi = 0; pi < n_phases_ts; pi++) {
             const char* phase_name = phases[pi].name;
+
+            /* Skip excluded phases */
+            if (is_phase_excluded(phase_name, global->exclude_list)) {
+                if (t == 0)
+                    printf("  [%s] SKIPPED (excluded by VPIC_EXCLUDE)\n", phase_name);
+                continue;
+            }
+
             int do_sgd  = phases[pi].sgd;
             int do_expl = phases[pi].explore;
             int wt_idx  = phases[pi].nn_weight_idx;

@@ -1060,6 +1060,112 @@ def make_timestep_chunks_figure(tc_csv_path, output_path, phase_filter="nn-rl"):
     print(f"  Saved: {output_path}")
 
 
+def make_timestep_chunks_multi_phase(tc_csv_path, output_path,
+                                      phases=("nn", "nn-rl", "nn-rl+exp50")):
+    """Plot predicted vs actual for multiple NN phases side by side.
+
+    Layout: N_phases rows × 3 metric columns (ratio, comp time, decomp time).
+    Each row picks the last available timestep for that phase.
+    """
+    all_rows = parse_csv(tc_csv_path)
+    if not all_rows:
+        return
+
+    metrics = [
+        ("Compression Ratio",  "predicted_ratio",    ("actual_ratio",),                          "x",  "mape_ratio"),
+        ("Comp Time",          "predicted_comp_ms",  ("actual_comp_ms_raw", "actual_comp_ms"),    "ms", "mape_comp"),
+        ("Decomp Time",        "predicted_decomp_ms",("actual_decomp_ms_raw", "actual_decomp_ms"),"ms", "mape_decomp"),
+    ]
+
+    # Group by phase → timestep → rows
+    by_phase = {}
+    for r in all_rows:
+        ph = r.get("phase", "")
+        ts = int(g(r, "timestep", "field_idx"))
+        by_phase.setdefault(ph, {}).setdefault(ts, []).append(r)
+
+    # Filter to requested phases that have data
+    active_phases = [ph for ph in phases if ph in by_phase]
+    if not active_phases:
+        return
+
+    n_phases = len(active_phases)
+    fig, axes = plt.subplots(n_phases, 3, figsize=(14, 3.5 * n_phases + 2),
+                              squeeze=False)
+
+    fig.suptitle("NN Predicted vs Actual: All Phases\n"
+                 "(ratio, compression time, decompression time)",
+                 fontsize=14, fontweight="bold", y=0.99)
+
+    phase_labels = {"nn": "NN Inference", "nn-rl": "NN + SGD",
+                    "nn-rl+exp50": "NN + SGD + Explore"}
+
+    for row_idx, ph in enumerate(active_phases):
+        ts_data = by_phase[ph]
+        last_ts = max(ts_data.keys())
+        chunk_rows = ts_data[last_ts]
+        chunks = np.array([int(g(r, "chunk")) for r in chunk_rows])
+        sort_idx = np.argsort(chunks)
+        chunks = chunks[sort_idx]
+
+        for col_idx, (label, pred_key, act_key, unit, mape_key) in enumerate(metrics):
+            ax = axes[row_idx, col_idx]
+            pred = np.array([g(r, pred_key) for r in chunk_rows])[sort_idx]
+            act_keys = act_key if isinstance(act_key, tuple) else (act_key,)
+            act = np.array([g(r, *act_keys) for r in chunk_rows])[sort_idx]
+            if col_idx > 0:
+                act = np.maximum(act, 5.0)
+            mape_vals = np.array([g(r, mape_key) for r in chunk_rows])[sort_idx]
+
+            ax.plot(chunks, act, color="#2c3e50", linewidth=2.0, label="Actual",
+                    zorder=3, marker='o', markersize=3)
+            ax.plot(chunks, pred, color="#3498db", linewidth=2.0, linestyle="--",
+                    alpha=0.9, label="Predicted", zorder=3, marker='s', markersize=3)
+            ax.fill_between(chunks, act, pred, color="#3498db", alpha=0.15, zorder=2)
+
+            bad = mape_vals > 50
+            if np.any(bad):
+                ax.scatter(chunks[bad], pred[bad], color="#e74c3c", s=20,
+                           zorder=4, marker="x", linewidths=1.5)
+
+            if row_idx == 0:
+                ax.set_title(f"{label} ({unit})", fontweight="bold")
+            if row_idx == 0 and col_idx == 2:
+                ax.legend(loc="upper left", framealpha=0.9)
+            if row_idx == n_phases - 1:
+                ax.set_xlabel("Chunk Index")
+            if col_idx == 0:
+                ax.set_ylabel(f"{phase_labels.get(ph, ph)}\n(T={last_ts})",
+                              fontweight="bold", fontsize=9)
+            ax.grid(alpha=0.2, linestyle="-")
+            ax.minorticks_on()
+
+            all_vals = np.concatenate([pred, act])
+            pos = all_vals[all_vals > 0]
+            if col_idx == 0:
+                p95 = np.percentile(pos, 95) if len(pos) > 0 else 1
+                ax.set_ylim(0, p95 * 1.6)
+            else:
+                vmin = np.min(pos) if len(pos) > 0 else 0
+                vmax = np.max(pos) if len(pos) > 0 else 1
+                margin = max((vmax - vmin) * 0.3, vmax * 0.1, 0.5)
+                ax.set_ylim(max(0, vmin - margin), vmax + margin)
+
+            avg_mape = np.mean(mape_vals)
+            ax.text(0.98, 0.95,
+                    f"MAPE: avg={avg_mape:.0f}%",
+                    transform=ax.transAxes, fontsize=8, ha="right", va="top",
+                    fontfamily="monospace",
+                    bbox=dict(facecolor="white", alpha=0.9, edgecolor="#bbb",
+                              boxstyle="round,pad=0.3"))
+
+    _sc_finalize(fig, pad=1.5, rect=[0, 0, 1, 0.96])
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {output_path}")
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # View 3: Per-Chunk Algorithm Selection
 # ═══════════════════════════════════════════════════════════════════════
@@ -1329,7 +1435,8 @@ def make_milestone_actions_figure(tc_csv_path, output_path, chunk_csv_path=None)
         ts = int(g(r, "timestep", "field_idx"))
         by_phase_ts.setdefault(ph, {}).setdefault(ts, []).append(r)
 
-    # Load single-shot nn phase for reference (static column)
+    # Load nn phase for reference (static column).
+    # Try single-shot chunks CSV first; fall back to timestep_chunks "nn" phase at T=0.
     nn_ref_strip = None
     if chunk_csv_path:
         try:
@@ -1342,12 +1449,19 @@ def make_milestone_actions_figure(tc_csv_path, output_path, chunk_csv_path=None)
                     for r in nn_chunks]
         except Exception:
             pass
+    # Fallback: use "nn" phase from timestep_chunks at first timestep
+    if nn_ref_strip is None and "nn" in by_phase_ts:
+        first_ts = min(by_phase_ts["nn"].keys())
+        nn_chunks = sorted(by_phase_ts["nn"][first_ts],
+                           key=lambda r: int(g(r, "chunk")))
+        if nn_chunks:
+            nn_ref_strip = [_config_to_idx(
+                r.get("action_final", r.get("action", "none")))
+                for r in nn_chunks]
 
-    # Build phase columns: nn (static ref) + available multi-timestep phases
+    # Build phase columns: all available multi-timestep NN phases
     phase_columns = []  # list of (label, data_source)
-    if nn_ref_strip is not None:
-        phase_columns.append(("NN Inference\n(static)", "nn_ref"))
-    ts_phase_order = ["nn-rl", "nn-rl+exp50"]
+    ts_phase_order = ["nn", "nn-rl", "nn-rl+exp50"]
     for ph in ts_phase_order:
         if ph in by_phase_ts:
             phase_columns.append((PHASE_LABELS.get(ph, ph), ph))

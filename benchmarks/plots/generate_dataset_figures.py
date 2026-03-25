@@ -2,15 +2,15 @@
 """
 Generate all figures for a single dataset + policy combination.
 
-Produces up to 7 figures:
-  1_summary.png            - 4-panel: ratio, write, read, Pareto (all policies)
-  2_latency_breakdown.png  - stacked bar: comp, NN, stats, SGD (balanced only)
-  3_algorithm_evolution.png - heatmap: algo per chunk over time (all policies)
-  4_predicted_vs_actual.png - per-chunk accuracy at milestones (balanced only)
-  5a_sgd_convergence.png   - MAPE convergence over timesteps (balanced only)
-  5b_sgd_exploration_firing.png - SGD/exploration firing rates (balanced only)
-  5c_mae_over_time.png     - MAE convergence over timesteps (balanced only)
-  5d_r2_over_time.png      - R² score over timesteps (balanced only)
+Produces up to 9 figures:
+  1_summary.png            - 4-panel: ratio, write, read, Pareto
+  2_latency_breakdown.png  - stacked bar: comp, NN, stats, SGD
+  3_algorithm_evolution.png - heatmap: algo per chunk over time (nn, nn-rl, nn-rl+exp)
+  4_predicted_vs_actual.png - per-chunk predicted vs actual (nn, nn-rl, nn-rl+exp)
+  5a_sgd_convergence.png   - MAPE convergence over timesteps
+  5b_sgd_exploration_firing.png - SGD/exploration firing rates
+  5c_mae_over_time.png     - MAE convergence over timesteps
+  5d_r2_over_time.png      - R² score over timesteps
   5e_ranking_quality.png   - Kendall tau, top-1 accuracy, regret at milestones
 
 Usage:
@@ -38,7 +38,6 @@ def generate_figures(dataset, policy, out_dir):
         return 0
 
     count = 0
-    is_balanced = (policy == BALANCED)
 
     # Find aggregate CSV (try exact name first, then glob for partial match)
     agg_csv = ""
@@ -108,7 +107,7 @@ def generate_figures(dataset, policy, out_dir):
             viz.make_summary_figure(display, rows, out, meta_text)
             count += 1
 
-    # ── 2. Latency breakdown (balanced only) ──
+    # ── 2. Latency breakdown ──
     if os.path.exists(agg_csv):
         rows = viz.parse_csv(agg_csv)
         if rows:
@@ -133,13 +132,13 @@ def generate_figures(dataset, policy, out_dir):
                                           ch_csv if os.path.exists(ch_csv) else None)
         count += 1
 
-    # ── 4. Predicted vs actual (balanced only) ──
+    # ── 4. Predicted vs actual — all 3 NN phases in one figure ──
     if os.path.exists(tc_csv):
         out = os.path.join(out_dir, "4_predicted_vs_actual.png")
-        viz.make_timestep_chunks_figure(tc_csv, out)
+        viz.make_timestep_chunks_multi_phase(tc_csv, out)
         count += 1
 
-    # ── 5. Learning dynamics: MAPE + firing rates (balanced only) ──
+    # ── 5. Learning dynamics: MAPE + firing rates ──
     if csv_base:
         ts_csv = os.path.join(data_dir, f"{csv_base}_timesteps.csv")
     elif dataset in DATASETS:

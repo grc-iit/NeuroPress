@@ -23,12 +23,20 @@ set +e  # Don't exit on error — VPIC cleanup may segfault after benchmark comp
 
 # ── Configuration ──
 # Override with env vars: NX=64 TIMESTEPS=5 bash benchmarks/vpic-kokkos/run_vpic_eval.sh
+#
+# Policy selection (run only specific policies):
+#   POLICIES="balanced"              — balanced only
+#   POLICIES="balanced,ratio"        — balanced + ratio_only
+#   POLICIES="balanced,ratio,speed"  — all 3 (default)
+#   POLICIES="ratio"                 — ratio_only only
+#
 NX=${NX:-156}                  # Grid size: (NX+2)^3 * 16 * 4 bytes (~253 MB for NX=156)
 CHUNK_MB=${CHUNK_MB:-4}        # Chunk size in MB
 TIMESTEPS=${TIMESTEPS:-100}    # Number of multi-timestep writes
 RUNS=${RUNS:-3}                # Single-shot repetitions (3 for error bars)
 WARMUP_STEPS=${WARMUP_STEPS:-100}  # VPIC physics warmup steps
 DEBUG_NN=${DEBUG_NN:-0}        # 1=print NN debug per-chunk, 0=quiet (default off)
+POLICIES=${POLICIES:-balanced,ratio,speed}  # Comma-separated: balanced, ratio, speed
 
 # ── Paths ──
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -47,11 +55,30 @@ mkdir -p "$EVAL_DIR"
 
 # ── Cost model configurations ──
 # Format: "label w0 w1 w2"
-CONFIGS=(
+ALL_CONFIGS=(
     "balanced_w1-1-1       1.0 1.0 1.0"
     "ratio_only_w0-0-1     0.0 0.0 1.0"
     "speed_only_w1-1-0     1.0 1.0 0.0"
 )
+
+# Filter configs based on POLICIES env var
+CONFIGS=()
+for cfg_line in "${ALL_CONFIGS[@]}"; do
+    label=$(echo "$cfg_line" | awk '{print $1}')
+    if [[ "$POLICIES" == *"balanced"* ]] && [[ "$label" == *"balanced"* ]]; then
+        CONFIGS+=("$cfg_line")
+    elif [[ "$POLICIES" == *"ratio"* ]] && [[ "$label" == *"ratio"* ]]; then
+        CONFIGS+=("$cfg_line")
+    elif [[ "$POLICIES" == *"speed"* ]] && [[ "$label" == *"speed"* ]]; then
+        CONFIGS+=("$cfg_line")
+    fi
+done
+
+if [ ${#CONFIGS[@]} -eq 0 ]; then
+    echo "ERROR: No policies matched POLICIES='$POLICIES'"
+    echo "  Valid: balanced, ratio, speed (comma-separated)"
+    exit 1
+fi
 
 # ── Verify binary exists ──
 if [ ! -f "$VPIC_BIN" ]; then

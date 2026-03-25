@@ -513,7 +513,8 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
             120.0, primary_cost});
 
         /* ── SGD Phase 1: learn from PRIMARY result immediately ── */
-        auto t_sgd_start = std::chrono::steady_clock::now();
+        float sgd_phase1_ms = 0.0f, sgd_phase2_ms = 0.0f;
+        auto t_sgd1_start = std::chrono::steady_clock::now();
         if (error_pct > static_cast<double>(g_reinforce_mape_threshold) && d_stats_ptr && !g_best_mode.load()) {
             SGDSample primary_sgd[1];
             primary_sgd[0].action            = explored_samples[0].action;
@@ -536,6 +537,10 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
                     sgd_fired = true;
                 }
             }
+        }
+        if (sgd_fired) {
+            sgd_phase1_ms = std::chrono::duration<float, std::milli>(
+                std::chrono::steady_clock::now() - t_sgd1_start).count();
         }
 
         if (g_exploration_enabled && (g_best_mode.load() || error_pct > g_exploration_threshold) && top_actions) {
@@ -787,6 +792,7 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
         }
 
         /* ── SGD Phase 2: learn from EXPLORATION results separately ── */
+        auto t_sgd2_start = std::chrono::steady_clock::now();
         if (exploration_triggered && explored_samples.size() > 1 && d_stats_ptr && !g_best_mode.load()) {
             std::sort(explored_samples.begin() + 1, explored_samples.end(),
                       [](const ExploredResult& a, const ExploredResult& b) {
@@ -812,9 +818,12 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
                     &gn, &gc, &gs);
             }
         }
-        if (sgd_fired) {
-            diag_sgd_ms = std::chrono::duration<float, std::milli>(
-                std::chrono::steady_clock::now() - t_sgd_start).count();
+        /* Bug fix: sgd_ms now measures Phase 1 + Phase 2 only,
+         * excluding exploration time (was double-counted with explore_ms). */
+        if (sgd_fired || exploration_triggered) {
+            sgd_phase2_ms = std::chrono::duration<float, std::milli>(
+                std::chrono::steady_clock::now() - t_sgd2_start).count();
+            diag_sgd_ms = sgd_phase1_ms + sgd_phase2_ms;
         }
     }
 
