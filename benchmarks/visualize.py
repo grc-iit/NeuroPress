@@ -2080,19 +2080,27 @@ def make_cross_phase_pipeline_overhead(phase_csv_map, output_path, title=""):
     phase_csv_map: dict of {phase_name: csv_path}
       Each CSV is a benchmark_vpic_deck_timesteps.csv for that one phase.
     Bars show mean across timesteps (T>0 to skip first-write warmup).
+
+    Stage 1 is decomposed into three sub-segments:
+      S1a: Stats Kernel  — GPU stats time (CUDA-event measured, summed across chunks)
+      S1b: NN Inference  — GPU NN inference time (CUDA-event measured)
+      S1c: S1 Residual   — vol_stage1_ms - stats_ms - nn_ms  (WQ posting + sync overhead)
     Phases that bypass the VOL pipeline (no-comp) show only h5dwrite_ms.
     """
     import matplotlib.pyplot as plt
     import numpy as np
     from matplotlib.patches import Patch
 
+    # vol_stage1_ms is replaced by three derived sub-segments (S1a/S1b/S1c)
     STAGES = [
-        ("vol_setup_ms",  "#95a5a6", "Setup (threads + alloc)"),
-        ("vol_stage1_ms", "#3498db", "S1: Inference"),
-        ("vol_stage2_ms", "#2ecc71", "S2: Compression"),
-        ("vol_stage3_ms", "#e74c3c", "S3: I/O Write"),
-        ("vol_join_ms",   "#9b59b6", "Thread Join"),
-        ("h5dclose_ms",   "#f39c12", "H5Dclose (metadata)"),
+        ("vol_setup_ms",   "#95a5a6", "Setup (threads + alloc)"),
+        ("s1a_stats_ms",   "#aed6f1", "S1a: Stats Kernel"),
+        ("s1b_nn_ms",      "#2980b9", "S1b: NN Inference"),
+        ("s1c_residual_ms","#1a5276", "S1c: WQ Post / Sync"),
+        ("vol_stage2_ms",  "#2ecc71", "S2: Compression"),
+        ("vol_stage3_ms",  "#e74c3c", "S3: I/O Write"),
+        ("vol_join_ms",    "#9b59b6", "Thread Join"),
+        ("h5dclose_ms",    "#f39c12", "H5Dclose (metadata)"),
     ]
 
     PHASE_DISPLAY = {
@@ -2110,6 +2118,10 @@ def make_cross_phase_pipeline_overhead(phase_csv_map, output_path, title=""):
         "nn-rl+exp50":  "NN+SGD\n+Explore",
     }
 
+    # Raw CSV columns needed (beyond STAGES keys)
+    RAW_COLS = ["vol_setup_ms", "vol_stage1_ms", "vol_stage2_ms", "vol_stage3_ms",
+                "vol_join_ms", "h5dclose_ms", "stats_ms", "nn_ms", "write_ms"]
+
     # Collect mean values per phase
     phases_ordered = list(phase_csv_map.keys())
     data = {}   # phase -> {col: mean_ms}
@@ -2124,11 +2136,19 @@ def make_cross_phase_pipeline_overhead(phase_csv_map, output_path, title=""):
         if not rows_use:
             continue
         means = {}
-        for col, _, _ in STAGES:
+        for col in RAW_COLS:
             vals = [g(r, col) for r in rows_use if g(r, col) >= 0]
             means[col] = float(np.mean(vals)) if vals else 0.0
-        # Also capture raw write time for annotation
-        means["write_ms"] = float(np.mean([g(r, "write_ms") for r in rows_use]))
+
+        # Derive S1 sub-segments
+        s1_total   = means.get("vol_stage1_ms", 0.0)
+        s1a        = means.get("stats_ms", 0.0)
+        s1b        = means.get("nn_ms", 0.0)
+        s1c        = max(0.0, s1_total - s1a - s1b)   # residual: WQ posting + sync
+        means["s1a_stats_ms"]    = s1a
+        means["s1b_nn_ms"]       = s1b
+        means["s1c_residual_ms"] = s1c
+
         data[ph] = means
 
     if not data:
@@ -2151,9 +2171,9 @@ def make_cross_phase_pipeline_overhead(phase_csv_map, output_path, title=""):
         # Only draw bar segments that are non-negligible
         mask = vals > 0.5
         if mask.any():
-            bars = ax.bar(x, vals, bar_w, bottom=bottoms,
-                          color=color, edgecolor="white", linewidth=0.5,
-                          label=label)
+            ax.bar(x, vals, bar_w, bottom=bottoms,
+                   color=color, edgecolor="white", linewidth=0.5,
+                   label=label)
             # Annotate segments > 20ms with their value
             for i, (v, bot) in enumerate(zip(vals, bottoms)):
                 if v > 20:
@@ -2173,14 +2193,14 @@ def make_cross_phase_pipeline_overhead(phase_csv_map, output_path, title=""):
                        fontsize=9)
     ax.set_ylabel("Time (ms)", fontweight="bold")
     ax.set_title(title or "VOL Pipeline Stage Overhead by Phase\n"
-                 "(mean across timesteps, T>0; stacked = sum of stages)",
+                 "(mean across timesteps T>0; S1 split into Stats / NN / WQ-Post)",
                  fontweight="bold", fontsize=11)
     ax.grid(axis="y", alpha=0.2, linestyle="--")
     ax.set_axisbelow(True)
     ax.legend(handles=legend_handles, loc="upper left", fontsize=8,
               framealpha=0.9, ncol=2)
 
-    # Highlight setup bar with an annotation arrow on the first phase that has it
+    # Annotate the setup bar on the first phase that has significant setup time
     for i, ph in enumerate(phases_plot):
         setup_v = data[ph].get("vol_setup_ms", 0)
         if setup_v > 50:

@@ -27,6 +27,7 @@ data/
 test_results/
 *.csv
 test_data/*.csv
+profiling/
 
 # Plots / images (generated)
 *.png
