@@ -685,7 +685,11 @@ def make_r2_figure(ts_csv_path, output_path):
         phase_data[ph] = (timesteps, r2)
 
     # Check if we need a split view (nn phase has very negative R²)
+    if not phase_data:
+        return
     all_r2 = np.concatenate([r2 for _, r2 in phase_data.values()])
+    if len(all_r2) == 0:
+        return
     needs_split = np.min(all_r2) < -2.0 and np.max(all_r2) > 0.5
 
     if needs_split:
@@ -2065,6 +2069,132 @@ def make_pipeline_waterfall(ts_csv_path, output_path):
     fig.suptitle("VOL Pipeline Waterfall (stages overlap — sum > h5dwrite)",
                  fontsize=13, fontweight="bold")
     _sc_finalize(fig, pad=1.5, rect=[0, 0, 1, 0.95])
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {output_path}")
+
+
+def make_cross_phase_pipeline_overhead(phase_csv_map, output_path, title=""):
+    """Stacked bar comparing VOL pipeline stage overhead across all phases.
+
+    phase_csv_map: dict of {phase_name: csv_path}
+      Each CSV is a benchmark_vpic_deck_timesteps.csv for that one phase.
+    Bars show mean across timesteps (T>0 to skip first-write warmup).
+    Phases that bypass the VOL pipeline (no-comp) show only h5dwrite_ms.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from matplotlib.patches import Patch
+
+    STAGES = [
+        ("vol_setup_ms",  "#95a5a6", "Setup (threads + alloc)"),
+        ("vol_stage1_ms", "#3498db", "S1: Inference"),
+        ("vol_stage2_ms", "#2ecc71", "S2: Compression"),
+        ("vol_stage3_ms", "#e74c3c", "S3: I/O Write"),
+        ("vol_join_ms",   "#9b59b6", "Thread Join"),
+        ("h5dclose_ms",   "#f39c12", "H5Dclose (metadata)"),
+    ]
+
+    PHASE_DISPLAY = {
+        "no-comp":      "No-Comp",
+        "lz4":          "LZ4",
+        "snappy":       "Snappy",
+        "deflate":      "Deflate",
+        "gdeflate":     "GDeflate",
+        "zstd":         "Zstd",
+        "ans":          "ANS",
+        "cascaded":     "Cascaded",
+        "bitcomp":      "Bitcomp",
+        "nn":           "NN\n(Inference)",
+        "nn-rl":        "NN+SGD",
+        "nn-rl+exp50":  "NN+SGD\n+Explore",
+    }
+
+    # Collect mean values per phase
+    phases_ordered = list(phase_csv_map.keys())
+    data = {}   # phase -> {col: mean_ms}
+    for ph, csv_path in phase_csv_map.items():
+        if not os.path.exists(csv_path):
+            continue
+        rows = parse_csv(csv_path)
+        # Skip T=0 (first-call warmup) when enough data available
+        rows_use = [r for r in rows if g(r, "timestep") > 0]
+        if not rows_use:
+            rows_use = rows
+        if not rows_use:
+            continue
+        means = {}
+        for col, _, _ in STAGES:
+            vals = [g(r, col) for r in rows_use if g(r, col) >= 0]
+            means[col] = float(np.mean(vals)) if vals else 0.0
+        # Also capture raw write time for annotation
+        means["write_ms"] = float(np.mean([g(r, "write_ms") for r in rows_use]))
+        data[ph] = means
+
+    if not data:
+        return
+
+    phases_plot = [ph for ph in phases_ordered if ph in data]
+    n = len(phases_plot)
+    if n == 0:
+        return
+
+    fig, ax = plt.subplots(figsize=(max(7, n * 1.4 + 2), 5))
+
+    x = np.arange(n)
+    bar_w = 0.6
+    bottoms = np.zeros(n)
+    legend_handles = []
+
+    for col, color, label in STAGES:
+        vals = np.array([data[ph].get(col, 0.0) for ph in phases_plot])
+        # Only draw bar segments that are non-negligible
+        mask = vals > 0.5
+        if mask.any():
+            bars = ax.bar(x, vals, bar_w, bottom=bottoms,
+                          color=color, edgecolor="white", linewidth=0.5,
+                          label=label)
+            # Annotate segments > 20ms with their value
+            for i, (v, bot) in enumerate(zip(vals, bottoms)):
+                if v > 20:
+                    ax.text(i, bot + v / 2, f"{v:.0f}", ha="center", va="center",
+                            fontsize=7.5, color="white", fontweight="bold")
+            legend_handles.append(Patch(facecolor=color, label=label))
+        bottoms += vals
+
+    # Annotate total write_ms above each bar
+    for i, ph in enumerate(phases_plot):
+        total = data[ph].get("write_ms", 0)
+        ax.text(i, bottoms[i] + 8, f"{total:.0f} ms", ha="center", va="bottom",
+                fontsize=8, color="#333333", fontweight="bold")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([PHASE_DISPLAY.get(ph, ph) for ph in phases_plot],
+                       fontsize=9)
+    ax.set_ylabel("Time (ms)", fontweight="bold")
+    ax.set_title(title or "VOL Pipeline Stage Overhead by Phase\n"
+                 "(mean across timesteps, T>0; stacked = sum of stages)",
+                 fontweight="bold", fontsize=11)
+    ax.grid(axis="y", alpha=0.2, linestyle="--")
+    ax.set_axisbelow(True)
+    ax.legend(handles=legend_handles, loc="upper left", fontsize=8,
+              framealpha=0.9, ncol=2)
+
+    # Highlight setup bar with an annotation arrow on the first phase that has it
+    for i, ph in enumerate(phases_plot):
+        setup_v = data[ph].get("vol_setup_ms", 0)
+        if setup_v > 50:
+            ax.annotate(f"Thread\nspawn\n{setup_v:.0f}ms",
+                        xy=(i, setup_v / 2),
+                        xytext=(i + 0.45, setup_v * 0.6),
+                        fontsize=7, color="#555555",
+                        arrowprops=dict(arrowstyle="->", color="#888888",
+                                        lw=0.8),
+                        ha="left", va="center")
+            break
+
+    _sc_finalize(fig, pad=1.5)
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved: {output_path}")

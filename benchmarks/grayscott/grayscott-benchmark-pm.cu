@@ -1517,7 +1517,7 @@ int main(int argc, char **argv)
                     ts_mae_r, ts_mae_c, ts_mae_d, ts_r2,
                     vol_s1, vol_s2, vol_s3,
                     h5dwrite_ms_t, cuda_sync_ms_t, h5dclose_ms_t, h5fclose_ms_t,
-                    vol_setup, vol_func, vol_join);
+                    vol_setup, vol_total, vol_join);
                 fflush(ts_csv);
             }
 

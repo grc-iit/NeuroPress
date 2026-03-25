@@ -163,6 +163,7 @@ def generate_figures(dataset, policy, out_dir):
         count += 1
 
     # ── 5e. Ranking quality (Kendall tau) ──
+    ranking_csv = ""
     if csv_base:
         ranking_csv = os.path.join(data_dir, f"{csv_base}_ranking.csv")
     if not os.path.exists(ranking_csv) and dataset in DATASETS:
@@ -191,6 +192,31 @@ def generate_figures(dataset, policy, out_dir):
 
         out_gpu = os.path.join(out_dir, "6c_gpu_breakdown_over_time.png")
         viz.make_gpu_breakdown_over_time(ts_csv, out_gpu)
+        count += 1
+
+    # ── 6d. Cross-phase pipeline overhead comparison ──
+    # Walk sibling phase_<name>/ directories to collect per-phase timestep CSVs.
+    # Works for both VPIC phase-major layout and Gray-Scott (single ts_csv only).
+    phase_csv_map = {}
+    phase_parent = data_dir  # phase_<name>/ dirs live inside the policy dir
+    if os.path.isdir(phase_parent):
+        for entry in sorted(os.listdir(phase_parent)):
+            if not entry.startswith("phase_"):
+                continue
+            ph_name = entry[len("phase_"):]
+            # Try both VPIC and Gray-Scott naming conventions
+            for candidate in (
+                f"benchmark_vpic_deck_timesteps.csv",
+                f"benchmark_grayscott_timesteps.csv",
+                f"benchmark_{dataset}_timesteps.csv",
+            ):
+                cpath = os.path.join(phase_parent, entry, candidate)
+                if os.path.exists(cpath):
+                    phase_csv_map[ph_name] = cpath
+                    break
+    if len(phase_csv_map) >= 2:
+        out_pd = os.path.join(out_dir, "6d_cross_phase_pipeline_overhead.png")
+        viz.make_cross_phase_pipeline_overhead(phase_csv_map, out_pd)
         count += 1
 
     return count

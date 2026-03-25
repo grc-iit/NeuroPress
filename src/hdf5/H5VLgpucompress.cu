@@ -383,7 +383,7 @@ static int    s_d2h_count = 0;   /* number of D→H cudaMemcpy calls  */
 static int    s_d2d_count = 0;   /* number of D→D cudaMemcpy calls  */
 /* Wall-clock stage timing (ms) for the last H5Dwrite call */
 static double s_stage1_ms = 0;   /* Stage 1: stats + NN inference (main thread) */
-static double s_stage2_ms = 0;   /* Stage 2: compression + D→H (worker threads wall clock) */
+static double s_stage2_ms = 0;   /* Stage 2: worker join - stage1 end (compression + D→H wall clock) */
 static double s_stage3_ms = 0;   /* Stage 3: HDF5 chunk writes (I/O thread wall clock) */
 static double s_total_ms  = 0;   /* Total wall clock for the pipeline */
 static double s_vol_func_ms = 0; /* Total wall clock for gpu_aware_chunked_write */
@@ -1539,7 +1539,7 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
 
             /* ---- Join workers and propagate errors ---- */
             for (auto &t : workers) t.join();
-            s_stage2_ms = _now_ms() - _pipeline_start;
+            s_stage2_ms = _now_ms() - _s1_start - s_stage1_ms; /* exclude S1 overlap */
             /* Compute max per-worker total wall time (= bottleneck worker) */
             for (int w = 0; w < N_COMP_WORKERS; w++) {
                 if (worker_comp_ms[w] > s_max_worker_comp_ms) s_max_worker_comp_ms = worker_comp_ms[w];
