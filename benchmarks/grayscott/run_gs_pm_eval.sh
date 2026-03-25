@@ -70,9 +70,52 @@ echo ""
 IFS=',' read -ra PHASE_LIST <<< "$PHASES"
 IFS=',' read -ra POLICY_LIST <<< "$POLICIES"
 
-TOTAL=$(( ${#PHASE_LIST[@]} * ${#POLICY_LIST[@]} ))
+# ── Separate NN phases (policy-sensitive) from fixed phases (policy-invariant) ──
+NN_PHASES=()
+FIXED_PHASES=()
+for phase in "${PHASE_LIST[@]}"; do
+    case "$phase" in
+        nn|nn-rl|nn-rl+exp50) NN_PHASES+=("$phase") ;;
+        *) FIXED_PHASES+=("$phase") ;;
+    esac
+done
+
+TOTAL=$(( ${#FIXED_PHASES[@]} + ${#NN_PHASES[@]} * ${#POLICY_LIST[@]} ))
 RUN_NUM=0
 
+# ── Run fixed phases once (policy doesn't affect algorithm choice) ──
+FIXED_DIR="$EVAL_DIR/fixed_phases"
+if [ ${#FIXED_PHASES[@]} -gt 0 ]; then
+    mkdir -p "$FIXED_DIR"
+    echo "============================================================"
+    echo "  Fixed phases (run once — policy-invariant)"
+    echo "============================================================"
+
+    for phase in "${FIXED_PHASES[@]}"; do
+        RUN_NUM=$((RUN_NUM + 1))
+        PHASE_DIR="$FIXED_DIR/phase_${phase}"
+        mkdir -p "$PHASE_DIR"
+
+        echo "  [$RUN_NUM/$TOTAL] $phase → $PHASE_DIR"
+
+        RUN_START=$(date +%s)
+        GPUCOMPRESS_DETAILED_TIMING=1 \
+        GPUCOMPRESS_DEBUG_NN=$DEBUG_NN \
+        "$GS_BIN" "$WEIGHTS" \
+            --L $L --steps $STEPS --chunk-mb $CHUNK_MB --timesteps $TIMESTEPS \
+            --phase "$phase" \
+            --w0 1.0 --w1 1.0 --w2 1.0 \
+            --out-dir "$PHASE_DIR" \
+            > "$PHASE_DIR/gs_benchmark.log" 2>&1
+
+        RUN_END=$(date +%s)
+        ELAPSED=$((RUN_END - RUN_START))
+        echo "    Done (${ELAPSED}s)"
+    done
+    echo ""
+fi
+
+# ── Run NN phases per policy (cost model weights affect algorithm selection) ──
 for policy in "${POLICY_LIST[@]}"; do
     LABEL="${POLICY_LABELS[$policy]}"
     W0="${POLICY_W0[$policy]}"
@@ -82,11 +125,13 @@ for policy in "${POLICY_LIST[@]}"; do
     POLICY_DIR="$EVAL_DIR/$LABEL"
     mkdir -p "$POLICY_DIR"
 
+    if [ ${#NN_PHASES[@]} -eq 0 ]; then continue; fi
+
     echo "============================================================"
-    echo "  Policy: $LABEL (w0=$W0 w1=$W1 w2=$W2)"
+    echo "  Policy: $LABEL (w0=$W0 w1=$W1 w2=$W2) — NN phases"
     echo "============================================================"
 
-    for phase in "${PHASE_LIST[@]}"; do
+    for phase in "${NN_PHASES[@]}"; do
         RUN_NUM=$((RUN_NUM + 1))
         PHASE_DIR="$POLICY_DIR/phase_${phase}"
         mkdir -p "$PHASE_DIR"
@@ -117,8 +162,13 @@ for policy in "${POLICY_LIST[@]}"; do
     for csv_name in benchmark_grayscott_vol.csv benchmark_grayscott_timesteps.csv benchmark_grayscott_timestep_chunks.csv benchmark_grayscott_vol_chunks.csv benchmark_grayscott_ranking.csv benchmark_grayscott_ranking_costs.csv; do
         MERGED="$MERGE_DIR/$csv_name"
         FIRST=1
+        # Merge fixed phases (from fixed_phases/) + NN phases (from policy dir)
         for phase in "${PHASE_LIST[@]}"; do
-            SRC="$POLICY_DIR/phase_${phase}/$csv_name"
+            # Fixed phases live in fixed_phases/, NN phases in policy dir
+            case "$phase" in
+                nn|nn-rl|nn-rl+exp50) SRC="$POLICY_DIR/phase_${phase}/$csv_name" ;;
+                *) SRC="$FIXED_DIR/phase_${phase}/$csv_name" ;;
+            esac
             if [ -f "$SRC" ]; then
                 if [ $FIRST -eq 1 ]; then
                     cp "$SRC" "$MERGED"
