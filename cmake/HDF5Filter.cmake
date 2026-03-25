@@ -44,16 +44,7 @@ target_compile_definitions(H5Zgpucompress PRIVATE GPUCOMPRESS_BUILD_HDF5_PLUGIN)
 # HDF5 Filter Tests (H5Z, no VOL)
 # ============================================================
 
-# DESIGN-6 regression: chunk tracker grows past 256 without overflow
-add_executable(test_design6_chunk_tracker tests/regression/test_design6_chunk_tracker.c)
-target_include_directories(test_design6_chunk_tracker PRIVATE
-    ${HDF5_INCLUDE_DIRS}
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-)
-target_link_libraries(test_design6_chunk_tracker PRIVATE
-    gpucompress H5Zgpucompress ${HDF5_C_LIBRARIES} m
-)
+# (Removed: test_design6_chunk_tracker — host-path stub, H5Z filter calls gpucompress_compress())
 
 # HDF5 configuration validation test
 add_executable(test_hdf5_configs tests/hdf5/test_hdf5_configs.c)

@@ -65,7 +65,7 @@ std::atomic<bool> g_sgd_ever_fired{false};
 float g_rank_w0 = 1.0f;                   // weight on compression time
 float g_rank_w1 = 1.0f;                   // weight on decompression time
 float g_rank_w2 = 1.0f;                   // weight on I/O cost (data_size / (ratio * bw))
-float g_measured_bw_bytes_per_ms = 1e6f;   // default 1 GB/s = 1e6 bytes/ms
+float g_measured_bw_bytes_per_ms = 5e6f;   // 5 GB/s = 5e6 bytes/ms (representative HPC storage)
 
 
 /* ============================================================
@@ -196,33 +196,17 @@ extern "C" gpucompress_error_t gpucompress_init(const char* weights_path) {
         return GPUCOMPRESS_ERROR_OUT_OF_MEMORY;
     }
 
-    // Bandwidth probe: write+read 16MB temp file to measure storage BW
+    // Storage bandwidth: static 5 GB/s (representative HPC parallel filesystem).
+    // Override at runtime via gpucompress_set_bandwidth() or GPUCOMPRESS_BW_GBPS env var.
     {
-        const size_t probe_sz = 16 * 1024 * 1024;
-        char tmp_path[] = "/tmp/gpucompress_bw_XXXXXX";
-        int fd = mkstemp(tmp_path);
-        if (fd >= 0) {
-            std::vector<char> buf(probe_sz, 0x42);
-            auto t_bw0 = std::chrono::steady_clock::now();
-            ssize_t wr = write(fd, buf.data(), probe_sz);
-            fsync(fd);
-            posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
-            lseek(fd, 0, SEEK_SET);
-            ssize_t rd = read(fd, buf.data(), probe_sz);
-            auto t_bw1 = std::chrono::steady_clock::now();
-            close(fd);
-            unlink(tmp_path);
-            if (wr == (ssize_t)probe_sz && rd == (ssize_t)probe_sz) {
-                double ms = std::chrono::duration<double, std::milli>(t_bw1 - t_bw0).count();
-                if (ms > 0.0) {
-                    // Use min of write and read BW (conservative)
-                    g_measured_bw_bytes_per_ms = static_cast<float>(
-                        static_cast<double>(probe_sz) / ms);
-                    fprintf(stderr, "gpucompress: storage bandwidth probe: %.1f MB/s (%.1f ms for %zu MB)\n",
-                            g_measured_bw_bytes_per_ms / 1000.0, ms, probe_sz >> 20);
-                }
-            }
+        const char* bw_env = getenv("GPUCOMPRESS_BW_GBPS");
+        if (bw_env) {
+            float bw_gbps = (float)atof(bw_env);
+            if (bw_gbps > 0.0f)
+                g_measured_bw_bytes_per_ms = bw_gbps * 1e6f;
         }
+        fprintf(stderr, "gpucompress: storage bandwidth: %.1f GB/s\n",
+                g_measured_bw_bytes_per_ms / 1e6);
     }
 
     // Load NN weights if path provided
