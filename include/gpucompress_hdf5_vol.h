@@ -112,6 +112,11 @@ void H5VL_gpucompress_get_worker_timing(double *max_worker_ms);
 void H5VL_gpucompress_get_vol_func_timing(double *setup_ms, double *vol_func_ms,
                                           double *join_ms);
 
+/** Release cached VOL pipeline buffers (device + pinned host).
+ *  Called automatically by gpucompress_cleanup(). Can also be called
+ *  explicitly to free ~1.7GB of cached memory between benchmark phases. */
+void H5VL_gpucompress_release_buf_cache(void);
+
 /**
  * Enable (on=1) or disable (on=0) call-sequence tracing.
  * When enabled, every VOL callback and every underlying H5VL* native call

@@ -65,6 +65,18 @@ struct VolWriteCtx {
     bool     initialized;
 };
 
+/* P0 fix: global buffer cache — survives H5Dclose → H5Dcreate cycles.
+ * H5Dclose donates buffers here instead of freeing; next H5Dwrite reclaims.
+ * Single-slot cache. Mutex ordering: acquirable independently or under g_init_mutex. */
+struct VolBufCache {
+    uint8_t* d_comp_w[M4_N_COMP_WORKERS];
+    void*    io_pool_bufs[M4_N_IO_BUFS];
+    size_t   max_comp;
+    bool     valid;
+};
+static std::mutex   s_buf_cache_mtx;
+static VolBufCache  s_buf_cache = {};
+
 /** Wrapped HDF5 object.  For datasets, dcpl_id holds a copy of the DCPL. */
 typedef struct H5VL_gpucompress_t {
     hid_t  under_vol_id;    /**< ID of the underlying VOL connector       */
@@ -440,6 +452,22 @@ H5VL_gpucompress_get_vol_func_timing(double *setup_ms, double *vol_func_ms,
     if (setup_ms)    *setup_ms    = s_setup_ms;
     if (vol_func_ms) *vol_func_ms = s_vol_func_ms;
     if (join_ms)     *join_ms     = s_join_ms_g;
+}
+
+extern "C" void
+H5VL_gpucompress_release_buf_cache(void)
+{
+    std::lock_guard<std::mutex> lk(s_buf_cache_mtx);
+    if (s_buf_cache.valid) {
+        for (int w = 0; w < M4_N_COMP_WORKERS; w++) {
+            if (s_buf_cache.d_comp_w[w]) { cudaFree(s_buf_cache.d_comp_w[w]); s_buf_cache.d_comp_w[w] = nullptr; }
+        }
+        for (int i = 0; i < M4_N_IO_BUFS; i++) {
+            if (s_buf_cache.io_pool_bufs[i]) { cudaFreeHost(s_buf_cache.io_pool_bufs[i]); s_buf_cache.io_pool_bufs[i] = nullptr; }
+        }
+        s_buf_cache.valid = false;
+        s_buf_cache.max_comp = 0;
+    }
 }
 
 extern "C" void
@@ -1080,7 +1108,8 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
             float          infer_stats_ms;
             /* Pre-computed stats from Stage 1 (D→D copy from infer_ctx).
              * Avoids redundant stats recomputation in Stage 2 for SGD. */
-            AutoStatsGPU*  d_stats_copy;   /* owned: worker cudaFrees after use */
+            AutoStatsGPU*  d_stats_copy;   /* stats for SGD; ring-managed or worker-owned */
+            bool           d_stats_ring_managed; /* true: from ring buffer (don't cudaFree) */
             /* Detailed timing: VOL Stage 1 per-chunk */
             float          vol_stats_malloc_ms;
             float          vol_stats_copy_ms;
@@ -1099,6 +1128,8 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
         memset(worker_comp_ms, 0, sizeof(worker_comp_ms));
         hsize_t *d_dset_dims = NULL, *d_chunk_dims = NULL, *d_chunk_start = NULL;
         uint8_t* d_comp_w[N_COMP_WORKERS] = {};
+        AutoStatsGPU** d_stats_ring = nullptr;
+        size_t d_stats_ring_count = 0;
         std::atomic<herr_t>     worker_err{0};
         std::mutex              pool_mtx;
         std::condition_variable pool_cv;
@@ -1129,8 +1160,21 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
         double _vol_func_start = _now_ms();
 
         if (!o->write_ctx) {
-            o->write_ctx = new VolWriteCtx{};
-            memset(o->write_ctx, 0, sizeof(VolWriteCtx));
+            o->write_ctx = new VolWriteCtx{};  /* value-init zeros all members */
+            /* P0: try reclaim buffers from global cache (always reclaim if valid;
+             * the realloc path below handles size growth if cached < needed). */
+            {
+                std::lock_guard<std::mutex> lk(s_buf_cache_mtx);
+                if (s_buf_cache.valid) {
+                    memcpy(o->write_ctx->d_comp_w, s_buf_cache.d_comp_w, sizeof(s_buf_cache.d_comp_w));
+                    memcpy(o->write_ctx->io_pool_bufs, s_buf_cache.io_pool_bufs, sizeof(s_buf_cache.io_pool_bufs));
+                    o->write_ctx->max_comp = s_buf_cache.max_comp;
+                    o->write_ctx->initialized = true;
+                    s_buf_cache.valid = false;
+                    memset(s_buf_cache.d_comp_w, 0, sizeof(s_buf_cache.d_comp_w));
+                    memset(s_buf_cache.io_pool_bufs, 0, sizeof(s_buf_cache.io_pool_bufs));
+                }
+            }
         }
         VolWriteCtx* wctx = o->write_ctx;
 
@@ -1151,7 +1195,19 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
             for (int i = 0; i < N_IO_BUFS && ok; i++) {
                 if (cudaMallocHost(&wctx->io_pool_bufs[i], max_comp) != cudaSuccess) ok = false;
             }
-            if (!ok) goto done_write;
+            if (!ok) {
+                /* Clean up partial allocations to avoid leaks on retry */
+                for (int w = 0; w < N_COMP_WORKERS; w++) {
+                    if (wctx->d_comp_w[w]) { cudaFree(wctx->d_comp_w[w]); wctx->d_comp_w[w] = nullptr; }
+                }
+                for (int i = 0; i < N_IO_BUFS; i++) {
+                    if (wctx->io_pool_bufs[i]) { cudaFreeHost(wctx->io_pool_bufs[i]); wctx->io_pool_bufs[i] = nullptr; }
+                }
+                wctx->initialized = false;
+                wctx->max_comp = 0;
+                ret = -1;
+                goto done_write;
+            }
             wctx->max_comp = max_comp;
             wctx->initialized = true;
         }
@@ -1217,7 +1273,7 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
 
                         /* Free per-chunk owned buffers after compression completes */
                         if (wi.d_owned) { cudaFree(wi.d_owned); wi.d_owned = NULL; }
-                        if (wi.d_stats_copy) { cudaFree(wi.d_stats_copy); wi.d_stats_copy = NULL; }
+                        if (wi.d_stats_copy && !wi.d_stats_ring_managed) { cudaFree(wi.d_stats_copy); wi.d_stats_copy = NULL; }
 
                         if (ce != GPUCOMPRESS_SUCCESS) {
                             fprintf(stderr, "gpucompress VOL: worker %d compress failed "
@@ -1318,6 +1374,31 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                     if (!infer_ctx) {
                         fprintf(stderr, "gpucompress VOL: failed to acquire inference CompContext\n");
                         use_seq_inference = false;
+                    }
+                }
+
+                /* Pre-allocate d_stats_copy ring buffer (one per chunk).
+                 * Eliminates per-chunk cudaMalloc (~0.31ms each) from the hot path.
+                 * Each entry holds a copy of infer_ctx->d_stats for SGD in Stage 2.
+                 * Safe: each chunk index is used exactly once, freed after worker join. */
+                if (use_seq_inference && total_chunks > 0) {
+                    d_stats_ring = (AutoStatsGPU**)calloc(total_chunks, sizeof(AutoStatsGPU*));
+                    if (d_stats_ring) {
+                        bool ring_ok = true;
+                        for (size_t i = 0; i < total_chunks && ring_ok; i++) {
+                            if (cudaMalloc(&d_stats_ring[i], sizeof(AutoStatsGPU)) != cudaSuccess)
+                                ring_ok = false;
+                        }
+                        if (ring_ok) {
+                            d_stats_ring_count = total_chunks;
+                        } else {
+                            /* Partial alloc cleanup */
+                            for (size_t i = 0; i < total_chunks; i++) {
+                                if (d_stats_ring[i]) cudaFree(d_stats_ring[i]);
+                            }
+                            free(d_stats_ring);
+                            d_stats_ring = nullptr;
+                        }
                     }
                 }
 
@@ -1450,6 +1531,7 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                                 cudaEventElapsedTime(&wi.infer_stats_ms,
                                     infer_ctx->stats_start, infer_ctx->stats_stop);
                                 wi.d_stats_copy   = nullptr;  /* no SGD in heuristic mode */
+                                wi.d_stats_ring_managed = false;
                             }
                         } else {
                             /* NN path: full stats + inference */
@@ -1473,14 +1555,19 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                                 /* Capture Stage 1 timing from infer_ctx CUDA events */
                                 cudaEventElapsedTime(&wi.infer_nn_ms, infer_ctx->nn_start, infer_ctx->nn_stop);
                                 cudaEventElapsedTime(&wi.infer_stats_ms, infer_ctx->stats_start, infer_ctx->stats_stop);
-                                /* Copy stats from infer_ctx to a per-chunk buffer so
-                                 * Stage 2 worker can reuse them for SGD without recomputing.
+                                /* Copy stats from infer_ctx to a pre-allocated per-chunk buffer
+                                 * so Stage 2 worker can reuse them for SGD without recomputing.
                                  * infer_ctx->d_stats will be overwritten by the next chunk. */
                                 double _t_sm = _now_ms();
                                 AutoStatsGPU* d_sc = nullptr;
-                                if (cudaMalloc(&d_sc, sizeof(AutoStatsGPU)) != cudaSuccess) {
-                                    fprintf(stderr, "gpucompress VOL: stats copy alloc failed\n");
-                                    ret = -1; break;
+                                if (d_stats_ring && ci < d_stats_ring_count) {
+                                    d_sc = d_stats_ring[ci];  /* pre-allocated, no cudaMalloc */
+                                } else {
+                                    /* Fallback: per-chunk alloc (ring not available) */
+                                    if (cudaMalloc(&d_sc, sizeof(AutoStatsGPU)) != cudaSuccess) {
+                                        fprintf(stderr, "gpucompress VOL: stats copy alloc failed\n");
+                                        ret = -1; break;
+                                    }
                                 }
                                 wi.vol_stats_malloc_ms = (float)(_now_ms() - _t_sm);
 
@@ -1489,15 +1576,18 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                                                                       cudaMemcpyDeviceToDevice, infer_ctx->stream);
                                 if (sc_err != cudaSuccess) {
                                     fprintf(stderr, "gpucompress VOL: stats copy memcpy failed\n");
-                                    cudaFree(d_sc); ret = -1; break;
+                                    if (!d_stats_ring) cudaFree(d_sc);
+                                    ret = -1; break;
                                 }
                                 sc_err = cudaStreamSynchronize(infer_ctx->stream);
                                 if (sc_err != cudaSuccess) {
                                     fprintf(stderr, "gpucompress VOL: stats copy sync failed\n");
-                                    cudaFree(d_sc); ret = -1; break;
+                                    if (!d_stats_ring) cudaFree(d_sc);
+                                    ret = -1; break;
                                 }
                                 wi.vol_stats_copy_ms = (float)(_now_ms() - _t_sc);
                                 wi.d_stats_copy = d_sc;
+                                wi.d_stats_ring_managed = (d_stats_ring != nullptr && ci < d_stats_ring_count);
                             }
                         }
                     }
@@ -1514,7 +1604,7 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                           wq.push(wi);
                       else {
                           if (wi.d_owned) { cudaFree(wi.d_owned); wi.d_owned = NULL; }
-                          if (wi.d_stats_copy) { cudaFree(wi.d_stats_copy); wi.d_stats_copy = NULL; }
+                          if (wi.d_stats_copy && !wi.d_stats_ring_managed) { cudaFree(wi.d_stats_copy); wi.d_stats_copy = NULL; }
                       } }
                     wq_ready_cv.notify_one();
                 } /* chunk loop */
@@ -1547,6 +1637,15 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
             if (worker_err.load() != 0 && ret == 0) ret = (herr_t)-1;
 
         } /* workers + Stage 1 scope */
+
+        /* Free pre-allocated d_stats ring buffer (all workers joined, safe) */
+        if (d_stats_ring) {
+            for (size_t i = 0; i < d_stats_ring_count; i++) {
+                if (d_stats_ring[i]) cudaFree(d_stats_ring[i]);
+            }
+            free(d_stats_ring);
+            d_stats_ring = nullptr;
+        }
 
 done_write:
         /* ---- Signal I/O thread and join ---- */
@@ -2191,15 +2290,31 @@ H5VL_gpucompress_dataset_close(void *dset, hid_t dxpl_id, void **req)
     herr_t rv = H5VLdataset_close(o->under_object, o->under_vol_id, dxpl_id, req);
     if (req && *req) *req = new_obj(*req, o->under_vol_id);
     if (rv >= 0) {
-        /* M4 fix: free persistent write buffers */
+        /* P0 fix: donate write buffers to global cache instead of freeing.
+         * Next H5Dwrite reclaims them, avoiding ~750ms of cudaMalloc/cudaMallocHost. */
         if (o->write_ctx) {
             VolWriteCtx* wctx = o->write_ctx;
             if (wctx->initialized) {
-                for (int w = 0; w < M4_N_COMP_WORKERS; w++) {
-                    if (wctx->d_comp_w[w]) cudaFree(wctx->d_comp_w[w]);
-                }
-                for (int i = 0; i < M4_N_IO_BUFS; i++) {
-                    if (wctx->io_pool_bufs[i]) cudaFreeHost(wctx->io_pool_bufs[i]);
+                std::lock_guard<std::mutex> lk(s_buf_cache_mtx);
+                if (!s_buf_cache.valid || wctx->max_comp > s_buf_cache.max_comp) {
+                    /* Evict smaller cached buffers if present */
+                    if (s_buf_cache.valid) {
+                        for (int w = 0; w < M4_N_COMP_WORKERS; w++)
+                            if (s_buf_cache.d_comp_w[w]) cudaFree(s_buf_cache.d_comp_w[w]);
+                        for (int i = 0; i < M4_N_IO_BUFS; i++)
+                            if (s_buf_cache.io_pool_bufs[i]) cudaFreeHost(s_buf_cache.io_pool_bufs[i]);
+                    }
+                    /* Donate to cache — no cudaFree, pointers transferred */
+                    memcpy(s_buf_cache.d_comp_w, wctx->d_comp_w, sizeof(wctx->d_comp_w));
+                    memcpy(s_buf_cache.io_pool_bufs, wctx->io_pool_bufs, sizeof(wctx->io_pool_bufs));
+                    s_buf_cache.max_comp = wctx->max_comp;
+                    s_buf_cache.valid = true;
+                } else {
+                    /* Cache already has equal/larger buffers — free these normally */
+                    for (int w = 0; w < M4_N_COMP_WORKERS; w++)
+                        if (wctx->d_comp_w[w]) cudaFree(wctx->d_comp_w[w]);
+                    for (int i = 0; i < M4_N_IO_BUFS; i++)
+                        if (wctx->io_pool_bufs[i]) cudaFreeHost(wctx->io_pool_bufs[i]);
                 }
             }
             delete wctx;

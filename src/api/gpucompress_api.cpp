@@ -262,6 +262,11 @@ extern "C" void gpucompress_cleanup(void) {
         g_best_mode.store(false);
         gpucompress_nn_cleanup_impl();
         gpucompress_free_stats_workspace();
+        /* P0: free cached VOL buffers while CUDA context is still alive.
+         * Weak reference avoids circular dependency (gpucompress ↔ H5VLgpucompress). */
+        extern void H5VL_gpucompress_release_buf_cache(void) __attribute__((weak));
+        if (H5VL_gpucompress_release_buf_cache)
+            H5VL_gpucompress_release_buf_cache();
         gpucompress::destroyCompContextPool();
         free_range_bufs();
         if (g_sgd_stream) { cudaStreamDestroy(g_sgd_stream); g_sgd_stream = nullptr; }
