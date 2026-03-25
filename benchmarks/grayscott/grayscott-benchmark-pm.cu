@@ -1008,6 +1008,9 @@ int main(int argc, char **argv)
     float F      = DEFAULT_F;
     float k      = DEFAULT_K;
     float  sgd_lr    = REINFORCE_LR;  /* overridable via --lr */
+    float  sgd_mape  = REINFORCE_MAPE; /* overridable via --mape */
+    int    explore_k = 4;              /* overridable via --explore-k */
+    float  explore_thresh = 0.20f;     /* overridable via --explore-thresh */
     float  rank_w0 = 1.0f, rank_w1 = 1.0f, rank_w2 = 1.0f;  /* cost model weights */
     double error_bound = 0.0;  /* 0 = lossless, >0 = lossy quantization */
     const char *out_dir_override = NULL;  /* overridable via --out-dir */
@@ -1047,6 +1050,12 @@ int main(int argc, char **argv)
             error_bound = atof(argv[++i]);
         } else if (strcmp(argv[i], "--lr") == 0 && i + 1 < argc) {
             sgd_lr = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--mape") == 0 && i + 1 < argc) {
+            sgd_mape = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--explore-k") == 0 && i + 1 < argc) {
+            explore_k = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--explore-thresh") == 0 && i + 1 < argc) {
+            explore_thresh = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--w0") == 0 && i + 1 < argc) {
             rank_w0 = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--w1") == 0 && i + 1 < argc) {
@@ -1302,14 +1311,14 @@ int main(int argc, char **argv)
         gpucompress_flush_manager_cache();
         if (do_sgd) {
             gpucompress_enable_online_learning();
-            gpucompress_set_reinforcement(1, sgd_lr, REINFORCE_MAPE, REINFORCE_MAPE);
+            gpucompress_set_reinforcement(1, sgd_lr, sgd_mape, sgd_mape);
         } else {
             gpucompress_disable_online_learning();
         }
         gpucompress_set_exploration(do_expl);
         if (do_expl) {
-            gpucompress_set_exploration_threshold(0.20);
-            gpucompress_set_exploration_k(4);
+            gpucompress_set_exploration_threshold(explore_thresh);
+            gpucompress_set_exploration_k(explore_k);
         }
 
         /* Build DCPL for this phase */
@@ -1960,14 +1969,14 @@ int main(int argc, char **argv)
             gpucompress_flush_manager_cache();
             if (do_sgd) {
                 gpucompress_enable_online_learning();
-                gpucompress_set_reinforcement(1, sgd_lr, REINFORCE_MAPE, REINFORCE_MAPE);
+                gpucompress_set_reinforcement(1, sgd_lr, sgd_mape, sgd_mape);
             } else {
                 gpucompress_disable_online_learning();
             }
             gpucompress_set_exploration(do_expl);
             if (do_expl) {
-                gpucompress_set_exploration_threshold(0.20);
-                gpucompress_set_exploration_k(4);
+                gpucompress_set_exploration_threshold(explore_thresh);
+                gpucompress_set_exploration_k(explore_k);
             }
 
             printf("  %-4s  %-8s  %-7s  %-7s  %-7s  %-8s  %-8s  %-8s  %-4s  %-4s\n",

@@ -26,6 +26,10 @@ TIMESTEPS=${TIMESTEPS:-100}
 DEBUG_NN=${DEBUG_NN:-0}
 PHASES=${PHASES:-"no-comp,lz4,snappy,deflate,gdeflate,zstd,ans,cascaded,bitcomp,nn,nn-rl,nn-rl+exp50"}
 POLICIES=${POLICIES:-"balanced,ratio,speed"}
+SGD_LR=${SGD_LR:-0.2}
+SGD_MAPE=${SGD_MAPE:-0.10}
+EXPLORE_K=${EXPLORE_K:-4}
+EXPLORE_THRESH=${EXPLORE_THRESH:-0.20}
 
 # ── Paths ──
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -148,6 +152,8 @@ for policy in "${POLICY_LIST[@]}"; do
         VPIC_NX=$NX VPIC_CHUNK_MB=$CHUNK_MB VPIC_TIMESTEPS=$TIMESTEPS \
         VPIC_PHASE="$phase" \
         VPIC_RESULTS_DIR="$PHASE_DIR" \
+        VPIC_LR=$SGD_LR VPIC_MAPE_THRESHOLD=$SGD_MAPE \
+        VPIC_EXPLORE_K=$EXPLORE_K VPIC_EXPLORE_THRESH=$EXPLORE_THRESH \
         "$VPIC_BIN" "$VPIC_DECK" > "$PHASE_DIR/vpic_benchmark.log" 2>&1
 
         RUN_END=$(date +%s)

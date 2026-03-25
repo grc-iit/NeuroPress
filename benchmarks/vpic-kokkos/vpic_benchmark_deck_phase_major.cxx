@@ -76,7 +76,7 @@ extern "C" float gpucompress_get_bandwidth_bytes_per_ms(void);
 // ============================================================
 // Constants
 // ============================================================
-#define REINFORCE_LR        0.1f
+#define REINFORCE_LR        0.2f
 #define REINFORCE_MAPE      0.10f
 
 #define H5Z_FILTER_GPUCOMPRESS    305
@@ -150,8 +150,10 @@ begin_globals {
     float*             h_read;            // Host buffer for verification
 
     // Configurable hyperparameters
-    float              reinforce_lr;      // SGD learning rate (default 0.9, env VPIC_LR)
-    float              reinforce_mape;    // MAPE threshold for SGD (default 0.20, env VPIC_MAPE_THRESHOLD)
+    float              reinforce_lr;      // SGD learning rate (env VPIC_LR)
+    float              reinforce_mape;    // MAPE threshold for SGD (env VPIC_MAPE_THRESHOLD)
+    int                explore_k;         // Exploration K alternatives (env VPIC_EXPLORE_K)
+    float              explore_thresh;    // Exploration error threshold (env VPIC_EXPLORE_THRESH)
     /* n_runs removed — phase-major doesn't use single-shot repetitions */
 
     // Ranking quality profiler
@@ -717,8 +719,12 @@ begin_initialization {
 
     const char* env_lr = getenv("VPIC_LR");
     const char* env_mape = getenv("VPIC_MAPE_THRESHOLD");
+    const char* env_ek = getenv("VPIC_EXPLORE_K");
+    const char* env_et = getenv("VPIC_EXPLORE_THRESH");
     float reinforce_lr   = env_lr   ? (float)atof(env_lr)   : REINFORCE_LR;
     float reinforce_mape = env_mape ? (float)atof(env_mape) : REINFORCE_MAPE;
+    int   explore_k      = env_ek   ? atoi(env_ek)          : 4;
+    float explore_thresh = env_et   ? (float)atof(env_et)   : 0.20f;
 
     // Run warmup steps, then single-shot phases (1 step), then multi-timestep writes
     num_step        = warmup + 1 + timesteps;
@@ -757,6 +763,8 @@ begin_initialization {
     global->tc_csv          = NULL;
     global->reinforce_lr    = reinforce_lr;
     global->reinforce_mape  = reinforce_mape;
+    global->explore_k       = explore_k;
+    global->explore_thresh  = explore_thresh;
     /* n_runs removed */
 
     // Grid setup
@@ -1237,8 +1245,8 @@ begin_diagnostics {
             }
             gpucompress_set_exploration(do_expl);
             if (do_expl) {
-                gpucompress_set_exploration_threshold(0.20);
-                gpucompress_set_exploration_k(4);
+                gpucompress_set_exploration_threshold(global->explore_thresh);
+                gpucompress_set_exploration_k(global->explore_k);
             }
 
             /* Build DCPL for this phase */
