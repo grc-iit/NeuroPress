@@ -2063,7 +2063,7 @@ def make_pipeline_waterfall(ts_csv_path, output_path):
                        for s in stages]
             ax.legend(handles=handles, loc="upper right", fontsize=7, framealpha=0.9)
 
-    fig.suptitle("VOL Pipeline Waterfall (stages overlap — sum > h5dwrite)",
+    fig.suptitle("VOL Pipeline Waterfall (additive stages within h5dwrite)",
                  fontsize=13, fontweight="bold")
     _sc_finalize(fig, pad=1.5, rect=[0, 0, 1, 0.95])
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
@@ -2090,14 +2090,18 @@ def make_cross_phase_pipeline_overhead(phase_csv_map, output_path, title=""):
 
     # Additive breakdown: setup + S1a + S1b + S1c + drain + io_drain + h5dclose
     STAGES = [
-        ("vol_setup_ms",     "#95a5a6", "Setup (threads + alloc)"),
-        ("s1a_stats_ms",     "#aed6f1", "S1a: Stats Kernel"),
-        ("s1b_nn_ms",        "#2980b9", "S1b: NN Inference"),
-        ("s1c_residual_ms",  "#1a5276", "S1c: WQ Post / Sync"),
-        ("vol_drain_ms",     "#2ecc71", "Worker Drain"),
+        ("vol_setup_ms",     "#bdc3c7", "Setup (threads + alloc)"),
+        ("s1a_stats_ms",     "#85c1e9", "S1a: Stats Kernel"),
+        ("s1b_nn_ms",        "#2e86c1", "S1b: NN Inference"),
+        ("s1c_residual_ms",  "#1a5276", "S1c: Host Sync Overhead"),
+        ("vol_drain_ms",     "#27ae60", "Worker Drain (compress + D2H)"),
         ("vol_io_drain_ms",  "#e74c3c", "I/O Drain"),
         ("h5dclose_ms",      "#f39c12", "H5Dclose (metadata)"),
     ]
+
+    # Preferred display order (fixed algos first, then NN variants)
+    PHASE_ORDER = ["no-comp", "lz4", "snappy", "deflate", "gdeflate", "zstd",
+                   "ans", "cascaded", "bitcomp", "nn", "nn-rl", "nn-rl+exp50"]
 
     PHASE_DISPLAY = {
         "no-comp":      "No-Comp",
@@ -2110,16 +2114,17 @@ def make_cross_phase_pipeline_overhead(phase_csv_map, output_path, title=""):
         "cascaded":     "Cascaded",
         "bitcomp":      "Bitcomp",
         "nn":           "NN\n(Inference)",
-        "nn-rl":        "NN+SGD",
+        "nn-rl":        "NN\n+SGD",
         "nn-rl+exp50":  "NN+SGD\n+Explore",
     }
 
     # Raw CSV columns needed (beyond STAGES keys)
     RAW_COLS = ["vol_setup_ms", "vol_stage1_ms", "vol_drain_ms", "vol_io_drain_ms",
-                "h5dclose_ms", "stats_ms", "nn_ms", "write_ms"]
+                "h5dclose_ms", "stats_ms", "nn_ms", "write_ms",
+                "vol_s2_busy_ms", "vol_s3_busy_ms", "comp_ms",
+                "vol_pipeline_ms", "h5dwrite_ms"]
 
     # Collect mean values per phase
-    phases_ordered = list(phase_csv_map.keys())
     data = {}   # phase -> {col: mean_ms}
     for ph, csv_path in phase_csv_map.items():
         if not os.path.exists(csv_path):
@@ -2140,7 +2145,7 @@ def make_cross_phase_pipeline_overhead(phase_csv_map, output_path, title=""):
         s1_total   = means.get("vol_stage1_ms", 0.0)
         s1a        = means.get("stats_ms", 0.0)
         s1b        = means.get("nn_ms", 0.0)
-        s1c        = max(0.0, s1_total - s1a - s1b)   # residual: WQ posting + sync
+        s1c        = max(0.0, s1_total - s1a - s1b)   # residual: sync overhead
         means["s1a_stats_ms"]    = s1a
         means["s1b_nn_ms"]       = s1b
         means["s1c_residual_ms"] = s1c
@@ -2150,66 +2155,69 @@ def make_cross_phase_pipeline_overhead(phase_csv_map, output_path, title=""):
     if not data:
         return
 
-    phases_plot = [ph for ph in phases_ordered if ph in data]
+    # Sort phases in canonical order, then any extras alphabetically
+    phases_plot = sorted(data.keys(),
+                         key=lambda p: (PHASE_ORDER.index(p)
+                                        if p in PHASE_ORDER else 999, p))
     n = len(phases_plot)
     if n == 0:
         return
 
-    fig, ax = plt.subplots(figsize=(max(7, n * 1.4 + 2), 5))
+    fig, ax = plt.subplots(figsize=(max(8, n * 1.2 + 3), 5.5))
 
     x = np.arange(n)
-    bar_w = 0.6
+    bar_w = min(0.65, 6.0 / max(n, 1))
     bottoms = np.zeros(n)
     legend_handles = []
 
+    max_bar_height = 0
     for col, color, label in STAGES:
         vals = np.array([data[ph].get(col, 0.0) for ph in phases_plot])
-        # Only draw bar segments that are non-negligible
-        mask = vals > 0.5
-        if mask.any():
-            ax.bar(x, vals, bar_w, bottom=bottoms,
-                   color=color, edgecolor="white", linewidth=0.5,
-                   label=label)
-            # Annotate segments > 20ms with their value
-            for i, (v, bot) in enumerate(zip(vals, bottoms)):
-                if v > 20:
-                    ax.text(i, bot + v / 2, f"{v:.0f}", ha="center", va="center",
-                            fontsize=7.5, color="white", fontweight="bold")
-            legend_handles.append(Patch(facecolor=color, label=label))
+        # Only add to legend if any phase has a visible segment
+        if vals.max() < 0.3:
+            bottoms += vals
+            continue
+        ax.bar(x, vals, bar_w, bottom=bottoms,
+               color=color, edgecolor="white", linewidth=0.5)
+        # Annotate segments that are large enough to read
+        for i, (v, bot) in enumerate(zip(vals, bottoms)):
+            bar_total = bottoms[i] + vals[i]
+            # Label if segment is > 15% of bar or > 5ms absolute
+            if v > max(bar_total * 0.15, 5):
+                ax.text(i, bot + v / 2, f"{v:.0f}",
+                        ha="center", va="center",
+                        fontsize=7, color="white", fontweight="bold")
+        legend_handles.append(Patch(facecolor=color, label=label))
         bottoms += vals
+        max_bar_height = max(max_bar_height, bottoms.max())
 
     # Annotate total write_ms above each bar
+    y_pad = max_bar_height * 0.04
     for i, ph in enumerate(phases_plot):
         total = data[ph].get("write_ms", 0)
-        ax.text(i, bottoms[i] + 8, f"{total:.0f} ms", ha="center", va="bottom",
-                fontsize=8, color="#333333", fontweight="bold")
+        pipeline = data[ph].get("vol_pipeline_ms", 0)
+        label = f"{total:.0f} ms" if total > 0 else ""
+        ax.text(i, bottoms[i] + y_pad, label, ha="center", va="bottom",
+                fontsize=7.5, color="#333333", fontweight="bold")
 
+    # Y-axis: add headroom for annotations
+    ax.set_ylim(0, max_bar_height * 1.15)
     ax.set_xticks(x)
     ax.set_xticklabels([PHASE_DISPLAY.get(ph, ph) for ph in phases_plot],
-                       fontsize=9)
+                       fontsize=8)
     ax.set_ylabel("Time (ms)", fontweight="bold")
     ax.set_title(title or "VOL Pipeline Stage Overhead by Phase\n"
-                 "(mean across timesteps T>0; S1 split into Stats / NN / WQ-Post)",
+                 "(mean across timesteps T>0; S1 decomposed into Stats / NN / Host Sync)",
                  fontweight="bold", fontsize=11)
-    ax.grid(axis="y", alpha=0.2, linestyle="--")
+    ax.grid(axis="y", alpha=0.15, linestyle="--")
     ax.set_axisbelow(True)
-    ax.legend(handles=legend_handles, loc="upper left", fontsize=8,
-              framealpha=0.9, ncol=2)
 
-    # Annotate the setup bar on the first phase that has significant setup time
-    for i, ph in enumerate(phases_plot):
-        setup_v = data[ph].get("vol_setup_ms", 0)
-        if setup_v > 50:
-            ax.annotate(f"Thread\nspawn\n{setup_v:.0f}ms",
-                        xy=(i, setup_v / 2),
-                        xytext=(i + 0.45, setup_v * 0.6),
-                        fontsize=7, color="#555555",
-                        arrowprops=dict(arrowstyle="->", color="#888888",
-                                        lw=0.8),
-                        ha="left", va="center")
-            break
+    # Place legend outside the plot area for clarity
+    ax.legend(handles=legend_handles, loc="upper left", fontsize=7.5,
+              framealpha=0.92, ncol=1, borderpad=0.6,
+              handlelength=1.2, handletextpad=0.5)
 
-    _sc_finalize(fig, pad=1.5)
+    _sc_finalize(fig, pad=1.5, rect=[0, 0, 1, 0.93])
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(fig)

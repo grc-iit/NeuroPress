@@ -199,22 +199,30 @@ def generate_figures(dataset, policy, out_dir):
         count += 1
 
     # ── 6d. Cross-phase pipeline overhead comparison ──
-    # Walk sibling phase_<name>/ directories to collect per-phase timestep CSVs.
-    # Works for both VPIC phase-major layout and Gray-Scott (single ts_csv only).
+    # Walk phase_<name>/ directories in BOTH the policy dir (NN phases) and
+    # the sibling fixed_phases/ dir (fixed-algorithm phases) to collect
+    # per-phase timestep CSVs.
     phase_csv_map = {}
-    phase_parent = data_dir  # phase_<name>/ dirs live inside the policy dir
-    if os.path.isdir(phase_parent):
-        for entry in sorted(os.listdir(phase_parent)):
+    search_dirs = [data_dir]
+    # Also search fixed_phases/ sibling (Gray-Scott / VPIC layout)
+    fixed_sibling = os.path.join(os.path.dirname(data_dir), "fixed_phases")
+    if os.path.isdir(fixed_sibling):
+        search_dirs.append(fixed_sibling)
+
+    ts_candidates = (
+        "benchmark_vpic_deck_timesteps.csv",
+        "benchmark_grayscott_timesteps.csv",
+        f"benchmark_{dataset}_timesteps.csv",
+    )
+    for search_dir in search_dirs:
+        if not os.path.isdir(search_dir):
+            continue
+        for entry in sorted(os.listdir(search_dir)):
             if not entry.startswith("phase_"):
                 continue
             ph_name = entry[len("phase_"):]
-            # Try both VPIC and Gray-Scott naming conventions
-            for candidate in (
-                f"benchmark_vpic_deck_timesteps.csv",
-                f"benchmark_grayscott_timesteps.csv",
-                f"benchmark_{dataset}_timesteps.csv",
-            ):
-                cpath = os.path.join(phase_parent, entry, candidate)
+            for candidate in ts_candidates:
+                cpath = os.path.join(search_dir, entry, candidate)
                 if os.path.exists(cpath):
                     phase_csv_map[ph_name] = cpath
                     break
