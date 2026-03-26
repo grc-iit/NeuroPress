@@ -19,16 +19,18 @@ H5Dwrite entry
 │
 ├── [Stage 1]   Main thread: per-chunk stats kernel → NN inference → post WorkItem
 │
-├── [Stage 2]   Worker threads: compress (overlaps with S1 on subsequent chunks)
-│                               D→H memcpy into pinned pool buffer
+├── [Workers]   Worker threads: compress + D→H memcpy (overlaps with S1)
 │
-├── [Stage 3]   I/O thread: H5Dwrite_chunk for each compressed chunk
+├── [I/O]       I/O thread: H5Dwrite_chunk for each compressed chunk
 │
-└── [Join]      Signal I/O thread done; join all workers
+├── [Drain]     S1 end → all compression workers joined
+│
+└── [I/O Drain] Workers joined → I/O thread joined
 ```
 
-Timing is captured per `H5Dwrite` call into the timestep CSV columns:
-`vol_setup_ms`, `vol_stage1_ms`, `vol_stage2_ms`, `vol_stage3_ms`, `vol_join_ms`.
+Timing is captured per `H5Dwrite` call into the timestep CSV columns.
+Additive decomposition: `vol_stage1_ms + vol_drain_ms + vol_io_drain_ms = vol_pipeline_ms`.
+Non-additive busy times for bottleneck analysis: `vol_s2_busy_ms`, `vol_s3_busy_ms`.
 
 ---
 
@@ -39,8 +41,8 @@ The `6d_cross_phase_pipeline_overhead.png` figure was generated comparing five p
 
 ### Measured mean overhead per H5Dwrite (ms), T > 0
 
-| Phase     | Setup | S1a Stats | S1b NN | S1c WQ | S2 Comp | S3 I/O | Join | H5Dclose | **write_ms** |
-|-----------|------:|----------:|-------:|-------:|--------:|-------:|-----:|---------:|-------------:|
+| Phase     | Setup | S1a Stats | S1b NN | S1c WQ | Drain | I/O Drain | H5Dclose | **write_ms** |
+|-----------|------:|----------:|-------:|-------:|------:|----------:|---------:|-------------:|
 | No-Comp   |     0 |         0 |      0 |      0 |       0 |      0 |    0 |        0 |         629  |
 | Cascaded  |   383 |        ~1 |      0 |     ~1 |      30 |    123 |  104 |      151 |         654  |
 | LZ4       |   381 |        ~1 |      0 |     ~1 |      45 |    126 |  118 |      151 |         732  |

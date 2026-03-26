@@ -74,6 +74,29 @@ POLICY_LABELS[speed]="speed_only_w1-1-0"
 EVAL_NAME="eval_${DATASET}_chunk${CHUNK_MB}mb"
 EVAL_DIR="$SCRIPT_DIR/results/$EVAL_NAME"
 
+# ── Write params.txt so we know how this eval was invoked ──
+mkdir -p "$EVAL_DIR"
+cat > "$EVAL_DIR/params.txt" <<PARAMS_EOF
+# SDRBench Phase-Major Benchmark Parameters
+# Generated: $(date -Iseconds)
+# Command:   $0
+
+DATASET=$DATASET
+DATA_DIR=$DATA_DIR
+DIMS=$DIMS
+EXT=$EXT
+CHUNK_MB=$CHUNK_MB
+PHASES=$PHASES
+POLICIES=$POLICIES
+SGD_LR=$SGD_LR
+SGD_MAPE=$SGD_MAPE
+EXPLORE_K=$EXPLORE_K
+EXPLORE_THRESH=$EXPLORE_THRESH
+VERIFY=$VERIFY
+DEBUG_NN=$DEBUG_NN
+WEIGHTS=$WEIGHTS
+PARAMS_EOF
+
 # ── Verify binary ──
 if [ ! -f "$SDR_BIN" ]; then
     echo "ERROR: generic_benchmark not found: $SDR_BIN"

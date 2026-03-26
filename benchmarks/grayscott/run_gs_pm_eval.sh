@@ -52,6 +52,28 @@ POLICY_LABELS[speed]="speed_only_w1-1-0"
 EVAL_NAME="eval_L${L}_chunk${CHUNK_MB}mb_ts${TIMESTEPS}"
 EVAL_DIR="$SCRIPT_DIR/results/$EVAL_NAME"
 
+# ── Write params.txt so we know how this eval was invoked ──
+mkdir -p "$EVAL_DIR"
+cat > "$EVAL_DIR/params.txt" <<PARAMS_EOF
+# Gray-Scott Phase-Major Benchmark Parameters
+# Generated: $(date -Iseconds)
+# Command:   $0
+
+L=$L
+CHUNK_MB=$CHUNK_MB
+TIMESTEPS=$TIMESTEPS
+STEPS=$STEPS
+PHASES=$PHASES
+POLICIES=$POLICIES
+SGD_LR=$SGD_LR
+SGD_MAPE=$SGD_MAPE
+EXPLORE_K=$EXPLORE_K
+EXPLORE_THRESH=$EXPLORE_THRESH
+VERIFY=$VERIFY
+DEBUG_NN=$DEBUG_NN
+WEIGHTS=$WEIGHTS
+PARAMS_EOF
+
 # ── Verify binary ──
 if [ ! -f "$GS_BIN" ]; then
     echo "ERROR: GS phase-major binary not found: $GS_BIN"
@@ -110,6 +132,7 @@ if [ ${#FIXED_PHASES[@]} -gt 0 ]; then
             --L $L --steps $STEPS --chunk-mb $CHUNK_MB --timesteps $TIMESTEPS \
             --phase "$phase" \
             --w0 1.0 --w1 1.0 --w2 1.0 \
+            ${VERIFY:+$([ "$VERIFY" = "0" ] && echo "--no-verify")} \
             --out-dir "$PHASE_DIR" \
             > "$PHASE_DIR/gs_benchmark.log" 2>&1
 

@@ -150,10 +150,13 @@ typedef struct {
     double decomp_ms;
     double explore_ms;
     double sgd_ms;
-    /* Wall-clock stage timing from VOL pipeline (ms) */
-    double stage1_ms;   /* stats + NN inference (main thread) */
-    double stage2_ms;   /* compression + D→H (parallel workers) */
-    double stage3_ms;   /* HDF5 chunk writes (I/O thread) */
+    /* Additive pipeline timing from VOL (stage1 + drain + io_drain = total) */
+    double stage1_ms;     /* stats + NN inference (main thread) */
+    double drain_ms;      /* worker drain: S1 end → workers joined */
+    double io_drain_ms;   /* I/O drain: workers joined → I/O joined */
+    /* Overlapping busy times (NOT additive with above) */
+    double s2_busy_ms;    /* bottleneck worker wall time */
+    double s3_busy_ms;    /* I/O write time (serial, accumulated) */
     /* Standard deviations (populated when --runs N > 1) */
     double write_ms_std;
     double read_ms_std;
@@ -635,8 +638,9 @@ static int run_phase_vol(float *d_data, float *d_read,
 
     if (wret < 0) { fprintf(stderr, "[%s] H5Dwrite failed\n", phase_name); return 1; }
 
-    /* Capture wall-clock stage timing from VOL pipeline */
-    H5VL_gpucompress_get_stage_timing(&r->stage1_ms, &r->stage2_ms, &r->stage3_ms, NULL);
+    /* Capture additive pipeline timing + busy times from VOL */
+    H5VL_gpucompress_get_stage_timing(&r->stage1_ms, &r->drain_ms, &r->io_drain_ms, NULL);
+    H5VL_gpucompress_get_busy_timing(&r->s2_busy_ms, &r->s3_busy_ms);
     drop_pagecache(tmp_file);
 
     /* Read */
@@ -759,6 +763,7 @@ static void run_phase_all_fields(
     double sum_nn_ms = 0, sum_stats_ms = 0, sum_preproc_ms = 0;
     double sum_comp_ms = 0, sum_decomp_ms = 0, sum_explore_ms = 0, sum_sgd_ms = 0;
     double sum_stage1 = 0, sum_stage2 = 0, sum_stage3 = 0;
+    double sum_s2_busy = 0, sum_s3_busy = 0;
     size_t sum_file_bytes = 0;
     int sum_sgd_fires = 0, sum_explorations = 0;
     double sum_mae_r = 0, sum_mae_c = 0, sum_mae_d = 0, sum_r2_r = 0;
@@ -805,8 +810,10 @@ static void run_phase_all_fields(
         sum_explore_ms   += fr.explore_ms;
         sum_sgd_ms       += fr.sgd_ms;
         sum_stage1       += fr.stage1_ms;
-        sum_stage2       += fr.stage2_ms;
-        sum_stage3       += fr.stage3_ms;
+        sum_stage2       += fr.drain_ms;
+        sum_stage3       += fr.io_drain_ms;
+        sum_s2_busy      += fr.s2_busy_ms;
+        sum_s3_busy      += fr.s3_busy_ms;
         sum_sgd_fires    += fr.sgd_fires;
         sum_explorations += fr.explorations;
         sum_mape_r       += fr.mape_ratio_pct;
@@ -840,8 +847,10 @@ static void run_phase_all_fields(
         out->explore_ms   = sum_explore_ms / count;
         out->sgd_ms       = sum_sgd_ms / count;
         out->stage1_ms    = sum_stage1 / count;
-        out->stage2_ms    = sum_stage2 / count;
-        out->stage3_ms    = sum_stage3 / count;
+        out->drain_ms     = sum_stage2 / count;
+        out->io_drain_ms  = sum_stage3 / count;
+        out->s2_busy_ms   = sum_s2_busy / count;
+        out->s3_busy_ms   = sum_s3_busy / count;
         out->sgd_fires    = sum_sgd_fires;
         out->explorations = sum_explorations;
         out->mape_ratio_pct = sum_mape_r / count;
@@ -892,7 +901,8 @@ static void write_summary_csv(const char *dataset_name,
             "mape_ratio_pct,mape_comp_pct,mape_decomp_pct,"
             "mae_ratio,mae_comp_ms,mae_decomp_ms,r2_ratio,"
             "comp_gbps_std,decomp_gbps_std,"
-            "stage1_ms,stage2_ms,stage3_ms\n");
+            "vol_stage1_ms,vol_drain_ms,vol_io_drain_ms,"
+            "vol_s2_busy_ms,vol_s3_busy_ms\n");
 
     for (int i = 0; i < n_phases; i++) {
         PhaseResult *r = &results[i];
@@ -904,7 +914,8 @@ static void write_summary_csv(const char *dataset_name,
                 "%.2f,%.2f,%.2f,"
                 "%.4f,%.4f,%.4f,%.4f,"
                 "%.4f,%.4f,"
-                "%.2f,%.2f,%.2f\n",
+                "%.2f,%.2f,%.2f,"
+                "%.2f,%.2f\n",
                 dataset_name, r->phase, r->n_runs,
                 r->write_ms, r->write_ms_std, r->read_ms, r->read_ms_std,
                 (double)r->file_bytes / (1 << 20),
@@ -917,7 +928,8 @@ static void write_summary_csv(const char *dataset_name,
                 r->mape_ratio_pct, r->mape_comp_pct, r->mape_decomp_pct,
                 r->mae_ratio, r->mae_comp_ms, r->mae_decomp_ms, r->r2_ratio,
                 r->comp_gbps_std, r->decomp_gbps_std,
-                r->stage1_ms, r->stage2_ms, r->stage3_ms);
+                r->stage1_ms, r->drain_ms, r->io_drain_ms,
+                r->s2_busy_ms, r->s3_busy_ms);
     }
     fclose(f);
     printf("\nSummary CSV: %s\n", OUT_CSV);
@@ -1428,9 +1440,10 @@ int main(int argc, char **argv)
                     "file_bytes,"
                     "stats_ms,nn_ms,preproc_ms,comp_ms,decomp_ms,explore_ms,sgd_ms,"
                     "mae_ratio,mae_comp_ms,mae_decomp_ms,r2_ratio,"
-                    "vol_stage1_ms,vol_stage2_ms,vol_stage3_ms,"
+                    "vol_stage1_ms,vol_drain_ms,vol_io_drain_ms,"
+                    "vol_s2_busy_ms,vol_s3_busy_ms,"
                     "h5dwrite_ms,cuda_sync_ms,h5dclose_ms,h5fclose_ms,"
-                    "vol_setup_ms,vol_pipeline_ms,vol_join_ms\n");
+                    "vol_setup_ms,vol_pipeline_ms\n");
         }
 
         /* Open timestep-chunks CSV for milestone fields */
@@ -1542,30 +1555,30 @@ int main(int argc, char **argv)
                 double h5dclose_ms_t  = tw_after_dclose - tw_after_sync;
                 double h5fclose_ms_t  = tw1 - tw_after_dclose;
 
-                /* VOL pipeline stage timing */
-                double vol_s1 = 0, vol_s2 = 0, vol_s3 = 0, vol_total = 0;
-                H5VL_gpucompress_get_stage_timing(&vol_s1, &vol_s2, &vol_s3, &vol_total);
-                double vol_setup = 0, vol_func = 0, vol_join = 0;
-                H5VL_gpucompress_get_vol_func_timing(&vol_setup, &vol_func, &vol_join);
+                /* VOL additive pipeline timing + busy times */
+                double vol_s1 = 0, vol_drain = 0, vol_io_drain = 0, vol_total = 0;
+                H5VL_gpucompress_get_stage_timing(&vol_s1, &vol_drain, &vol_io_drain, &vol_total);
+                double vol_s2_busy = 0, vol_s3_busy = 0;
+                H5VL_gpucompress_get_busy_timing(&vol_s2_busy, &vol_s3_busy);
+                double vol_setup = 0;
+                H5VL_gpucompress_get_vol_func_timing(&vol_setup, NULL);
 
-                double read_ms_t = 0;
+                /* Always read back for timing; only validate if do_verify */
+                drop_pagecache(TMP_NN_RL);
+                fapl = make_vol_fapl();
+                file = H5Fopen(TMP_NN_RL, H5F_ACC_RDONLY, fapl);
+                H5Pclose(fapl);
+                dset = H5Dopen2(file, "field", H5P_DEFAULT);
+
+                double tr0 = now_ms();
+                H5Dread(dset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL, H5P_DEFAULT, d_read);
+                cudaDeviceSynchronize();
+                H5Dclose(dset); H5Fclose(file);
+                double tr1 = now_ms();
+                double read_ms_t = tr1 - tr0;
+
                 unsigned long long mm = 0;
                 if (do_verify) {
-                    drop_pagecache(TMP_NN_RL);
-
-                    /* Read back + verify */
-                    fapl = make_vol_fapl();
-                    file = H5Fopen(TMP_NN_RL, H5F_ACC_RDONLY, fapl);
-                    H5Pclose(fapl);
-                    dset = H5Dopen2(file, "field", H5P_DEFAULT);
-
-                    double tr0 = now_ms();
-                    H5Dread(dset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL, H5P_DEFAULT, d_read);
-                    cudaDeviceSynchronize();
-                    H5Dclose(dset); H5Fclose(file);
-                    double tr1 = now_ms();
-                    read_ms_t = tr1 - tr0;
-
                     mm = gpu_compare(d_data, d_read, n_floats, d_count);
                 }
                 size_t file_sz = get_file_size(TMP_NN_RL);
@@ -1631,8 +1644,9 @@ int main(int argc, char **argv)
                             "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
                             "%.4f,%.4f,%.4f,%.4f,"
                             "%.3f,%.3f,%.3f,"
+                            "%.3f,%.3f,"
                             "%.3f,%.3f,%.3f,%.3f,"
-                            "%.3f,%.3f,%.3f\n",
+                            "%.3f,%.3f\n",
                             phase_name, fi, fname,
                             write_ms_t, read_ms_t, ratio_t,
                             field_r.mape_ratio_pct, field_r.mape_comp_pct,
@@ -1642,9 +1656,10 @@ int main(int argc, char **argv)
                             field_r.stats_ms, field_r.nn_ms, field_r.preproc_ms,
                             field_r.comp_ms, field_r.decomp_ms, field_r.explore_ms, field_r.sgd_ms,
                             field_r.mae_ratio, field_r.mae_comp_ms, field_r.mae_decomp_ms, field_r.r2_ratio,
-                            vol_s1, vol_s2, vol_s3,
+                            vol_s1, vol_drain, vol_io_drain,
+                            vol_s2_busy, vol_s3_busy,
                             h5dwrite_ms_t, cuda_sync_ms_t, h5dclose_ms_t, h5fclose_ms_t,
-                            vol_setup, vol_total, vol_join);
+                            vol_setup, vol_total);
                 }
 
                 /* Write per-chunk detail at milestone fields */

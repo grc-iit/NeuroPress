@@ -895,7 +895,7 @@ static void write_chunk_csv(const char *phase_name, int n_chunks)
 
 static void print_summary(PhaseResult *res, int n_phases,
                           int L, int steps, int chunk_z,
-                          float F, float k)
+                          float F, float k, int do_verify)
 {
     double dataset_mb = (double)L * L * L * sizeof(float) / (1 << 20);
     double chunk_mb   = (double)L * L * chunk_z * sizeof(float) / (1024.0 * 1024.0);
@@ -913,7 +913,8 @@ static void print_summary(PhaseResult *res, int n_phases,
     printf("╠══════════════╬══════════╬══════════╬═══════╬══════════╬═════════╬══════╬═════════════╣\n");
     for (int i = 0; i < n_phases; i++) {
         PhaseResult *r = &res[i];
-        const char *verdict = (r->mismatches == 0) ? "PASS" : "FAIL";
+        const char *verdict = !do_verify ? "SKIP"
+                             : (r->mismatches == 0) ? "PASS" : "FAIL";
         printf("║  %-12s║ %8.0f ║ %8.0f ║ %5.0f ║ %7.2f  ║ %5.2fx  ║ %4.0f ║ %-11s ║\n",
                r->phase, r->sim_ms, r->write_mbps, r->read_mbps,
                r->comp_gbps, r->ratio, (double)r->file_bytes / (1 << 20), verdict);
@@ -1014,7 +1015,7 @@ int main(int argc, char **argv)
     float  rank_w0 = 1.0f, rank_w1 = 1.0f, rank_w2 = 1.0f;  /* cost model weights */
     double error_bound = 0.0;  /* 0 = lossless, >0 = lossy quantization */
     const char *out_dir_override = NULL;  /* overridable via --out-dir */
-    int do_verify = 1;       /* --no-verify: skip read-back + bitwise verification */
+    int do_verify = 1;       /* --no-verify: skip bitwise validation (read-back still runs for timing) */
     int verbose_chunks = 0;  /* --verbose-chunks: print per-chunk detail at milestones */
     int inject_patterns = 0; /* --inject-patterns: overwrite middle chunks with contrasting data */
 
@@ -1122,6 +1123,16 @@ int main(int argc, char **argv)
     }
     if (chunk_z < 1) chunk_z = L / 4;
     if (chunk_z < 1) chunk_z = 1;
+
+    /* Alignment fix: nvcomp algorithms (bitcomp, ANS, etc.) require the chunk
+     * element count to be even so internal uint2/uint4 loads stay 8-byte aligned.
+     * When L is odd, L*L is odd, so L*L*chunk_z is odd iff chunk_z is odd —
+     * bump chunk_z up by 1 to make the product even without exceeding L. */
+    if (((size_t)L * L * (size_t)chunk_z) % 2 != 0) {
+        int new_z = chunk_z + 1;
+        if (new_z <= L) chunk_z = new_z;
+        /* else: already at L, cannot go higher — fall through and hope for the best */
+    }
 
     size_t n_floats    = (size_t)L * L * L;
     size_t total_bytes = n_floats * sizeof(float);
@@ -1257,9 +1268,10 @@ int main(int argc, char **argv)
                 "write_mbps,read_mbps,file_bytes,"
                 "stats_ms,nn_ms,preproc_ms,comp_ms,decomp_ms,explore_ms,sgd_ms,"
                 "mae_ratio,mae_comp_ms,mae_decomp_ms,r2_ratio,"
-                "vol_stage1_ms,vol_stage2_ms,vol_stage3_ms,"
+                "vol_stage1_ms,vol_drain_ms,vol_io_drain_ms,"
+                "vol_s2_busy_ms,vol_s3_busy_ms,"
                 "h5dwrite_ms,cuda_sync_ms,h5dclose_ms,h5fclose_ms,"
-                "vol_setup_ms,vol_pipeline_ms,vol_join_ms\n");
+                "vol_setup_ms,vol_pipeline_ms\n");
     }
     /* Open timestep-chunks CSV */
     tc_csv = fopen(OUT_TSTEP_CHUNKS, "w");
@@ -1394,30 +1406,30 @@ int main(int argc, char **argv)
             double h5fclose_ms_t  = tw1 - tw_after_dclose;
 
             /* VOL pipeline stage timing */
-            double vol_s1 = 0, vol_s2 = 0, vol_s3 = 0, vol_total = 0;
-            H5VL_gpucompress_get_stage_timing(&vol_s1, &vol_s2, &vol_s3, &vol_total);
-            double vol_setup = 0, vol_func = 0, vol_join = 0;
-            H5VL_gpucompress_get_vol_func_timing(&vol_setup, &vol_func, &vol_join);
+            double vol_s1 = 0, vol_drain = 0, vol_io_drain = 0, vol_total = 0;
+            H5VL_gpucompress_get_stage_timing(&vol_s1, &vol_drain, &vol_io_drain, &vol_total);
+            double vol_s2_busy = 0, vol_s3_busy = 0;
+            H5VL_gpucompress_get_busy_timing(&vol_s2_busy, &vol_s3_busy);
+            double vol_setup = 0;
+            H5VL_gpucompress_get_vol_func_timing(&vol_setup, NULL);
 
             if (wret < 0) { printf("  %-4d  H5Dwrite failed\n", t); continue; }
 
-            double read_ms_t = 0;
+            /* Always read back for timing; only validate if do_verify */
+            drop_pagecache(all_phases[pi].tmp_file);
+            fapl = make_vol_fapl();
+            file = H5Fopen(all_phases[pi].tmp_file, H5F_ACC_RDONLY, fapl);
+            H5Pclose(fapl);
+            dset = H5Dopen2(file, "V", H5P_DEFAULT);
+            double tr0  = now_ms();
+            H5Dread(dset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL, H5P_DEFAULT, d_read);
+            cudaDeviceSynchronize();
+            H5Dclose(dset); H5Fclose(file);
+            double tr1  = now_ms();
+            double read_ms_t = tr1 - tr0;
+
             unsigned long long mm = 0;
             if (do_verify) {
-                drop_pagecache(all_phases[pi].tmp_file);
-
-                /* Read back + verify */
-                fapl = make_vol_fapl();
-                file = H5Fopen(all_phases[pi].tmp_file, H5F_ACC_RDONLY, fapl);
-                H5Pclose(fapl);
-                dset = H5Dopen2(file, "V", H5P_DEFAULT);
-                double tr0  = now_ms();
-                H5Dread(dset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL, H5P_DEFAULT, d_read);
-                cudaDeviceSynchronize();
-                H5Dclose(dset); H5Fclose(file);
-                double tr1  = now_ms();
-                read_ms_t = tr1 - tr0;
-
                 mm = gpu_compare(d_v, d_read, n_floats, d_count);
             }
 
@@ -1523,17 +1535,19 @@ int main(int argc, char **argv)
                     "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
                     "%.4f,%.4f,%.4f,%.4f,"
                     "%.3f,%.3f,%.3f,"
+                    "%.3f,%.3f,"
                     "%.3f,%.3f,%.3f,%.3f,"
-                    "%.3f,%.3f,%.3f\n",
+                    "%.3f,%.3f\n",
                     phase_name, t, cum_sim_step, write_ms_t, read_ms_t, ratio_t,
                     real_mape_r, real_mape_c, real_mape_d,
                     sgd_t, expl_t, n_hist, (unsigned long long)mm, wr_mbps, rd_mbps,
                     file_sz,
                     ts_stats, ts_nn, ts_preproc, ts_comp, ts_decomp, ts_explore, ts_sgd,
                     ts_mae_r, ts_mae_c, ts_mae_d, ts_r2,
-                    vol_s1, vol_s2, vol_s3,
+                    vol_s1, vol_drain, vol_io_drain,
+                    vol_s2_busy, vol_s3_busy,
                     h5dwrite_ms_t, cuda_sync_ms_t, h5dclose_ms_t, h5fclose_ms_t,
-                    vol_setup, vol_total, vol_join);
+                    vol_setup, vol_total);
                 fflush(ts_csv);
             }
 
@@ -2389,7 +2403,7 @@ int main(int argc, char **argv)
 #endif /* OLD CODE */
 
     /* ── Summary ───────────────────────────────────────────────────── */
-    print_summary(results, n_phases, L, steps, chunk_z, F, k);
+    print_summary(results, n_phases, L, steps, chunk_z, F, k, do_verify);
     write_aggregate_csv(results, n_phases, L, steps, chunk_z, F, k);
     printf("Per-chunk CSV written to: %s\n", OUT_CHUNKS);
 

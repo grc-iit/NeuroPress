@@ -152,9 +152,6 @@ endforeach()
 # ============================================================
 # VOL Benchmarks
 # ============================================================
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/grayscott/grayscott-benchmark.cu")
-    add_vol_demo(grayscott_benchmark       benchmarks/grayscott/grayscott-benchmark.cu)
-endif()
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/grayscott/grayscott-benchmark-pm.cu")
     add_vol_demo(grayscott_benchmark_pm    benchmarks/grayscott/grayscott-benchmark-pm.cu)
 endif()

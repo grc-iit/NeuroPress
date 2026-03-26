@@ -1983,9 +1983,9 @@ def make_write_path_decomposition(ts_csv_path, output_path):
 
 
 def make_pipeline_waterfall(ts_csv_path, output_path):
-    """Gantt-style waterfall: setup | S1 | S2 | S3 | join within h5dwrite.
+    """Gantt-style waterfall: setup | S1 | drain | io_drain within h5dwrite.
 
-    Shows overlapping pipeline stages per timestep. One panel per phase.
+    Shows additive pipeline stages per timestep. One panel per phase.
     """
     all_rows = parse_csv(ts_csv_path)
     if not all_rows or "vol_setup_ms" not in all_rows[0]:
@@ -2004,18 +2004,16 @@ def make_pipeline_waterfall(ts_csv_path, output_path):
         return
 
     stage_colors = {
-        "vol_setup_ms":    "#95a5a6",
-        "vol_stage1_ms":   "#3498db",
-        "vol_stage2_ms":   "#2ecc71",
-        "vol_stage3_ms":   "#e74c3c",
-        "vol_join_ms":     "#9b59b6",
+        "vol_setup_ms":      "#95a5a6",
+        "vol_stage1_ms":     "#3498db",
+        "vol_drain_ms":      "#2ecc71",
+        "vol_io_drain_ms":   "#e74c3c",
     }
     stage_labels = {
-        "vol_setup_ms":    "Setup (threads + alloc)",
-        "vol_stage1_ms":   "S1: Inference",
-        "vol_stage2_ms":   "S2: Compression",
-        "vol_stage3_ms":   "S3: I/O Write",
-        "vol_join_ms":     "Thread Join",
+        "vol_setup_ms":      "Setup (threads + alloc)",
+        "vol_stage1_ms":     "S1: Inference",
+        "vol_drain_ms":      "Worker Drain",
+        "vol_io_drain_ms":   "I/O Drain",
     }
     stages = list(stage_colors.keys())
 
@@ -2043,8 +2041,7 @@ def make_pipeline_waterfall(ts_csv_path, output_path):
                     ax.barh(i, val, left=x_offset, height=0.6,
                             color=stage_colors[stage],
                             edgecolor="white", linewidth=0.5)
-                # Stages overlap in pipeline — show them stacked for visual
-                # but note they run concurrently
+                # Additive: setup + stage1 + drain + io_drain = pipeline total
                 x_offset += val
 
             # Show h5dwrite wall time as a reference line
@@ -2091,16 +2088,15 @@ def make_cross_phase_pipeline_overhead(phase_csv_map, output_path, title=""):
     import numpy as np
     from matplotlib.patches import Patch
 
-    # vol_stage1_ms is replaced by three derived sub-segments (S1a/S1b/S1c)
+    # Additive breakdown: setup + S1a + S1b + S1c + drain + io_drain + h5dclose
     STAGES = [
-        ("vol_setup_ms",   "#95a5a6", "Setup (threads + alloc)"),
-        ("s1a_stats_ms",   "#aed6f1", "S1a: Stats Kernel"),
-        ("s1b_nn_ms",      "#2980b9", "S1b: NN Inference"),
-        ("s1c_residual_ms","#1a5276", "S1c: WQ Post / Sync"),
-        ("vol_stage2_ms",  "#2ecc71", "S2: Compression"),
-        ("vol_stage3_ms",  "#e74c3c", "S3: I/O Write"),
-        ("vol_join_ms",    "#9b59b6", "Thread Join"),
-        ("h5dclose_ms",    "#f39c12", "H5Dclose (metadata)"),
+        ("vol_setup_ms",     "#95a5a6", "Setup (threads + alloc)"),
+        ("s1a_stats_ms",     "#aed6f1", "S1a: Stats Kernel"),
+        ("s1b_nn_ms",        "#2980b9", "S1b: NN Inference"),
+        ("s1c_residual_ms",  "#1a5276", "S1c: WQ Post / Sync"),
+        ("vol_drain_ms",     "#2ecc71", "Worker Drain"),
+        ("vol_io_drain_ms",  "#e74c3c", "I/O Drain"),
+        ("h5dclose_ms",      "#f39c12", "H5Dclose (metadata)"),
     ]
 
     PHASE_DISPLAY = {
@@ -2119,8 +2115,8 @@ def make_cross_phase_pipeline_overhead(phase_csv_map, output_path, title=""):
     }
 
     # Raw CSV columns needed (beyond STAGES keys)
-    RAW_COLS = ["vol_setup_ms", "vol_stage1_ms", "vol_stage2_ms", "vol_stage3_ms",
-                "vol_join_ms", "h5dclose_ms", "stats_ms", "nn_ms", "write_ms"]
+    RAW_COLS = ["vol_setup_ms", "vol_stage1_ms", "vol_drain_ms", "vol_io_drain_ms",
+                "h5dclose_ms", "stats_ms", "nn_ms", "write_ms"]
 
     # Collect mean values per phase
     phases_ordered = list(phase_csv_map.keys())

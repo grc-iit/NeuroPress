@@ -386,23 +386,22 @@ static std::atomic<int> s_gpu_writes      {0};  /* GPU compression path (gpu_awa
 static std::atomic<int> s_gpu_reads       {0};  /* GPU decompression path (gpu_aware_chunked_read)*/
 static std::atomic<int> s_chunks_comp     {0};  /* chunks successfully compressed on GPU          */
 static std::atomic<int> s_chunks_decomp   {0};  /* chunks successfully decompressed on GPU        */
-/* Transfer byte counters */
-static size_t s_h2d_bytes = 0;   /* total bytes copied host→device */
-static size_t s_d2h_bytes = 0;   /* total bytes copied device→host */
-static size_t s_d2d_bytes = 0;   /* total bytes copied device→device */
-static int    s_h2d_count = 0;   /* number of H→D cudaMemcpy calls  */
-static int    s_d2h_count = 0;   /* number of D→H cudaMemcpy calls  */
-static int    s_d2d_count = 0;   /* number of D→D cudaMemcpy calls  */
+/* Transfer byte counters (atomic: written from 8 concurrent worker threads via vol_memcpy) */
+static std::atomic<size_t> s_h2d_bytes{0};  /* total bytes copied host→device */
+static std::atomic<size_t> s_d2h_bytes{0};  /* total bytes copied device→host */
+static std::atomic<size_t> s_d2d_bytes{0};  /* total bytes copied device→device */
+static std::atomic<int>    s_h2d_count{0};  /* number of H→D cudaMemcpy calls  */
+static std::atomic<int>    s_d2h_count{0};  /* number of D→H cudaMemcpy calls  */
+static std::atomic<int>    s_d2d_count{0};  /* number of D→D cudaMemcpy calls  */
 /* Wall-clock stage timing (ms) for the last H5Dwrite call */
-static double s_stage1_ms = 0;   /* Stage 1: stats + NN inference (main thread) */
-static double s_stage2_ms = 0;   /* Stage 2: worker join - stage1 end (compression + D→H wall clock) */
-static double s_stage3_ms = 0;   /* Stage 3: HDF5 chunk writes (I/O thread wall clock) */
-static double s_total_ms  = 0;   /* Total wall clock for the pipeline */
-static double s_vol_func_ms = 0; /* Total wall clock for gpu_aware_chunked_write */
-static double s_setup_ms = 0;   /* Setup before pipeline (VolWriteCtx, threads, etc) */
-static double s_join_ms_g = 0;  /* Thread join time (signal I/O done + join) */
-/* Max per-worker wall-clock time (bottleneck worker = actual Stage 2 wall time) */
-static double s_max_worker_comp_ms = 0;
+static double s_stage1_ms = 0;         /* Stage 1: stats + NN inference (main thread, sequential) */
+static double s_drain_ms = 0;          /* Worker drain: S1 end → all workers joined (sentinel + tail) */
+static double s_io_drain_ms = 0;       /* I/O drain: workers joined → I/O thread joined */
+static double s_s2_busy_ms = 0;        /* Stage 2 actual: max per-worker wall time (bottleneck) */
+static double s_s3_busy_ms = 0;        /* Stage 3 actual: I/O thread write time (serial writes) */
+static double s_total_ms  = 0;         /* Total pipeline wall clock (stage1 + drain + io_drain) */
+static double s_vol_func_ms = 0;       /* Total gpu_aware_chunked_write wall clock */
+static double s_setup_ms = 0;          /* Setup before pipeline (VolWriteCtx, threads, etc) */
 
 static double _now_ms() {
     struct timespec ts;
@@ -415,9 +414,9 @@ static inline cudaError_t vol_memcpy(void *dst, const void *src,
                                       size_t bytes, cudaMemcpyKind kind)
 {
     switch (kind) {
-        case cudaMemcpyHostToDevice:   s_h2d_bytes += bytes; s_h2d_count++; break;
-        case cudaMemcpyDeviceToHost:   s_d2h_bytes += bytes; s_d2h_count++; break;
-        case cudaMemcpyDeviceToDevice: s_d2d_bytes += bytes; s_d2d_count++; break;
+        case cudaMemcpyHostToDevice:   s_h2d_bytes.fetch_add(bytes, std::memory_order_relaxed); s_h2d_count.fetch_add(1, std::memory_order_relaxed); break;
+        case cudaMemcpyDeviceToHost:   s_d2h_bytes.fetch_add(bytes, std::memory_order_relaxed); s_d2h_count.fetch_add(1, std::memory_order_relaxed); break;
+        case cudaMemcpyDeviceToDevice: s_d2d_bytes.fetch_add(bytes, std::memory_order_relaxed); s_d2d_count.fetch_add(1, std::memory_order_relaxed); break;
         default: break;
     }
     return cudaMemcpy(dst, src, bytes, kind);
@@ -428,30 +427,35 @@ H5VL_gpucompress_reset_stats(void)
 {
     s_gpu_writes.store(0);      s_gpu_reads.store(0);
     s_chunks_comp.store(0);     s_chunks_decomp.store(0);
-    s_h2d_bytes = s_d2h_bytes = s_d2d_bytes = 0;
-    s_h2d_count = s_d2h_count = s_d2d_count = 0;
-    s_stage1_ms = s_stage2_ms = s_stage3_ms = s_total_ms = 0;
-    s_vol_func_ms = s_setup_ms = s_join_ms_g = 0;
-    s_max_worker_comp_ms = 0;
+    s_h2d_bytes.store(0); s_d2h_bytes.store(0); s_d2d_bytes.store(0);
+    s_h2d_count.store(0); s_d2h_count.store(0); s_d2d_count.store(0);
+    s_stage1_ms = s_drain_ms = s_io_drain_ms = s_total_ms = 0;
+    s_s2_busy_ms = s_s3_busy_ms = 0;
+    s_vol_func_ms = s_setup_ms = 0;
 }
 
 extern "C" void
-H5VL_gpucompress_get_stage_timing(double *stage1_ms, double *stage2_ms,
-                                   double *stage3_ms, double *total_ms)
+H5VL_gpucompress_get_stage_timing(double *stage1_ms, double *drain_ms,
+                                   double *io_drain_ms, double *total_ms)
 {
-    if (stage1_ms) *stage1_ms = s_stage1_ms;
-    if (stage2_ms) *stage2_ms = s_stage2_ms;
-    if (stage3_ms) *stage3_ms = s_stage3_ms;
-    if (total_ms)  *total_ms  = s_total_ms;
+    if (stage1_ms)   *stage1_ms   = s_stage1_ms;
+    if (drain_ms)    *drain_ms    = s_drain_ms;
+    if (io_drain_ms) *io_drain_ms = s_io_drain_ms;
+    if (total_ms)    *total_ms    = s_total_ms;
 }
 
 extern "C" void
-H5VL_gpucompress_get_vol_func_timing(double *setup_ms, double *vol_func_ms,
-                                      double *join_ms)
+H5VL_gpucompress_get_busy_timing(double *s2_busy_ms, double *s3_busy_ms)
+{
+    if (s2_busy_ms) *s2_busy_ms = s_s2_busy_ms;
+    if (s3_busy_ms) *s3_busy_ms = s_s3_busy_ms;
+}
+
+extern "C" void
+H5VL_gpucompress_get_vol_func_timing(double *setup_ms, double *vol_func_ms)
 {
     if (setup_ms)    *setup_ms    = s_setup_ms;
     if (vol_func_ms) *vol_func_ms = s_vol_func_ms;
-    if (join_ms)     *join_ms     = s_join_ms_g;
 }
 
 extern "C" void
@@ -471,12 +475,6 @@ H5VL_gpucompress_release_buf_cache(void)
 }
 
 extern "C" void
-H5VL_gpucompress_get_worker_timing(double *max_worker_ms)
-{
-    if (max_worker_ms) *max_worker_ms = s_max_worker_comp_ms;
-}
-
-extern "C" void
 H5VL_gpucompress_get_stats(int *writes, int *reads, int *comp, int *decomp)
 {
     if (writes) *writes = s_gpu_writes.load();
@@ -491,12 +489,12 @@ H5VL_gpucompress_get_transfer_stats(
     int *d2h_count, size_t *d2h_bytes,
     int *d2d_count, size_t *d2d_bytes)
 {
-    if (h2d_count) *h2d_count = s_h2d_count;
-    if (h2d_bytes) *h2d_bytes = s_h2d_bytes;
-    if (d2h_count) *d2h_count = s_d2h_count;
-    if (d2h_bytes) *d2h_bytes = s_d2h_bytes;
-    if (d2d_count) *d2d_count = s_d2d_count;
-    if (d2d_bytes) *d2d_bytes = s_d2d_bytes;
+    if (h2d_count) *h2d_count = s_h2d_count.load();
+    if (h2d_bytes) *h2d_bytes = s_h2d_bytes.load();
+    if (d2h_count) *d2h_count = s_d2h_count.load();
+    if (d2h_bytes) *d2h_bytes = s_d2h_bytes.load();
+    if (d2d_count) *d2d_count = s_d2d_count.load();
+    if (d2d_bytes) *d2d_bytes = s_d2d_bytes.load();
 }
 
 /* ============================================================
@@ -1122,7 +1120,7 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
 
         /* All pipeline-local variables declared up-front (before any goto,
          * nvcc requires no init-bypass for non-trivial types). */
-        double _pipeline_start = 0, _s1_start = 0;
+        double _pipeline_start = 0, _s1_start = 0, _t_drain_end = 0;
         double io_write_total_ms = 0;  /* direct S3 measurement from I/O thread */
         double worker_comp_ms[M4_N_COMP_WORKERS];
         memset(worker_comp_ms, 0, sizeof(worker_comp_ms));
@@ -1269,8 +1267,6 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                                 wi.src, wi.sz, d_comp_w[w], &comp_sz, &cfg, &wstats, NULL);
                         }
 
-                        w_total += _now_ms() - _w_start;
-
                         /* Free per-chunk owned buffers after compression completes */
                         if (wi.d_owned) { cudaFree(wi.d_owned); wi.d_owned = NULL; }
                         if (wi.d_stats_copy && !wi.d_stats_ring_managed) { cudaFree(wi.d_stats_copy); wi.d_stats_copy = NULL; }
@@ -1329,8 +1325,10 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                             gpucompress_record_chunk_s1_timing(diag_slot,
                                 wi.vol_stats_malloc_ms, wi.vol_stats_copy_ms, wi.vol_wq_post_wait_ms);
                         }
+
+                        w_total += _now_ms() - _w_start;
                     }
-                    /* Store per-worker total wall time */
+                    /* Store per-worker total wall time (full iteration: compress + cudaFree + pool + D2H + I/O post) */
                     worker_comp_ms[w] = w_total;
                 });
             }
@@ -1629,10 +1627,11 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
 
             /* ---- Join workers and propagate errors ---- */
             for (auto &t : workers) t.join();
-            s_stage2_ms = _now_ms() - _s1_start - s_stage1_ms; /* exclude S1 overlap */
-            /* Compute max per-worker total wall time (= bottleneck worker) */
+            _t_drain_end = _now_ms();
+            s_drain_ms = _t_drain_end - _s1_start - s_stage1_ms; /* S1 end → workers joined */
+            /* Actual Stage 2: max per-worker wall time (bottleneck) */
             for (int w = 0; w < N_COMP_WORKERS; w++) {
-                if (worker_comp_ms[w] > s_max_worker_comp_ms) s_max_worker_comp_ms = worker_comp_ms[w];
+                if (worker_comp_ms[w] > s_s2_busy_ms) s_s2_busy_ms = worker_comp_ms[w];
             }
             if (worker_err.load() != 0 && ret == 0) ret = (herr_t)-1;
 
@@ -1649,19 +1648,28 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
 
 done_write:
         /* ---- Signal I/O thread and join ---- */
-        double s_join_ms = 0;
         if (io_started) {
-            double _t_join = _now_ms();
+            /* Use _t_drain_end (captured after worker join) so that ring buffer
+             * cleanup time is absorbed into io_drain — preserving the additive
+             * invariant: stage1 + drain + io_drain = total. */
             { std::lock_guard<std::mutex> lk(io_mtx); io_done_flag = true; }
             io_cv.notify_all();
             io_thr.join();
-            s_join_ms = _now_ms() - _t_join;
-            s_join_ms_g = s_join_ms;
-            s_total_ms = _now_ms() - _pipeline_start;  /* total wall clock */
-            /* Stage 3: direct measurement from I/O thread */
-            s_stage3_ms = io_write_total_ms;
+            double _t_end = _now_ms();
+            s_io_drain_ms = (_t_drain_end > 0) ? (_t_end - _t_drain_end) : 0;
+            s_s3_busy_ms = io_write_total_ms;      /* actual I/O write time */
+            s_total_ms = (_pipeline_start > 0) ? (_t_end - _pipeline_start) : 0;
             if (io_err < 0 && ret == 0) ret = -1;
         }
+
+#ifndef NDEBUG
+        if (s_total_ms > 0) {
+            double _sum = s_stage1_ms + s_drain_ms + s_io_drain_ms;
+            double _diff = _sum - s_total_ms;
+            if (_diff < 0) _diff = -_diff;
+            assert(_diff < 0.01); /* additive invariant (exact by construction) */
+        }
+#endif
 
         s_vol_func_ms = _now_ms() - _vol_func_start;
 

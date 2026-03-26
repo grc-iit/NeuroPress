@@ -88,29 +88,31 @@ herr_t H5Pset_fapl_gpucompress(hid_t fapl_id, hid_t under_vol_id,
 void H5VL_gpucompress_reset_stats(void);
 
 /**
- * Get wall-clock stage timing from the last H5Dwrite call (ms).
- * Stage 1: stats + NN inference (main thread, sequential per chunk)
- * Stage 2: compression + D→H (parallel workers, wall clock)
- * Stage 3: HDF5 chunk writes to disk (I/O thread, wall clock)
- * Total:   end-to-end pipeline wall clock
- * Note: stages overlap due to pipelining, so stage1+stage2+stage3 > total.
+ * Get additive pipeline timing from the last H5Dwrite call (ms).
+ * stage1_ms:   Stats + NN inference (main thread, sequential per chunk)
+ * drain_ms:    Worker drain (S1 end → all compression workers joined)
+ * io_drain_ms: I/O drain (workers joined → I/O thread joined, includes cleanup)
+ * total_ms:    End-to-end pipeline wall clock
+ * Additive: stage1_ms + drain_ms + io_drain_ms = total_ms
  */
-void H5VL_gpucompress_get_stage_timing(double *stage1_ms, double *stage2_ms,
-                                        double *stage3_ms, double *total_ms);
+void H5VL_gpucompress_get_stage_timing(double *stage1_ms, double *drain_ms,
+                                        double *io_drain_ms, double *total_ms);
 
 /**
- * Get the max per-worker wall-clock time from the last H5Dwrite call (ms).
- * This is the bottleneck worker's total time (compression + exploration + SGD + D->H).
- * Represents the actual Stage 2 wall-clock contribution.
+ * Get actual busy time for overlapping stages (ms).
+ * s2_busy_ms: Bottleneck worker wall time (compress + cudaFree + pool + D→H + I/O post)
+ * s3_busy_ms: Total I/O write time (serial writes, accumulated across all chunks)
+ * These overlap with stage1 and drain — NOT additive with them.
+ * Use for bottleneck analysis: if s2_busy > stage1, compression is slower than
+ * inference; if io_drain is large, I/O couldn't keep up.
  */
-void H5VL_gpucompress_get_worker_timing(double *max_worker_ms);
+void H5VL_gpucompress_get_busy_timing(double *s2_busy_ms, double *s3_busy_ms);
 
 /**
  * Get VOL function-level timing: setup (VolWriteCtx alloc + thread creation)
  * and total gpu_aware_chunked_write wall clock.
  */
-void H5VL_gpucompress_get_vol_func_timing(double *setup_ms, double *vol_func_ms,
-                                          double *join_ms);
+void H5VL_gpucompress_get_vol_func_timing(double *setup_ms, double *vol_func_ms);
 
 /** Release cached VOL pipeline buffers (device + pinned host).
  *  Called automatically by gpucompress_cleanup(). Can also be called

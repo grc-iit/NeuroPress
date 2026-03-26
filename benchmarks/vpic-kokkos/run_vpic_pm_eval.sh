@@ -53,6 +53,27 @@ POLICY_LABELS[speed]="speed_only_w1-1-0"
 EVAL_NAME="eval_NX${NX}_chunk${CHUNK_MB}mb_ts${TIMESTEPS}"
 EVAL_DIR="$SCRIPT_DIR/results/$EVAL_NAME"
 
+# ── Write params.txt so we know how this eval was invoked ──
+mkdir -p "$EVAL_DIR"
+cat > "$EVAL_DIR/params.txt" <<PARAMS_EOF
+# VPIC Phase-Major Benchmark Parameters
+# Generated: $(date -Iseconds)
+# Command:   $0
+
+NX=$NX
+CHUNK_MB=$CHUNK_MB
+TIMESTEPS=$TIMESTEPS
+PHASES=$PHASES
+POLICIES=$POLICIES
+SGD_LR=$SGD_LR
+SGD_MAPE=$SGD_MAPE
+EXPLORE_K=$EXPLORE_K
+EXPLORE_THRESH=$EXPLORE_THRESH
+VERIFY=$VERIFY
+DEBUG_NN=$DEBUG_NN
+WEIGHTS=$WEIGHTS
+PARAMS_EOF
+
 # ── Verify binary ──
 if [ ! -f "$VPIC_BIN" ]; then
     echo "ERROR: Phase-major binary not found: $VPIC_BIN"
