@@ -1314,6 +1314,7 @@ int main(int argc, char **argv)
                phase_name, timesteps,
                do_sgd ? "on" : "off", do_expl ? "on" : "off");
         printf("══════════════════════════════════════════════════════════════\n\n");
+        fflush(stdout);
 
         /* Re-create simulation for fresh start */
         gpucompress_grayscott_destroy(sim);
@@ -1363,6 +1364,7 @@ int main(int argc, char **argv)
                "MAPE_R", "MAPE_C", "MAPE_D", "SGD");
         printf("  ----  --------  -------  -------  -------  "
                "--------  --------  --------  ----\n");
+        fflush(stdout);
 
         for (int t = 0; t < timesteps; t++) {
             int cum_sim_step = (t + 1) * steps;
@@ -1522,10 +1524,11 @@ int main(int argc, char **argv)
             if (ts_comp > 0) sum_comp_gbps += (double)total_bytes / 1e9 / (ts_comp / 1000.0);
             if (ts_decomp > 0) sum_decomp_gbps += (double)total_bytes / 1e9 / (ts_decomp / 1000.0);
 
-            /* Print row */
+            /* Print row (flush so stderr VOL warnings don't interleave) */
             printf("  %-4d  %-8d  %6.0f  %6.0f   %5.2fx  %7.1f%%  %7.1f%%  %7.1f%%  %3d\n",
                    t, cum_sim_step, write_ms_t, read_ms_t, ratio_t,
                    real_mape_r, real_mape_c, real_mape_d, sgd_t);
+            fflush(stdout);
 
             /* Write timestep CSV row */
             if (ts_csv) {

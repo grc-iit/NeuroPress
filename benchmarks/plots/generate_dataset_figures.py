@@ -132,11 +132,15 @@ def generate_figures(dataset, policy, out_dir):
                                           ch_csv if os.path.exists(ch_csv) else None)
         count += 1
 
-    # ── 4. Predicted vs actual — all 3 NN phases in one figure ──
+    # ── 4. Predicted vs actual — all 3 NN phases in one figure + per-phase ──
     if os.path.exists(tc_csv):
         out = os.path.join(out_dir, "4_predicted_vs_actual.png")
         viz.make_timestep_chunks_multi_phase(tc_csv, out)
         count += 1
+        for ph in ("nn", "nn-rl", "nn-rl+exp50"):
+            out_ph = os.path.join(out_dir, f"4_{ph}_predicted_vs_actual.png")
+            viz.make_timestep_chunks_figure(tc_csv, out_ph, phase_filter=ph)
+            count += 1
 
     # ── 5. Learning dynamics: MAPE + firing rates ──
     ts_csv = os.path.join(data_dir, f"{csv_base}_timesteps.csv") if csv_base else ""
