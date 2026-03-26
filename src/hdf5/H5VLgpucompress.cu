@@ -1484,8 +1484,30 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                     }
 
                     /* ---- Sequential inference: run stats+NN on main thread ----
-                     * Each chunk sees the latest SGD-updated weights because
-                     * runNNFusedInferenceCtx waits on g_sgd_done before reading.
+                     *
+                     * Design intent: if chunk N has high MAPE prediction error,
+                     * its worker fires SGD to update NN weights in-place on
+                     * g_sgd_stream (via nnSGDKernel). Chunk N+K's inference
+                     * then sees corrected weights through the GPU-level barrier:
+                     *   runNNFusedInferenceCtx → cudaStreamWaitEvent(g_sgd_done)
+                     * which prevents the inference kernel from reading d_nn_weights
+                     * until the SGD kernel on g_sgd_stream completes.
+                     *
+                     * The SGD visibility depends on timing. cudaStreamWaitEvent
+                     * captures the event's most recent recording at HOST call time.
+                     * For chunk N+1 to see chunk N's SGD, the worker must finish
+                     * compression (~20ms) + fire SGD + cudaEventRecord(g_sgd_done)
+                     * BEFORE the main thread reaches chunk N+1's inference call.
+                     * Since S1 processes ~7ms per chunk, chunk N+1's WaitEvent
+                     * typically captures a PRIOR SGD recording (already completed),
+                     * so chunk N+1 reads old weights. The update becomes visible
+                     * at chunk N+K where K ≈ ceil(compress_ms / per_chunk_s1_ms),
+                     * typically 3-4 chunks later.
+                     *
+                     * With many chunks (64+), this converges quickly: early SGD
+                     * corrections propagate to later chunks within the same write.
+                     * With few chunks (2-4), most chunks run with stale weights
+                     * and the SGD benefit is deferred to the next H5Dwrite call.
                      *
                      * In heuristic mode, we skip the NN and use entropy-based
                      * rules instead — stats kernel still runs for entropy. */
