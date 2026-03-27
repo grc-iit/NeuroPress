@@ -61,7 +61,7 @@
 /* Kendall tau ranking profiler (CUDA, linked from vpic_ranking_profiler.cu) */
 struct RankingMilestoneResult {
     int timestep; int n_chunks;
-    double mean_tau, std_tau, top1_accuracy, mean_regret, profiling_ms;
+    double mean_tau, std_tau, mean_regret, profiling_ms;
 };
 extern "C" int vpic_run_ranking_profiler(
     const void* d_data, size_t total_bytes, size_t chunk_bytes,
@@ -166,7 +166,39 @@ begin_globals {
 
     // Phase-major: VPIC_PHASE="nn-rl" runs only that one phase (exact match)
     char               single_phase[64];  // empty = all phases (current behavior)
+
+    // Field dump: VPIC_DUMP_FIELDS=1 dumps raw field binary each timestep
+    int                dump_fields;       // 0 = off, 1 = dump to RESULTS_DIR/fields_t<N>.raw
+    int                grid_n;            // NX (grid size without ghost cells)
 };
+
+// ============================================================
+// Helper: dump raw field binary for visualization
+// ============================================================
+static void dump_fields_raw(const float* d_fields, size_t n_floats,
+                            int timestep, int grid_n)
+{
+    char path[700];
+    snprintf(path, sizeof(path), "%s/fields_t%04d_NX%d.raw",
+             RESULTS_DIR, timestep, grid_n);
+    size_t nbytes = n_floats * sizeof(float);
+    float* h_buf = (float*)malloc(nbytes);
+    if (!h_buf) {
+        fprintf(stderr, "[dump] malloc failed (%zu bytes)\n", nbytes);
+        return;
+    }
+    cudaDeviceSynchronize();
+    cudaMemcpy(h_buf, d_fields, nbytes, cudaMemcpyDeviceToHost);
+    FILE* f = fopen(path, "wb");
+    if (f) {
+        fwrite(h_buf, sizeof(float), n_floats, f);
+        fclose(f);
+        fprintf(stderr, "[dump] Wrote %s (%.1f MB)\n", path, nbytes / 1e6);
+    } else {
+        fprintf(stderr, "[dump] Failed to open %s\n", path);
+    }
+    free(h_buf);
+}
 
 // ============================================================
 // Helper: timing
@@ -424,7 +456,6 @@ static int run_phase_REMOVED(const char* phase_name, const char* tmp_file,
     double mape_ratio_sum = 0.0, mape_comp_sum = 0.0, mape_decomp_sum = 0.0;
     int    mape_ratio_cnt = 0,   mape_comp_cnt = 0,   mape_decomp_cnt = 0;
     double mae_r_sum = 0.0, mae_c_sum = 0.0, mae_d_sum = 0.0;
-    double ss_res_r = 0.0, sum_ratio = 0.0;
     int    r2_cnt = 0;
     double total_stats_ms   = 0.0;
     double total_nn_ms      = 0.0;
@@ -484,11 +515,9 @@ static int run_phase_REMOVED(const char* phase_name, const char* tmp_file,
                 mape_decomp_sum += fabs(d.predicted_decomp_time - d.decompression_ms) / fabs(d.decompression_ms) * 100.0;
                 mape_decomp_cnt++;
             }
-            /* MAE and R² accumulators */
+            /* MAE accumulators */
             if (d.actual_ratio > 0 && d.predicted_ratio > 0) {
                 mae_r_sum += fabs(d.predicted_ratio - d.actual_ratio);
-                ss_res_r  += (d.predicted_ratio - d.actual_ratio) * (d.predicted_ratio - d.actual_ratio);
-                sum_ratio += d.actual_ratio;
                 r2_cnt++;
             }
             if (d.compression_ms_raw > 0)
@@ -571,22 +600,6 @@ static int run_phase_REMOVED(const char* phase_name, const char* tmp_file,
     r->mae_ratio     = r2_cnt ? mae_r_sum / r2_cnt : 0.0;
     r->mae_comp_ms   = mape_comp_cnt  ? mae_c_sum / mape_comp_cnt  : 0.0;
     r->mae_decomp_ms = mape_decomp_cnt ? mae_d_sum / mape_decomp_cnt : 0.0;
-    if (r2_cnt > 1) {
-        double mean_r = sum_ratio / r2_cnt;
-        double ss_tot = 0.0;
-        /* Second pass for R²: need SS_tot (same guard as ss_res_r) */
-        for (int i = 0; i < n_hist; i++) {
-            gpucompress_chunk_diag_t d2;
-            if (gpucompress_get_chunk_diag(i, &d2) == 0
-                && d2.actual_ratio > 0 && d2.predicted_ratio > 0) {
-                double diff = d2.actual_ratio - mean_r;
-                ss_tot += diff * diff;
-            }
-        }
-        r->r2_ratio = (ss_tot > 0) ? 1.0 - ss_res_r / ss_tot : 0.0;
-    } else {
-        r->r2_ratio = 0.0;
-    }
     r->stats_ms     = total_stats_ms;
     r->nn_ms        = total_nn_ms;
     r->preproc_ms   = total_preproc_ms;
@@ -662,7 +675,8 @@ begin_initialization {
     double nx   = grid_n;
     double ny   = grid_n;
     double nz   = grid_n;
-    double nppc = 2;
+    const char* env_nppc = getenv("VPIC_NPPC");
+    double nppc = env_nppc ? atof(env_nppc) : 2;
 
     double damp      = 0.001;
     double cfl_req   = 0.99;
@@ -767,6 +781,10 @@ begin_initialization {
     global->explore_thresh  = explore_thresh;
     const char* env_verify = getenv("VPIC_VERIFY");
     global->do_verify       = env_verify ? atoi(env_verify) : 1;
+
+    const char* env_dump = getenv("VPIC_DUMP_FIELDS");
+    global->dump_fields     = env_dump ? atoi(env_dump) : 0;
+    global->grid_n          = grid_n;
 
     // Grid setup
     define_units(c, eps0);
@@ -879,6 +897,8 @@ begin_initialization {
         sim_log("  Exclude: " << global->exclude_list);
     if (global->single_phase[0])
         sim_log("  Phase-major: " << global->single_phase << " only");
+    if (global->dump_fields)
+        sim_log("  Field dump: ON → " << RESULTS_DIR << "/fields_t*.raw");
 
     // Allocate GPU read-back buffer and host verification buffers
     cudaMalloc(&global->d_read, field_bytes);
@@ -950,7 +970,7 @@ begin_diagnostics {
                                  "nn_ms,stats_ms,preproc_ms,comp_ms,decomp_ms,explore_ms,sgd_ms,"
                                  "comp_gbps,decomp_gbps,"
                                  "mape_ratio_pct,mape_comp_pct,mape_decomp_pct,"
-                                 "mae_ratio,mae_comp_ms,mae_decomp_ms,r2_ratio,"
+                                 "mae_ratio,mae_comp_ms,mae_decomp_ms,"
                                  "comp_gbps_std,decomp_gbps_std,"
                                  "vol_stage1_ms,vol_drain_ms,vol_io_drain_ms,"
                                  "vol_s2_busy_ms,vol_s3_busy_ms\n");
@@ -968,7 +988,7 @@ begin_diagnostics {
                             double sum_file_sz;
                             double sum_stats_ms, sum_nn_ms, sum_preproc_ms;
                             double sum_comp_ms, sum_decomp_ms, sum_explore_ms, sum_sgd_ms;
-                            double sum_mae_r, sum_mae_c, sum_mae_d, sum_r2;
+                            double sum_mae_r, sum_mae_c, sum_mae_d;
                             double sum_vs1, sum_vs2, sum_vs3;
                             double sum_vs2_busy, sum_vs3_busy;
                             int    count;
@@ -988,19 +1008,19 @@ begin_diagnostics {
                             int sgd, expl, nch;
                             unsigned long long mm, fbytes = 0;
                             double t_stats = 0, t_nn = 0, t_pre = 0, t_comp = 0, t_dec = 0, t_expl = 0, t_sgd = 0;
-                            double t_mae_r = 0, t_mae_c = 0, t_mae_d = 0, t_r2 = 0;
+                            double t_mae_r = 0, t_mae_c = 0, t_mae_d = 0;
                             double t_vs1 = 0, t_drain = 0, t_io_drain = 0;
                             double t_vs2_busy = 0, t_vs3_busy = 0;
                             int nf = sscanf(line, "%63[^,],%d,%*[^,],%lf,%lf,%lf,%lf,%lf,%lf,%d,%d,%d,%llu,%lf,%lf,"
                                        "%llu,"
                                        "%lf,%lf,%lf,%lf,%lf,%lf,%lf,"
-                                       "%lf,%lf,%lf,%lf,"
+                                       "%lf,%lf,%lf,"
                                        "%lf,%lf,%lf,"
                                        "%lf,%lf",
                                        ph, &ts_idx, &wr, &rd, &rat, &mr, &mc, &md,
                                        &sgd, &expl, &nch, &mm, &wmbps, &rmbps, &fbytes,
                                        &t_stats, &t_nn, &t_pre, &t_comp, &t_dec, &t_expl, &t_sgd,
-                                       &t_mae_r, &t_mae_c, &t_mae_d, &t_r2,
+                                       &t_mae_r, &t_mae_c, &t_mae_d,
                                        &t_vs1, &t_drain, &t_io_drain,
                                        &t_vs2_busy, &t_vs3_busy);
                             if (nf >= 12 && ts_idx >= WARMUP) {
@@ -1027,21 +1047,20 @@ begin_diagnostics {
                                             pa[pi].sum_explore_ms += t_expl;
                                             pa[pi].sum_sgd_ms     += t_sgd;
                                         }
-                                        /* MAE/R² (columns 26-29, nf >= 26) */
-                                        if (nf >= 26) {
+                                        /* MAE (columns 23-25, nf >= 25) */
+                                        if (nf >= 25) {
                                             pa[pi].sum_mae_r += t_mae_r;
                                             pa[pi].sum_mae_c += t_mae_c;
                                             pa[pi].sum_mae_d += t_mae_d;
-                                            pa[pi].sum_r2    += t_r2;
                                         }
-                                        /* VOL additive timing (columns 28-30, nf >= 29) */
-                                        if (nf >= 29) {
+                                        /* VOL additive timing (columns 26-28, nf >= 28) */
+                                        if (nf >= 28) {
                                             pa[pi].sum_vs1 += t_vs1;
                                             pa[pi].sum_vs2 += t_drain;
                                             pa[pi].sum_vs3 += t_io_drain;
                                         }
-                                        /* VOL busy times (columns 31-32, nf >= 31) */
-                                        if (nf >= 31) {
+                                        /* VOL busy times (columns 29-30, nf >= 30) */
+                                        if (nf >= 30) {
                                             pa[pi].sum_vs2_busy += t_vs2_busy;
                                             pa[pi].sum_vs3_busy += t_vs3_busy;
                                         }
@@ -1085,7 +1104,7 @@ begin_diagnostics {
                                          "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,"
                                          "%.4f,%.4f,"
                                          "%.2f,%.2f,%.2f,"
-                                         "%.4f,%.4f,%.4f,%.4f,"
+                                         "%.4f,%.4f,%.4f,"
                                          "0.0000,0.0000,"
                                          "%.2f,%.2f,%.2f,%.2f,%.2f\n",
                                     pnames[pi], n, avg_wr, avg_rd,
@@ -1098,7 +1117,6 @@ begin_diagnostics {
                                     cgbps, dgbps,
                                     fmin(200.0, pa[pi].sum_mape_r / n), fmin(200.0, pa[pi].sum_mape_c / n), fmin(200.0, pa[pi].sum_mape_d / n),
                                     pa[pi].sum_mae_r / n, pa[pi].sum_mae_c / n, pa[pi].sum_mae_d / n,
-                                    pa[pi].sum_r2 / n,
                                     pa[pi].sum_vs1 / n, pa[pi].sum_vs2 / n, pa[pi].sum_vs3 / n,
                                     pa[pi].sum_vs2_busy / n, pa[pi].sum_vs3_busy / n);
                         }
@@ -1149,7 +1167,7 @@ begin_diagnostics {
                         "write_mbps,read_mbps,"
                         "file_bytes,"
                         "stats_ms,nn_ms,preproc_ms,comp_ms,decomp_ms,explore_ms,sgd_ms,"
-                        "mae_ratio,mae_comp_ms,mae_decomp_ms,r2_ratio,"
+                        "mae_ratio,mae_comp_ms,mae_decomp_ms,"
                         "vol_stage1_ms,vol_drain_ms,vol_io_drain_ms,"
                         "vol_s2_busy_ms,vol_s3_busy_ms,"
                         "h5dwrite_ms,cuda_sync_ms,h5dclose_ms,h5fclose_ms,"
@@ -1222,6 +1240,10 @@ begin_diagnostics {
         if (t % 5 == 0 || t == global->timesteps - 1)
             fprintf(stderr, "\r  [VPIC] Timestep %d/%d (%d%%)  ",
                     t, global->timesteps, t * 100 / global->timesteps);
+
+        /* Dump raw field binary for visualization (gated by VPIC_DUMP_FIELDS=1) */
+        if (global->dump_fields)
+            dump_fields_raw(d_fields, n_floats, t, global->grid_n);
 
         for (int pi = 0; pi < n_phases_ts; pi++) {
             const char* phase_name = phases[pi].name;
@@ -1367,7 +1389,6 @@ begin_diagnostics {
             double ts_stats_ms = 0, ts_nn_ms = 0, ts_preproc_ms = 0;
             double ts_comp_ms = 0, ts_decomp_ms = 0, ts_explore_ms = 0, ts_sgd_ms = 0;
             double mae_r_sum = 0, mae_c_sum = 0, mae_d_sum = 0;
-            double ss_res_r = 0, sum_ratio = 0;
             int    r2_cnt = 0;
             for (int ci = 0; ci < n_hist; ci++) {
                 gpucompress_chunk_diag_t diag;
@@ -1395,11 +1416,9 @@ begin_diagnostics {
                     mape_d_sum += fabs(diag.predicted_decomp_time - diag.decompression_ms) / fabs(diag.decompression_ms);
                     mcnt_d++;
                 }
-                /* MAE and R² accumulators */
+                /* MAE accumulators */
                 if (diag.actual_ratio > 0 && diag.predicted_ratio > 0) {
                     mae_r_sum += fabs(diag.predicted_ratio - diag.actual_ratio);
-                    ss_res_r  += (diag.predicted_ratio - diag.actual_ratio) * (diag.predicted_ratio - diag.actual_ratio);
-                    sum_ratio += diag.actual_ratio;
                     r2_cnt++;
                 }
                 if (diag.compression_ms_raw > 0)
@@ -1411,20 +1430,6 @@ begin_diagnostics {
             double ts_mae_r = r2_cnt ? mae_r_sum / r2_cnt : 0.0;
             double ts_mae_c = mcnt_c ? mae_c_sum / mcnt_c : 0.0;
             double ts_mae_d = mcnt_d ? mae_d_sum / mcnt_d : 0.0;
-            double ts_r2 = 0.0;
-            if (r2_cnt > 1) {
-                double mean_r = sum_ratio / r2_cnt;
-                double ss_tot = 0.0;
-                for (int ci = 0; ci < n_hist; ci++) {
-                    gpucompress_chunk_diag_t d2;
-                    if (gpucompress_get_chunk_diag(ci, &d2) == 0
-                        && d2.actual_ratio > 0 && d2.predicted_ratio > 0) {
-                        double diff = d2.actual_ratio - mean_r;
-                        ss_tot += diff * diff;
-                    }
-                }
-                ts_r2 = (ss_tot > 0) ? 1.0 - ss_res_r / ss_tot : 0.0;
-            }
             double real_mape_r = fmin(200.0, mcnt_r ? (mape_r_sum / mcnt_r) * 100.0 : 0.0);
             double real_mape_c = fmin(200.0, mcnt_c ? (mape_c_sum / mcnt_c) * 100.0 : 0.0);
             double real_mape_d = fmin(200.0, mcnt_d ? (mape_d_sum / mcnt_d) * 100.0 : 0.0);
@@ -1445,7 +1450,7 @@ begin_diagnostics {
                         "%s,%d,%d,%.2f,%.2f,%.4f,%.2f,%.2f,%.2f,%d,%d,%d,%llu,%.1f,%.1f,"
                         "%zu,"
                         "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
-                        "%.4f,%.4f,%.4f,%.4f,"
+                        "%.4f,%.4f,%.4f,"
                         "%.2f,%.2f,%.2f,"
                         "%.2f,%.2f,"
                         "%.2f,%.2f,%.2f,%.2f,"
@@ -1457,7 +1462,7 @@ begin_diagnostics {
                         file_sz,
                         ts_stats_ms, ts_nn_ms, ts_preproc_ms,
                         ts_comp_ms, ts_decomp_ms, ts_explore_ms, ts_sgd_ms,
-                        ts_mae_r, ts_mae_c, ts_mae_d, ts_r2,
+                        ts_mae_r, ts_mae_c, ts_mae_d,
                         vol_s1, vol_drain, vol_io_drain,
                         vol_s2_busy, vol_s3_busy,
                         h5dwrite_ms, cuda_sync_ms, h5dclose_ms, h5fclose_ms,
@@ -1534,9 +1539,8 @@ begin_diagnostics {
                     global->rank_w0, global->rank_w1, global->rank_w2, bw,
                     3, global->ranking_csv, global->ranking_costs_csv,
                     phase_name, t, &tau_result);
-                printf("    [τ] T=%d: τ=%.3f  top1=%.0f%%  regret=%.3fx  (%.0fms)\n",
+                printf("    [τ] T=%d: τ=%.3f  regret=%.3fx  (%.0fms)\n",
                        t, tau_result.mean_tau,
-                       tau_result.top1_accuracy * 100.0,
                        tau_result.mean_regret,
                        tau_result.profiling_ms);
             }

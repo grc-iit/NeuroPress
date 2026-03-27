@@ -647,115 +647,8 @@ def make_mae_figure(ts_csv_path, output_path):
     print(f"  Saved: {output_path}")
 
 
-def make_r2_figure(ts_csv_path, output_path):
-    """Plot R² score for compression ratio prediction over timesteps."""
-    rows = parse_csv(ts_csv_path)
-    if not rows:
-        print(f"  No timestep data in {ts_csv_path}, skipping R² plot.")
-        return
-
-    if "r2_ratio" not in rows[0]:
-        print(f"  No R² column in {ts_csv_path}, skipping R² plot.")
-        return
-
-    is_field_based = "field_idx" in rows[0] and "timestep" not in rows[0]
-    x_label = "Field" if is_field_based else "Timestep"
-
-    by_phase = {}
-    for r in rows:
-        ph = r.get("phase", "nn-rl")
-        by_phase.setdefault(ph, []).append(r)
-
-    phase_order = ["nn", "nn-rl", "nn-rl+exp50"]
-    phase_styles = {
-        "nn":          {"color": "#7f8c8d", "ls": ":",  "marker": "s", "lw": 2.0},
-        "nn-rl":       {"color": "#8e44ad", "ls": "-",  "marker": "o", "lw": 2.0},
-        "nn-rl+exp50": {"color": "#c0392b", "ls": "--", "marker": "D", "lw": 2.0},
-    }
-    phases_present = [p for p in phase_order if p in by_phase]
-
-    title_suffix = "Fields" if is_field_based else "Timesteps"
-
-    # Collect all data first
-    phase_data = {}
-    for ph in phases_present:
-        ph_rows = by_phase[ph]
-        timesteps = np.array([g(r, "timestep", "field_idx") for r in ph_rows])
-        r2 = np.array([g(r, "r2_ratio") for r in ph_rows])
-        phase_data[ph] = (timesteps, r2)
-
-    # Check if we need a split view (nn phase has very negative R²)
-    if not phase_data:
-        return
-    all_r2 = np.concatenate([r2 for _, r2 in phase_data.values()])
-    if len(all_r2) == 0:
-        return
-    needs_split = np.min(all_r2) < -2.0 and np.max(all_r2) > 0.5
-
-    if needs_split:
-        fig, (ax_full, ax_zoom) = plt.subplots(2, 1, figsize=(14, 8),
-                                                 gridspec_kw={"height_ratios": [1, 2]})
-        fig.suptitle(f"Compression Ratio Prediction R² Over {title_suffix}\n"
-                     "(coefficient of determination, per-timestep two-pass computation)",
-                     fontsize=14, fontweight="bold", y=0.99)
-
-        for ph in phases_present:
-            ts, r2 = phase_data[ph]
-            sty = phase_styles.get(ph, {"color": "black", "ls": "-", "marker": ".", "lw": 2.0})
-            for ax in (ax_full, ax_zoom):
-                ax.plot(ts, r2, color=sty["color"], linestyle=sty["ls"],
-                        marker=sty["marker"], markersize=5, linewidth=2.0,
-                        label=ph, alpha=0.9, zorder=3)
-
-        # Full range panel
-        ax_full.axhline(0.0, color="#e74c3c", linewidth=1, linestyle="--", alpha=0.4)
-        ax_full.set_ylabel("R² (full range)", fontweight="bold")
-        ax_full.grid(axis="y", alpha=0.2, linestyle="--")
-        ax_full.legend(loc="lower right", fontsize=9)
-        ax_full.set_title("All phases (full scale)", fontsize=10, loc="left")
-
-        # Zoomed panel — focus on learning phases
-        ax_zoom.axhline(1.0, color="#27ae60", linewidth=1, linestyle="--", alpha=0.6, label="Perfect (R²=1)")
-        ax_zoom.axhline(0.0, color="#e74c3c", linewidth=1, linestyle="--", alpha=0.4, label="R²=0 (mean baseline)")
-        ax_zoom.set_ylim(-0.5, 1.05)
-        ax_zoom.set_ylabel("R² (zoomed)", fontweight="bold")
-        ax_zoom.set_xlabel(x_label, fontweight="bold")
-        ax_zoom.grid(axis="y", alpha=0.2, linestyle="--")
-        ax_zoom.grid(axis="y", which='minor', alpha=0.1, linestyle=':')
-        ax_zoom.minorticks_on()
-        ax_zoom.legend(loc="lower right", fontsize=9)
-        ax_zoom.set_title("Learning phases detail (R² > -0.5)", fontsize=10, loc="left")
-    else:
-        fig, ax = plt.subplots(1, 1, figsize=(14, 5))
-        fig.suptitle(f"Compression Ratio Prediction R² Over {title_suffix}\n"
-                     "(coefficient of determination, per-timestep two-pass computation)",
-                     fontsize=14, fontweight="bold", y=0.99)
-
-        for ph in phases_present:
-            ts, r2 = phase_data[ph]
-            sty = phase_styles.get(ph, {"color": "black", "ls": "-", "marker": ".", "lw": 2.0})
-            ax.plot(ts, r2, color=sty["color"], linestyle=sty["ls"],
-                    marker=sty["marker"], markersize=6, linewidth=2.0,
-                    label=ph, alpha=0.9, zorder=3)
-
-        ax.axhline(1.0, color="#27ae60", linewidth=1, linestyle="--", alpha=0.6, label="Perfect (R²=1)")
-        ax.axhline(0.0, color="#e74c3c", linewidth=1, linestyle="--", alpha=0.4, label="R²=0 (mean baseline)")
-        ax.set_ylabel("R² Score", fontweight="bold")
-        ax.set_xlabel(x_label, fontweight="bold")
-        ax.grid(axis="y", alpha=0.2, linestyle="--")
-        ax.grid(axis="y", which='minor', alpha=0.1, linestyle=':')
-        ax.minorticks_on()
-        ax.legend(loc="lower right")
-
-    _sc_finalize(fig, pad=1.5, rect=[0, 0, 1, 0.96])
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    fig.savefig(output_path, dpi=300, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved: {output_path}")
-
-
 def make_ranking_quality_figure(ranking_csv_path, output_path):
-    """Plot Kendall tau-b, top-1 accuracy, and top-1 regret over milestone timesteps."""
+    """Plot Kendall tau-b and selection regret over milestone timesteps."""
     rows = parse_csv(ranking_csv_path)
     if not rows:
         print(f"  No ranking data in {ranking_csv_path}, skipping.")
@@ -778,42 +671,36 @@ def make_ranking_quality_figure(ranking_csv_path, output_path):
     }
     phases_present = [p for p in phase_order if p in by_phase]
 
-    # Aggregate per-phase per-timestep: mean tau, top1 accuracy, mean regret
+    # Aggregate per-phase per-timestep: mean tau, mean regret
     def aggregate(ph_rows):
         ts_map = {}
         for r in ph_rows:
             t = int(g(r, "timestep"))
             ts_map.setdefault(t, []).append(r)
         timesteps = sorted(ts_map.keys())
-        mean_tau, std_tau, top1_acc, mean_regret = [], [], [], []
+        mean_tau, std_tau, mean_regret = [], [], []
         for t in timesteps:
             chunk_rows = ts_map[t]
             taus = [g(r, "kendall_tau_b") for r in chunk_rows]
-            top1s = [g(r, "top1_correct") for r in chunk_rows]
             regrets = [g(r, "top1_regret") for r in chunk_rows]
             mean_tau.append(np.mean(taus))
             std_tau.append(np.std(taus))
-            top1_acc.append(np.mean(top1s) * 100.0)
             mean_regret.append(np.mean(regrets))
-        return np.array(timesteps), np.array(mean_tau), np.array(std_tau), np.array(top1_acc), np.array(mean_regret)
+        return np.array(timesteps), np.array(mean_tau), np.array(std_tau), np.array(mean_regret)
 
-    fig, (ax_tau, ax_top1, ax_regret) = plt.subplots(3, 1, figsize=(14, 10))
+    fig, (ax_tau, ax_regret) = plt.subplots(2, 1, figsize=(14, 7))
     fig.suptitle("NN Algorithm Ranking Quality Over Timesteps\n"
-                 "(Kendall \u03c4-b, Top-1 Accuracy, Top-1 Regret at milestones)",
+                 "(Kendall \u03c4-b, Selection Regret at milestones)",
                  fontsize=14, fontweight="bold", y=0.99)
 
     for ph in phases_present:
-        ts, mt, st, t1, mr = aggregate(by_phase[ph])
+        ts, mt, st, mr = aggregate(by_phase[ph])
         sty = phase_styles.get(ph, {"color": "black", "ls": "-", "marker": ".", "lw": 2.0})
 
         ax_tau.plot(ts, mt, color=sty["color"], linestyle=sty["ls"],
                     marker=sty["marker"], markersize=6, linewidth=2.0,
                     label=ph, alpha=0.9, zorder=3)
         ax_tau.fill_between(ts, mt - st, mt + st, color=sty["color"], alpha=0.1)
-
-        ax_top1.plot(ts, t1, color=sty["color"], linestyle=sty["ls"],
-                     marker=sty["marker"], markersize=6, linewidth=2.0,
-                     label=ph, alpha=0.9, zorder=3)
 
         ax_regret.plot(ts, mr, color=sty["color"], linestyle=sty["ls"],
                        marker=sty["marker"], markersize=6, linewidth=2.0,
@@ -827,15 +714,9 @@ def make_ranking_quality_figure(ranking_csv_path, output_path):
     ax_tau.grid(axis="y", alpha=0.2, linestyle="--")
     ax_tau.legend(loc="lower right", fontsize=9)
 
-    # Top-1 panel
-    ax_top1.set_ylabel("Top-1 Accuracy (%)", fontweight="bold")
-    ax_top1.set_ylim(-5, 105)
-    ax_top1.grid(axis="y", alpha=0.2, linestyle="--")
-    ax_top1.legend(loc="lower right", fontsize=9)
-
     # Regret panel
     ax_regret.axhline(1.0, color="#27ae60", linewidth=1, linestyle="--", alpha=0.4, label="Optimal (1.0x)")
-    ax_regret.set_ylabel("Top-1 Regret (x)", fontweight="bold")
+    ax_regret.set_ylabel("Selection Regret (x)", fontweight="bold")
     ax_regret.set_xlabel("Timestep", fontweight="bold")
     ax_regret.set_ylim(bottom=0.95)
     ax_regret.grid(axis="y", alpha=0.2, linestyle="--")
@@ -1256,10 +1137,22 @@ ALGO_COLORS = {a: CONFIG_COLORS[a] for a in ALGO_NAMES}
 
 
 def _normalize_action(action_str):
-    """Normalize action string to canonical form: 'algo[+quant][+shuf]'."""
-    if not action_str or action_str == "none":
+    """Normalize action string to canonical form: 'algo[+shuf][+quant]'.
+
+    Accepts both named actions ('bitcomp', 'lz4+shuf') and numeric IDs
+    (e.g. '6' = cascaded, '17' = lz4+shuf) from the SDRBench CSV.
+    """
+    if action_str is None or action_str == "" or action_str == "none":
         return "none"
-    parts = action_str.lower().split("+")
+    # Handle numeric action IDs: algo = id % 8, quant = (id//8)%2, shuf = (id//16)%2
+    s = str(action_str).strip()
+    try:
+        val = float(s)
+        if val == int(val) and 0 <= val < 256:
+            return _decode_action(int(val))
+    except ValueError:
+        pass
+    parts = s.lower().split("+")
     algo = parts[0]
     shuf = "shuf" in parts
     quant = "quant" in parts
@@ -1723,116 +1616,6 @@ def make_per_dataset_phase_comparison(all_datasets, output_path):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# View: Latency Breakdown Stacked Bar
-# ═══════════════════════════════════════════════════════════════════════
-
-def make_latency_breakdown_figure(rows, output_path, source_name=""):
-    """End-to-end write time per phase with NN overhead annotation.
-
-    Shows write_ms as the total bar for each phase. For NN phases,
-    annotates the NN inference + stats overhead as a percentage.
-    Uses a 3-stage pipelined architecture where stages overlap,
-    so component times do NOT sum to wall-clock time.
-    """
-    _normalize_rows(rows)
-    phases, ordered = _ordered(rows)
-    # Only show phases with write_ms > 0
-    valid = [(p, r) for p, r in zip(phases, ordered)
-             if g(r, "write_ms") > 0]
-    if not valid:
-        return
-
-    phases_v = [p for p, _ in valid]
-    rows_v = [r for _, r in valid]
-    n = len(phases_v)
-
-    fig, ax = plt.subplots(figsize=(max(10, 1.2 * n + 2), 6), facecolor="white")
-
-    x = np.arange(n)
-    write_times = np.array([g(r, "write_ms") for r in rows_v])
-    nn_times = np.array([g(r, "nn_ms") for r in rows_v])
-    stats_times = np.array([g(r, "stats_ms") for r in rows_v])
-    explore_times = np.array([g(r, "explore_ms") for r in rows_v])
-    sgd_times = np.array([g(r, "sgd_ms") for r in rows_v])
-    nn_overhead = nn_times + stats_times  # sequential on main thread
-
-    colors = [PHASE_COLORS.get(p, "#bdc3c7") for p in phases_v]
-    hatches = [PHASE_HATCHES.get(p, "") for p in phases_v]
-
-    # Main bars: end-to-end write_ms
-    bars = ax.bar(x, write_times, color=colors, edgecolor="black",
-                  linewidth=0.5, width=0.6, zorder=3, alpha=0.85)
-    for i, (bar, h) in enumerate(zip(bars, hatches)):
-        if h:
-            bar.set_hatch(h)
-
-    # Overlay: only NN+Stats as bar segment (sequential on main thread, accurate)
-    # Exploration and SGD are cumulative across parallel workers — text annotation only
-    nn_phase_names = {"nn", "nn-rl", "nn-rl+exp50"}
-    nn_label_done = False
-    for i, p in enumerate(phases_v):
-        if p not in nn_phase_names:
-            continue
-        oh = nn_overhead[i]
-        if oh > 0:
-            ax.bar(i, oh, color="#e67e22", edgecolor="black",
-                   linewidth=0.5, width=0.6, zorder=4, alpha=0.9,
-                   hatch="//", label="NN + Stats Overhead" if not nn_label_done else "")
-            nn_label_done = True
-
-    # Annotate: sequential metrics as %, cumulative as absolute with worker count
-    N_WORKERS = 8
-    for i, (wt, p) in enumerate(zip(write_times, phases_v)):
-        oh = nn_overhead[i]
-        sgd = sgd_times[i]
-        exp = explore_times[i]
-        label_parts = [f"{wt:.0f} ms"]
-        if p in nn_phase_names and oh > 0 and wt > 0:
-            label_parts.append(f"NN+Stats: {100*oh/wt:.0f}%")
-        if sgd > 0:
-            label_parts.append(f"SGD: {sgd:.0f} ms ({N_WORKERS}w)")
-        if exp > 0:
-            label_parts.append(f"Exp: {exp:.0f} ms ({N_WORKERS}w)")
-        ax.text(i, wt + write_times.max() * 0.02,
-                "\n".join(label_parts),
-                ha="center", va="bottom", fontsize=9, fontweight="bold")
-
-    ax.set_xticks(x)
-    labels = [PHASE_LABELS.get(p, p).replace("\n", " ") for p in phases_v]
-    ax.set_xticklabels(labels, rotation=25, ha='right', fontsize=11)
-    ax.set_ylabel("End-to-End Write Time (ms)", fontsize=13, fontweight="bold")
-    ax.set_ylim(0, write_times.max() * 1.25)
-
-    title = "Per-Phase Write Latency"
-    if source_name:
-        title += f" ({source_name})"
-    ax.set_title(title, fontsize=14, fontweight="bold", pad=12)
-    ax.grid(axis="y", alpha=0.15, linestyle="--", zorder=0)
-
-    # Legend
-    handles, lbls = ax.get_legend_handles_labels()
-    if handles:
-        ax.legend(handles, lbls, loc="upper left", fontsize=10,
-                  framealpha=0.95, edgecolor="#cccccc", fancybox=True)
-
-    # Caption note
-    ax.text(0.98, 0.02,
-            "NN overhead (orange) is sequential on main thread.\n"
-            "*SGD/Exploration times are cumulative across\n"
-            " parallel workers (overlap with compression).",
-            transform=ax.transAxes, fontsize=8, color="#666",
-            ha="right", va="bottom",
-            bbox=dict(boxstyle="round,pad=0.3", facecolor="white",
-                      edgecolor="#ccc", alpha=0.9))
-
-    _sc_finalize(fig, pad=2.0)
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    fig.savefig(output_path, dpi=300, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved: {output_path}")
-
-
-# ═══════════════════════════════════════════════════════════════════════
 # View: Algorithm Selection Frequency Histogram
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -1908,75 +1691,6 @@ def make_algorithm_histogram(chunk_csv_paths, output_path):
 
     _sc_finalize(fig, pad=1.5)
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    fig.savefig(output_path, dpi=300, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved: {output_path}")
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# Write Path Decomposition + Pipeline Waterfall
-# ═══════════════════════════════════════════════════════════════════════
-
-def make_write_path_decomposition(ts_csv_path, output_path):
-    """Stacked bar: write_ms = h5dwrite + cuda_sync + h5dclose + h5fclose per timestep.
-
-    100% additive — these are consecutive chrono slices of the write path.
-    Shows one panel per phase, timesteps on x-axis.
-    """
-    all_rows = parse_csv(ts_csv_path)
-    if not all_rows or "h5dwrite_ms" not in all_rows[0]:
-        return
-
-    # Group by phase
-    by_phase = {}
-    for r in all_rows:
-        ph = r.get("phase", "")
-        by_phase.setdefault(ph, []).append(r)
-
-    # Only plot NN phases
-    nn_phases = [ph for ph in ["nn", "nn-rl", "nn-rl+exp50"] if ph in by_phase]
-    if not nn_phases:
-        nn_phases = list(by_phase.keys())[:3]
-    n = len(nn_phases)
-    if n == 0:
-        return
-
-    fig, axes = plt.subplots(1, n, figsize=(5 * n + 2, 5), squeeze=False)
-
-    colors = {"h5dwrite_ms": "#3498db", "cuda_sync_ms": "#e74c3c",
-              "h5dclose_ms": "#f39c12", "h5fclose_ms": "#95a5a6"}
-    labels = {"h5dwrite_ms": "H5Dwrite (VOL pipeline)",
-              "cuda_sync_ms": "cudaDeviceSync",
-              "h5dclose_ms": "H5Dclose (metadata)",
-              "h5fclose_ms": "H5Fclose"}
-    components = ["h5dwrite_ms", "cuda_sync_ms", "h5dclose_ms", "h5fclose_ms"]
-
-    phase_labels = {"nn": "NN Inference", "nn-rl": "NN + SGD",
-                    "nn-rl+exp50": "NN + SGD + Explore"}
-
-    for col, ph in enumerate(nn_phases):
-        ax = axes[0, col]
-        rows = sorted(by_phase[ph], key=lambda r: int(g(r, "timestep")))
-        ts = [int(g(r, "timestep")) for r in rows]
-        bottom = np.zeros(len(rows))
-
-        for comp in components:
-            vals = np.array([g(r, comp) for r in rows])
-            ax.bar(ts, vals, bottom=bottom, color=colors[comp],
-                   label=labels[comp], width=0.8, edgecolor="white", linewidth=0.3)
-            bottom += vals
-
-        ax.set_xlabel("Timestep")
-        if col == 0:
-            ax.set_ylabel("Time (ms)")
-        ax.set_title(phase_labels.get(ph, ph), fontweight="bold")
-        if col == n - 1:
-            ax.legend(loc="upper right", fontsize=7, framealpha=0.9)
-        ax.grid(axis="y", alpha=0.2)
-
-    fig.suptitle("Write Path Decomposition (100% additive)",
-                 fontsize=13, fontweight="bold")
-    _sc_finalize(fig, pad=1.5, rect=[0, 0, 1, 0.95])
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved: {output_path}")
@@ -2876,14 +2590,6 @@ def main():
                                   os.path.join(out_dir, "multi_dataset_comparison.png"))
         make_per_dataset_phase_comparison(all_datasets_for_comparison,
                                           os.path.join(out_dir, "per_dataset_phase_comparison.png"))
-
-    # ── Latency breakdown (from Gray-Scott which has per-component timing) ──
-    if gs_agg and os.path.exists(gs_agg) and "summary" in views:
-        rows = parse_csv(gs_agg)
-        if any(g(r, "comp_ms") > 0 or g(r, "nn_ms") > 0 for r in rows):
-            print("Generating latency breakdown figure")
-            make_latency_breakdown_figure(rows,
-                os.path.join(gs_out_dir, "latency_breakdown.png"), "Gray-Scott")
 
     # ── Algorithm selection histogram (from chunk CSVs) ──
     chunk_csv_paths = []

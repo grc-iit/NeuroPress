@@ -257,7 +257,41 @@ done
 
 echo "============================================================"
 echo "  All runs complete. Results in: $EVAL_DIR"
+echo "============================================================"
+echo ""
+
+# ── Generate plots per policy ──
+echo "Generating figures..."
+for policy in "${POLICY_LIST[@]}"; do
+    LABEL="${POLICY_LABELS[$policy]}"
+    POLICY_DIR="$EVAL_DIR/$LABEL"
+    FIG_DIR="$POLICY_DIR/figures"
+    mkdir -p "$FIG_DIR"
+
+    SDR_DIR="$EVAL_DIR" SDR_CHUNK="$CHUNK_MB" \
+    python3 "$GPU_DIR/benchmarks/plots/generate_dataset_figures.py" \
+        --dataset "$DATASET" --policy "$LABEL" 2>&1 | grep -E "Saved|Generated|Error"
+
+    # Move generated figures to the figures/ subdirectory
+    PLOT_SRC="$GPU_DIR/benchmarks/results/per_dataset/${DATASET}/${EVAL_NAME}/${LABEL}"
+    if [ -d "$PLOT_SRC" ]; then
+        mv "$PLOT_SRC"/*.png "$FIG_DIR/" 2>/dev/null
+        echo "  Figures → $FIG_DIR/ ($(ls "$FIG_DIR"/*.png 2>/dev/null | wc -l) plots)"
+    else
+        # Try without eval_name
+        PLOT_SRC2="$GPU_DIR/benchmarks/results/per_dataset/${DATASET}/${LABEL}"
+        if [ -d "$PLOT_SRC2" ]; then
+            mv "$PLOT_SRC2"/*.png "$FIG_DIR/" 2>/dev/null
+            echo "  Figures → $FIG_DIR/ ($(ls "$FIG_DIR"/*.png 2>/dev/null | wc -l) plots)"
+        fi
+    fi
+done
+
+echo ""
+echo "============================================================"
+echo "  Results: $EVAL_DIR"
 echo "  Structure per policy:"
 echo "    phase_<name>/     — raw per-phase CSVs + logs"
 echo "    merged_csv/       — combined CSVs (all phases)"
+echo "    figures/           — plots (*.png)"
 echo "============================================================"

@@ -33,7 +33,6 @@ struct RankingChunkResult {
     int    chunk_idx;
     int    n_active_configs;
     double kendall_tau_b;
-    int    top1_correct;
     double top1_regret;        /* actual_cost[nn_pick] / actual_cost[oracle_pick] */
     int    predicted_best;     /* action ID of NN's top pick */
     int    actual_best;        /* action ID of actual best config */
@@ -46,7 +45,6 @@ struct RankingMilestoneResult {
     int    n_chunks;
     double mean_tau;
     double std_tau;
-    double top1_accuracy;      /* fraction of chunks where top-1 matched */
     double mean_regret;
     double profiling_ms;       /* wall-clock time for the profiling pass */
 };
@@ -286,7 +284,6 @@ static int run_ranking_profiler(
     /* ── 6. Compute ranking metrics per chunk ── */
     std::vector<RankingChunkResult> chunk_results(n_chunks);
     double sum_tau = 0.0, sum_tau2 = 0.0;
-    int    top1_hits = 0;
     double sum_regret = 0.0;
     int    valid_chunks = 0;
 
@@ -316,15 +313,12 @@ static int run_ranking_profiler(
 
         if (pred_count < 2) {
             /* No valid predicted ranking (non-AUTO phase) — skip */
-            chunk_results[ci] = {ci, n_active, 0.0, 0, 1.0, -1, actual_ranking[0], 0.0, results[ci][actual_order[0]].cost};
+            chunk_results[ci] = {ci, n_active, 0.0, 1.0, -1, actual_ranking[0], 0.0, results[ci][actual_order[0]].cost};
             continue;
         }
 
         /* Compute Kendall tau-b */
         double tau = compute_kendall_tau_b(predicted_ranking, actual_ranking, n_active);
-
-        /* Top-1 accuracy */
-        int top1 = (predicted_ranking[0] == actual_ranking[0]) ? 1 : 0;
 
         /* Top-1 regret: find cost of NN's predicted best in actual results */
         double nn_pick_cost = 0.0;
@@ -337,13 +331,12 @@ static int run_ranking_profiler(
         double oracle_cost = results[ci][actual_order[0]].cost;
         double regret = (oracle_cost > 0.0) ? nn_pick_cost / oracle_cost : 1.0;
 
-        chunk_results[ci] = {ci, n_active, tau, top1, regret,
+        chunk_results[ci] = {ci, n_active, tau, regret,
                              predicted_ranking[0], actual_ranking[0],
                              nn_pick_cost, oracle_cost};
 
         sum_tau += tau;
         sum_tau2 += tau * tau;
-        top1_hits += top1;
         sum_regret += regret;
         valid_chunks++;
     }
@@ -354,9 +347,9 @@ static int run_ranking_profiler(
 
     for (int ci = 0; ci < n_chunks; ci++) {
         auto& cr = chunk_results[ci];
-        fprintf(csv, "%s,%d,%d,%d,%.6f,%d,%.6f,%d,%d,%.4f,%.4f,%.1f\n",
+        fprintf(csv, "%s,%d,%d,%d,%.6f,%.6f,%d,%d,%.4f,%.4f,%.1f\n",
                 phase_name, timestep, ci, cr.n_active_configs,
-                cr.kendall_tau_b, cr.top1_correct, cr.top1_regret,
+                cr.kendall_tau_b, cr.top1_regret,
                 cr.predicted_best, cr.actual_best,
                 cr.predicted_best_cost, cr.actual_best_cost,
                 profiling_ms / n_chunks);
@@ -420,12 +413,10 @@ static int run_ranking_profiler(
             out->mean_tau = sum_tau / valid_chunks;
             double var = (sum_tau2 / valid_chunks) - (out->mean_tau * out->mean_tau);
             out->std_tau = (var > 0.0) ? sqrt(var) : 0.0;
-            out->top1_accuracy = (double)top1_hits / valid_chunks;
             out->mean_regret = sum_regret / valid_chunks;
         } else {
             out->mean_tau = 0.0;
             out->std_tau = 0.0;
-            out->top1_accuracy = 0.0;
             out->mean_regret = 1.0;
         }
         out->profiling_ms = profiling_ms;
@@ -446,7 +437,7 @@ static int run_ranking_profiler(
 static inline void write_ranking_csv_header(FILE* csv) {
     if (!csv) return;
     fprintf(csv, "phase,timestep,chunk,n_active_configs,"
-                 "kendall_tau_b,top1_correct,top1_regret,"
+                 "kendall_tau_b,top1_regret,"
                  "predicted_best,actual_best,"
                  "predicted_best_cost,actual_best_cost,"
                  "profiling_ms\n");

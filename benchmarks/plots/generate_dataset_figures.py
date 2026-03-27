@@ -4,14 +4,12 @@ Generate all figures for a single dataset + policy combination.
 
 Produces up to 9 figures:
   1_summary.png            - 4-panel: ratio, write, read, Pareto
-  2_latency_breakdown.png  - stacked bar: comp, NN, stats, SGD
   3_algorithm_evolution.png - heatmap: algo per chunk over time (nn, nn-rl, nn-rl+exp)
-  4_predicted_vs_actual.png - per-chunk predicted vs actual (nn, nn-rl, nn-rl+exp)
+  4_<phase>_predicted_vs_actual.png - per-chunk predicted vs actual (per phase)
   5a_sgd_convergence.png   - MAPE convergence over timesteps
   5b_sgd_exploration_firing.png - SGD/exploration firing rates
   5c_mae_over_time.png     - MAE convergence over timesteps
-  5d_r2_over_time.png      - R² score over timesteps
-  5e_ranking_quality.png   - Kendall tau, top-1 accuracy, regret at milestones
+  5d_ranking_quality.png   - Kendall tau, selection regret at milestones
 
 Usage:
   python3 generate_dataset_figures.py --dataset hurricane_isabel
@@ -46,7 +44,9 @@ def generate_figures(dataset, policy, out_dir):
     if not os.path.exists(agg_csv):
         # Search for any matching CSV (handles long SDRBench names like SDRBENCH-EXASKY-NYX-...)
         all_csvs = glob.glob(os.path.join(data_dir, "benchmark_*.csv"))
-        all_csvs = [c for c in all_csvs if "_chunks" not in c and "_timesteps" not in c]
+        all_csvs = [c for c in all_csvs
+                     if "_chunks" not in c and "_timesteps" not in c
+                     and "_ranking" not in c]
         ds_lower = dataset.lower().replace("_", "")
         for c in all_csvs:
             bn = os.path.basename(c).lower().replace("-", "").replace("_", "")
@@ -107,14 +107,6 @@ def generate_figures(dataset, policy, out_dir):
             viz.make_summary_figure(display, rows, out, meta_text)
             count += 1
 
-    # ── 2. Latency breakdown ──
-    if os.path.exists(agg_csv):
-        rows = viz.parse_csv(agg_csv)
-        if rows:
-            out = os.path.join(out_dir, "2_latency_breakdown.png")
-            viz.make_latency_breakdown_figure(rows, out, dataset)
-            count += 1
-
     # ── 3. Algorithm evolution heatmap (all policies) ──
     # Try derived name from csv_base first, then config registry, then generic
     tc_csv = os.path.join(data_dir, f"{csv_base}_timestep_chunks.csv") if csv_base else ""
@@ -132,11 +124,8 @@ def generate_figures(dataset, policy, out_dir):
                                           ch_csv if os.path.exists(ch_csv) else None)
         count += 1
 
-    # ── 4. Predicted vs actual — all 3 NN phases in one figure + per-phase ──
+    # ── 4. Predicted vs actual — per-phase figures ──
     if os.path.exists(tc_csv):
-        out = os.path.join(out_dir, "4_predicted_vs_actual.png")
-        viz.make_timestep_chunks_multi_phase(tc_csv, out)
-        count += 1
         for ph in ("nn", "nn-rl", "nn-rl+exp50"):
             out_ph = os.path.join(out_dir, f"4_{ph}_predicted_vs_actual.png")
             viz.make_timestep_chunks_figure(tc_csv, out_ph, phase_filter=ph)
@@ -162,11 +151,7 @@ def generate_figures(dataset, policy, out_dir):
         viz.make_mae_figure(ts_csv, out_mae)
         count += 1
 
-        out_r2 = os.path.join(out_dir, "5d_r2_over_time.png")
-        viz.make_r2_figure(ts_csv, out_r2)
-        count += 1
-
-    # ── 5e. Ranking quality (Kendall tau) ──
+    # ── 5d. Ranking quality (Kendall tau) ──
     ranking_csv = ""
     if csv_base:
         ranking_csv = os.path.join(data_dir, f"{csv_base}_ranking.csv")
@@ -184,12 +169,8 @@ def generate_figures(dataset, policy, out_dir):
         viz.make_ranking_quality_figure(ranking_csv, out_ranking)
         count += 1
 
-    # ── 6. Write path decomposition + pipeline waterfall ──
+    # ── 6. Pipeline waterfall ──
     if os.path.exists(ts_csv):
-        out_wp = os.path.join(out_dir, "6a_write_path_decomposition.png")
-        viz.make_write_path_decomposition(ts_csv, out_wp)
-        count += 1
-
         out_wf = os.path.join(out_dir, "6b_pipeline_waterfall.png")
         viz.make_pipeline_waterfall(ts_csv, out_wf)
         count += 1
