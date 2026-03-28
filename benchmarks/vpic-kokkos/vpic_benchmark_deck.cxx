@@ -541,10 +541,26 @@ begin_initialization {
     species_t* ion      = define_species("ion",       ec, mi, 1.5*Ni/nproc(), -1, 0, 1);
     species_t* electron = define_species("electron", -ec, me, 1.5*Ne/nproc(), -1, 0, 1);
 
-    // Load fields (Harris current sheet)
+    // Load fields (Harris current sheet + perturbation + guide field)
+    //
+    // Bz  = b0 * tanh(x/L)           — Harris equilibrium (reverses at x=0)
+    // Bx  = b0 * pert * sin(2πy/Ly)  — tearing mode seed (skips slow linear phase)
+    // By  = b0 * guide               — guide field (enables 3D structure)
+    //
+    // VPIC_PERTURBATION: amplitude of Bx seed (default 0.1 = 10% of b0)
+    //   Higher = faster instability onset, 0 = wait for particle noise
+    // VPIC_GUIDE_FIELD: strength of By guide field (default 0.0 = no guide)
+    //   0.2-0.5 produces 3D magnetic islands and flux ropes
+    const char* env_pert  = getenv("VPIC_PERTURBATION");
+    const char* env_guide = getenv("VPIC_GUIDE_FIELD");
+    double pert_amp  = env_pert  ? atof(env_pert)  : 0.1;   // fraction of b0
+    double guide_fld = env_guide ? atof(env_guide) : 0.0;   // fraction of b0
+
     set_region_field(everywhere,
                      0, 0, 0,
-                     0, 0, b0*tanh(x/L));
+                     b0*pert_amp*sin(2*M_PI*y/Ly),
+                     b0*guide_fld,
+                     b0*tanh(x/L));
 
     // Load particles (drifting Maxwellians)
     double ymin = rank()*Ly/nproc();
@@ -619,7 +635,8 @@ begin_initialization {
             << grid->nv << " cells)");
     sim_log("  Chunks   : " << global->chunk_bytes / (1024*1024) << " MB each");
     sim_log("  Particles: " << nppc << " per cell");
-    sim_log("  Physics  : mi_me=" << mi_me << " wpe_wce=" << wpe_wce << " Ti_Te=" << Ti_Te);
+    sim_log("  Physics  : mi_me=" << mi_me << " wpe_wce=" << wpe_wce << " Ti_Te=" << Ti_Te
+            << " pert=" << pert_amp << " guide=" << guide_fld);
     sim_log("  Warmup   : " << global->sim_steps << " steps");
     if (sim_interval > 1)
         sim_log("  Sim interval: " << sim_interval << " steps between writes");
