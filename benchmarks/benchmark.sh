@@ -408,13 +408,20 @@ for r in rows:
     d['n'] += 1
 with open('$AGG_CSV','w') as f:
     f.write('source,phase,n_runs,write_ms,write_ms_std,read_ms,read_ms_std,file_mib,orig_mib,ratio,write_mibps,read_mibps,mismatches,sgd_fires,explorations,n_chunks\n')
+    # Get constant orig size from first no-comp row (ratio~1, file_bytes~orig)
+    first_orig = 0
+    for r in rows:
+        if r['phase'] == 'no-comp':
+            first_orig = int(r.get('file_bytes',0)) / (1024*1024)
+            break
     for p,d in phases.items():
         n = d['n']
         wr = d['sum_wr']/n if n else 0
         rd = d['sum_rd']/n if n else 0
-        rat = d['sum_rat']/n if n else 0
-        avg_file_mib = d['sum_file_bytes'] / n / (1024*1024) if n else 0
-        orig_mib = avg_file_mib * rat if rat > 0 else avg_file_mib
+        total_file_mib = d['sum_file_bytes'] / (1024*1024) if n else 0
+        avg_file_mib = total_file_mib / n if n else 0
+        orig_mib = first_orig if first_orig > 0 else avg_file_mib
+        rat = (n * orig_mib) / total_file_mib if total_file_mib > 0 else 0
         wr_mibps = orig_mib / (wr/1000.0) if wr > 0 else 0
         rd_mibps = orig_mib / (rd/1000.0) if rd > 0 else 0
         f.write(f'vpic,{p},{n},{wr:.2f},0.00,{rd:.2f},0.00,{avg_file_mib:.2f},{orig_mib:.2f},{rat:.4f},{wr_mibps:.1f},{rd_mibps:.1f},0,0,0,{d[\"n_chunks\"]}\n')

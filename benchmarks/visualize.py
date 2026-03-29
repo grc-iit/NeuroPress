@@ -253,17 +253,24 @@ def _merge_timestep_phases(rows, ts_csv_path, orig_mib):
         total_data_mib = n_ts * orig_mib
         total_write_s = sum(g(r, "write_ms") for r in ph_rows) / 1000.0
         total_read_s = sum(g(r, "read_ms") for r in ph_rows) / 1000.0
-        ratio_avg = _avg_all(ph_rows, "ratio")
+        # Ratio = total_original / total_compressed (not mean of per-timestep ratios)
+        total_file_bytes = sum(g(r, "file_bytes") for r in ph_rows)
+        if total_file_bytes > 0:
+            total_file_mib = total_file_bytes / (1024 * 1024)
+            ratio_agg = total_data_mib / total_file_mib
+        else:
+            ratio_agg = _avg_all(ph_rows, "ratio")  # fallback for old CSVs
+            total_file_mib = total_data_mib / max(ratio_agg, 1e-6)
         total_sgd = sum(int(g(r, "sgd_fires")) for r in ph_rows)
         total_expl = sum(int(g(r, "explorations")) for r in ph_rows)
         total_chunks = sum(int(g(r, "n_chunks")) for r in ph_rows)
         rows.append({
             "phase": ph,
-            "ratio": ratio_avg,
+            "ratio": ratio_agg,
             "write_mibps": total_data_mib / total_write_s if total_write_s > 0 else 0,
             "read_mibps": total_data_mib / total_read_s if total_read_s > 0 else 0,
             "orig_mib": orig_mib,
-            "file_mib": orig_mib / max(ratio_avg, 1e-6),
+            "file_mib": total_file_mib / n_ts,
             "n_chunks": total_chunks,
             "sgd_fires": total_sgd,
             "explorations": total_expl,

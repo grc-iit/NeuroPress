@@ -66,6 +66,29 @@ def generate_figures(dataset, policy, out_dir):
     if os.path.exists(agg_csv):
         rows = viz.parse_csv(agg_csv)
         if rows:
+            # Fix NN phase ratios: use total_orig/total_compressed from timestep CSV
+            # instead of mean(per-timestep ratios) which has Jensen's inequality bias.
+            ts_csv_for_fix = ""
+            if csv_base:
+                ts_csv_for_fix = os.path.join(data_dir, f"{csv_base}_timesteps.csv")
+            if not os.path.exists(ts_csv_for_fix) and dataset in DATASETS:
+                ts_csv_for_fix = os.path.join(data_dir, DATASETS[dataset]["timesteps_csv"])
+            if os.path.exists(ts_csv_for_fix):
+                ts_rows = viz.parse_csv(ts_csv_for_fix)
+                for r in rows:
+                    ph = r.get("phase", "")
+                    if ph not in ("nn-rl", "nn-rl+exp50", "nn"):
+                        continue
+                    ph_ts = [t for t in ts_rows if t.get("phase", "") == ph]
+                    if not ph_ts:
+                        continue
+                    total_file = sum(viz.g(t, "file_bytes") for t in ph_ts)
+                    orig_mib = viz.g(r, "orig_mib", "orig_mb")
+                    if total_file > 0 and orig_mib > 0:
+                        total_file_mib = total_file / (1024 * 1024)
+                        r["ratio"] = (len(ph_ts) * orig_mib) / total_file_mib
+                        r["file_mib"] = total_file_mib / len(ph_ts)
+
             out = os.path.join(out_dir, "1_summary.png")
             display = dataset.replace("_", " ").title()
 
