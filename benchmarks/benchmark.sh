@@ -294,7 +294,7 @@ for bench in "${BENCH_LIST[@]}"; do
                 esac
             done
 
-            VPIC_EVAL_DIR="$SCRIPT_DIR/vpic-kokkos/results/eval_NX${VPIC_NX}_chunk${CHUNK_MB}mb_ts${TIMESTEPS}"
+            VPIC_EVAL_DIR="$SCRIPT_DIR/vpic-kokkos/results/eval_NX${VPIC_NX}_chunk${CHUNK_MB}mb_ts${TIMESTEPS}${VPIC_EVAL_SUFFIX:-}"
 
             # Helper: build VPIC_EXCLUDE from a comma-separated list of phases to INCLUDE
             vpic_exclude_from() {
