@@ -231,24 +231,20 @@ for bench in "${BENCH_LIST[@]}"; do
 
                     echo "      Done. Log: $GS_NN_DIR/gs_benchmark.log"
 
-                    # Merge fixed + NN CSVs
+                    # Merge fixed + NN CSVs.
+                    # Build merged file in temp, then overwrite the NN dir copy.
                     if [ -n "$GS_FIXED_LIST" ] && [ -d "$GS_FIXED_DIR" ]; then
-                        MERGE_DIR="$GS_NN_DIR/merged_csv"
-                        mkdir -p "$MERGE_DIR"
-                        for csv_name in benchmark_grayscott_vol.csv benchmark_grayscott_timesteps.csv benchmark_grayscott_timestep_chunks.csv benchmark_grayscott_ranking.csv benchmark_grayscott_ranking_costs.csv benchmark_grayscott_vol_chunks.csv; do
-                            MERGED="$MERGE_DIR/$csv_name"
-                            FIRST=1
-                            for src in "$GS_FIXED_DIR/$csv_name" "$GS_NN_DIR/$csv_name"; do
-                                if [ -f "$src" ]; then
-                                    if [ $FIRST -eq 1 ]; then
-                                        cp "$src" "$MERGED"
-                                        FIRST=0
-                                    else
-                                        tail -n+2 "$src" >> "$MERGED"
-                                    fi
-                                fi
-                            done
-                            [ -f "$MERGED" ] && ln -sf "$MERGE_DIR/$csv_name" "$GS_NN_DIR/$csv_name"
+                        for csv_name in benchmark_grayscott_vol.csv benchmark_grayscott_timesteps.csv benchmark_grayscott_timestep_chunks.csv benchmark_grayscott_ranking.csv benchmark_grayscott_ranking_costs.csv; do
+                            FIXED_SRC="$GS_FIXED_DIR/$csv_name"
+                            NN_SRC="$GS_NN_DIR/$csv_name"
+                            if [ -f "$FIXED_SRC" ] && [ -f "$NN_SRC" ]; then
+                                TMP_MERGED=$(mktemp)
+                                cp "$FIXED_SRC" "$TMP_MERGED"
+                                tail -n+2 "$NN_SRC" >> "$TMP_MERGED"
+                                mv "$TMP_MERGED" "$NN_SRC"
+                            elif [ -f "$FIXED_SRC" ] && [ ! -f "$NN_SRC" ]; then
+                                cp "$FIXED_SRC" "$NN_SRC"
+                            fi
                         done
                     fi
 
@@ -382,24 +378,22 @@ for bench in "${BENCH_LIST[@]}"; do
 
                     echo "      Done. Log: $NN_DIR/vpic_benchmark.log"
 
-                    # Merge fixed + NN CSVs for this policy and generate plots
+                    # Merge fixed + NN CSVs for this policy.
+                    # Strategy: build merged file in temp, then overwrite the NN dir copy
+                    # so the plot generator finds all phases in one file.
                     if [ -n "$VPIC_FIXED_PHASES" ] && [ -d "$FIXED_DIR" ]; then
-                        MERGE_DIR="$NN_DIR/merged_csv"
-                        mkdir -p "$MERGE_DIR"
-                        for csv_name in benchmark_vpic_deck_timesteps.csv benchmark_vpic_deck_timestep_chunks.csv benchmark_vpic_deck_ranking.csv benchmark_vpic_deck_ranking_costs.csv; do
-                            MERGED="$MERGE_DIR/$csv_name"
-                            FIRST=1
-                            for src in "$FIXED_DIR/$csv_name" "$NN_DIR/$csv_name"; do
-                                if [ -f "$src" ]; then
-                                    if [ $FIRST -eq 1 ]; then
-                                        cp "$src" "$MERGED"
-                                        FIRST=0
-                                    else
-                                        tail -n+2 "$src" >> "$MERGED"
-                                    fi
-                                fi
-                            done
-                            [ -f "$MERGED" ] && ln -sf "$MERGE_DIR/$csv_name" "$NN_DIR/$csv_name"
+                        for csv_name in benchmark_vpic_deck.csv benchmark_vpic_deck_timesteps.csv benchmark_vpic_deck_timestep_chunks.csv benchmark_vpic_deck_ranking.csv benchmark_vpic_deck_ranking_costs.csv; do
+                            FIXED_SRC="$FIXED_DIR/$csv_name"
+                            NN_SRC="$NN_DIR/$csv_name"
+                            if [ -f "$FIXED_SRC" ] && [ -f "$NN_SRC" ]; then
+                                # Merge: fixed header+data, then NN data (skip header)
+                                TMP_MERGED=$(mktemp)
+                                cp "$FIXED_SRC" "$TMP_MERGED"
+                                tail -n+2 "$NN_SRC" >> "$TMP_MERGED"
+                                mv "$TMP_MERGED" "$NN_SRC"
+                            elif [ -f "$FIXED_SRC" ] && [ ! -f "$NN_SRC" ]; then
+                                cp "$FIXED_SRC" "$NN_SRC"
+                            fi
                         done
                     fi
 
