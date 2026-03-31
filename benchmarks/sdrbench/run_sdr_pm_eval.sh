@@ -25,6 +25,33 @@
 # ============================================================
 set +e
 
+# ── Multi-GPU / Multi-Node (MPI) ──
+MPI_NP=${MPI_NP:-1}
+GPUS_PER_NODE=${GPUS_PER_NODE:-1}
+LAUNCHER=${LAUNCHER:-auto}
+
+mpi_launch() {
+    if [ "$MPI_NP" -le 1 ]; then
+        "$@"
+        return
+    fi
+    local use_launcher="$LAUNCHER"
+    if [ "$use_launcher" = "auto" ]; then
+        if [ -n "$SLURM_JOB_ID" ]; then use_launcher="srun"; else use_launcher="mpirun"; fi
+    fi
+    case "$use_launcher" in
+        srun)
+            srun --ntasks="$MPI_NP" --gpus-per-task=1 --kill-on-bad-exit=1 "$@"
+            ;;
+        mpirun)
+            mpirun -np "$MPI_NP" \
+                bash -c 'export CUDA_VISIBLE_DEVICES=$((${OMPI_COMM_WORLD_LOCAL_RANK:-${PMI_LOCAL_RANK:-${MPI_LOCALRANKID:-${SLURM_LOCALID:-0}}}} % '"$GPUS_PER_NODE"')); exec "$@"' \
+                _ "$@"
+            ;;
+        *) echo "ERROR: Unknown LAUNCHER=$use_launcher" >&2; return 1 ;;
+    esac
+}
+
 # ── Configuration ──
 CHUNK_MB=${CHUNK_MB:-4}
 DEBUG_NN=${DEBUG_NN:-0}
@@ -164,7 +191,7 @@ if [ ${#FIXED_PHASES[@]} -gt 0 ]; then
         RUN_START=$(date +%s)
         GPUCOMPRESS_DETAILED_TIMING=1 \
         GPUCOMPRESS_DEBUG_NN=$DEBUG_NN \
-        "$SDR_BIN" "$WEIGHTS" \
+        mpi_launch "$SDR_BIN" "$WEIGHTS" \
             $COMMON_ARGS \
             --phase "$phase" \
             --w0 1.0 --w1 1.0 --w2 1.0 \
@@ -206,7 +233,7 @@ for policy in "${POLICY_LIST[@]}"; do
         RUN_START=$(date +%s)
         GPUCOMPRESS_DETAILED_TIMING=1 \
         GPUCOMPRESS_DEBUG_NN=$DEBUG_NN \
-        "$SDR_BIN" "$WEIGHTS" \
+        mpi_launch "$SDR_BIN" "$WEIGHTS" \
             $COMMON_ARGS \
             --phase "$phase" \
             --w0 $W0 --w1 $W1 --w2 $W2 \

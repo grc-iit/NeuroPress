@@ -75,6 +75,9 @@ for ds in "${DS_LIST[@]}"; do
     EXPLORE_THRESH=$EXPLORE_THRESH \
     VERIFY=$VERIFY \
     DEBUG_NN=$DEBUG_NN \
+    MPI_NP=${MPI_NP:-1} \
+    GPUS_PER_NODE=${GPUS_PER_NODE:-1} \
+    LAUNCHER=${LAUNCHER:-auto} \
     bash "$SCRIPT_DIR/run_sdr_pm_eval.sh"
 
     echo ""

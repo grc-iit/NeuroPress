@@ -32,6 +32,9 @@ find_package(CUDAToolkit REQUIRED)
 # Optional: Find HDF5 for filter plugin
 find_package(HDF5 COMPONENTS C)
 
+# Optional: Find MPI for multi-GPU benchmark support
+find_package(MPI)
+
 # External dependency prefix (nvcomp, etc.)
 set(NVCOMP_PREFIX "/tmp" CACHE PATH "nvcomp install prefix (include/ and lib/)")
 

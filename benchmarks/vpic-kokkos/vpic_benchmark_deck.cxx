@@ -82,19 +82,36 @@ extern "C" float gpucompress_get_bandwidth_bytes_per_ms(void);
 
 /* Temporary HDF5 files written to /tmp (typically tmpfs / RAM-backed).
  * This isolates GPU compression pipeline overhead from disk I/O variability.
- * Note: drop_pagecache() is a no-op on tmpfs, so reads may hit warm cache. */
-#define TMP_NOCOMP    "/tmp/bm_vpic_nocomp.h5"
-#define TMP_FIX_LZ4   "/tmp/bm_vpic_fix_lz4.h5"
-#define TMP_FIX_SNAPPY "/tmp/bm_vpic_fix_snappy.h5"
-#define TMP_FIX_DEFL  "/tmp/bm_vpic_fix_deflate.h5"
-#define TMP_FIX_GDEFL "/tmp/bm_vpic_fix_gdefl.h5"
-#define TMP_FIX_ZSTD  "/tmp/bm_vpic_fix_zstd.h5"
-#define TMP_FIX_ANS   "/tmp/bm_vpic_fix_ans.h5"
-#define TMP_FIX_CASC  "/tmp/bm_vpic_fix_cascaded.h5"
-#define TMP_FIX_BITCOMP "/tmp/bm_vpic_fix_bitcomp.h5"
-#define TMP_NN        "/tmp/bm_vpic_nn.h5"
-#define TMP_NN_RL    "/tmp/bm_vpic_nn_rl.h5"
-#define TMP_NN_RLEXP "/tmp/bm_vpic_nn_rlexp.h5"
+ * Note: drop_pagecache() is a no-op on tmpfs, so reads may hit warm cache.
+ * Paths are rank-suffixed to avoid collisions when multiple MPI ranks share
+ * a node (e.g., 1 node × 2 GPUs). Populated by init_tmp_paths(). */
+static char TMP_NOCOMP[256];
+static char TMP_FIX_LZ4[256];
+static char TMP_FIX_SNAPPY[256];
+static char TMP_FIX_DEFL[256];
+static char TMP_FIX_GDEFL[256];
+static char TMP_FIX_ZSTD[256];
+static char TMP_FIX_ANS[256];
+static char TMP_FIX_CASC[256];
+static char TMP_FIX_BITCOMP[256];
+static char TMP_NN[256];
+static char TMP_NN_RL[256];
+static char TMP_NN_RLEXP[256];
+
+static void init_tmp_paths(int mpi_rank) {
+    snprintf(TMP_NOCOMP,      sizeof(TMP_NOCOMP),      "/tmp/bm_vpic_nocomp_rank%d.h5",      mpi_rank);
+    snprintf(TMP_FIX_LZ4,     sizeof(TMP_FIX_LZ4),     "/tmp/bm_vpic_fix_lz4_rank%d.h5",     mpi_rank);
+    snprintf(TMP_FIX_SNAPPY,   sizeof(TMP_FIX_SNAPPY),   "/tmp/bm_vpic_fix_snappy_rank%d.h5",   mpi_rank);
+    snprintf(TMP_FIX_DEFL,    sizeof(TMP_FIX_DEFL),    "/tmp/bm_vpic_fix_deflate_rank%d.h5", mpi_rank);
+    snprintf(TMP_FIX_GDEFL,   sizeof(TMP_FIX_GDEFL),   "/tmp/bm_vpic_fix_gdefl_rank%d.h5",   mpi_rank);
+    snprintf(TMP_FIX_ZSTD,    sizeof(TMP_FIX_ZSTD),    "/tmp/bm_vpic_fix_zstd_rank%d.h5",    mpi_rank);
+    snprintf(TMP_FIX_ANS,     sizeof(TMP_FIX_ANS),     "/tmp/bm_vpic_fix_ans_rank%d.h5",     mpi_rank);
+    snprintf(TMP_FIX_CASC,    sizeof(TMP_FIX_CASC),    "/tmp/bm_vpic_fix_cascaded_rank%d.h5", mpi_rank);
+    snprintf(TMP_FIX_BITCOMP,  sizeof(TMP_FIX_BITCOMP),  "/tmp/bm_vpic_fix_bitcomp_rank%d.h5",  mpi_rank);
+    snprintf(TMP_NN,          sizeof(TMP_NN),          "/tmp/bm_vpic_nn_rank%d.h5",          mpi_rank);
+    snprintf(TMP_NN_RL,       sizeof(TMP_NN_RL),       "/tmp/bm_vpic_nn_rl_rank%d.h5",       mpi_rank);
+    snprintf(TMP_NN_RLEXP,    sizeof(TMP_NN_RLEXP),    "/tmp/bm_vpic_nn_rlexp_rank%d.h5",    mpi_rank);
+}
 /* CSV output directory: set VPIC_RESULTS_DIR env var to override.
  * The eval script sets this per-run so CSVs land in the right subdirectory. */
 static char RESULTS_DIR[512];
@@ -104,7 +121,7 @@ static char RANKING_CSV[600];
 static char RANKING_COSTS_CSV[600];
 static char AGG_CSV[600];
 
-static void init_csv_paths() {
+static void init_csv_paths(int mpi_rank, int mpi_size) {
     const char* env = getenv("VPIC_RESULTS_DIR");
     if (env && env[0]) {
         snprintf(RESULTS_DIR, sizeof(RESULTS_DIR), "%s", env);
@@ -113,16 +130,29 @@ static void init_csv_paths() {
                  "%s/benchmarks/vpic-kokkos/results", GPU_DIR);
     }
     mkdir(RESULTS_DIR, 0755);
-    snprintf(TSTEP_CSV, sizeof(TSTEP_CSV),
-             "%s/benchmark_vpic_deck_timesteps.csv", RESULTS_DIR);
-    snprintf(TSTEP_CHUNKS_CSV, sizeof(TSTEP_CHUNKS_CSV),
-             "%s/benchmark_vpic_deck_timestep_chunks.csv", RESULTS_DIR);
-    snprintf(RANKING_CSV, sizeof(RANKING_CSV),
-             "%s/benchmark_vpic_deck_ranking.csv", RESULTS_DIR);
-    snprintf(RANKING_COSTS_CSV, sizeof(RANKING_COSTS_CSV),
-             "%s/benchmark_vpic_deck_ranking_costs.csv", RESULTS_DIR);
-    snprintf(AGG_CSV, sizeof(AGG_CSV),
-             "%s/benchmark_vpic_deck.csv", RESULTS_DIR);
+    if (mpi_size > 1) {
+        snprintf(TSTEP_CSV, sizeof(TSTEP_CSV),
+                 "%s/benchmark_vpic_deck_timesteps_rank%d.csv", RESULTS_DIR, mpi_rank);
+        snprintf(TSTEP_CHUNKS_CSV, sizeof(TSTEP_CHUNKS_CSV),
+                 "%s/benchmark_vpic_deck_timestep_chunks_rank%d.csv", RESULTS_DIR, mpi_rank);
+        snprintf(RANKING_CSV, sizeof(RANKING_CSV),
+                 "%s/benchmark_vpic_deck_ranking_rank%d.csv", RESULTS_DIR, mpi_rank);
+        snprintf(RANKING_COSTS_CSV, sizeof(RANKING_COSTS_CSV),
+                 "%s/benchmark_vpic_deck_ranking_costs_rank%d.csv", RESULTS_DIR, mpi_rank);
+        snprintf(AGG_CSV, sizeof(AGG_CSV),
+                 "%s/benchmark_vpic_deck_rank%d.csv", RESULTS_DIR, mpi_rank);
+    } else {
+        snprintf(TSTEP_CSV, sizeof(TSTEP_CSV),
+                 "%s/benchmark_vpic_deck_timesteps.csv", RESULTS_DIR);
+        snprintf(TSTEP_CHUNKS_CSV, sizeof(TSTEP_CHUNKS_CSV),
+                 "%s/benchmark_vpic_deck_timestep_chunks.csv", RESULTS_DIR);
+        snprintf(RANKING_CSV, sizeof(RANKING_CSV),
+                 "%s/benchmark_vpic_deck_ranking.csv", RESULTS_DIR);
+        snprintf(RANKING_COSTS_CSV, sizeof(RANKING_COSTS_CSV),
+                 "%s/benchmark_vpic_deck_ranking_costs.csv", RESULTS_DIR);
+        snprintf(AGG_CSV, sizeof(AGG_CSV),
+                 "%s/benchmark_vpic_deck.csv", RESULTS_DIR);
+    }
 }
 
 // ============================================================
@@ -647,6 +677,11 @@ begin_initialization {
         inject_particle(electron, px, py, pz, ux, uy, uz, we, 0, 0);
     }
 
+    // ---- MPI rank-aware path initialization ----
+    // Rank-suffix all /tmp HDF5 paths to avoid collisions when multiple
+    // MPI ranks share a node (e.g., 1 node × 2 GPUs).
+    init_tmp_paths(rank());
+
     // ---- GPUCompress + HDF5 VOL initialization ----
     global->gpucompress_ready = 0;
     global->d_read    = NULL;
@@ -695,6 +730,7 @@ begin_initialization {
 
     size_t field_bytes = (size_t)grid->nv * 16 * sizeof(float);
     sim_log("=== VPIC Benchmark Deck: Harris Sheet Reconnection ===");
+    sim_log("  MPI ranks: " << nproc() << " (rank " << rank() << ")");
     sim_log("  Grid     : " << (int)nx << "x" << (int)ny << "x" << (int)nz
             << " = " << grid->nv << " voxels");
     sim_log("  Fields   : " << field_bytes / (1024*1024) << " MB (16 vars x "
@@ -767,7 +803,7 @@ begin_diagnostics {
         double warmup_elapsed_s = (now_ms() - warmup_start_ms) / 1000.0;
         fprintf(stderr, "\r  Warmup %d/%d [####################] 100%%  done (%.1fs)               \n",
                 global->sim_steps, global->sim_steps, warmup_elapsed_s);
-        init_csv_paths();
+        init_csv_paths(rank(), nproc());
         csv_paths_init = true;
     }
 
@@ -840,7 +876,7 @@ begin_diagnostics {
             {
                 FILE* agg = fopen(AGG_CSV, "w");
                 if (agg && global->ts_csv == NULL) {
-                    fprintf(agg, "source,phase,n_runs,write_ms,write_ms_std,read_ms,read_ms_std,"
+                    fprintf(agg, "rank,source,phase,n_runs,write_ms,write_ms_std,read_ms,read_ms_std,"
                                  "file_mib,orig_mib,ratio,"
                                  "write_mibps,read_mibps,mismatches,sgd_fires,explorations,n_chunks,"
                                  "nn_ms,stats_ms,preproc_ms,comp_ms,decomp_ms,explore_ms,sgd_ms,"
@@ -889,8 +925,9 @@ begin_diagnostics {
                             double t_vs1 = 0, t_drain = 0, t_io_drain = 0;
                             double t_vs2_busy = 0, t_vs3_busy = 0;
                             double t_mape_p = 0;
-                            int nf = sscanf(line, "%63[^,],%d,%*[^,],%lf,%lf,%lf,%lf,%lf,%lf,%d,%d,%d,%llu,%lf,%lf,"
-                                       "%llu,"
+                            /* Skip leading rank column (%*[^,],), then parse phase onward */
+                            int nf = sscanf(line, "%*[^,],%63[^,],%d,%*[^,],%lf,%lf,%lf,%lf,%lf,%lf,%d,%d,%d,%llu,%lf,%lf,"
+                                       "%llu,%*[^,],"
                                        "%lf,%lf,%lf,%lf,%lf,%lf,%lf,"
                                        "%lf,%lf,%lf,%lf,"
                                        "%lf,%lf,%lf,"
@@ -901,12 +938,13 @@ begin_diagnostics {
                                        &t_mae_r, &t_mae_c, &t_mae_d, &t_mae_p,
                                        &t_vs1, &t_drain, &t_io_drain,
                                        &t_vs2_busy, &t_vs3_busy);
-                            /* Parse mape_psnr from the last CSV field */
+                            /* Parse mape_psnr from the last CSV field.
+                             * Column layout: rank(0),...,mape_psnr(42) → skip 42 commas. */
                             {
                                 const char* p = line;
                                 int commas = 0;
-                                while (*p && commas < 40) { if (*p == ',') commas++; p++; }
-                                if (commas >= 40) t_mape_p = atof(p);
+                                while (*p && commas < 42) { if (*p == ',') commas++; p++; }
+                                if (commas >= 42) t_mape_p = atof(p);
                             }
                             if (nf >= 12 && ts_idx >= WARMUP) {
                                 for (int pi = 0; pi < N_AGG_PHASES; pi++) {
@@ -983,7 +1021,7 @@ begin_diagnostics {
                                 ? orig_bytes / 1e9 / (avg_comp_ms / 1000.0) : 0.0;
                             double dgbps = (avg_decomp_ms > 0)
                                 ? orig_bytes / 1e9 / (avg_decomp_ms / 1000.0) : 0.0;
-                            fprintf(agg, "vpic,%s,%d,%.2f,0.00,%.2f,0.00,"
+                            fprintf(agg, "%d,vpic,%s,%d,%.2f,0.00,%.2f,0.00,"
                                          "%.2f,%.2f,%.4f,"
                                          "%.1f,%.1f,0,%.0f,%.0f,%d,"
                                          "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,"
@@ -992,7 +1030,7 @@ begin_diagnostics {
                                          "%.4f,%.4f,%.4f,%.4f,"
                                          "0.0000,0.0000,"
                                          "%.2f,%.2f,%.2f,%.2f,%.2f\n",
-                                    pnames[pi], n, avg_wr, avg_rd,
+                                    rank(), pnames[pi], n, avg_wr, avg_rd,
                                     avg_file_mib, orig_mib, avg_ratio,
                                     wmbps, rmbps,
                                     (double)pa[pi].sum_sgd / n, (double)pa[pi].sum_expl / n, pa[pi].n_chunks_last,
@@ -1056,11 +1094,11 @@ begin_diagnostics {
 
             global->ts_csv = fopen(TSTEP_CSV, "w");
             if (global->ts_csv) {
-                fprintf(global->ts_csv, "phase,timestep,sim_step,write_ms,read_ms,ratio,"
+                fprintf(global->ts_csv, "rank,phase,timestep,sim_step,write_ms,read_ms,ratio,"
                         "mape_ratio,mape_comp,mape_decomp,"
                         "sgd_fires,explorations,n_chunks,mismatches,"
                         "write_mibps,read_mibps,"
-                        "file_bytes,"
+                        "file_bytes,orig_mib,"
                         "stats_ms,nn_ms,preproc_ms,comp_ms,decomp_ms,explore_ms,sgd_ms,"
                         "mae_ratio,mae_comp_ms,mae_decomp_ms,mae_psnr_db,"
                         "vol_stage1_ms,vol_drain_ms,vol_io_drain_ms,"
@@ -1072,7 +1110,7 @@ begin_diagnostics {
             }
             global->tc_csv = fopen(TSTEP_CHUNKS_CSV, "w");
             if (global->tc_csv) {
-                fprintf(global->tc_csv, "phase,timestep,chunk,action,action_orig,"
+                fprintf(global->tc_csv, "rank,phase,timestep,chunk,action,action_orig,"
                         "predicted_ratio,actual_ratio,"
                         "predicted_comp_ms,actual_comp_ms_raw,"
                         "predicted_decomp_ms,actual_decomp_ms_raw,"
@@ -1465,8 +1503,8 @@ begin_diagnostics {
 
             if (global->ts_csv) {
                 fprintf(global->ts_csv,
-                        "%s,%d,%d,%.2f,%.2f,%.4f,%.2f,%.2f,%.2f,%d,%d,%d,%llu,%.1f,%.1f,"
-                        "%zu,"
+                        "%d,%s,%d,%d,%.2f,%.2f,%.4f,%.2f,%.2f,%.2f,%d,%d,%d,%llu,%.1f,%.1f,"
+                        "%zu,%.2f,"
                         "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
                         "%.4f,%.4f,%.4f,%.4f,"
                         "%.2f,%.2f,%.2f,"
@@ -1475,11 +1513,11 @@ begin_diagnostics {
                         "%.2f,%.2f,"
                         "%.2f,%.2f,"
                         "%.2f\n",
-                        display_name, t, (int)step(), write_ms_t, read_ms_t, ratio_t,
+                        rank(), display_name, t, (int)step(), write_ms_t, read_ms_t, ratio_t,
                         real_mape_r, real_mape_c, real_mape_d,
                         sgd_t, expl_t, n_hist,
                         (unsigned long long)mm, wr_mbps, rd_mbps,
-                        file_sz,
+                        file_sz, orig_mib,
                         ts_stats_ms, ts_nn_ms, ts_preproc_ms,
                         ts_comp_ms, ts_decomp_ms, ts_explore_ms, ts_sgd_ms,
                         ts_mae_r, ts_mae_c, ts_mae_d, ts_mae_p,
@@ -1518,12 +1556,12 @@ begin_diagnostics {
                         action_to_str(dd.nn_action, action_str, sizeof(action_str));
                         action_to_str(dd.nn_original_action, orig_str, sizeof(orig_str));
                         fprintf(global->tc_csv,
-                                "%s,%d,%d,%s,%s,"
+                                "%d,%s,%d,%d,%s,%s,"
                                 "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
                                 "%.2f,%.2f,"
                                 "%.2f,%.2f,%.2f,%.2f,%d,%d,"
                                 "%.4f,%.4f,%.4f,%d",
-                                display_name, t, ci, action_str, orig_str,
+                                rank(), display_name, t, ci, action_str, orig_str,
                                 (double)dd.predicted_ratio, (double)dd.actual_ratio,
                                 (double)dd.predicted_comp_time, (double)dd.compression_ms_raw,
                                 (double)dd.predicted_decomp_time, (double)dd.decompression_ms_raw,

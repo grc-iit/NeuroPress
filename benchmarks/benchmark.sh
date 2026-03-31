@@ -31,6 +31,11 @@ GENERAL
   VERIFY              [1]                        Bitwise verify (0=skip for speed)
   DEBUG_NN            [0]                        NN debug output
 
+MULTI-GPU / MULTI-NODE
+  MPI_NP              [1]                        Total MPI ranks (1 = single-process)
+  GPUS_PER_NODE       [1]                        GPUs per node (for CUDA_VISIBLE_DEVICES mapping)
+  LAUNCHER            [auto]                     auto (detect SLURM), srun, or mpirun
+
 NN HYPERPARAMETERS
   SGD_LR              [0.2]                      SGD learning rate
   SGD_MAPE            [0.10]                     MAPE threshold for SGD updates
@@ -104,6 +109,56 @@ POLICIES=${POLICIES:-"balanced,ratio,speed"}
 PHASES=${PHASES:-"no-comp,lz4,snappy,deflate,gdeflate,zstd,ans,cascaded,bitcomp,nn,nn-rl,nn-rl+exp50"}
 DEBUG_NN=${DEBUG_NN:-0}
 
+# ── Multi-GPU / Multi-Node (MPI) ──
+# MPI_NP: total number of MPI ranks (default 1 = single-process, no mpirun)
+# GPUS_PER_NODE: GPUs per node (used for CUDA_VISIBLE_DEVICES mapping)
+# LAUNCHER: auto (detect SLURM vs mpirun), srun, or mpirun
+MPI_NP=${MPI_NP:-1}
+GPUS_PER_NODE=${GPUS_PER_NODE:-1}
+LAUNCHER=${LAUNCHER:-auto}
+
+# Helper: wrap binary with srun or mpirun for multi-GPU, setting per-rank GPU binding.
+# - SLURM (srun): uses --gpus-per-task=1 for automatic GPU binding (no manual
+#   CUDA_VISIBLE_DEVICES needed). Detects SLURM via SLURM_JOB_ID env var.
+# - mpirun: sets CUDA_VISIBLE_DEVICES=$((LOCAL_RANK % GPUS_PER_NODE)) per rank.
+# - Single-rank (MPI_NP=1): runs binary directly, no launcher.
+mpi_launch() {
+    if [ "$MPI_NP" -le 1 ]; then
+        "$@"
+        return
+    fi
+
+    # Determine launcher
+    local use_launcher="$LAUNCHER"
+    if [ "$use_launcher" = "auto" ]; then
+        if [ -n "$SLURM_JOB_ID" ]; then
+            use_launcher="srun"
+        else
+            use_launcher="mpirun"
+        fi
+    fi
+
+    case "$use_launcher" in
+        srun)
+            # SLURM: srun handles rank-to-GPU binding natively with --gpus-per-task
+            srun --ntasks="$MPI_NP" \
+                 --gpus-per-task=1 \
+                 --kill-on-bad-exit=1 \
+                 "$@"
+            ;;
+        mpirun)
+            # Non-SLURM: manual CUDA_VISIBLE_DEVICES mapping per rank
+            mpirun -np "$MPI_NP" \
+                bash -c 'export CUDA_VISIBLE_DEVICES=$((${OMPI_COMM_WORLD_LOCAL_RANK:-${PMI_LOCAL_RANK:-${MPI_LOCALRANKID:-${SLURM_LOCALID:-0}}}} % '"$GPUS_PER_NODE"')); exec "$@"' \
+                _ "$@"
+            ;;
+        *)
+            echo "ERROR: Unknown LAUNCHER=$use_launcher (use: auto, srun, mpirun)" >&2
+            return 1
+            ;;
+    esac
+}
+
 # ── GS-specific defaults ──
 GS_STEPS=${GS_STEPS:-500}
 
@@ -132,6 +187,9 @@ echo "  Chunk size  : ${CHUNK_MB} MB"
 echo "  Timesteps   : ${TIMESTEPS}"
 echo "  Policies    : ${POLICIES}"
 echo "  Phases      : ${PHASES}"
+if [ "$MPI_NP" -gt 1 ]; then
+echo "  MPI ranks   : ${MPI_NP} (GPUs/node: ${GPUS_PER_NODE})"
+fi
 echo ""
 echo "  NN hyperparameters:"
 echo "    SGD_LR=${SGD_LR}  SGD_MAPE=${SGD_MAPE}"
@@ -192,7 +250,7 @@ for bench in "${BENCH_LIST[@]}"; do
 
                 GPUCOMPRESS_DETAILED_TIMING=1 \
                 GPUCOMPRESS_DEBUG_NN=$DEBUG_NN \
-                "$GS_BIN" "$GS_WEIGHTS" \
+                mpi_launch "$GS_BIN" "$GS_WEIGHTS" \
                     --L $GS_L --steps $GS_STEPS --chunk-mb $CHUNK_MB --timesteps $TIMESTEPS \
                     $GS_FIXED_ARGS \
                     --w0 1.0 --w1 1.0 --w2 1.0 \
@@ -228,7 +286,7 @@ for bench in "${BENCH_LIST[@]}"; do
 
                     GPUCOMPRESS_DETAILED_TIMING=1 \
                     GPUCOMPRESS_DEBUG_NN=$DEBUG_NN \
-                    "$GS_BIN" "$GS_WEIGHTS" \
+                    mpi_launch "$GS_BIN" "$GS_WEIGHTS" \
                         --L $GS_L --steps $GS_STEPS --chunk-mb $CHUNK_MB --timesteps $TIMESTEPS \
                         $GS_NN_ARGS \
                         --w0 $W0 --w1 $W1 --w2 $W2 \
@@ -241,11 +299,31 @@ for bench in "${BENCH_LIST[@]}"; do
                     echo "      Done. Log: $GS_NN_DIR/gs_benchmark.log"
 
                     # Merge fixed + NN CSVs.
-                    # Build merged file in temp, then overwrite the NN dir copy.
+                    # In MPI mode, merge rank-suffixed files into canonical names first,
+                    # then merge fixed phases into NN CSVs.
                     if [ -n "$GS_FIXED_LIST" ] && [ -d "$GS_FIXED_DIR" ]; then
-                        for csv_name in benchmark_grayscott_vol.csv benchmark_grayscott_timesteps.csv benchmark_grayscott_timestep_chunks.csv benchmark_grayscott_ranking.csv benchmark_grayscott_ranking_costs.csv; do
+                        for csv_base in benchmark_grayscott_vol benchmark_grayscott_timesteps benchmark_grayscott_timestep_chunks benchmark_grayscott_ranking benchmark_grayscott_ranking_costs; do
+                            csv_name="${csv_base}.csv"
                             FIXED_SRC="$GS_FIXED_DIR/$csv_name"
                             NN_SRC="$GS_NN_DIR/$csv_name"
+
+                            # MPI mode: merge rank-suffixed files into canonical name
+                            if [ "$MPI_NP" -gt 1 ]; then
+                                for src_dir in "$GS_FIXED_DIR" "$GS_NN_DIR"; do
+                                    canonical="$src_dir/$csv_name"
+                                    if [ ! -f "$canonical" ]; then
+                                        rank0="$src_dir/${csv_base}_rank0.csv"
+                                        if [ -f "$rank0" ]; then
+                                            cp "$rank0" "$canonical"
+                                            for ri in $(seq 1 $((MPI_NP - 1))); do
+                                                rf="$src_dir/${csv_base}_rank${ri}.csv"
+                                                [ -f "$rf" ] && tail -n+2 "$rf" >> "$canonical"
+                                            done
+                                        fi
+                                    fi
+                                done
+                            fi
+
                             if [ -f "$FIXED_SRC" ] && [ -f "$NN_SRC" ]; then
                                 TMP_MERGED=$(mktemp)
                                 cp "$FIXED_SRC" "$TMP_MERGED"
@@ -331,7 +409,7 @@ for bench in "${BENCH_LIST[@]}"; do
                 VPIC_POLICIES="$POLICIES" \
                 VPIC_LR=$SGD_LR VPIC_MAPE_THRESHOLD=$SGD_MAPE \
                 VPIC_EXPLORE_K=$EXPLORE_K VPIC_EXPLORE_THRESH=$EXPLORE_THRESH \
-                "$VPIC_BIN" "$VPIC_DECK" \
+                mpi_launch "$VPIC_BIN" "$VPIC_DECK" \
                 > "$RESULTS_DIR/vpic_benchmark.log" 2> >(tee -a "$RESULTS_DIR/vpic_benchmark.log" >&2)
             }
 
@@ -367,20 +445,36 @@ for bench in "${BENCH_LIST[@]}"; do
                 POL_DIR="$VPIC_RESULTS/$LABEL"
                 mkdir -p "$POL_DIR"
 
-                # For each CSV: extract fixed rows + this policy's NN rows
-                for csv_name in benchmark_vpic_deck_timesteps.csv benchmark_vpic_deck_timestep_chunks.csv benchmark_vpic_deck_ranking.csv benchmark_vpic_deck_ranking_costs.csv; do
+                # For each CSV: extract fixed rows + this policy's NN rows.
+                # With MPI_NP>1, CSV files are rank-suffixed; merge all ranks first.
+                for csv_base in benchmark_vpic_deck_timesteps benchmark_vpic_deck_timestep_chunks benchmark_vpic_deck_ranking benchmark_vpic_deck_ranking_costs; do
+                    csv_name="${csv_base}.csv"
                     SRC="$VPIC_RESULTS/$csv_name"
+
+                    # If rank-suffixed files exist (MPI mode), merge them
+                    if [ ! -f "$SRC" ] && [ "$MPI_NP" -gt 1 ]; then
+                        RANK0="$VPIC_RESULTS/${csv_base}_rank0.csv"
+                        if [ -f "$RANK0" ]; then
+                            cp "$RANK0" "$SRC"
+                            for rank_i in $(seq 1 $((MPI_NP - 1))); do
+                                RANKF="$VPIC_RESULTS/${csv_base}_rank${rank_i}.csv"
+                                [ -f "$RANKF" ] && tail -n+2 "$RANKF" >> "$SRC"
+                            done
+                        fi
+                    fi
+
                     [ -f "$SRC" ] || continue
                     DST="$POL_DIR/$csv_name"
 
                     # Header + fixed rows (no "/" in phase) + this policy's NN rows (strip suffix)
+                    # Phase is in column $2 (after rank column)
                     head -1 "$SRC" > "$DST"
                     tail -n+2 "$SRC" | awk -F',' -v pol="/$pol" '{
-                        phase=$1;
+                        phase=$2;
                         if (index(phase, "/") == 0) print;
                         else if (index(phase, pol) > 0) {
                             sub(pol, "", phase);
-                            $1 = phase;
+                            $2 = phase;
                             print;
                         }
                     }' OFS=',' >> "$DST"
@@ -436,7 +530,7 @@ if first_orig <= 0:
             first_orig = int(r.get('file_bytes',0)) / (1024*1024)
             break
 with open('$AGG_CSV','w') as f:
-    hdr = ('source,phase,n_runs,write_ms,write_ms_std,read_ms,read_ms_std,'
+    hdr = ('rank,source,phase,n_runs,write_ms,write_ms_std,read_ms,read_ms_std,'
            'file_mib,orig_mib,ratio,write_mibps,read_mibps,mismatches,'
            'sgd_fires,explorations,n_chunks,'
            'nn_ms,stats_ms,preproc_ms,comp_ms,decomp_ms,explore_ms,sgd_ms,'
@@ -463,7 +557,7 @@ with open('$AGG_CSV','w') as f:
         orig_bytes = orig_mib * 1024 * 1024
         cgbps = orig_bytes / 1e9 / (avg_comp / 1000.0) if avg_comp > 0 else 0
         dgbps = orig_bytes / 1e9 / (avg_dec / 1000.0) if avg_dec > 0 else 0
-        f.write(f'vpic,{p},{n},{avg_wr:.2f},0.00,{avg_rd:.2f},0.00,'
+        f.write(f'-1,vpic,{p},{n},{avg_wr:.2f},0.00,{avg_rd:.2f},0.00,'
                 f'{avg_file_mib:.2f},{orig_mib:.2f},{rat:.4f},{wr_mibps:.1f},{rd_mibps:.1f},0,'
                 f'{d["sum_sgd"]/n:.0f},{d["sum_expl"]/n:.0f},{d["n_chunks"]},'
                 f'{d["sum_nn"]/n:.2f},{d["sum_stats"]/n:.2f},{d["sum_pre"]/n:.2f},'
@@ -499,6 +593,9 @@ with open('$AGG_CSV','w') as f:
             EXPLORE_THRESH=$EXPLORE_THRESH \
             VERIFY=$VERIFY \
             DEBUG_NN=$DEBUG_NN \
+            MPI_NP=$MPI_NP \
+            GPUS_PER_NODE=$GPUS_PER_NODE \
+            LAUNCHER=$LAUNCHER \
             bash "$SCRIPT_DIR/sdrbench/run_all_sdr.sh"
             ;;
         *)

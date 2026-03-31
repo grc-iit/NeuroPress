@@ -626,7 +626,9 @@ int main(int argc, char* argv[]) {
         CUDA_CHECK(cudaMemsetAsync(d_invalid, 0, sizeof(int), stream));
 
         cudaDeviceProp deviceProp;
-        CUDA_CHECK(cudaGetDeviceProperties(&deviceProp, 0));
+        int cur_dev = 0;
+        CUDA_CHECK(cudaGetDevice(&cur_dev));
+        CUDA_CHECK(cudaGetDeviceProperties(&deviceProp, cur_dev));
         int sm_count = deviceProp.multiProcessorCount;
 
         compare_buffers<<<2 * sm_count, 1024, 0, stream>>>(

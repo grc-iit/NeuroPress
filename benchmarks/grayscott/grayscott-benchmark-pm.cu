@@ -75,10 +75,18 @@
 #include <cuda_runtime.h>
 #include <hdf5.h>
 
+#ifdef GPUCOMPRESS_USE_MPI
+#include <mpi.h>
+#endif
+
 #include "gpucompress.h"
 #include "gpucompress_grayscott.h"
 #include "gpucompress_hdf5_vol.h"
 #include "../kendall_tau_profiler.cuh"
+
+/* MPI rank/size — defaults to single-process when MPI is not used */
+static int g_mpi_rank = 0;
+static int g_mpi_size = 1;
 
 /* ============================================================
  * Compile-time constants
@@ -94,18 +102,36 @@
 #define REINFORCE_LR        0.2f
 #define REINFORCE_MAPE      0.10f
 
-#define TMP_NOCOMP    "/tmp/bm_gs_nocomp.h5"
-#define TMP_FIX_LZ4     "/tmp/bm_gs_fix_lz4.h5"
-#define TMP_FIX_SNAPPY  "/tmp/bm_gs_fix_snappy.h5"
-#define TMP_FIX_DEFL    "/tmp/bm_gs_fix_deflate.h5"
-#define TMP_FIX_GDEFL   "/tmp/bm_gs_fix_gdefl.h5"
-#define TMP_FIX_ZSTD    "/tmp/bm_gs_fix_zstd.h5"
-#define TMP_FIX_ANS     "/tmp/bm_gs_fix_ans.h5"
-#define TMP_FIX_CASC    "/tmp/bm_gs_fix_cascaded.h5"
-#define TMP_FIX_BITCOMP "/tmp/bm_gs_fix_bitcomp.h5"
-#define TMP_NN        "/tmp/bm_gs_nn.h5"
-#define TMP_NN_RL    "/tmp/bm_gs_nn_rl.h5"
-#define TMP_NN_RLEXP "/tmp/bm_gs_nn_rlexp.h5"
+/* Temporary HDF5 files — rank-suffixed to avoid collisions on multi-GPU nodes. */
+static char TMP_NOCOMP[256];
+static char TMP_FIX_LZ4[256];
+static char TMP_FIX_SNAPPY[256];
+static char TMP_FIX_DEFL[256];
+static char TMP_FIX_GDEFL[256];
+static char TMP_FIX_ZSTD[256];
+static char TMP_FIX_ANS[256];
+static char TMP_FIX_CASC[256];
+static char TMP_FIX_BITCOMP[256];
+static char TMP_NN[256];
+static char TMP_NN_RL[256];
+static char TMP_NN_RLEXP[256];
+static char TMP_WARMUP[256];
+
+static void init_tmp_paths(int mpi_rank) {
+    snprintf(TMP_NOCOMP,      sizeof(TMP_NOCOMP),      "/tmp/bm_gs_nocomp_rank%d.h5",      mpi_rank);
+    snprintf(TMP_FIX_LZ4,     sizeof(TMP_FIX_LZ4),     "/tmp/bm_gs_fix_lz4_rank%d.h5",     mpi_rank);
+    snprintf(TMP_FIX_SNAPPY,   sizeof(TMP_FIX_SNAPPY),   "/tmp/bm_gs_fix_snappy_rank%d.h5",   mpi_rank);
+    snprintf(TMP_FIX_DEFL,    sizeof(TMP_FIX_DEFL),    "/tmp/bm_gs_fix_deflate_rank%d.h5", mpi_rank);
+    snprintf(TMP_FIX_GDEFL,   sizeof(TMP_FIX_GDEFL),   "/tmp/bm_gs_fix_gdefl_rank%d.h5",   mpi_rank);
+    snprintf(TMP_FIX_ZSTD,    sizeof(TMP_FIX_ZSTD),    "/tmp/bm_gs_fix_zstd_rank%d.h5",    mpi_rank);
+    snprintf(TMP_FIX_ANS,     sizeof(TMP_FIX_ANS),     "/tmp/bm_gs_fix_ans_rank%d.h5",     mpi_rank);
+    snprintf(TMP_FIX_CASC,    sizeof(TMP_FIX_CASC),    "/tmp/bm_gs_fix_cascaded_rank%d.h5", mpi_rank);
+    snprintf(TMP_FIX_BITCOMP,  sizeof(TMP_FIX_BITCOMP),  "/tmp/bm_gs_fix_bitcomp_rank%d.h5",  mpi_rank);
+    snprintf(TMP_NN,          sizeof(TMP_NN),          "/tmp/bm_gs_nn_rank%d.h5",          mpi_rank);
+    snprintf(TMP_NN_RL,       sizeof(TMP_NN_RL),       "/tmp/bm_gs_nn_rl_rank%d.h5",       mpi_rank);
+    snprintf(TMP_NN_RLEXP,    sizeof(TMP_NN_RLEXP),    "/tmp/bm_gs_nn_rlexp_rank%d.h5",    mpi_rank);
+    snprintf(TMP_WARMUP,      sizeof(TMP_WARMUP),      "/tmp/bm_gs_warmup_rank%d.h5",      mpi_rank);
+}
 
 #define DEFAULT_OUT_DIR "benchmarks/grayscott/results"
 
@@ -444,7 +470,7 @@ static int run_phase_nocomp(float *d_v, float *d_read,
     /* Warmup write: primes VOL fallback path and HDF5 infrastructure.
      * Results discarded — only the timed run counts. */
     {
-        const char *warmup_file = "/tmp/bm_gs_warmup.h5";
+        const char *warmup_file = TMP_WARMUP;
         remove(warmup_file);
         hid_t wdcpl = make_dcpl_nocomp(L, chunk_z);
         hid_t wfapl = make_vol_fapl();
@@ -567,7 +593,7 @@ static int run_phase_vol(float *d_v, float *d_read,
      * Learning is temporarily disabled to prevent SGD from modifying weights
      * before the timed run. */
     {
-        const char *warmup_file = "/tmp/bm_gs_warmup.h5";
+        const char *warmup_file = TMP_WARMUP;
         int save_learning = gpucompress_online_learning_enabled();
         gpucompress_disable_online_learning();
 
@@ -750,7 +776,7 @@ static void write_aggregate_csv(PhaseResult *res, int n_phases,
     FILE *f = fopen(OUT_CSV, "w");
     if (!f) { perror(OUT_CSV); return; }
 
-    fprintf(f, "source,phase,n_runs,write_ms,write_ms_std,read_ms,read_ms_std,"
+    fprintf(f, "rank,source,phase,n_runs,write_ms,write_ms_std,read_ms,read_ms_std,"
                "file_mib,orig_mib,ratio,"
                "write_mibps,read_mibps,mismatches,sgd_fires,explorations,n_chunks,"
                "nn_ms,stats_ms,preproc_ms,comp_ms,decomp_ms,explore_ms,sgd_ms,"
@@ -761,7 +787,7 @@ static void write_aggregate_csv(PhaseResult *res, int n_phases,
                "L,steps,F,k,chunk_z,sim_ms\n");
     for (int i = 0; i < n_phases; i++) {
         PhaseResult *r = &res[i];
-        fprintf(f, "grayscott,%s,%d,%.2f,%.2f,%.2f,%.2f,"
+        fprintf(f, "%d,grayscott,%s,%d,%.2f,%.2f,%.2f,%.2f,"
                    "%.2f,%.2f,%.4f,"
                    "%.1f,%.1f,%llu,%d,%d,%d,"
                    "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,"
@@ -770,7 +796,7 @@ static void write_aggregate_csv(PhaseResult *res, int n_phases,
                    "%.4f,%.4f,%.4f,"
                    "%.4f,%.4f,"
                    "%d,%d,%.4f,%.5f,%d,%.2f\n",
-                r->phase, r->n_runs,
+                g_mpi_rank, r->phase, r->n_runs,
                 r->write_ms, r->write_ms_std, r->read_ms, r->read_ms_std,
                 (double)r->file_bytes / (1 << 20),
                 (double)r->orig_bytes / (1 << 20), r->ratio,
@@ -978,6 +1004,15 @@ static void merge_phase_results(PhaseResult *runs, int n, PhaseResult *out)
 
 int main(int argc, char **argv)
 {
+#ifdef GPUCOMPRESS_USE_MPI
+    MPI_Init(&argc, &argv);
+    MPI_Comm_rank(MPI_COMM_WORLD, &g_mpi_rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &g_mpi_size);
+#endif
+
+    /* Initialize rank-suffixed /tmp paths before any CUDA or HDF5 calls */
+    init_tmp_paths(g_mpi_rank);
+
     /* Defaults */
     const char *weights_path = NULL;
     int L        = DEFAULT_L;
@@ -1120,9 +1155,12 @@ int main(int argc, char **argv)
     double dataset_mb  = (double)total_bytes / (1 << 20);
     double cmb         = (double)L * L * chunk_z * sizeof(float) / (1024.0 * 1024.0);
 
+    if (g_mpi_rank == 0) {
     printf("╔═══════════════════════════════════════════════════════════════════════════╗\n");
     printf("║  Gray-Scott VOL Benchmark: No-Comp vs NN+SGD                            ║\n");
     printf("╚═══════════════════════════════════════════════════════════════════════════╝\n\n");
+    if (g_mpi_size > 1)
+        printf("  MPI ranks: %d\n", g_mpi_size);
     printf("  Grid     : %d^3 = %zu floats (%.1f MB)\n", L, n_floats, dataset_mb);
     printf("  Chunks   : %d x %d x %d  (%d chunks, %.1f MB each)\n",
            L, L, chunk_z, n_chunks, cmb);
@@ -1141,17 +1179,27 @@ int main(int argc, char **argv)
             printf("  WARNING  : --runs %d capped to 32\n", n_runs);
     }
     printf("  Weights  : %s\n\n", weights_path);
+    } /* end if (g_mpi_rank == 0) */
 
-    /* Set up output paths */
+    /* Set up output paths (rank-suffixed for multi-GPU) */
     {
         const char *od = out_dir_override ? out_dir_override : DEFAULT_OUT_DIR;
         snprintf(OUT_DIR, sizeof(OUT_DIR), "%s", od);
-        snprintf(OUT_CSV, sizeof(OUT_CSV), "%s/benchmark_grayscott_vol.csv", od);
-        snprintf(OUT_CHUNKS, sizeof(OUT_CHUNKS), "%s/benchmark_grayscott_vol_chunks.csv", od);
-        snprintf(OUT_TSTEP, sizeof(OUT_TSTEP), "%s/benchmark_grayscott_timesteps.csv", od);
-        snprintf(OUT_TSTEP_CHUNKS, sizeof(OUT_TSTEP_CHUNKS), "%s/benchmark_grayscott_timestep_chunks.csv", od);
-        snprintf(OUT_RANKING, sizeof(OUT_RANKING), "%s/benchmark_grayscott_ranking.csv", od);
-        snprintf(OUT_RANKING_COSTS, sizeof(OUT_RANKING_COSTS), "%s/benchmark_grayscott_ranking_costs.csv", od);
+        if (g_mpi_size > 1) {
+            snprintf(OUT_CSV, sizeof(OUT_CSV), "%s/benchmark_grayscott_vol_rank%d.csv", od, g_mpi_rank);
+            snprintf(OUT_CHUNKS, sizeof(OUT_CHUNKS), "%s/benchmark_grayscott_vol_chunks_rank%d.csv", od, g_mpi_rank);
+            snprintf(OUT_TSTEP, sizeof(OUT_TSTEP), "%s/benchmark_grayscott_timesteps_rank%d.csv", od, g_mpi_rank);
+            snprintf(OUT_TSTEP_CHUNKS, sizeof(OUT_TSTEP_CHUNKS), "%s/benchmark_grayscott_timestep_chunks_rank%d.csv", od, g_mpi_rank);
+            snprintf(OUT_RANKING, sizeof(OUT_RANKING), "%s/benchmark_grayscott_ranking_rank%d.csv", od, g_mpi_rank);
+            snprintf(OUT_RANKING_COSTS, sizeof(OUT_RANKING_COSTS), "%s/benchmark_grayscott_ranking_costs_rank%d.csv", od, g_mpi_rank);
+        } else {
+            snprintf(OUT_CSV, sizeof(OUT_CSV), "%s/benchmark_grayscott_vol.csv", od);
+            snprintf(OUT_CHUNKS, sizeof(OUT_CHUNKS), "%s/benchmark_grayscott_vol_chunks.csv", od);
+            snprintf(OUT_TSTEP, sizeof(OUT_TSTEP), "%s/benchmark_grayscott_timesteps.csv", od);
+            snprintf(OUT_TSTEP_CHUNKS, sizeof(OUT_TSTEP_CHUNKS), "%s/benchmark_grayscott_timestep_chunks.csv", od);
+            snprintf(OUT_RANKING, sizeof(OUT_RANKING), "%s/benchmark_grayscott_ranking.csv", od);
+            snprintf(OUT_RANKING_COSTS, sizeof(OUT_RANKING_COSTS), "%s/benchmark_grayscott_ranking_costs.csv", od);
+        }
     }
 
     /* Create output directory (recursive) and clear stale chunks CSV */
@@ -1242,7 +1290,7 @@ int main(int argc, char **argv)
     /* Open timestep CSV */
     ts_csv = fopen(OUT_TSTEP, "w");
     if (ts_csv) {
-        fprintf(ts_csv, "phase,timestep,sim_step,write_ms,read_ms,ratio,"
+        fprintf(ts_csv, "rank,phase,timestep,sim_step,write_ms,read_ms,ratio,"
                 "mape_ratio,mape_comp,mape_decomp,"
                 "sgd_fires,explorations,n_chunks,mismatches,"
                 "write_mbps,read_mbps,file_bytes,"
@@ -1256,7 +1304,7 @@ int main(int argc, char **argv)
     /* Open timestep-chunks CSV */
     tc_csv = fopen(OUT_TSTEP_CHUNKS, "w");
     if (tc_csv) {
-        fprintf(tc_csv, "phase,timestep,chunk,action,action_orig,"
+        fprintf(tc_csv, "rank,phase,timestep,chunk,action,action_orig,"
                 "predicted_ratio,actual_ratio,predicted_comp_ms,actual_comp_ms_raw,"
                 "predicted_decomp_ms,actual_decomp_ms_raw,"
                 "mape_ratio,mape_comp,mape_decomp,"
@@ -1502,7 +1550,7 @@ int main(int argc, char **argv)
             /* Write timestep CSV row */
             if (ts_csv) {
                 fprintf(ts_csv,
-                    "%s,%d,%d,%.2f,%.2f,%.4f,%.2f,%.2f,%.2f,%d,%d,%d,%llu,%.1f,%.1f,"
+                    "%d,%s,%d,%d,%.2f,%.2f,%.4f,%.2f,%.2f,%.2f,%d,%d,%d,%llu,%.1f,%.1f,"
                     "%zu,"
                     "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
                     "%.4f,%.4f,%.4f,"
@@ -1510,7 +1558,7 @@ int main(int argc, char **argv)
                     "%.3f,%.3f,"
                     "%.3f,%.3f,%.3f,%.3f,"
                     "%.3f,%.3f\n",
-                    phase_name, t, cum_sim_step, write_ms_t, read_ms_t, ratio_t,
+                    g_mpi_rank, phase_name, t, cum_sim_step, write_ms_t, read_ms_t, ratio_t,
                     real_mape_r, real_mape_c, real_mape_d,
                     sgd_t, expl_t, n_hist, (unsigned long long)mm, wr_mbps, rd_mbps,
                     file_sz,
@@ -1532,11 +1580,11 @@ int main(int argc, char **argv)
                     char act_str[40], orig_str[40];
                     action_to_str(dd.nn_action, act_str, sizeof(act_str));
                     action_to_str(dd.nn_original_action, orig_str, sizeof(orig_str));
-                    fprintf(tc_csv, "%s,%d,%d,%s,%s,"
+                    fprintf(tc_csv, "%d,%s,%d,%d,%s,%s,"
                             "%.4f,%.4f,%.3f,%.3f,%.3f,%.3f,"
                             "%.1f,%.1f,%.1f,%d,%d,"
                             "%.4f,%.4f,%.4f,%d",
-                            phase_name, t, ci, act_str, orig_str,
+                            g_mpi_rank, phase_name, t, ci, act_str, orig_str,
                             dd.predicted_ratio, dd.actual_ratio,
                             dd.predicted_comp_time, dd.compression_ms_raw,
                             dd.predicted_decomp_time, dd.decompression_ms_raw,
@@ -1904,7 +1952,7 @@ int main(int argc, char **argv)
         /* Open timestep CSV (shared across phases) */
         FILE *ts_csv = fopen(OUT_TSTEP, "w");
         if (ts_csv) {
-            fprintf(ts_csv, "phase,timestep,sim_step,write_ms,read_ms,ratio,"
+            fprintf(ts_csv, "rank,phase,timestep,sim_step,write_ms,read_ms,ratio,"
                     "mape_ratio,mape_comp,mape_decomp,"
                     "sgd_fires,explorations,n_chunks,mismatches,"
                     "write_mbps,read_mbps,"
@@ -1916,7 +1964,7 @@ int main(int argc, char **argv)
         /* Open per-chunk milestone CSV (shared across phases) */
         FILE *tc_csv = fopen(OUT_TSTEP_CHUNKS, "w");
         if (tc_csv) {
-            fprintf(tc_csv, "phase,timestep,chunk,action,action_orig,"
+            fprintf(tc_csv, "rank,phase,timestep,chunk,action,action_orig,"
                     "predicted_ratio,actual_ratio,"
                     "predicted_comp_ms,actual_comp_ms_raw,"
                     "predicted_decomp_ms,actual_decomp_ms_raw,"
@@ -2207,11 +2255,11 @@ int main(int argc, char **argv)
                                 char action_str[40], orig_str[40];
                                 action_to_str(dd.nn_action, action_str, sizeof(action_str));
                                 action_to_str(dd.nn_original_action, orig_str, sizeof(orig_str));
-                                fprintf(tc_csv, "%s,%d,%d,%s,%s,"
+                                fprintf(tc_csv, "%d,%s,%d,%d,%s,%s,"
                                         "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
                                         "%.2f,%.2f,%.2f,%d,%d,"
                                         "%.4f,%.4f,%.4f,%d",
-                                        phase_name, t, ci, action_str, orig_str,
+                                        g_mpi_rank, phase_name, t, ci, action_str, orig_str,
                                         (double)dd.predicted_ratio, (double)dd.actual_ratio,
                                         (double)dd.predicted_comp_time, (double)dd.compression_ms_raw,
                                         (double)dd.predicted_decomp_time, (double)dd.decompression_ms_raw,
@@ -2264,10 +2312,10 @@ int main(int argc, char **argv)
                 }
 
                 if (ts_csv) {
-                    fprintf(ts_csv, "%s,%d,%d,%.2f,%.2f,%.4f,%.2f,%.2f,%.2f,%d,%d,%d,%llu,%.1f,%.1f,%zu,"
+                    fprintf(ts_csv, "%d,%s,%d,%d,%.2f,%.2f,%.4f,%.2f,%.2f,%.2f,%d,%d,%d,%llu,%.1f,%.1f,%zu,"
                             "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
                             "%.4f,%.4f,%.4f\n",
-                            phase_name, t, cum_sim_step, write_ms_t, read_ms_t, ratio_t,
+                            g_mpi_rank, phase_name, t, cum_sim_step, write_ms_t, read_ms_t, ratio_t,
                             real_mape_r, real_mape_c, real_mape_d,
                             sgd_t, expl_t, n_hist,
                             (unsigned long long)mm, wr_mbps, rd_mbps,
@@ -2376,6 +2424,11 @@ int main(int argc, char **argv)
     remove(TMP_NN_RL);
     remove(TMP_NN_RLEXP);
 
-    printf("\n=== Benchmark %s ===\n", any_fail ? "FAILED" : "PASSED");
+    if (g_mpi_rank == 0)
+        printf("\n=== Benchmark %s ===\n", any_fail ? "FAILED" : "PASSED");
+
+#ifdef GPUCOMPRESS_USE_MPI
+    MPI_Finalize();
+#endif
     return any_fail ? 1 : 0;
 }

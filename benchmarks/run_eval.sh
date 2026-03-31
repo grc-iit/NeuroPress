@@ -21,20 +21,20 @@ export BENCHMARKS=vpic
 export DATA_MB=256
 export CHUNK_MB=4
 export TIMESTEPS=25
-export POLICIES="balanced,ratio,speed"
+export POLICIES="balanced"
 export VERIFY=0
 
-echo "============================================================"
-echo "  Run 1/2: VPIC Lossy (error_bound=0.01, min_psnr=50)"
-echo "============================================================"
-export VPIC_ERROR_BOUND=0.01
-export VPIC_MIN_PSNR=50
-export VPIC_EVAL_SUFFIX="_lossy_001"
-bash "$SCRIPT_DIR/benchmark.sh"
+# echo "============================================================"
+# echo "  Run 1/2: VPIC Lossy (error_bound=0.01, min_psnr=50)"
+# echo "============================================================"
+# export VPIC_ERROR_BOUND=0.01
+# export VPIC_MIN_PSNR=50
+# export VPIC_EVAL_SUFFIX="_lossy_001"
+# bash "$SCRIPT_DIR/benchmark.sh"
 
 echo ""
 echo "============================================================"
-echo "  Run 2/2: VPIC Lossless"
+echo "  Run: VPIC Lossless"
 echo "============================================================"
 unset VPIC_ERROR_BOUND
 unset VPIC_MIN_PSNR

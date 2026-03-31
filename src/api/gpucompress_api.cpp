@@ -150,6 +150,34 @@ extern "C" gpucompress_error_t gpucompress_init(const char* weights_path) {
         return GPUCOMPRESS_SUCCESS;
     }
 
+    // Allow per-rank GPU selection via GPUCOMPRESS_DEVICE env var.
+    // Primary multi-GPU mechanism is CUDA_VISIBLE_DEVICES from the mpirun
+    // wrapper, but this provides a fallback/override for non-MPI use cases.
+    // WARNING: GPUCOMPRESS_DEVICE and CUDA_VISIBLE_DEVICES are mutually exclusive.
+    // When CUDA_VISIBLE_DEVICES is set, device indices are remapped so that device 0
+    // is the only (or first) visible GPU. Setting GPUCOMPRESS_DEVICE to a value > 0
+    // under CUDA_VISIBLE_DEVICES will fail or select the wrong physical device.
+    const char* env_dev = getenv("GPUCOMPRESS_DEVICE");
+    if (env_dev) {
+        if (getenv("CUDA_VISIBLE_DEVICES")) {
+            fprintf(stderr, "gpucompress: WARNING: both GPUCOMPRESS_DEVICE and "
+                    "CUDA_VISIBLE_DEVICES are set. These are mutually exclusive — "
+                    "GPUCOMPRESS_DEVICE will be ignored; CUDA_VISIBLE_DEVICES remaps "
+                    "device indices and device 0 is the correct target.\n");
+        } else {
+            int requested = atoi(env_dev);
+            int dev_count = 0;
+            cudaGetDeviceCount(&dev_count);
+            if (requested >= 0 && requested < dev_count) {
+                g_cuda_device = requested;
+            } else {
+                fprintf(stderr, "gpucompress: GPUCOMPRESS_DEVICE=%d out of range (0..%d), using 0\n",
+                        requested, dev_count - 1);
+                g_cuda_device = 0;
+            }
+        }
+    }
+
     // Initialize CUDA
     cudaError_t err = cudaSetDevice(g_cuda_device);
     if (err != cudaSuccess) {
