@@ -97,6 +97,7 @@ static char TMP_FIX_BITCOMP[256];
 static char TMP_NN[256];
 static char TMP_NN_RL[256];
 static char TMP_NN_RLEXP[256];
+static char TMP_WARMUP[256];
 
 static void init_tmp_paths(int mpi_rank) {
     snprintf(TMP_NOCOMP,      sizeof(TMP_NOCOMP),      "/tmp/bm_vpic_nocomp_rank%d.h5",      mpi_rank);
@@ -111,6 +112,7 @@ static void init_tmp_paths(int mpi_rank) {
     snprintf(TMP_NN,          sizeof(TMP_NN),          "/tmp/bm_vpic_nn_rank%d.h5",          mpi_rank);
     snprintf(TMP_NN_RL,       sizeof(TMP_NN_RL),       "/tmp/bm_vpic_nn_rl_rank%d.h5",       mpi_rank);
     snprintf(TMP_NN_RLEXP,    sizeof(TMP_NN_RLEXP),    "/tmp/bm_vpic_nn_rlexp_rank%d.h5",    mpi_rank);
+    snprintf(TMP_WARMUP,      sizeof(TMP_WARMUP),      "/tmp/bm_vpic_warmup_rank%d.h5",      mpi_rank);
 }
 /* CSV output directory: set VPIC_RESULTS_DIR env var to override.
  * The eval script sets this per-run so CSVs land in the right subdirectory. */
@@ -894,6 +896,7 @@ begin_diagnostics {
 
                         struct PhaseAccum {
                             double sum_write, sum_read;
+                            double sum_write_sq, sum_read_sq;  /* for std deviation */
                             double sum_mape_r, sum_mape_c, sum_mape_d;
                             int    sum_sgd, sum_expl, n_chunks_last;
                             size_t last_file_sz;
@@ -954,6 +957,8 @@ begin_diagnostics {
                                         && (ph[plen] == '\0' || ph[plen] == '/')) {
                                         pa[pi].sum_write += wr;
                                         pa[pi].sum_read  += rd;
+                                        pa[pi].sum_write_sq += wr * wr;
+                                        pa[pi].sum_read_sq  += rd * rd;
                                         pa[pi].sum_mape_r += mr;
                                         pa[pi].sum_mape_c += mc;
                                         pa[pi].sum_mape_d += md;
@@ -1005,6 +1010,11 @@ begin_diagnostics {
                             int n = pa[pi].count;
                             double avg_wr = pa[pi].sum_write / n;
                             double avg_rd = pa[pi].sum_read / n;
+                            /* Sample std: sqrt((sum_sq/n - mean^2) * n/(n-1)) */
+                            double wr_var = (n > 1) ? (pa[pi].sum_write_sq / n - avg_wr * avg_wr) * n / (n - 1) : 0.0;
+                            double rd_var = (n > 1) ? (pa[pi].sum_read_sq / n - avg_rd * avg_rd) * n / (n - 1) : 0.0;
+                            double wr_std = (wr_var > 0) ? sqrt(wr_var) : 0.0;
+                            double rd_std = (rd_var > 0) ? sqrt(rd_var) : 0.0;
                             /* Ratio = total_orig / total_compressed (not mean of
                                per-timestep ratios, which has Jensen's inequality bias). */
                             double total_file_mib = pa[pi].sum_file_sz / (double)(1 << 20);
@@ -1021,7 +1031,7 @@ begin_diagnostics {
                                 ? orig_bytes / 1e9 / (avg_comp_ms / 1000.0) : 0.0;
                             double dgbps = (avg_decomp_ms > 0)
                                 ? orig_bytes / 1e9 / (avg_decomp_ms / 1000.0) : 0.0;
-                            fprintf(agg, "%d,vpic,%s,%d,%.2f,0.00,%.2f,0.00,"
+                            fprintf(agg, "%d,vpic,%s,%d,%.2f,%.2f,%.2f,%.2f,"
                                          "%.2f,%.2f,%.4f,"
                                          "%.1f,%.1f,0,%.0f,%.0f,%d,"
                                          "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,"
@@ -1030,7 +1040,7 @@ begin_diagnostics {
                                          "%.4f,%.4f,%.4f,%.4f,"
                                          "0.0000,0.0000,"
                                          "%.2f,%.2f,%.2f,%.2f,%.2f\n",
-                                    rank(), pnames[pi], n, avg_wr, avg_rd,
+                                    rank(), pnames[pi], n, avg_wr, wr_std, avg_rd, rd_std,
                                     avg_file_mib, orig_mib, avg_ratio,
                                     wmbps, rmbps,
                                     (double)pa[pi].sum_sgd / n, (double)pa[pi].sum_expl / n, pa[pi].n_chunks_last,
@@ -1080,6 +1090,7 @@ begin_diagnostics {
             remove(TMP_NN);
             remove(TMP_NN_RL);
             remove(TMP_NN_RLEXP);
+            remove(TMP_WARMUP);
             gpucompress_cleanup();
             return;
         }
@@ -1308,6 +1319,52 @@ begin_diagnostics {
                        "--------  --------  --------  ----\n");
             }
 
+            /* Per-phase warmup write on first timestep.
+             * Primes the VOL pipeline, nvcomp managers, and CUDA JIT so the
+             * timed T=0 measurement is not inflated by one-time init costs.
+             * Matches Gray-Scott's warmup methodology for fair cross-benchmark
+             * comparison. SGD is temporarily disabled during warmup. */
+            if (t == 0) {
+                int warmup_sgd = gpucompress_online_learning_enabled();
+                gpucompress_disable_online_learning();
+                gpucompress_set_exploration(0);
+
+                remove(TMP_WARMUP);
+                hid_t wfapl = H5Pcreate(H5P_FILE_ACCESS);
+                hid_t wnid = H5VLget_connector_id_by_name("native");
+                H5Pset_fapl_gpucompress(wfapl, wnid, NULL);
+                H5VLclose(wnid);
+                hid_t wfile = H5Fcreate(TMP_WARMUP, H5F_ACC_TRUNC, H5P_DEFAULT, wfapl);
+                H5Pclose(wfapl);
+                if (wfile >= 0) {
+                    hid_t wfsp  = H5Screate_simple(1, dims, NULL);
+                    hid_t wdset = H5Dcreate2(wfile, "warmup", H5T_NATIVE_FLOAT,
+                                              wfsp, H5P_DEFAULT, dcpl, H5P_DEFAULT);
+                    H5Sclose(wfsp);
+                    if (wdset >= 0) {
+                        H5Dwrite(wdset, H5T_NATIVE_FLOAT,
+                                 H5S_ALL, H5S_ALL, H5P_DEFAULT, d_fields);
+                        cudaDeviceSynchronize();
+                        H5Dclose(wdset);
+                    }
+                    H5Fclose(wfile);
+                }
+                remove(TMP_WARMUP);
+                gpucompress_flush_manager_cache();
+
+                /* Restore SGD/exploration state */
+                if (warmup_sgd) {
+                    gpucompress_enable_online_learning();
+                    gpucompress_set_reinforcement(1, global->reinforce_lr,
+                                                  global->reinforce_mape, global->reinforce_mape);
+                }
+                if (do_expl) {
+                    gpucompress_set_exploration(1);
+                    gpucompress_set_exploration_threshold(global->explore_thresh);
+                    gpucompress_set_exploration_k(global->explore_k);
+                }
+            }
+
             /* Suppress VOL warnings for no-comp (they are expected and noisy) */
             int saved_stderr = -1;
             if (strcmp(phase_name, "no-comp") == 0) {
@@ -1446,9 +1503,9 @@ begin_diagnostics {
                     r2_cnt++;
                 }
                 if (diag.compression_ms_raw > 0)
-                    mae_c_sum += fabs(diag.predicted_comp_time - diag.compression_ms);
-                if (diag.decompression_ms > 0)
-                    mae_d_sum += fabs(diag.predicted_decomp_time - diag.decompression_ms);
+                    mae_c_sum += fabs(diag.predicted_comp_time - diag.compression_ms_raw);
+                if (diag.decompression_ms_raw > 0)
+                    mae_d_sum += fabs(diag.predicted_decomp_time - diag.decompression_ms_raw);
                 /* PSNR MAPE/MAE (skip lossless: both are 120, MAPE=0 is trivial) */
                 if (diag.predicted_psnr > 0.0f && diag.actual_psnr < 120.0f && diag.actual_psnr > 0.0f) {
                     mape_p_sum += fabs(diag.predicted_psnr - diag.actual_psnr) / fabs(diag.actual_psnr);

@@ -235,6 +235,35 @@ def generate_figures(dataset, policy, out_dir):
                 if os.path.exists(cpath):
                     phase_csv_map[ph_name] = cpath
                     break
+    # Fallback: if no phase_* directories found, split the combined timestep
+    # CSV by the 'phase' column (VPIC/Gray-Scott have all phases in one file).
+    if len(phase_csv_map) < 2 and ts_csv and os.path.exists(ts_csv):
+        import csv, tempfile
+        with open(ts_csv) as f:
+            reader = csv.DictReader(f)
+            rows_by_phase = {}
+            header = reader.fieldnames
+            for row in reader:
+                ph = row.get("phase", "")
+                # Strip policy suffix (e.g., "nn-rl/balanced" → "nn-rl")
+                if "/" in ph:
+                    ph = ph.split("/")[0]
+                if ph and ph not in rows_by_phase:
+                    rows_by_phase[ph] = []
+                if ph:
+                    rows_by_phase[ph].append(row)
+
+        if len(rows_by_phase) >= 2:
+            # Write temporary per-phase CSVs
+            tmpdir = tempfile.mkdtemp(prefix="gpucompress_phase_split_")
+            for ph, rows in rows_by_phase.items():
+                tmp_csv = os.path.join(tmpdir, f"{ph}.csv")
+                with open(tmp_csv, "w", newline="") as f:
+                    writer = csv.DictWriter(f, fieldnames=header)
+                    writer.writeheader()
+                    writer.writerows(rows)
+                phase_csv_map[ph] = tmp_csv
+
     if len(phase_csv_map) >= 2:
         out_pd = os.path.join(out_dir, "6d_cross_phase_pipeline_overhead.png")
         viz.make_cross_phase_pipeline_overhead(phase_csv_map, out_pd)

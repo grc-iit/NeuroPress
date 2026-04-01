@@ -413,6 +413,12 @@ typedef struct {
     double comp_gbps_std;
     double decomp_gbps_std;
     int    n_runs;  /* number of runs used for this result */
+    /* VOL pipeline stage timing (averaged across timesteps) */
+    double stage1_ms;
+    double drain_ms;
+    double io_drain_ms;
+    double s2_busy_ms;
+    double s3_busy_ms;
     /* Multi-timestep averaged I/O (set after multi-timestep loop; 0 if single-shot only) */
     double write_ms_avg;
     double read_ms_avg;
@@ -784,6 +790,8 @@ static void write_aggregate_csv(PhaseResult *res, int n_phases,
                "mape_ratio_pct,mape_comp_pct,mape_decomp_pct,"
                "mae_ratio,mae_comp_ms,mae_decomp_ms,"
                "comp_gbps_std,decomp_gbps_std,"
+               "vol_stage1_ms,vol_drain_ms,vol_io_drain_ms,"
+               "vol_s2_busy_ms,vol_s3_busy_ms,"
                "L,steps,F,k,chunk_z,sim_ms\n");
     for (int i = 0; i < n_phases; i++) {
         PhaseResult *r = &res[i];
@@ -795,6 +803,7 @@ static void write_aggregate_csv(PhaseResult *res, int n_phases,
                    "%.2f,%.2f,%.2f,"
                    "%.4f,%.4f,%.4f,"
                    "%.4f,%.4f,"
+                   "%.2f,%.2f,%.2f,%.2f,%.2f,"
                    "%d,%d,%.4f,%.5f,%d,%.2f\n",
                 g_mpi_rank, r->phase, r->n_runs,
                 r->write_ms, r->write_ms_std, r->read_ms, r->read_ms_std,
@@ -808,6 +817,8 @@ static void write_aggregate_csv(PhaseResult *res, int n_phases,
                 r->mape_ratio_pct, r->mape_comp_pct, r->mape_decomp_pct,
                 r->mae_ratio, r->mae_comp_ms, r->mae_decomp_ms,
                 r->comp_gbps_std, r->decomp_gbps_std,
+                r->stage1_ms, r->drain_ms, r->io_drain_ms,
+                r->s2_busy_ms, r->s3_busy_ms,
                 L, steps, F, k, chunk_z, r->sim_ms);
     }
     fclose(f);
@@ -1293,7 +1304,7 @@ int main(int argc, char **argv)
         fprintf(ts_csv, "rank,phase,timestep,sim_step,write_ms,read_ms,ratio,"
                 "mape_ratio,mape_comp,mape_decomp,"
                 "sgd_fires,explorations,n_chunks,mismatches,"
-                "write_mbps,read_mbps,file_bytes,"
+                "write_mibps,read_mibps,file_bytes,"
                 "stats_ms,nn_ms,preproc_ms,comp_ms,decomp_ms,explore_ms,sgd_ms,"
                 "mae_ratio,mae_comp_ms,mae_decomp_ms,"
                 "vol_stage1_ms,vol_drain_ms,vol_io_drain_ms,"
@@ -1383,6 +1394,8 @@ int main(int argc, char **argv)
         double sum_mae_r = 0, sum_mae_c = 0, sum_mae_d = 0;
         double sum_mape_r = 0, sum_mape_c = 0, sum_mape_d = 0;
         double sum_file_sz = 0;
+        double sum_vol_s1 = 0, sum_vol_drain = 0, sum_vol_io_drain = 0;
+        double sum_vol_s2_busy = 0, sum_vol_s3_busy = 0;
         size_t last_file_sz = 0;
         int n_steady = 0;
         int cum_sgd = 0, cum_expl = 0;
@@ -1534,6 +1547,11 @@ int main(int argc, char **argv)
             sum_mae_c      += ts_mae_c;
             sum_mae_d      += ts_mae_d;
             sum_file_sz    += (double)file_sz;
+            sum_vol_s1       += vol_s1;
+            sum_vol_drain    += vol_drain;
+            sum_vol_io_drain += vol_io_drain;
+            sum_vol_s2_busy  += vol_s2_busy;
+            sum_vol_s3_busy  += vol_s3_busy;
 
             double wr_mbps = (write_ms_t > 0) ? orig_mib / (write_ms_t / 1000.0) : 0;
             double rd_mbps = (read_ms_t > 0) ? orig_mib / (read_ms_t / 1000.0) : 0;
@@ -1658,6 +1676,11 @@ int main(int argc, char **argv)
             r.mae_ratio  = sum_mae_r / n;
             r.mae_comp_ms = sum_mae_c / n;
             r.mae_decomp_ms = sum_mae_d / n;
+            r.stage1_ms   = sum_vol_s1 / n;
+            r.drain_ms    = sum_vol_drain / n;
+            r.io_drain_ms = sum_vol_io_drain / n;
+            r.s2_busy_ms  = sum_vol_s2_busy / n;
+            r.s3_busy_ms  = sum_vol_s3_busy / n;
             r.sim_ms     = (double)timesteps * steps;  /* placeholder */
             r.n_runs     = n;
         }
@@ -1955,7 +1978,7 @@ int main(int argc, char **argv)
             fprintf(ts_csv, "rank,phase,timestep,sim_step,write_ms,read_ms,ratio,"
                     "mape_ratio,mape_comp,mape_decomp,"
                     "sgd_fires,explorations,n_chunks,mismatches,"
-                    "write_mbps,read_mbps,"
+                    "write_mibps,read_mibps,"
                     "file_bytes,"
                     "stats_ms,nn_ms,preproc_ms,comp_ms,decomp_ms,explore_ms,sgd_ms,"
                     "mae_ratio,mae_comp_ms,mae_decomp_ms\n");
@@ -2033,6 +2056,8 @@ int main(int argc, char **argv)
             double sum_mae_r = 0, sum_mae_c = 0, sum_mae_d = 0;
             double sum_mape_r = 0, sum_mape_c = 0, sum_mape_d = 0;
             double sum_file_sz = 0;
+            double sum_vol_s1 = 0, sum_vol_drain = 0, sum_vol_io_drain = 0;
+            double sum_vol_s2_busy = 0, sum_vol_s3_busy = 0;
             size_t last_file_sz = 0;
             int    n_steady = 0;
             /* Per-timestep MAPE (tracked for console output) */
@@ -2082,6 +2107,12 @@ int main(int argc, char **argv)
                 H5Dclose(dset); H5Fclose(file);
                 double tw1  = now_ms();
                 double write_ms_t = tw1 - tw0;
+
+                /* VOL pipeline stage timing */
+                double vol_s1 = 0, vol_drain = 0, vol_io_drain = 0, vol_total = 0;
+                H5VL_gpucompress_get_stage_timing(&vol_s1, &vol_drain, &vol_io_drain, &vol_total);
+                double vol_s2_busy = 0, vol_s3_busy = 0;
+                H5VL_gpucompress_get_busy_timing(&vol_s2_busy, &vol_s3_busy);
 
                 if (wret < 0) {
                     printf("  %-4d  H5Dwrite failed\n", t);
@@ -2193,6 +2224,11 @@ int main(int argc, char **argv)
                     sum_mae_r       += ts_mae_r;
                     sum_mae_c       += ts_mae_c;
                     sum_mae_d       += ts_mae_d;
+                    sum_vol_s1       += vol_s1;
+                    sum_vol_drain    += vol_drain;
+                    sum_vol_io_drain += vol_io_drain;
+                    sum_vol_s2_busy  += vol_s2_busy;
+                    sum_vol_s3_busy  += vol_s3_busy;
                     double ts_comp_gbps = (ts_comp_ms > 0)
                         ? (double)total_bytes / ts_comp_ms / 1e6 : 0.0;
                     double ts_decomp_gbps = (ts_decomp_ms > 0)
@@ -2370,6 +2406,11 @@ int main(int argc, char **argv)
                     pr->mae_ratio     = sum_mae_r / n_steady;
                     pr->mae_comp_ms   = sum_mae_c / n_steady;
                     pr->mae_decomp_ms = sum_mae_d / n_steady;
+                    pr->stage1_ms     = sum_vol_s1 / n_steady;
+                    pr->drain_ms      = sum_vol_drain / n_steady;
+                    pr->io_drain_ms   = sum_vol_io_drain / n_steady;
+                    pr->s2_busy_ms    = sum_vol_s2_busy / n_steady;
+                    pr->s3_busy_ms    = sum_vol_s3_busy / n_steady;
                 }
                 pr->sgd_fires   = cum_sgd;
                 pr->explorations = cum_expl;
