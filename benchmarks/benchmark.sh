@@ -63,7 +63,7 @@ SDRBENCH (static scientific datasets)
   SDR_DATASETS        [nyx,hurricane_isabel,cesm_atm]  Datasets to run
 
 AI_TRAINING (neural network checkpoint compression)
-  AI_MODEL            [vit_b_16]                   Model: vit_b_16 (327MB), vit_l_16 (1.16GB), gpt2 (473MB)
+  AI_MODEL            [vit_b_16]                   Model: vit_b_16 (327MB), gpt2 (473MB)
   AI_DATASET          [cifar10]                    Training dataset (cifar10 for ViT, wikitext2 for GPT-2)
   AI_CHECKPOINT_DIR   [auto]                       Path to exported .f32 checkpoint files
                         Generate with: python3 scripts/train_and_export_checkpoints.py
@@ -83,11 +83,10 @@ STANDALONE BENCHMARKS
   # ── 4. AI Training (neural network checkpoint compression) ──
   # Step 1: Generate checkpoint data (one-time)
   python3 scripts/train_and_export_checkpoints.py --model vit_b_16 --epochs 20  # ~25 min, 10 GB
-  python3 scripts/train_and_export_checkpoints.py --model vit_l_16 --epochs 20  # ~60 min, 37 GB
+  python3 scripts/train_gpt2_checkpoints.py --epochs 5                          # ~20 min, 7.4 GB
   python3 scripts/train_gpt2_checkpoints.py --epochs 5                          # ~20 min, 7.6 GB
   # Step 2: Run benchmark
   BENCHMARKS=ai_training AI_MODEL=vit_b_16 CHUNK_MB=4 VERIFY=0 bash benchmarks/benchmark.sh
-  BENCHMARKS=ai_training AI_MODEL=vit_l_16 CHUNK_MB=16 VERIFY=0 bash benchmarks/benchmark.sh
   BENCHMARKS=ai_training AI_MODEL=gpt2 AI_DATASET=wikitext2 CHUNK_MB=4 VERIFY=0 bash benchmarks/benchmark.sh
 
 EXAMPLES
@@ -137,6 +136,9 @@ SGD_MAPE=${SGD_MAPE:-0.10}
 EXPLORE_K=${EXPLORE_K:-4}
 EXPLORE_THRESH=${EXPLORE_THRESH:-0.20}
 VERIFY=${VERIFY:-1}
+# Tag for directory naming: _noverify when VERIFY=0, empty when VERIFY=1
+_VERIFY_TAG=""
+[ "$VERIFY" = "0" ] && _VERIFY_TAG="_noverify"
 POLICIES=${POLICIES:-"balanced,ratio,speed"}
 PHASES=${PHASES:-"no-comp,lz4,snappy,deflate,gdeflate,zstd,ans,cascaded,bitcomp,nn,nn-rl,nn-rl+exp50"}
 DEBUG_NN=${DEBUG_NN:-0}
@@ -249,7 +251,7 @@ for bench in "${BENCH_LIST[@]}"; do
 
             GS_BIN="$SCRIPT_DIR/../build/grayscott_benchmark_pm"
             GS_WEIGHTS="$SCRIPT_DIR/../neural_net/weights/model.nnwt"
-            GS_EVAL_DIR="$SCRIPT_DIR/grayscott/results/eval_L${GS_L}_chunk${CHUNK_MB}mb_ts${TIMESTEPS}${VPIC_EVAL_SUFFIX:-}"
+            GS_EVAL_DIR="$SCRIPT_DIR/grayscott/results/eval_L${GS_L}_chunk${CHUNK_MB}mb_ts${TIMESTEPS}${_VERIFY_TAG}${VPIC_EVAL_SUFFIX:-}"
 
             VERIFY_ARG=""
             [ "$VERIFY" = "0" ] && VERIFY_ARG="--no-verify"
@@ -409,7 +411,7 @@ for bench in "${BENCH_LIST[@]}"; do
                 esac
             done
 
-            VPIC_EVAL_DIR="$SCRIPT_DIR/vpic-kokkos/results/eval_NX${VPIC_NX}_chunk${CHUNK_MB}mb_ts${TIMESTEPS}${VPIC_EVAL_SUFFIX:-}"
+            VPIC_EVAL_DIR="$SCRIPT_DIR/vpic-kokkos/results/eval_NX${VPIC_NX}_chunk${CHUNK_MB}mb_ts${TIMESTEPS}${_VERIFY_TAG}${VPIC_EVAL_SUFFIX:-}"
 
             # Helper: build VPIC_EXCLUDE from a comma-separated list of phases to INCLUDE
             vpic_exclude_from() {
@@ -659,10 +661,9 @@ with open('$AGG_CSV','w') as f:
             AI_WEIGHTS="$SCRIPT_DIR/../neural_net/weights/model.nnwt"
 
             # Resolve checkpoint data directory
-            # Naming: vit_b_16 → vit_b_cifar10, vit_l_16 → vit_l_cifar10, gpt2 → gpt2_wikitext2
+            # Naming: vit_b_16 → vit_b_cifar10, gpt2 → gpt2_wikitext2
             case "$AI_MODEL" in
                 vit_b_16) _AI_SHORT="vit_b" ;;
-                vit_l_16) _AI_SHORT="vit_l" ;;
                 *)        _AI_SHORT="$AI_MODEL" ;;
             esac
             AI_DIR_NAME="${_AI_SHORT}_${AI_DATASET}"
@@ -721,7 +722,7 @@ print(s)
                 esac
             done
 
-            AI_EVAL_DIR="$SCRIPT_DIR/ai_training/results/eval_${AI_DIR_NAME}_chunk${CHUNK_MB}mb${VPIC_EVAL_SUFFIX:-}"
+            AI_EVAL_DIR="$SCRIPT_DIR/ai_training/results/eval_${AI_DIR_NAME}_chunk${CHUNK_MB}mb${_VERIFY_TAG}${VPIC_EVAL_SUFFIX:-}"
             VERIFY_ARG=""
             [ "$VERIFY" = "0" ] && VERIFY_ARG="--no-verify"
 

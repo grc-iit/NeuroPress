@@ -101,7 +101,9 @@ POLICY_LABELS[ratio]="ratio_only_w0-0-1"
 POLICY_LABELS[speed]="speed_only_w1-1-0"
 
 # ── Eval directory ──
-EVAL_NAME="eval_${DATASET}_chunk${CHUNK_MB}mb${VPIC_EVAL_SUFFIX:-}"
+_VERIFY_TAG=""
+[ "${VERIFY:-1}" = "0" ] && _VERIFY_TAG="_noverify"
+EVAL_NAME="eval_${DATASET}_chunk${CHUNK_MB}mb${_VERIFY_TAG}${VPIC_EVAL_SUFFIX:-}"
 EVAL_DIR="$SCRIPT_DIR/results/$EVAL_NAME"
 
 # ── Write params.txt so we know how this eval was invoked ──
