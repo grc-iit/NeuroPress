@@ -84,6 +84,7 @@ DATASETS = {
 AI_DATASETS = {
     "vit_b_cifar10": {"model": "vit_b_16", "params": "86M"},
     "vit_l_cifar10": {"model": "vit_l_16", "params": "304M"},
+    "gpt2_wikitext2": {"model": "gpt2", "params": "124M"},
 }
 
 # SDRBench datasets are auto-discovered from the eval directory

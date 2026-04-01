@@ -63,8 +63,8 @@ SDRBENCH (static scientific datasets)
   SDR_DATASETS        [nyx,hurricane_isabel,cesm_atm]  Datasets to run
 
 AI_TRAINING (neural network checkpoint compression)
-  AI_MODEL            [vit_b_16]                   Model: vit_b_16 (327MB) or vit_l_16 (1.16GB)
-  AI_DATASET          [cifar10]                    Training dataset
+  AI_MODEL            [vit_b_16]                   Model: vit_b_16 (327MB), vit_l_16 (1.16GB), gpt2 (473MB)
+  AI_DATASET          [cifar10]                    Training dataset (cifar10 for ViT, wikitext2 for GPT-2)
   AI_CHECKPOINT_DIR   [auto]                       Path to exported .f32 checkpoint files
                         Generate with: python3 scripts/train_and_export_checkpoints.py
 
@@ -81,12 +81,14 @@ STANDALONE BENCHMARKS
   BENCHMARKS=sdrbench SDR_DATASETS="nyx,hurricane_isabel,cesm_atm" bash benchmarks/benchmark.sh
 
   # ── 4. AI Training (neural network checkpoint compression) ──
-  # Step 1: Generate checkpoint data (one-time, ~4 min for vit_b, ~45 min for vit_l)
-  python3 scripts/train_and_export_checkpoints.py --model vit_b_16 --epochs 3
-  python3 scripts/train_and_export_checkpoints.py --model vit_l_16 --epochs 20  # 1+ GB/file
+  # Step 1: Generate checkpoint data (one-time)
+  python3 scripts/train_and_export_checkpoints.py --model vit_b_16 --epochs 20  # ~25 min, 10 GB
+  python3 scripts/train_and_export_checkpoints.py --model vit_l_16 --epochs 20  # ~60 min, 37 GB
+  python3 scripts/train_gpt2_checkpoints.py --epochs 5                          # ~20 min, 7.6 GB
   # Step 2: Run benchmark
   BENCHMARKS=ai_training AI_MODEL=vit_b_16 CHUNK_MB=4 VERIFY=0 bash benchmarks/benchmark.sh
   BENCHMARKS=ai_training AI_MODEL=vit_l_16 CHUNK_MB=16 VERIFY=0 bash benchmarks/benchmark.sh
+  BENCHMARKS=ai_training AI_MODEL=gpt2 AI_DATASET=wikitext2 CHUNK_MB=4 VERIFY=0 bash benchmarks/benchmark.sh
 
 EXAMPLES
   # Quick smoke test (smallest config, ~2 min)
@@ -642,8 +644,12 @@ with open('$AGG_CSV','w') as f:
             AI_WEIGHTS="$SCRIPT_DIR/../neural_net/weights/model.nnwt"
 
             # Resolve checkpoint data directory
-            # Naming convention: vit_b_cifar10, vit_l_cifar10, etc.
-            _AI_SHORT=$(echo "$AI_MODEL" | sed 's/vit_\(.\)_16/vit_\1/')
+            # Naming: vit_b_16 → vit_b_cifar10, vit_l_16 → vit_l_cifar10, gpt2 → gpt2_wikitext2
+            case "$AI_MODEL" in
+                vit_b_16) _AI_SHORT="vit_b" ;;
+                vit_l_16) _AI_SHORT="vit_l" ;;
+                *)        _AI_SHORT="$AI_MODEL" ;;
+            esac
             AI_DIR_NAME="${_AI_SHORT}_${AI_DATASET}"
             AI_DATA_DIR="${AI_CHECKPOINT_DIR:-$SCRIPT_DIR/../data/ai_training/${AI_DIR_NAME}}"
 
@@ -651,7 +657,11 @@ with open('$AGG_CSV','w') as f:
                 echo "ERROR: Checkpoint data not found at $AI_DATA_DIR"
                 echo ""
                 echo "Generate it first:"
-                echo "  python3 scripts/train_and_export_checkpoints.py --model $AI_MODEL --dataset $AI_DATASET"
+                case "$AI_MODEL" in
+                    vit_*) echo "  python3 scripts/train_and_export_checkpoints.py --model $AI_MODEL" ;;
+                    gpt2)  echo "  python3 scripts/train_gpt2_checkpoints.py" ;;
+                    *)     echo "  Generate .f32 files in data/ai_training/${AI_DIR_NAME}/" ;;
+                esac
                 echo ""
                 continue
             fi
@@ -782,6 +792,7 @@ print(s)
 
                     # Generate plots
                     AI_DIR="$AI_EVAL_DIR" AI_CHUNK="$CHUNK_MB" \
+                    AI_MODEL="$_AI_SHORT" AI_DATASET="$AI_DATASET" \
                     python3 "$SCRIPT_DIR/plots/generate_dataset_figures.py" \
                         --dataset "$AI_DIR_NAME" --policy "$LABEL" 2>&1 | grep -E "Generated"
                     echo ""
