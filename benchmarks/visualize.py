@@ -701,6 +701,107 @@ def make_mae_figure(ts_csv_path, output_path):
     print(f"  Saved: {output_path}")
 
 
+def make_r2_figure(ts_csv_path, output_path):
+    """Plot R² for ratio/comp_time/decomp_time/PSNR over timesteps, one line per NN phase.
+
+    R² = 1 - SS_res/SS_tot measures how well the NN predicts each target.
+    R² = 1.0 is perfect, R² = 0.0 is mean-only, R² < 0 is worse than mean.
+    """
+    rows = parse_csv(ts_csv_path)
+    if not rows:
+        print(f"  No timestep data in {ts_csv_path}, skipping R² plot.")
+        return
+
+    rows = _aggregate_timesteps_across_ranks(rows)
+
+    if "r2_ratio" not in rows[0]:
+        print(f"  No R² columns in {ts_csv_path}, skipping R² plot.")
+        return
+
+    is_field_based = "field_idx" in rows[0] and "timestep" not in rows[0]
+    x_label = "Field" if is_field_based else "Timestep"
+
+    # Normalize phase names: "nn/balanced" → "nn", "nn-rl/ratio" → "nn-rl"
+    by_phase = {}
+    for r in rows:
+        ph = r.get("phase", "nn-rl")
+        base_ph = ph.split("/")[0]  # strip policy suffix
+        by_phase.setdefault(base_ph, []).append(r)
+
+    phase_order = ["nn", "nn-rl", "nn-rl+exp50"]
+    phase_styles = {
+        "nn":          {"color": "#7f8c8d", "ls": ":",  "marker": "s", "lw": 2.0},
+        "nn-rl":       {"color": "#8e44ad", "ls": "-",  "marker": "o", "lw": 2.0},
+        "nn-rl+exp50": {"color": "#c0392b", "ls": "--", "marker": "D", "lw": 2.0},
+    }
+    phases_present = [p for p in phase_order if p in by_phase]
+
+    metric_keys = [
+        ("Compression Ratio", "r2_ratio"),
+        ("Compression Time",  "r2_comp"),
+        ("Decompression Time", "r2_decomp"),
+    ]
+    has_psnr_r2 = any(g(r, "r2_psnr") != 0 for r in rows)
+    if has_psnr_r2:
+        metric_keys.append(("PSNR", "r2_psnr"))
+
+    n_metrics = len(metric_keys)
+    n_phases = len(phases_present)
+    if n_phases == 0:
+        print(f"  No NN phases found in {ts_csv_path}, skipping R² plot.")
+        return
+
+    title_suffix = "Fields" if is_field_based else "Timesteps"
+
+    # Grid: rows = phases, columns = metrics
+    fig, axes = plt.subplots(n_phases, n_metrics,
+                              figsize=(4.5 * n_metrics, 3.5 * n_phases + 1),
+                              squeeze=False)
+    fig.suptitle(f"NN Prediction R² Over {title_suffix}\n"
+                 "(1.0 = perfect, 0.0 = mean-only)",
+                 fontsize=14, fontweight="bold", y=0.98)
+
+    phase_labels = {"nn": "NN Inference Only",
+                    "nn-rl": "NN + SGD",
+                    "nn-rl+exp50": "NN + SGD + Explore"}
+
+    for ri, ph in enumerate(phases_present):
+        ph_rows = sorted(by_phase[ph], key=lambda r: g(r, "timestep", "field_idx"))
+        timesteps = np.array([g(r, "timestep", "field_idx") for r in ph_rows])
+        sty = phase_styles.get(ph, {"color": "black", "ls": "-", "marker": ".", "lw": 2.0})
+
+        for ci, (metric_label, r2_key) in enumerate(metric_keys):
+            ax = axes[ri][ci]
+            r2_vals = np.array([g(r, r2_key) for r in ph_rows])
+
+            ax.plot(timesteps, r2_vals, color=sty["color"], linestyle=sty["ls"],
+                    marker=sty["marker"], markersize=6, linewidth=2.0,
+                    alpha=0.9, zorder=3)
+            ax.fill_between(timesteps, 0, r2_vals,
+                            where=(r2_vals >= 0), alpha=0.15, color=sty["color"])
+
+            ax.axhline(y=1.0, color="#2ecc71", linestyle="--", alpha=0.4, linewidth=1)
+            ax.axhline(y=0.0, color="#e74c3c", linestyle="--", alpha=0.4, linewidth=1)
+            ax.grid(axis="y", alpha=0.2, linestyle="--")
+
+            # Column title (top row only)
+            if ri == 0:
+                ax.set_title(metric_label, fontsize=12, fontweight="bold")
+            # Row label (left column only)
+            if ci == 0:
+                ax.set_ylabel(f"{phase_labels.get(ph, ph)}\nR²",
+                              fontsize=10, fontweight="bold")
+            # X label (bottom row only)
+            if ri == n_phases - 1:
+                ax.set_xlabel(x_label, fontsize=10)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {output_path}")
+
+
 def make_psnr_figure(ts_csv_path, output_path):
     """Plot PSNR (actual and predicted) over timesteps.
 

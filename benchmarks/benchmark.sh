@@ -676,7 +676,8 @@ for r in rows:
                      'sum_sgd':0,'sum_expl':0,'sum_mape_r':0,'sum_mape_c':0,'sum_mape_d':0,
                      'sum_mape_p':0,'sum_mae_r':0,'sum_mae_c':0,'sum_mae_d':0,'sum_mae_p':0,
                      'sum_stats':0,'sum_nn':0,'sum_pre':0,'sum_comp':0,'sum_dec':0,
-                     'sum_expl_ms':0,'sum_sgd_ms':0}
+                     'sum_expl_ms':0,'sum_sgd_ms':0,
+                     'sum_r2_ratio':0,'sum_r2_comp':0,'sum_r2_decomp':0,'sum_r2_psnr':0}
     d = phases[p]
     wr_val = float(r.get('write_ms',0))
     rd_val = float(r.get('read_ms',0))
@@ -703,6 +704,10 @@ for r in rows:
     d['sum_dec'] += float(r.get('decomp_ms',0))
     d['sum_expl_ms'] += float(r.get('explore_ms',0))
     d['sum_sgd_ms'] += float(r.get('sgd_ms',0))
+    d['sum_r2_ratio'] += float(r.get('r2_ratio',0))
+    d['sum_r2_comp'] += float(r.get('r2_comp',0))
+    d['sum_r2_decomp'] += float(r.get('r2_decomp',0))
+    d['sum_r2_psnr'] += float(r.get('r2_psnr',0))
     d['n'] += 1
 # Get constant orig size: prefer orig_mib column if present, else from no-comp file_bytes
 first_orig = 0
@@ -720,7 +725,8 @@ with open('$AGG_CSV','w') as f:
            'nn_ms,stats_ms,preproc_ms,comp_ms,decomp_ms,explore_ms,sgd_ms,'
            'comp_gbps,decomp_gbps,'
            'mape_ratio_pct,mape_comp_pct,mape_decomp_pct,mape_psnr_pct,'
-           'mae_ratio,mae_comp_ms,mae_decomp_ms,mae_psnr_db')
+           'mae_ratio,mae_comp_ms,mae_decomp_ms,mae_psnr_db,'
+           'r2_ratio,r2_comp,r2_decomp,r2_psnr')
     f.write(hdr + '\n')
     for p,d in phases.items():
         n = d['n']
@@ -753,6 +759,8 @@ with open('$AGG_CSV','w') as f:
         md=min(200,d['sum_mape_d']/n); mp=min(200,d['sum_mape_p']/n)
         ar=d['sum_mae_r']/n; ac=d['sum_mae_c']/n
         ad=d['sum_mae_d']/n; ap=d['sum_mae_p']/n
+        rr=d['sum_r2_ratio']/n; rc=d['sum_r2_comp']/n
+        rd2=d['sum_r2_decomp']/n; rp=d['sum_r2_psnr']/n
         f.write(f'-1,vpic,{p},{n},{avg_wr:.2f},{wr_std:.2f},{avg_rd:.2f},{rd_std:.2f},'
                 f'{avg_file_mib:.2f},{orig_mib:.2f},{rat:.4f},{wr_mibps:.1f},{rd_mibps:.1f},0,'
                 f'{sgd:.0f},{expl:.0f},{nch},'
@@ -760,7 +768,8 @@ with open('$AGG_CSV','w') as f:
                 f'{avg_comp:.2f},{avg_dec:.2f},{exms:.2f},{sgms:.2f},'
                 f'{cgbps:.4f},{dgbps:.4f},'
                 f'{mr:.2f},{mc:.2f},{md:.2f},{mp:.2f},'
-                f'{ar:.4f},{ac:.4f},{ad:.4f},{ap:.4f}\n')
+                f'{ar:.4f},{ac:.4f},{ad:.4f},{ap:.4f},'
+                f'{rr:.4f},{rc:.4f},{rd2:.4f},{rp:.4f}\n')
 " 2>/dev/null
                 fi
 

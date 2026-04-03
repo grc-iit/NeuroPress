@@ -175,6 +175,10 @@ def generate_figures(dataset, policy, out_dir):
         viz.make_mae_figure(ts_csv, out_mae)
         count += 1
 
+        out_r2 = os.path.join(out_dir, "5c2_r2_over_time.png")
+        viz.make_r2_figure(ts_csv, out_r2)
+        count += 1
+
         out_psnr = os.path.join(out_dir, "5d_psnr_quality.png")
         viz.make_psnr_figure(ts_csv, out_psnr)
         count += 1

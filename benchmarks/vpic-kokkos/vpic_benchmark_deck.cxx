@@ -905,7 +905,8 @@ begin_diagnostics {
                                  "mae_ratio,mae_comp_ms,mae_decomp_ms,mae_psnr_db,"
                                  "comp_gbps_std,decomp_gbps_std,"
                                  "vol_stage1_ms,vol_drain_ms,vol_io_drain_ms,"
-                                 "vol_s2_busy_ms,vol_s3_busy_ms\n");
+                                 "vol_s2_busy_ms,vol_s3_busy_ms,"
+                                 "r2_ratio,r2_comp,r2_decomp,r2_psnr\n");
                     /* Parse timestep CSV to compute steady-state averages per phase */
                     FILE* ts = fopen(TSTEP_CSV, "r");
                     if (ts) {
@@ -925,6 +926,7 @@ begin_diagnostics {
                             double sum_vs1, sum_vs2, sum_vs3;
                             double sum_vs2_busy, sum_vs3_busy;
                             double sum_mape_p;
+                            double sum_r2_ratio, sum_r2_comp, sum_r2_decomp, sum_r2_psnr;
                             int    count;
                         };
                         const int N_AGG_PHASES = 12;
@@ -946,6 +948,7 @@ begin_diagnostics {
                             double t_vs1 = 0, t_drain = 0, t_io_drain = 0;
                             double t_vs2_busy = 0, t_vs3_busy = 0;
                             double t_mape_p = 0;
+                            double t_r2_ratio = 0, t_r2_comp = 0, t_r2_decomp = 0, t_r2_psnr = 0;
                             /* Skip leading rank column (%*[^,],), then parse phase onward */
                             int nf = sscanf(line, "%*[^,],%63[^,],%d,%*[^,],%lf,%lf,%lf,%lf,%lf,%lf,%d,%d,%d,%llu,%lf,%lf,"
                                        "%llu,%*[^,],"
@@ -959,13 +962,21 @@ begin_diagnostics {
                                        &t_mae_r, &t_mae_c, &t_mae_d, &t_mae_p,
                                        &t_vs1, &t_drain, &t_io_drain,
                                        &t_vs2_busy, &t_vs3_busy);
-                            /* Parse mape_psnr from the last CSV field.
-                             * Column layout: rank(0),...,mape_psnr(42) → skip 42 commas. */
+                            /* Parse trailing fields by comma-counting.
+                             * Column layout: ...,mape_psnr(45),r2_ratio(46),r2_comp(47),r2_decomp(48),r2_psnr(49) */
                             {
                                 const char* p = line;
                                 int commas = 0;
                                 while (*p && commas < 45) { if (*p == ',') commas++; p++; }
                                 if (commas >= 45) t_mape_p = atof(p);
+                                while (*p && *p != ',') p++; if (*p == ',') p++;
+                                t_r2_ratio = atof(p);
+                                while (*p && *p != ',') p++; if (*p == ',') p++;
+                                t_r2_comp = atof(p);
+                                while (*p && *p != ',') p++; if (*p == ',') p++;
+                                t_r2_decomp = atof(p);
+                                while (*p && *p != ',') p++; if (*p == ',') p++;
+                                t_r2_psnr = atof(p);
                             }
                             if (nf >= 12 && ts_idx >= WARMUP) {
                                 for (int pi = 0; pi < N_AGG_PHASES; pi++) {
@@ -1014,6 +1025,11 @@ begin_diagnostics {
                                             pa[pi].sum_vs2_busy += t_vs2_busy;
                                             pa[pi].sum_vs3_busy += t_vs3_busy;
                                         }
+                                        /* R² (parsed via comma-counting) */
+                                        pa[pi].sum_r2_ratio  += t_r2_ratio;
+                                        pa[pi].sum_r2_comp   += t_r2_comp;
+                                        pa[pi].sum_r2_decomp += t_r2_decomp;
+                                        pa[pi].sum_r2_psnr   += t_r2_psnr;
                                         pa[pi].count++;
                                         break;
                                     }
@@ -1057,7 +1073,8 @@ begin_diagnostics {
                                          "%.2f,%.2f,%.2f,%.2f,"
                                          "%.4f,%.4f,%.4f,%.4f,"
                                          "0.0000,0.0000,"
-                                         "%.2f,%.2f,%.2f,%.2f,%.2f\n",
+                                         "%.2f,%.2f,%.2f,%.2f,%.2f,"
+                                         "%.4f,%.4f,%.4f,%.4f\n",
                                     rank(), pnames[pi], n, avg_wr, wr_std, avg_rd, rd_std,
                                     avg_file_mib, orig_mib, avg_ratio,
                                     wmbps, rmbps,
@@ -1071,7 +1088,9 @@ begin_diagnostics {
                                     pa[pi].sum_mae_r / n, pa[pi].sum_mae_c / n,
                                     pa[pi].sum_mae_d / n, pa[pi].sum_mae_p / n,
                                     pa[pi].sum_vs1 / n, pa[pi].sum_vs2 / n, pa[pi].sum_vs3 / n,
-                                    pa[pi].sum_vs2_busy / n, pa[pi].sum_vs3_busy / n);
+                                    pa[pi].sum_vs2_busy / n, pa[pi].sum_vs3_busy / n,
+                                    pa[pi].sum_r2_ratio / n, pa[pi].sum_r2_comp / n,
+                                    pa[pi].sum_r2_decomp / n, pa[pi].sum_r2_psnr / n);
                         }
                     }
                 }
@@ -1139,7 +1158,8 @@ begin_diagnostics {
                         "h5dwrite_ms,cuda_sync_ms,h5dclose_ms,h5fclose_ms,"
                         "vol_setup_ms,vol_pipeline_ms,"
                         "psnr_db,psnr_predicted_db,rmse,max_abs_err,bit_rate,"
-                        "mape_psnr\n");
+                        "mape_psnr,"
+                        "r2_ratio,r2_comp,r2_decomp,r2_psnr\n");
             }
             global->tc_csv = fopen(TSTEP_CHUNKS_CSV, "w");
             if (global->tc_csv) {
@@ -1498,7 +1518,11 @@ begin_diagnostics {
             double ts_comp_ms = 0, ts_decomp_ms = 0, ts_explore_ms = 0, ts_sgd_ms = 0;
             double mae_r_sum = 0, mae_c_sum = 0, mae_d_sum = 0, mae_p_sum = 0;
             double psnr_pred_sum = 0; int psnr_pred_cnt = 0;
-            int    r2_cnt = 0;
+            /* R² accumulators: one-pass via Σactual, Σactual², Σ(actual-predicted)² */
+            double r2_r_sum = 0, r2_r_sum2 = 0, r2_r_ss_res = 0; int r2_r_cnt = 0;
+            double r2_c_sum = 0, r2_c_sum2 = 0, r2_c_ss_res = 0; int r2_c_cnt = 0;
+            double r2_d_sum = 0, r2_d_sum2 = 0, r2_d_ss_res = 0; int r2_d_cnt = 0;
+            double r2_p_sum = 0, r2_p_sum2 = 0, r2_p_ss_res = 0; int r2_p_cnt = 0;
             for (int ci = 0; ci < n_hist; ci++) {
                 gpucompress_chunk_diag_t diag;
                 if (gpucompress_get_chunk_diag(ci, &diag) != 0) continue;
@@ -1525,30 +1549,51 @@ begin_diagnostics {
                     mape_d_sum += fabs(diag.predicted_decomp_time - diag.decompression_ms) / fabs(diag.decompression_ms);
                     mcnt_d++;
                 }
-                /* MAE accumulators */
+                /* MAE + R² accumulators */
                 if (diag.actual_ratio > 0 && diag.predicted_ratio > 0) {
-                    mae_r_sum += fabs(diag.predicted_ratio - diag.actual_ratio);
-                    r2_cnt++;
+                    double a = diag.actual_ratio, p = diag.predicted_ratio;
+                    mae_r_sum += fabs(p - a);
+                    r2_r_sum += a; r2_r_sum2 += a*a; r2_r_ss_res += (a-p)*(a-p); r2_r_cnt++;
                 }
-                if (diag.compression_ms_raw > 0)
-                    mae_c_sum += fabs(diag.predicted_comp_time - diag.compression_ms_raw);
-                if (diag.decompression_ms_raw > 0)
-                    mae_d_sum += fabs(diag.predicted_decomp_time - diag.decompression_ms_raw);
+                if (diag.compression_ms_raw > 0) {
+                    double a = diag.compression_ms_raw, p = diag.predicted_comp_time;
+                    mae_c_sum += fabs(p - a);
+                    r2_c_sum += a; r2_c_sum2 += a*a; r2_c_ss_res += (a-p)*(a-p); r2_c_cnt++;
+                }
+                if (diag.decompression_ms_raw > 0) {
+                    double a = diag.decompression_ms_raw, p = diag.predicted_decomp_time;
+                    mae_d_sum += fabs(p - a);
+                    r2_d_sum += a; r2_d_sum2 += a*a; r2_d_ss_res += (a-p)*(a-p); r2_d_cnt++;
+                }
                 /* PSNR MAPE/MAE (skip lossless: both are 120, MAPE=0 is trivial) */
                 if (diag.predicted_psnr > 0.0f && diag.actual_psnr < 120.0f && diag.actual_psnr > 0.0f) {
-                    mape_p_sum += fabs(diag.predicted_psnr - diag.actual_psnr) / fabs(diag.actual_psnr);
-                    mae_p_sum  += fabs(diag.predicted_psnr - diag.actual_psnr);
+                    double a = diag.actual_psnr, p = diag.predicted_psnr;
+                    mape_p_sum += fabs(p - a) / fabs(a);
+                    mae_p_sum  += fabs(p - a);
                     mcnt_p++;
+                    r2_p_sum += a; r2_p_sum2 += a*a; r2_p_ss_res += (a-p)*(a-p); r2_p_cnt++;
                 }
                 if (diag.predicted_psnr > 0.0f) {
                     psnr_pred_sum += diag.predicted_psnr;
                     psnr_pred_cnt++;
                 }
             }
-            /* Compute per-timestep MAE and R² */
-            double ts_mae_r = r2_cnt ? mae_r_sum / r2_cnt : 0.0;
-            double ts_mae_c = mcnt_c ? mae_c_sum / mcnt_c : 0.0;
-            double ts_mae_d = mcnt_d ? mae_d_sum / mcnt_d : 0.0;
+            /* Compute per-timestep MAE */
+            double ts_mae_r = r2_r_cnt ? mae_r_sum / r2_r_cnt : 0.0;
+            double ts_mae_c = r2_c_cnt ? mae_c_sum / r2_c_cnt : 0.0;
+            double ts_mae_d = r2_d_cnt ? mae_d_sum / r2_d_cnt : 0.0;
+
+            /* Compute R² = 1 - SS_res/SS_tot where SS_tot = Σ(x²) - (Σx)²/n */
+            auto compute_r2 = [](double sum, double sum2, double ss_res, int n) -> double {
+                if (n < 2) return 0.0;
+                double ss_tot = sum2 - (sum * sum) / n;
+                if (ss_tot < 1e-12) return 0.0;
+                return 1.0 - ss_res / ss_tot;
+            };
+            double r2_ratio    = compute_r2(r2_r_sum, r2_r_sum2, r2_r_ss_res, r2_r_cnt);
+            double r2_comp     = compute_r2(r2_c_sum, r2_c_sum2, r2_c_ss_res, r2_c_cnt);
+            double r2_decomp   = compute_r2(r2_d_sum, r2_d_sum2, r2_d_ss_res, r2_d_cnt);
+            double r2_psnr     = compute_r2(r2_p_sum, r2_p_sum2, r2_p_ss_res, r2_p_cnt);
             double real_mape_r = fmin(200.0, mcnt_r ? (mape_r_sum / mcnt_r) * 100.0 : 0.0);
             double real_mape_c = fmin(200.0, mcnt_c ? (mape_c_sum / mcnt_c) * 100.0 : 0.0);
             double real_mape_d = fmin(200.0, mcnt_d ? (mape_d_sum / mcnt_d) * 100.0 : 0.0);
@@ -1601,7 +1646,8 @@ begin_diagnostics {
                         "%.2f,%.2f,%.2f,%.2f,"
                         "%.2f,%.2f,"
                         "%.2f,%.2f,%.6e,%.6e,%.4f,"
-                        "%.2f\n",
+                        "%.2f,"
+                        "%.4f,%.4f,%.4f,%.4f\n",
                         rank(), display_name, t, (int)step(), write_ms_t, read_ms_t, ratio_t,
                         real_mape_r, real_mape_c, real_mape_d,
                         sgd_t, expl_t, n_hist,
@@ -1616,7 +1662,8 @@ begin_diagnostics {
                         vol_setup, vol_total,
                         psnr_db, psnr_predicted,
                         rmse, max_abs_err, bit_rate,
-                        real_mape_p);
+                        real_mape_p,
+                        r2_ratio, r2_comp, r2_decomp, r2_psnr);
                 fflush(global->ts_csv);
             }
 
