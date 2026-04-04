@@ -239,15 +239,15 @@ def main():
 
     plot_regret_vs_timestep(
         regret_data,
-        os.path.join(results_dir, "regret_vs_timestep.pdf"))
+        os.path.join(results_dir, "regret_vs_timestep.png"))
 
     plot_comp_mape_vs_timestep(
         comp_mape_data,
-        os.path.join(results_dir, "comp_mape_vs_timestep.pdf"))
+        os.path.join(results_dir, "comp_mape_vs_timestep.png"))
 
     plot_avg_mape_bar(
         bar_data,
-        os.path.join(results_dir, "avg_mape_per_dataset.pdf"))
+        os.path.join(results_dir, "avg_mape_per_dataset.png"))
 
     print(f"\nAll plots saved to: {results_dir}")
 

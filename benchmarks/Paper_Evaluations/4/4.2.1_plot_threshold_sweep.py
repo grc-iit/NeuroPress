@@ -82,7 +82,7 @@ def collect_data(sweep_dir):
     found = 0
     for i, x1 in enumerate(X1_VALUES):
         for j, delta in enumerate(DELTA_VALUES):
-            run_dir = os.path.join(sweep_dir, f"x1_{x1}_delta_{delta}")
+            run_dir = os.path.join(sweep_dir, f"x1_{x1:.2f}_delta_{delta:.2f}")
             summary_path = os.path.join(run_dir, f"benchmark_{DATASET_NAME}.csv")
             ranking_path = os.path.join(run_dir, f"benchmark_{DATASET_NAME}_ranking.csv")
 
@@ -139,7 +139,7 @@ def plot_3d_bars(data, title, zlabel, filename, cmap_name="viridis",
     dz_plot = np.where(valid, dz, 0)
 
     # Color by value
-    cmap = cm.get_cmap(cmap_name)
+    cmap = plt.colormaps.get_cmap(cmap_name)
     valid_vals = dz[valid]
     if len(valid_vals) > 0:
         vmin, vmax = valid_vals.min(), valid_vals.max()
@@ -181,8 +181,7 @@ def main():
         sweep_dir = sys.argv[1]
     else:
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        sweep_dir = os.path.join(script_dir, "..", "sdrbench", "results",
-                                 "threshold_sweep")
+        sweep_dir = os.path.join(script_dir, "results", "threshold_sweep")
 
     if not os.path.isdir(sweep_dir):
         print(f"ERROR: sweep directory not found: {sweep_dir}")
@@ -198,7 +197,7 @@ def main():
         regret,
         "Average Selection Regret vs Thresholds",
         "Regret (1.0 = optimal)",
-        os.path.join(out_dir, "threshold_sweep_regret.pdf"),
+        os.path.join(out_dir, "threshold_sweep_regret.png"),
         cmap_name="RdYlGn_r",
     )
 
@@ -206,7 +205,7 @@ def main():
         mape,
         "Average MAPE vs Thresholds",
         "MAPE (%)",
-        os.path.join(out_dir, "threshold_sweep_mape.pdf"),
+        os.path.join(out_dir, "threshold_sweep_mape.png"),
         cmap_name="RdYlGn_r",
     )
 
@@ -214,7 +213,7 @@ def main():
         write_bw,
         "Write Bandwidth vs Thresholds",
         "Write BW (MiB/s)",
-        os.path.join(out_dir, "threshold_sweep_write_bw.pdf"),
+        os.path.join(out_dir, "threshold_sweep_write_bw.png"),
         cmap_name="viridis",
     )
 
@@ -222,7 +221,7 @@ def main():
         read_bw,
         "Read Bandwidth vs Thresholds",
         "Read BW (MiB/s)",
-        os.path.join(out_dir, "threshold_sweep_read_bw.pdf"),
+        os.path.join(out_dir, "threshold_sweep_read_bw.png"),
         cmap_name="viridis",
     )
 

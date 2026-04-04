@@ -22,7 +22,7 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-GPU_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+GPU_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 # ── Fixed parameters ──
 WEIGHTS="$GPU_DIR/neural_net/weights/model.nnwt"
@@ -36,7 +36,7 @@ EXPLORE_K=${EXPLORE_K:-4}
 SGD_LR=${SGD_LR:-0.2}
 DRY_RUN=${DRY_RUN:-0}
 
-SWEEP_DIR="$GPU_DIR/benchmarks/sdrbench/results/threshold_sweep"
+SWEEP_DIR="$SCRIPT_DIR/results/threshold_sweep"
 
 # ── Validate ──
 if [ ! -f "$BIN" ]; then
