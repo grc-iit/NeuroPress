@@ -602,7 +602,7 @@ typedef struct {
     float  sgd_update_ms;        /* SGD weight update (0 if not fired)    */
 
     /* Per-chunk ratio and prediction accuracy */
-    float  actual_ratio;         /* input_size / compressed_size          */
+    float  actual_ratio;         /* input_size / primary_compressed_size (NN's pick, for MAPE) */
     float  predicted_ratio;      /* NN-predicted ratio (0 if not AUTO)    */
     float  predicted_comp_time;  /* NN-predicted compression time ms      */
     float  predicted_decomp_time;/* NN-predicted decompression time ms    */
@@ -663,6 +663,11 @@ typedef struct {
     float  vol_pool_acquire_ms;   /* Stage 2: pinned buffer pool acquire wait   */
     float  vol_d2h_copy_ms;       /* Stage 2: compressed chunk D→H cudaMemcpy   */
     float  vol_io_queue_wait_ms;  /* Stage 2: I/O queue backpressure wait       */
+
+    /* Final ratio after exploration (may differ from actual_ratio when
+     * exploration swaps in a better algorithm). Reflects what was actually
+     * written to disk. Equals actual_ratio when exploration did not fire. */
+    float  final_ratio;
 } gpucompress_chunk_diag_t;
 
 /**

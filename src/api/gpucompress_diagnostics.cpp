@@ -130,9 +130,14 @@ int recordChunkDiagnostic(const ChunkDiagInput& d)
         h->compression_ms_raw   = d.compression_ms_raw;
         h->exploration_ms        = d.exploration_ms;
         h->sgd_update_ms         = d.sgd_ms;
-        size_t comp_sz = (d.primary_compressed_size > 0) ? d.primary_compressed_size : d.compressed_size;
-        h->actual_ratio          = (comp_sz > 0)
-            ? std::min(100.0f, static_cast<float>(d.input_size) / static_cast<float>(comp_sz))
+        /* actual_ratio: uses primary compressed size (NN's pick) for fair MAPE reporting */
+        size_t primary_sz = (d.primary_compressed_size > 0) ? d.primary_compressed_size : d.compressed_size;
+        h->actual_ratio          = (primary_sz > 0)
+            ? std::min(100.0f, static_cast<float>(d.input_size) / static_cast<float>(primary_sz))
+            : 0.0f;
+        /* final_ratio: uses post-exploration compressed size (what was written to disk) */
+        h->final_ratio           = (d.compressed_size > 0)
+            ? std::min(100.0f, static_cast<float>(d.input_size) / static_cast<float>(d.compressed_size))
             : 0.0f;
         h->predicted_ratio       = d.predicted_ratio;
         h->predicted_comp_time   = d.predicted_comp_time;
@@ -219,7 +224,8 @@ int recordChunkDiagnostic(const ChunkDiagInput& d)
                         (double)h->orig_actual_ratio,
                         (double)h->orig_comp_ms,
                         (double)h->orig_cost);
-                fprintf(stderr, "             final: ratio=%.2f ct=%.3f cost=%.3f\n",
+                fprintf(stderr, "             final: ratio=%.2f (primary=%.2f) ct=%.3f cost=%.3f\n",
+                        (double)h->final_ratio,
                         (double)h->actual_ratio,
                         (double)h->compression_ms,
                         (double)h->actual_cost);

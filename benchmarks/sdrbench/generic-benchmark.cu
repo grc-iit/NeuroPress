@@ -1121,7 +1121,7 @@ static void write_chunk_csv(const char *phase_name)
 
     if (!append) {
         fprintf(f, "phase,chunk,action,"
-                "predicted_ratio,actual_ratio,"
+                "predicted_ratio,actual_ratio,final_ratio,"
                 "predicted_comp_ms,actual_comp_ms_raw,"
                 "predicted_decomp_ms,actual_decomp_ms_raw,"
                 "mape_ratio,mape_comp,mape_decomp,"
@@ -1141,11 +1141,11 @@ static void write_chunk_csv(const char *phase_name)
         if (diag.decompression_ms > 0)
             md = fmin(200.0, fabs(diag.predicted_decomp_time - diag.decompression_ms) / fabs(diag.decompression_ms) * 100.0);
 
-        fprintf(f, "%s,%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
+        fprintf(f, "%s,%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
                 "%.2f,%.2f,%.2f,%d,%d,"
                 "%.4f,%.6f,%.6f\n",
                 phase_name, ci, diag.nn_action,
-                diag.predicted_ratio, diag.actual_ratio,
+                diag.predicted_ratio, diag.actual_ratio, diag.final_ratio,
                 diag.predicted_comp_time, diag.compression_ms_raw,
                 diag.predicted_decomp_time, diag.decompression_ms_raw,
                 mr, mc, md,
@@ -1669,7 +1669,7 @@ int main(int argc, char **argv)
         FILE *tc_csv = fopen(OUT_TSTEP_CHUNKS, "w");
         if (tc_csv) {
             fprintf(tc_csv, "rank,phase,field_idx,field_name,chunk,action,action_orig,"
-                    "predicted_ratio,actual_ratio,"
+                    "predicted_ratio,actual_ratio,final_ratio,"
                     "predicted_comp_ms,actual_comp_ms_raw,"
                     "predicted_decomp_ms,actual_decomp_ms_raw,"
                     "mape_ratio,mape_comp,mape_decomp,"
@@ -1932,11 +1932,11 @@ int main(int argc, char **argv)
                         if (d.decompression_ms > 0 && d.predicted_decomp_time > 0)
                             md = fmin(fabs(d.predicted_decomp_time-d.decompression_ms)/fabs(d.decompression_ms)*100.0, 200.0);
                         fprintf(tc_csv, "%d,%s,%d,%s,%d,%d,%d,"
-                                "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
+                                "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
                                 "%.2f,%.2f,%.2f,"
                                 "%d,%d,%.4f,%.6f,%.6f\n",
                                 g_mpi_rank, phase_name, fi, fname, ci, d.nn_action, d.nn_original_action,
-                                d.predicted_ratio, d.actual_ratio,
+                                d.predicted_ratio, d.actual_ratio, d.final_ratio,
                                 d.predicted_comp_time, d.compression_ms_raw,
                                 d.predicted_decomp_time, d.decompression_ms_raw,
                                 mr, mc, md,

@@ -33,7 +33,7 @@ DELTA_VALUES = [0.05, 0.10, 0.20, 0.30, 0.50, 1.00, 10.00]
 X1_LABELS = ["5%", "10%", "20%", "30%", "50%", "100%", "1000%"]
 DELTA_LABELS = ["5%", "10%", "20%", "30%", "50%", "100%", "1000%"]
 
-DATASET_NAME = "hurricane_isabel"
+DATASET_NAME = None  # auto-detected from first run directory
 
 
 def read_summary_csv(path):
@@ -69,8 +69,28 @@ def read_ranking_csv(path):
     return np.mean(regrets) if regrets else None
 
 
+def detect_dataset_name(sweep_dir):
+    """Auto-detect dataset name from the first run directory."""
+    import glob as _glob
+    for x1 in X1_VALUES:
+        for delta in DELTA_VALUES:
+            run_dir = os.path.join(sweep_dir, f"x1_{x1:.2f}_delta_{delta:.2f}")
+            csvs = _glob.glob(os.path.join(run_dir, "benchmark_*.csv"))
+            for c in csvs:
+                bn = os.path.basename(c)
+                if "_ranking" not in bn and "_timestep" not in bn and "_chunks" not in bn:
+                    name = bn.replace("benchmark_", "").replace(".csv", "")
+                    return name
+    return "hurricane_isabel"  # fallback
+
+
 def collect_data(sweep_dir):
     """Collect metrics for all (X1, delta) pairs."""
+    global DATASET_NAME
+    if DATASET_NAME is None:
+        DATASET_NAME = detect_dataset_name(sweep_dir)
+        print(f"  Auto-detected dataset: {DATASET_NAME}")
+
     n_x1 = len(X1_VALUES)
     n_delta = len(DELTA_VALUES)
 

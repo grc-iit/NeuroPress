@@ -927,6 +927,7 @@ begin_diagnostics {
                             double sum_file_sz;
                             double sum_stats_ms, sum_nn_ms, sum_preproc_ms;
                             double sum_comp_ms, sum_decomp_ms, sum_explore_ms, sum_sgd_ms;
+                            double sum_comp_ms_sq, sum_decomp_ms_sq;  /* for gbps std */
                             double sum_mae_r, sum_mae_c, sum_mae_d, sum_mae_p;
                             double sum_vs1, sum_vs2, sum_vs3;
                             double sum_vs2_busy, sum_vs3_busy;
@@ -1028,7 +1029,9 @@ begin_diagnostics {
                                             pa[pi].sum_nn_ms      += t_nn;
                                             pa[pi].sum_preproc_ms += t_pre;
                                             pa[pi].sum_comp_ms    += t_comp;
+                                            pa[pi].sum_comp_ms_sq += t_comp * t_comp;
                                             pa[pi].sum_decomp_ms  += t_dec;
+                                            pa[pi].sum_decomp_ms_sq += t_dec * t_dec;
                                             pa[pi].sum_explore_ms += t_expl;
                                             pa[pi].sum_sgd_ms     += t_sgd;
                                         }
@@ -1102,6 +1105,17 @@ begin_diagnostics {
                                 ? orig_bytes / 1e9 / (avg_comp_ms / 1000.0) : 0.0;
                             double dgbps = (avg_decomp_ms > 0)
                                 ? orig_bytes / 1e9 / (avg_decomp_ms / 1000.0) : 0.0;
+                            /* Throughput std-dev from per-timestep comp/decomp ms */
+                            double cgbps_std = 0.0, dgbps_std = 0.0;
+                            if (n > 1) {
+                                double var_c = pa[pi].sum_comp_ms_sq / n - avg_comp_ms * avg_comp_ms;
+                                double var_d = pa[pi].sum_decomp_ms_sq / n - avg_decomp_ms * avg_decomp_ms;
+                                /* Convert ms std to gbps std via delta method: gbps = B/ms, d(gbps)/d(ms) = -B/ms^2 */
+                                if (avg_comp_ms > 0 && var_c > 0)
+                                    cgbps_std = cgbps * sqrt(var_c) / avg_comp_ms;
+                                if (avg_decomp_ms > 0 && var_d > 0)
+                                    dgbps_std = dgbps * sqrt(var_d) / avg_decomp_ms;
+                            }
                             fprintf(agg, "%d,vpic,%s,%d,%.2f,%.2f,%.2f,%.2f,"
                                          "%.2f,%.2f,%.4f,"
                                          "%.1f,%.1f,0,%.0f,%.0f,%d,"
@@ -1110,7 +1124,7 @@ begin_diagnostics {
                                          "%.2f,%.2f,%.2f,%.2f,"
                                          "%.4f,%.4f,%.4f,%.4f,"
                                          "%.4f,%.4f,%.4f,%.4f,"
-                                         "0.0000,0.0000,"
+                                         "%.4f,%.4f,"
                                          "%.2f,%.2f,%.2f,%.2f,%.2f,"
                                          "%.2f,%.6e,%.6e,%.6e,%.8f,%.4f\n",
                                     rank(), pnames[pi], n, avg_wr, wr_std, avg_rd, rd_std,
@@ -1127,6 +1141,7 @@ begin_diagnostics {
                                     pa[pi].sum_mae_d / n, pa[pi].sum_mae_p / n,
                                     pa[pi].sum_r2_ratio / n, pa[pi].sum_r2_comp / n,
                                     pa[pi].sum_r2_decomp / n, pa[pi].sum_r2_psnr / n,
+                                    cgbps_std, dgbps_std,
                                     pa[pi].sum_vs1 / n, pa[pi].sum_vs2 / n, pa[pi].sum_vs3 / n,
                                     pa[pi].sum_vs2_busy / n, pa[pi].sum_vs3_busy / n,
                                     (pa[pi].psnr_count > 0 && pa[pi].sum_mse > 0.0
@@ -1222,12 +1237,20 @@ begin_diagnostics {
                             ei, ei, ei, ei);
                 fprintf(global->tc_csv, ",feat_entropy,feat_mad,feat_deriv\n");
             }
-            global->ranking_csv = fopen(RANKING_CSV, "w");
-            if (global->ranking_csv)
-                vpic_write_ranking_csv_header(global->ranking_csv);
-            global->ranking_costs_csv = fopen(RANKING_COSTS_CSV, "w");
-            if (global->ranking_costs_csv)
-                vpic_write_ranking_costs_csv_header(global->ranking_costs_csv);
+            { const char* nr = getenv("VPIC_NO_RANKING");
+              if (nr && atoi(nr)) {
+                  sim_log("  [VPIC_NO_RANKING=1] Kendall tau ranking profiler disabled.");
+                  global->ranking_csv = NULL;
+                  global->ranking_costs_csv = NULL;
+              } else {
+                  global->ranking_csv = fopen(RANKING_CSV, "w");
+                  if (global->ranking_csv)
+                      vpic_write_ranking_csv_header(global->ranking_csv);
+                  global->ranking_costs_csv = fopen(RANKING_COSTS_CSV, "w");
+                  if (global->ranking_costs_csv)
+                      vpic_write_ranking_costs_csv_header(global->ranking_costs_csv);
+              }
+            }
 
             /* Reload pretrained weights and create per-(NN-phase × policy) GPU snapshots.
              * With N policies and 3 NN base phases, we allocate N*3 snapshots.
