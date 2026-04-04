@@ -49,7 +49,7 @@ GRAY-SCOTT (GPU reaction-diffusion simulation)
 
 VPIC (GPU plasma particle-in-cell simulation)
   VPIC_NX             [auto]                     Grid size NX ((NX+2)^3 * 64 bytes)
-  VPIC_NPPC           [2]                        Particles per cell
+  VPIC_NPPC           [10]                       Particles per cell
   VPIC_WARMUP_STEPS   [500]                      Simulation steps before benchmarking
   VPIC_SIM_INTERVAL   [190]                      Simulation steps between benchmark writes
   VPIC_MI_ME          [5]                        Ion/electron mass ratio (lower=faster)
@@ -323,7 +323,7 @@ PARAMS
 VPIC:
   NX:               ${VPIC_NX}
   Data (MB):        ${VPIC_DATA}
-  NPPC:             ${VPIC_NPPC:-2}
+  NPPC:             ${VPIC_NPPC:-10}
   MI_ME:            ${VPIC_MI_ME:-5}
   WPE_WCE:          ${VPIC_WPE_WCE:-1}
   TI_TE:            ${VPIC_TI_TE:-5}
@@ -514,7 +514,7 @@ for bench in "${BENCH_LIST[@]}"; do
             VPIC_MI_ME=${VPIC_MI_ME:-5}
             VPIC_WPE_WCE=${VPIC_WPE_WCE:-1}
             VPIC_TI_TE=${VPIC_TI_TE:-5}
-            VPIC_NPPC=${VPIC_NPPC:-2}
+            VPIC_NPPC=${VPIC_NPPC:-10}
             VPIC_WARMUP=${VPIC_WARMUP_STEPS:-500}
             VPIC_SIM_INT=${VPIC_SIM_INTERVAL:-190}
 
@@ -643,7 +643,7 @@ for bench in "${BENCH_LIST[@]}"; do
 
                     # Header + fixed rows (no "/" in phase) + this policy's NN rows (strip suffix)
                     # Phase column: $2 for timesteps/chunks (rank,$2,...), $1 for ranking (phase,$2,...)
-                    local _phase_col=2
+                    _phase_col=2
                     case "$csv_base" in
                         *ranking*) _phase_col=1 ;;
                     esac

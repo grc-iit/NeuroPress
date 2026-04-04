@@ -78,9 +78,13 @@ echo "  Started   : $(date)"
 echo "============================================================"
 echo ""
 
-# Clean previous results (exact match only — don't delete other configs)
+# Back up previous results if they exist, then create fresh directory
 _RESULT_DIR="benchmarks/vpic-kokkos/results/eval_NX${_VPIC_NX}_chunk${_CHUNK_MB}mb_ts${_TIMESTEPS}${_VERIFY_TAG}${_LOSSY_TAG}"
-rm -rf "$_RESULT_DIR"
+if [ -d "$_RESULT_DIR" ]; then
+    _BACKUP="${_RESULT_DIR}_backup_$(date +%Y%m%d_%H%M%S)"
+    mv "$_RESULT_DIR" "$_BACKUP"
+    echo "  Backed up previous results -> $_BACKUP"
+fi
 
 # Run benchmark
 MPI_NP=$_MPI_NP \

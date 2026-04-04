@@ -43,14 +43,14 @@ echo ""
 
 # ── Run 1: Lossless ──
 echo ">>> [1/2] Lossless test starting..."
-MPI_NP=4 GPUS_PER_NODE=2 VPIC_NX=200 CHUNK_MB=4 TIMESTEPS=100 \
+MPI_NP=4 GPUS_PER_NODE=2 VPIC_NX=200 CHUNK_MB=16 TIMESTEPS=100 \
 VERIFY=1 POLICIES=balanced,ratio LOSSY=0 \
 bash scripts/run_vpic_scaling.sh
 echo ""
 
 # ── Run 2: Lossy ──
 echo ">>> [2/2] Lossy test starting..."
-MPI_NP=4 GPUS_PER_NODE=2 VPIC_NX=200 CHUNK_MB=4 TIMESTEPS=100 \
+MPI_NP=4 GPUS_PER_NODE=2 VPIC_NX=200 CHUNK_MB=16 TIMESTEPS=100 \
 VERIFY=1 POLICIES=balanced,ratio LOSSY=0.01 \
 bash scripts/run_vpic_scaling.sh
 
@@ -63,9 +63,9 @@ echo "  Total wall time: ${_total_elapsed}s ($((_total_elapsed/60))m $((_total_e
 echo "  Finished: $(date)"
 echo ""
 echo "  Lossless results:"
-ls -d benchmarks/vpic-kokkos/results/eval_NX200_chunk4mb_ts100/ 2>/dev/null
+ls -d benchmarks/vpic-kokkos/results/eval_NX200_chunk16mb_ts100/ 2>/dev/null
 echo "  Lossy results:"
-ls -d benchmarks/vpic-kokkos/results/eval_NX200_chunk4mb_ts100_lossy0.01/ 2>/dev/null
+ls -d benchmarks/vpic-kokkos/results/eval_NX200_chunk16mb_ts100_lossy0.01/ 2>/dev/null
 echo "============================================================"
 
 # Cleanup hostfile

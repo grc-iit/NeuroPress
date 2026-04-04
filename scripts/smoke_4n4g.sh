@@ -40,7 +40,7 @@ echo "  Started: $(date)"
 echo "============================================================"
 echo ""
 
-MPI_NP=16 GPUS_PER_NODE=4 VPIC_NX=160 CHUNK_MB=16 TIMESTEPS=7 \
+MPI_NP=16 GPUS_PER_NODE=4 VPIC_NX=160 CHUNK_MB=16 TIMESTEPS=10 \
 VERIFY=1 POLICIES=balanced,ratio LOSSY=0 \
 bash scripts/run_vpic_scaling.sh
 

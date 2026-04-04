@@ -448,11 +448,11 @@ begin_initialization {
     double ny   = grid_n;
     double nz   = grid_n;
     const char* env_nppc = getenv("VPIC_NPPC");
-    double nppc = env_nppc ? atof(env_nppc) : 2;
+    double nppc = env_nppc ? atof(env_nppc) : 10;
 
     double damp      = 0.001;
-    double cfl_req   = 0.99;
-    double wpedt_max = 0.36;
+    double cfl_req   = 0.70;
+    double wpedt_max = 0.20;
 
     double mi   = me*mi_me;
     double kTe  = me*c*c/(2*wpe_wce*wpe_wce*(1+Ti_Te));
@@ -562,13 +562,13 @@ begin_initialization {
     // With sim_interval=10 and timesteps=50: 500 additional sim steps between writes
     num_step        = warmup + 1 + timesteps * sim_interval;
     status_interval = 50;
-    // Divergence cleaning disabled: saves ~46 kernel launches on cleaning steps.
-    // For compression benchmarking, divergence error is irrelevant.
-    clean_div_e_interval = 0;
-    clean_div_b_interval = 0;
+    // Divergence cleaning: prevents charge/field error buildup that causes
+    // unphysical particle acceleration on multi-node runs.
+    clean_div_e_interval = 200;
+    clean_div_b_interval = 200;
     // Single-process needs only 1 comm round (default 3 in vpic.cc).
     // Multi-rank runs need 3 rounds for particles crossing multiple boundaries.
-    num_comm_round = (nproc() <= 1) ? 1 : 3;
+    num_comm_round = (nproc() <= 1) ? 1 : 6;
 
     global->sim_steps       = warmup;
     global->timesteps       = timesteps;
@@ -634,8 +634,12 @@ begin_initialization {
 
     // sort_interval: disabled for benchmark (saves ~20ms on sort steps).
     // Cache degradation is negligible for short runs (<500 steps).
-    species_t* ion      = define_species("ion",       ec, mi, 1.5*Ni/nproc(), -1, 0, 1);
-    species_t* electron = define_species("electron", -ec, me, 1.5*Ne/nproc(), -1, 0, 1);
+    // max_nm: default (-1) = 8% of max_np, too small for multi-node reconnection.
+    // Use 20% for 16+ rank runs where particle jets cause heavy boundary crossing.
+    int max_np_local = (int)(1.5*Ni/nproc());
+    int max_nm_local = (nproc() > 4) ? max_np_local / 5 : -1;  // 20% or default
+    species_t* ion      = define_species("ion",       ec, mi, max_np_local, max_nm_local, 0, 1);
+    species_t* electron = define_species("electron", -ec, me, max_np_local, max_nm_local, 0, 1);
 
     // Load fields (Harris current sheet + perturbation + guide field)
     //
@@ -649,7 +653,7 @@ begin_initialization {
     //   0.2-0.5 produces 3D magnetic islands and flux ropes
     const char* env_pert  = getenv("VPIC_PERTURBATION");
     const char* env_guide = getenv("VPIC_GUIDE_FIELD");
-    double pert_amp  = env_pert  ? atof(env_pert)  : 0.1;   // fraction of b0
+    double pert_amp  = env_pert  ? atof(env_pert)  : 0.05;  // fraction of b0
     double guide_fld = env_guide ? atof(env_guide) : 0.0;   // fraction of b0
 
     set_region_field(everywhere,
