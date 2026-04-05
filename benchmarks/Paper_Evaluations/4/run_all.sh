@@ -32,12 +32,20 @@ echo ">>> 4.2.1 RL Adaptiveness on Unseen Workloads"
 bash "$SCRIPT_DIR/4.2.1_eval_rl_adaptiveness.sh"
 python3 "$SCRIPT_DIR/4.2.1_plot_rl_adaptiveness.py" "$SCRIPT_DIR/results/rl_adaptiveness_${POLICY}_${EB_TAG}_lr${SGD_LR}"
 
+# 4.2.1 VPIC Threshold Sweep (~12 min)
+echo ""
+echo ">>> 4.2.1 VPIC Threshold Sweep"
+VPIC_ERROR_BOUND=$ERROR_BOUND bash "$SCRIPT_DIR/4.2.1_eval_vpic_threshold_sweep.sh"
+python3 "$SCRIPT_DIR/4.2.1_plot_threshold_sweep.py" "$SCRIPT_DIR/results/vpic_threshold_sweep_${POLICY}_${EB_TAG}_lr${SGD_LR}"
+
+# 4.2.1 VPIC RL Adaptiveness (~5 min)
+echo ""
+echo ">>> 4.2.1 VPIC RL Adaptiveness"
+VPIC_ERROR_BOUND=$ERROR_BOUND bash "$SCRIPT_DIR/4.2.1_eval_vpic_adaptiveness.sh"
+python3 "$SCRIPT_DIR/4.2.1_plot_rl_adaptiveness.py" "$SCRIPT_DIR/results/vpic_adaptiveness_${POLICY}_${EB_TAG}_lr${SGD_LR}"
+
 # 4.2.1 AI Workload Adaptiveness (~30 min) — run separately:
 #   bash benchmarks/Paper_Evaluations/4/4.2.1_eval_ai_workloads.sh
-# echo ""
-# echo ">>> 4.2.1 RL Adaptiveness on AI Training Workloads"
-# bash "$SCRIPT_DIR/4.2.1_eval_ai_workloads.sh"
-# python3 "$SCRIPT_DIR/4.2.1_plot_rl_adaptiveness.py" "$SCRIPT_DIR/results/ai_workloads_${AI_MODEL:-vit_b_16}_${POLICY}_lr${SGD_LR}"
 
 echo ""
 echo "============================================================"

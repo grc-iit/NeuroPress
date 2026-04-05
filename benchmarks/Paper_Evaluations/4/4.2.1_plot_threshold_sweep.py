@@ -95,7 +95,10 @@ def collect_data(sweep_dir):
     n_delta = len(DELTA_VALUES)
 
     regret = np.full((n_x1, n_delta), np.nan)
-    mape = np.full((n_x1, n_delta), np.nan)
+    mape_ratio = np.full((n_x1, n_delta), np.nan)
+    mape_comp = np.full((n_x1, n_delta), np.nan)
+    mape_decomp = np.full((n_x1, n_delta), np.nan)
+    mape_psnr = np.full((n_x1, n_delta), np.nan)
     write_bw = np.full((n_x1, n_delta), np.nan)
     read_bw = np.full((n_x1, n_delta), np.nan)
     explorations = np.full((n_x1, n_delta), np.nan)
@@ -111,12 +114,12 @@ def collect_data(sweep_dir):
             row = read_summary_csv(summary_path)
             if row:
                 found += 1
-                # MAPE: average of ratio, comp, decomp
+                # Per-statistic MAPE
                 try:
-                    mape_r = float(row.get("mape_ratio_pct", 0))
-                    mape_c = float(row.get("mape_comp_pct", 0))
-                    mape_d = float(row.get("mape_decomp_pct", 0))
-                    mape[i, j] = (mape_r + mape_c + mape_d) / 3.0
+                    mape_ratio[i, j] = float(row.get("mape_ratio_pct", 0))
+                    mape_comp[i, j] = float(row.get("mape_comp_pct", 0))
+                    mape_decomp[i, j] = float(row.get("mape_decomp_pct", 0))
+                    mape_psnr[i, j] = float(row.get("mape_psnr_pct", 0))
                 except (ValueError, TypeError):
                     pass
 
@@ -131,15 +134,26 @@ def collect_data(sweep_dir):
                 except (ValueError, TypeError):
                     pass
 
-                # Exploration and SGD counts
-                try:
-                    explorations[i, j] = float(row.get("explorations", 0))
-                except (ValueError, TypeError):
-                    pass
-                try:
-                    sgd_fires[i, j] = float(row.get("sgd_fires", 0))
-                except (ValueError, TypeError):
-                    pass
+                # Exploration and SGD counts — sum from per-timestep CSV for totals
+                # (aggregate CSV reports averages which hide early-timestep activity)
+                ts_path = os.path.join(run_dir, f"benchmark_{DATASET_NAME}_timesteps.csv")
+                if os.path.isfile(ts_path):
+                    tot_expl, tot_sgd = 0, 0
+                    with open(ts_path, "r") as tf:
+                        for tr in csv.DictReader(tf):
+                            tot_expl += int(tr.get("explorations", 0))
+                            tot_sgd += int(tr.get("sgd_fires", 0))
+                    explorations[i, j] = tot_expl
+                    sgd_fires[i, j] = tot_sgd
+                else:
+                    try:
+                        explorations[i, j] = float(row.get("explorations", 0))
+                    except (ValueError, TypeError):
+                        pass
+                    try:
+                        sgd_fires[i, j] = float(row.get("sgd_fires", 0))
+                    except (ValueError, TypeError):
+                        pass
 
             # Regret from ranking CSV
             r = read_ranking_csv(ranking_path)
@@ -147,7 +161,7 @@ def collect_data(sweep_dir):
                 regret[i, j] = r
 
     print(f"Collected data from {found}/{n_x1 * n_delta} runs")
-    return regret, mape, write_bw, read_bw, explorations, sgd_fires
+    return regret, mape_ratio, mape_comp, mape_decomp, mape_psnr, write_bw, read_bw, explorations, sgd_fires
 
 
 def plot_heatmap(data, cbar_label, filename, cmap_name="viridis",
@@ -208,7 +222,7 @@ def main():
         sys.exit(1)
 
     print(f"Reading results from: {sweep_dir}")
-    regret, mape, write_bw, read_bw, explorations, sgd_fires = collect_data(sweep_dir)
+    regret, mape_ratio, mape_comp, mape_decomp, mape_psnr, write_bw, read_bw, explorations, sgd_fires = collect_data(sweep_dir)
 
     out_dir = sweep_dir
     print(f"\nGenerating plots...")
@@ -218,13 +232,34 @@ def main():
         "Regret (1.0x = optimal)",
         os.path.join(out_dir, "threshold_sweep_regret.png"),
         cmap_name="RdYlGn_r",
-        vmin=1.0,
+        fmt="%.4f",
     )
 
     plot_heatmap(
-        mape,
-        "MAPE (%)",
-        os.path.join(out_dir, "threshold_sweep_mape.png"),
+        mape_ratio,
+        "Ratio MAPE (%)",
+        os.path.join(out_dir, "threshold_sweep_mape_ratio.png"),
+        cmap_name="RdYlGn_r",
+    )
+
+    plot_heatmap(
+        mape_comp,
+        "Comp Time MAPE (%)",
+        os.path.join(out_dir, "threshold_sweep_mape_comp.png"),
+        cmap_name="RdYlGn_r",
+    )
+
+    plot_heatmap(
+        mape_decomp,
+        "Decomp Time MAPE (%)",
+        os.path.join(out_dir, "threshold_sweep_mape_decomp.png"),
+        cmap_name="RdYlGn_r",
+    )
+
+    plot_heatmap(
+        mape_psnr,
+        "PSNR MAPE (%)",
+        os.path.join(out_dir, "threshold_sweep_mape_psnr.png"),
         cmap_name="RdYlGn_r",
     )
 
@@ -252,10 +287,15 @@ def main():
         fmt="%.0f",
     )
 
+    # Total SGD samples = Phase 1 (1 sample per fire) + Phase 2 (K samples per exploration)
+    # K=4 (EXPLORE_K default in the sweep script)
+    EXPLORE_K = 4
+    total_sgd_samples = np.where(np.isfinite(sgd_fires) & np.isfinite(explorations),
+                                 sgd_fires + explorations * EXPLORE_K, np.nan)
     plot_heatmap(
-        sgd_fires,
-        "SGD Fires",
-        os.path.join(out_dir, "threshold_sweep_sgd_fires.png"),
+        total_sgd_samples,
+        "Total SGD Training Samples",
+        os.path.join(out_dir, "threshold_sweep_total_sgd.png"),
         cmap_name="YlOrRd",
         fmt="%.0f",
     )

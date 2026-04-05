@@ -24,6 +24,7 @@ set(LIB_SOURCES
     src/gray-scott/gray_scott_gpu.cu
     src/gray-scott/gray_scott_sim.cu
     src/vpic/vpic_adapter.cu
+    src/nyx/nyx_adapter.cu
 )
 
 # Set language property for .cpp files that use CUDA

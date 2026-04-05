@@ -71,7 +71,7 @@ echo "Compiling vpic_benchmark_deck ..."
   "${VPIC_DIR}/deck/wrapper.cc" \
   "${SCRIPT_DIR}/vpic_ranking_profiler.o" \
   "${SCRIPT_DIR}/vpic_psnr.o" \
-  -o vpic_benchmark_deck.Linux \
+  -o "${SCRIPT_DIR}/vpic_benchmark_deck.Linux" \
   -Wl,-rpath,"${VPIC_BUILD}" \
   -L"${VPIC_BUILD}" -lvpic \
   -lpthread -ldl \

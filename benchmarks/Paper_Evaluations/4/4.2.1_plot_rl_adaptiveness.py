@@ -21,10 +21,13 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-DATASETS = ["nyx", "hurricane_isabel", "cesm_atm", "cesm_atm_26ts"]
-DATASET_LABELS = {"nyx": "NYX", "hurricane_isabel": "Hurricane", "cesm_atm": "CESM-ATM", "cesm_atm_26ts": "CESM-ATM-26ts"}
-DATASET_COLORS = {"nyx": "#1f77b4", "hurricane_isabel": "#ff7f0e", "cesm_atm": "#2ca02c", "cesm_atm_26ts": "#d62728"}
-DATASET_MARKERS = {"nyx": "o", "hurricane_isabel": "s", "cesm_atm": "^", "cesm_atm_26ts": "D"}
+DATASETS = ["nyx", "hurricane_isabel", "cesm_atm", "cesm_atm_26ts", "vpic_deck"]
+DATASET_LABELS = {"nyx": "NYX", "hurricane_isabel": "Hurricane", "cesm_atm": "CESM-ATM",
+                  "cesm_atm_26ts": "CESM-ATM-26ts", "vpic_deck": "VPIC"}
+DATASET_COLORS = {"nyx": "#1f77b4", "hurricane_isabel": "#ff7f0e", "cesm_atm": "#2ca02c",
+                  "cesm_atm_26ts": "#d62728", "vpic_deck": "#9467bd"}
+DATASET_MARKERS = {"nyx": "o", "hurricane_isabel": "s", "cesm_atm": "^",
+                   "cesm_atm_26ts": "D", "vpic_deck": "P"}
 
 
 def read_timestep_csv(path):
@@ -76,7 +79,7 @@ def collect_mape_by_timestep(timestep_rows):
     mape_psnr = []
     for row in timestep_rows:
         try:
-            t = int(row.get("field_idx", -1))
+            t = int(row.get("field_idx", row.get("timestep", -1)))
             mr = float(row.get("mape_ratio", 0))
             mc = float(row.get("mape_comp", 0))
             md = float(row.get("mape_decomp", 0))
@@ -120,26 +123,31 @@ def plot_regret_vs_timestep(data, out_path):
     print(f"  Saved: {out_path}")
 
 
-def plot_comp_mape_vs_timestep(data, out_path):
-    """Chart 2: Compression Time MAPE vs Timestep, one line per dataset."""
-    fig, ax = plt.subplots(figsize=(8, 5))
+def plot_all_mape_vs_timestep(data, out_path):
+    """Chart 2: All 4 MAPE metrics vs Timestep, 2x2 grid, one line per dataset."""
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8), sharex=True)
+    metric_names = ["Ratio MAPE (%)", "Comp Time MAPE (%)",
+                    "Decomp Time MAPE (%)", "PSNR MAPE (%)"]
+    metric_indices = [0, 1, 2, 3]  # indices into data[ds] tuple
 
-    for ds in DATASETS:
-        if ds not in data:
-            continue
-        ts, mape_comp = data[ds]
-        if not ts:
-            continue
-        ax.plot(ts, mape_comp,
-                color=DATASET_COLORS[ds],
-                marker=DATASET_MARKERS[ds],
-                markersize=5, linewidth=1.5,
-                label=DATASET_LABELS[ds])
+    for ax, name, idx in zip(axes.flat, metric_names, metric_indices):
+        for ds in DATASETS:
+            if ds not in data:
+                continue
+            ts, values = data[ds][0], data[ds][idx + 1]  # data[ds] = (ts, ratio, comp, decomp, psnr)
+            if not ts:
+                continue
+            ax.plot(ts, values,
+                    color=DATASET_COLORS[ds],
+                    marker=DATASET_MARKERS[ds],
+                    markersize=4, linewidth=1.2,
+                    label=DATASET_LABELS[ds])
+        ax.set_ylabel(name, fontsize=10)
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8)
 
-    ax.set_xlabel("Timestep (field index)", fontsize=11)
-    ax.set_ylabel("Compression Time MAPE (%)", fontsize=11)
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3)
+    axes[1, 0].set_xlabel("Timestep (field index)", fontsize=11)
+    axes[1, 1].set_xlabel("Timestep (field index)", fontsize=11)
 
     plt.tight_layout()
     plt.savefig(out_path, dpi=200, bbox_inches="tight")
@@ -253,9 +261,17 @@ def main():
         ts_path = os.path.join(ds_dir, f"benchmark_{ds}_timesteps.csv")
         rank_path = os.path.join(ds_dir, f"benchmark_{ds}_ranking.csv")
 
+        # Also check flat layout (VPIC results live directly in results_dir)
         if not os.path.isdir(ds_dir):
-            print(f"  [{ds}] Not found, skipping.")
-            continue
+            flat_ts = os.path.join(results_dir, f"benchmark_{ds}_timesteps.csv")
+            flat_rank = os.path.join(results_dir, f"benchmark_{ds}_ranking.csv")
+            if os.path.isfile(flat_ts) or os.path.isfile(flat_rank):
+                ds_dir = results_dir
+                ts_path = flat_ts
+                rank_path = flat_rank
+            else:
+                print(f"  [{ds}] Not found, skipping.")
+                continue
 
         # Regret from ranking CSV
         ranking_rows = read_ranking_csv(rank_path)
@@ -280,7 +296,7 @@ def main():
         ts_rows = read_timestep_csv(ts_path)
         if ts_rows:
             ts_list, mr, mc, md, mp = collect_mape_by_timestep(ts_rows)
-            comp_mape_data[ds] = (ts_list, mc)
+            comp_mape_data[ds] = (ts_list, mr, mc, md, mp)
             bar_data[ds] = (mr, mc, md, mp)
             print(f"  [{ds}] Timesteps: {len(ts_rows)} rows")
         else:
@@ -297,9 +313,9 @@ def main():
         regret_data,
         os.path.join(results_dir, "regret_vs_timestep.png"))
 
-    plot_comp_mape_vs_timestep(
+    plot_all_mape_vs_timestep(
         comp_mape_data,
-        os.path.join(results_dir, "comp_mape_vs_timestep.png"))
+        os.path.join(results_dir, "all_mape_vs_timestep.png"))
 
     plot_avg_mape_bar(
         bar_data,

@@ -427,12 +427,12 @@ begin_initialization {
     const char* env_mime   = getenv("VPIC_MI_ME");
     const char* env_wpewce = getenv("VPIC_WPE_WCE");
     const char* env_tite   = getenv("VPIC_TI_TE");
-    // Fast reconnection defaults: visible structure in ~500 steps.
-    // Original slow defaults (mi_me=25, wpe_wce=3, Ti_Te=1) need ~20K steps.
-    double mi_me   = env_mime   ? atof(env_mime)   : 5;
+    // Original physics defaults (more diverse data, noisier fields).
+    // For fast reconnection (~500 steps), use VPIC_MI_ME=5 VPIC_WPE_WCE=1 VPIC_TI_TE=5.
+    double mi_me   = env_mime   ? atof(env_mime)   : 25;
     double rhoi_L  = 1;
-    double Ti_Te   = env_tite   ? atof(env_tite)   : 5;
-    double wpe_wce = env_wpewce ? atof(env_wpewce) : 1;
+    double Ti_Te   = env_tite   ? atof(env_tite)   : 1;
+    double wpe_wce = env_wpewce ? atof(env_wpewce) : 3;
 
     // Grid size configurable via VPIC_NX env var (default 200 ≈ 512 MB)
     // Field data = (nx+2)^3 * 16 * 4 bytes
@@ -448,11 +448,11 @@ begin_initialization {
     double ny   = grid_n;
     double nz   = grid_n;
     const char* env_nppc = getenv("VPIC_NPPC");
-    double nppc = env_nppc ? atof(env_nppc) : 10;
+    double nppc = env_nppc ? atof(env_nppc) : 2;
 
     double damp      = 0.001;
-    double cfl_req   = 0.70;
-    double wpedt_max = 0.20;
+    double cfl_req   = 0.99;
+    double wpedt_max = 0.36;
 
     double mi   = me*mi_me;
     double kTe  = me*c*c/(2*wpe_wce*wpe_wce*(1+Ti_Te));
@@ -562,10 +562,10 @@ begin_initialization {
     // With sim_interval=10 and timesteps=50: 500 additional sim steps between writes
     num_step        = warmup + 1 + timesteps * sim_interval;
     status_interval = 50;
-    // Divergence cleaning: prevents charge/field error buildup that causes
-    // unphysical particle acceleration on multi-node runs.
-    clean_div_e_interval = 200;
-    clean_div_b_interval = 200;
+    // Divergence cleaning disabled for single-node benchmarking.
+    // Enable (=200) for multi-node runs to prevent charge/field error buildup.
+    clean_div_e_interval = 0;
+    clean_div_b_interval = 0;
     // Single-process needs only 1 comm round (default 3 in vpic.cc).
     // Multi-rank runs need 3 rounds for particles crossing multiple boundaries.
     num_comm_round = (nproc() <= 1) ? 1 : 6;
@@ -653,7 +653,7 @@ begin_initialization {
     //   0.2-0.5 produces 3D magnetic islands and flux ropes
     const char* env_pert  = getenv("VPIC_PERTURBATION");
     const char* env_guide = getenv("VPIC_GUIDE_FIELD");
-    double pert_amp  = env_pert  ? atof(env_pert)  : 0.05;  // fraction of b0
+    double pert_amp  = env_pert  ? atof(env_pert)  : 0.1;   // fraction of b0
     double guide_fld = env_guide ? atof(env_guide) : 0.0;   // fraction of b0
 
     set_region_field(everywhere,

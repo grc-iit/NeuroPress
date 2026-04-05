@@ -323,10 +323,10 @@ PARAMS
 VPIC:
   NX:               ${VPIC_NX}
   Data (MB):        ${VPIC_DATA}
-  NPPC:             ${VPIC_NPPC:-10}
-  MI_ME:            ${VPIC_MI_ME:-5}
-  WPE_WCE:          ${VPIC_WPE_WCE:-1}
-  TI_TE:            ${VPIC_TI_TE:-5}
+  NPPC:             ${VPIC_NPPC:-2}
+  MI_ME:            ${VPIC_MI_ME:-25}
+  WPE_WCE:          ${VPIC_WPE_WCE:-3}
+  TI_TE:            ${VPIC_TI_TE:-1}
   Warmup steps:     ${VPIC_WARMUP_STEPS:-500}
   Sim interval:     ${VPIC_SIM_INTERVAL:-190}
   Perturbation:     ${VPIC_PERTURBATION:-0.1}
@@ -509,12 +509,12 @@ for bench in "${BENCH_LIST[@]}"; do
             VPIC_WEIGHTS="$SCRIPT_DIR/../neural_net/weights/model.nnwt"
             VPIC_LD_PATH="/tmp/hdf5-install/lib:$SCRIPT_DIR/../build:/tmp/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
-            # VPIC physics: wpe_wce=1 + Ti_Te=5 gives best compression diversity
-            # (2x field range, highest throughput, same runtime as default)
-            VPIC_MI_ME=${VPIC_MI_ME:-5}
-            VPIC_WPE_WCE=${VPIC_WPE_WCE:-1}
-            VPIC_TI_TE=${VPIC_TI_TE:-5}
-            VPIC_NPPC=${VPIC_NPPC:-10}
+            # VPIC physics: use deck defaults (mi_me=25, wpe_wce=3, Ti_Te=1, nppc=2)
+            # for diverse data. Override via env for fast reconnection.
+            VPIC_MI_ME=${VPIC_MI_ME:-25}
+            VPIC_WPE_WCE=${VPIC_WPE_WCE:-3}
+            VPIC_TI_TE=${VPIC_TI_TE:-1}
+            VPIC_NPPC=${VPIC_NPPC:-2}
             VPIC_WARMUP=${VPIC_WARMUP_STEPS:-500}
             VPIC_SIM_INT=${VPIC_SIM_INTERVAL:-190}
 

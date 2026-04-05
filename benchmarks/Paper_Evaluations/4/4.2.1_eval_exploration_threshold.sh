@@ -129,7 +129,7 @@ for x1 in "${X1_VALUES[@]}"; do
             continue
         fi
 
-        "$BIN" "$WEIGHTS" \
+        NO_RANKING=1 "$BIN" "$WEIGHTS" \
             --data-dir "$DATA_DIR" --dims "$DIMS" --ext "$EXT" \
             --chunk-mb "$CHUNK_MB" --error-bound "$ERROR_BOUND" \
             --phase nn-rl+exp50 \
