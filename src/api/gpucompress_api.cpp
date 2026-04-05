@@ -331,56 +331,12 @@ extern "C" gpucompress_error_t gpucompress_compress(
     const gpucompress_config_t* config,
     gpucompress_stats_t* stats
 ) {
-    if (!input || !output || !output_size || input_size == 0)
-        return GPUCOMPRESS_ERROR_INVALID_INPUT;
-
-    /* Allocate GPU input buffer and upload */
-    void* d_input = nullptr;
-    if (cudaMalloc(&d_input, input_size) != cudaSuccess)
-        return GPUCOMPRESS_ERROR_OUT_OF_MEMORY;
-    if (cudaMemcpy(d_input, input, input_size, cudaMemcpyHostToDevice) != cudaSuccess) {
-        cudaFree(d_input);
-        return GPUCOMPRESS_ERROR_CUDA_FAILED;
-    }
-
-    /* Allocate GPU output buffer */
-    size_t max_comp = gpucompress_max_compressed_size(input_size);
-    void* d_output = nullptr;
-    if (cudaMalloc(&d_output, max_comp) != cudaSuccess) {
-        cudaFree(d_input);
-        return GPUCOMPRESS_ERROR_OUT_OF_MEMORY;
-    }
-
-    /* Compress on GPU */
-    size_t comp_size = max_comp;
-    gpucompress_error_t err = gpucompress_compress_gpu(
-        d_input, input_size,
-        d_output, &comp_size,
-        config, stats, nullptr);
-
-    cudaFree(d_input);
-
-    if (err != GPUCOMPRESS_SUCCESS) {
-        cudaFree(d_output);
-        return err;
-    }
-
-    /* Check output buffer is large enough */
-    if (comp_size > *output_size) {
-        cudaFree(d_output);
-        *output_size = comp_size;
-        return GPUCOMPRESS_ERROR_BUFFER_TOO_SMALL;
-    }
-
-    /* Download compressed data to host */
-    if (cudaMemcpy(output, d_output, comp_size, cudaMemcpyDeviceToHost) != cudaSuccess) {
-        cudaFree(d_output);
-        return GPUCOMPRESS_ERROR_CUDA_FAILED;
-    }
-
-    cudaFree(d_output);
-    *output_size = comp_size;
-    return GPUCOMPRESS_SUCCESS;
+    (void)input; (void)input_size; (void)output; (void)output_size;
+    (void)config; (void)stats;
+    fprintf(stderr, "gpucompress_compress: host-path stub — use "
+                    "gpucompress_compress_gpu() or "
+                    "gpucompress_compress_with_action_gpu() instead.\n");
+    return GPUCOMPRESS_ERROR_INVALID_INPUT;
 }
 
 extern "C" gpucompress_error_t gpucompress_decompress(
@@ -389,58 +345,10 @@ extern "C" gpucompress_error_t gpucompress_decompress(
     void* output,
     size_t* output_size
 ) {
-    if (!input || !output || !output_size || input_size == 0)
-        return GPUCOMPRESS_ERROR_INVALID_INPUT;
-
-    /* Read original size from header to know decompressed buffer size */
-    size_t original_size = 0;
-    gpucompress_error_t err = gpucompress_get_original_size(input, &original_size);
-    if (err != GPUCOMPRESS_SUCCESS)
-        return err;
-
-    if (original_size > *output_size) {
-        *output_size = original_size;
-        return GPUCOMPRESS_ERROR_BUFFER_TOO_SMALL;
-    }
-
-    /* Upload compressed data to GPU */
-    void* d_input = nullptr;
-    if (cudaMalloc(&d_input, input_size) != cudaSuccess)
-        return GPUCOMPRESS_ERROR_OUT_OF_MEMORY;
-    if (cudaMemcpy(d_input, input, input_size, cudaMemcpyHostToDevice) != cudaSuccess) {
-        cudaFree(d_input);
-        return GPUCOMPRESS_ERROR_CUDA_FAILED;
-    }
-
-    /* Allocate GPU output buffer */
-    void* d_output = nullptr;
-    if (cudaMalloc(&d_output, original_size) != cudaSuccess) {
-        cudaFree(d_input);
-        return GPUCOMPRESS_ERROR_OUT_OF_MEMORY;
-    }
-
-    /* Decompress on GPU */
-    size_t decomp_size = original_size;
-    err = gpucompress_decompress_gpu(
-        d_input, input_size,
-        d_output, &decomp_size, nullptr);
-
-    cudaFree(d_input);
-
-    if (err != GPUCOMPRESS_SUCCESS) {
-        cudaFree(d_output);
-        return err;
-    }
-
-    /* Download decompressed data to host */
-    if (cudaMemcpy(output, d_output, decomp_size, cudaMemcpyDeviceToHost) != cudaSuccess) {
-        cudaFree(d_output);
-        return GPUCOMPRESS_ERROR_CUDA_FAILED;
-    }
-
-    cudaFree(d_output);
-    *output_size = decomp_size;
-    return GPUCOMPRESS_SUCCESS;
+    (void)input; (void)input_size; (void)output; (void)output_size;
+    fprintf(stderr, "gpucompress_decompress: host-path stub — use "
+                    "gpucompress_decompress_gpu() instead.\n");
+    return GPUCOMPRESS_ERROR_INVALID_INPUT;
 }
 
 extern "C" size_t gpucompress_max_compressed_size(size_t input_size) {
