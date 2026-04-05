@@ -1,0 +1,177 @@
+diff --git a/Source/Driver/Nyx.H b/Source/Driver/Nyx.H
+index f2f073b8..78404dc9 100644
+--- a/Source/Driver/Nyx.H
++++ b/Source/Driver/Nyx.H
+@@ -144,6 +144,9 @@ public:
+     virtual void write_parameter_file(const std::string& dir);
+     static int write_skip_prepost;
+     static int write_hdf5;
++#ifdef AMREX_USE_GPUCOMPRESS
++    static int use_gpucompress;
++#endif
+ 
+     static int runlog_precision;
+     static int runlog_precision_terse;
+diff --git a/Source/Driver/Nyx.cpp b/Source/Driver/Nyx.cpp
+index fdeda283..6da5c24f 100644
+--- a/Source/Driver/Nyx.cpp
++++ b/Source/Driver/Nyx.cpp
+@@ -223,6 +223,9 @@ int Nyx::runlog_precision_terse = 6;
+ int Nyx::write_parameters_in_plotfile = true;
+ int Nyx::write_skip_prepost = 0;
+ int Nyx::write_hdf5 = 0;
++#ifdef AMREX_USE_GPUCOMPRESS
++int Nyx::use_gpucompress = 0;
++#endif
+ 
+ // Do we use separate SPH particles to initialize
+ //  the density and momentum on the grid?
+@@ -391,6 +394,10 @@ Nyx::read_params ()
+         amrex::Error("Must compile with USE_HDF5 = TRUE for write_hdf5 = 1");
+ #endif
+ 
++#ifdef AMREX_USE_GPUCOMPRESS
++    pp_nyx.query("use_gpucompress", use_gpucompress);
++#endif
++
+ #ifdef AMREX_USE_HDF5_ASYNC
+     // Complete all previous async writes on amrex::Finalize()
+     amrex::ExecOnFinalize(H5VLasync_waitall);
+diff --git a/Source/IO/Nyx_output.cpp b/Source/IO/Nyx_output.cpp
+index eac9c122..84f9e70e 100644
+--- a/Source/IO/Nyx_output.cpp
++++ b/Source/IO/Nyx_output.cpp
+@@ -9,6 +9,10 @@
+ #include <AMReX_buildInfo.H>
+ #include <Forcing.H>
+ 
++#ifdef AMREX_USE_GPUCOMPRESS
++#include "nyx_amrex_bridge.hpp"
++#endif
++
+ void mt_write(std::ofstream& output);
+ 
+ using namespace amrex;
+@@ -111,6 +115,111 @@ Nyx::writePlotFile (const std::string& dir,
+                     VisMF::How         how)
+ {
+ 
++#ifdef AMREX_USE_GPUCOMPRESS
++    if(use_gpucompress && parent->finestLevel() == 0)
++    {
++#ifndef NO_HYDRO
++    Real cur_time = state[State_Type].curTime();
++#else
++    Real cur_time = state[PhiGrav_Type].curTime();
++#endif
++
++    std::string dir_final = dir;
++    if(!amrex::AsyncOut::UseAsyncOut())
++    {
++        auto start_position_to_erase = dir_final.find(".temp");
++        if (start_position_to_erase != std::string::npos)
++            dir_final.erase(start_position_to_erase,5);
++    }
++
++    /* Assemble plotMF from state + derived variables */
++    std::vector<std::pair<int,int> > plot_var_map;
++    for (int typ = 0; typ < desc_lst.size(); typ++)
++        for (int comp = 0; comp < desc_lst[typ].nComp(); comp++)
++            if (parent->isStatePlotVar(desc_lst[typ].name(comp))
++                && desc_lst[typ].getType() == IndexType::TheCellType())
++                plot_var_map.push_back(std::pair<int,int>(typ, comp));
++
++    int num_derive = 0;
++    std::list<std::string> derive_names;
++    for (std::list<DeriveRec>::const_iterator it = derive_lst.dlist().begin();
++         it != derive_lst.dlist().end(); ++it)
++        if (parent->isDerivePlotVar(it->name())) {
++            derive_names.push_back(it->name());
++            num_derive++;
++        }
++
++    int n_data_items = plot_var_map.size() + num_derive;
++    int cnt = 0;
++    const int nGrow = 0;
++    MultiFab plotMF(grids, dmap, n_data_items, nGrow);
++    Vector<std::string> varnames;
++
++    for (int i = 0; i < (int)plot_var_map.size(); i++) {
++        int typ = plot_var_map[i].first;
++        int comp = plot_var_map[i].second;
++        varnames.push_back(desc_lst[typ].name(comp));
++        MultiFab::Copy(plotMF, state[typ].newData(), comp, cnt, 1, nGrow);
++        cnt++;
++    }
++    for (auto it = derive_names.begin(); it != derive_names.end(); ++it) {
++        varnames.push_back(*it);
++        const auto& derive_dat = derive(*it, cur_time, nGrow);
++        MultiFab::Copy(plotMF, *derive_dat, 0, cnt, 1, nGrow);
++        cnt++;
++    }
++
++    /* Initialize GPUCompress + HDF5 VOL connector (once) */
++    static hid_t vol_fapl = H5I_INVALID_HID;
++    if (vol_fapl < 0) {
++        std::string weights_path;
++        ParmParse pp_gc("nyx");
++        pp_gc.query("gpucompress_weights", weights_path);
++        const char* wp = weights_path.empty() ? NULL : weights_path.c_str();
++        vol_fapl = gpucompress_nyx_bridge::init(wp);
++
++        /* Policy: speed (w0=1,w1=0,w2=0), balanced (w0=1,w1=1,w2=0.5), ratio (w0=0,w1=0,w2=1) */
++        std::string policy = "ratio";
++        pp_gc.query("gpucompress_policy", policy);
++        if (policy == "speed")
++            gpucompress_set_ranking_weights(1.0f, 0.0f, 0.0f);
++        else if (policy == "balanced")
++            gpucompress_set_ranking_weights(1.0f, 1.0f, 0.5f);
++        else /* ratio */
++            gpucompress_set_ranking_weights(0.0f, 0.0f, 1.0f);
++
++        if (ParallelDescriptor::IOProcessor())
++            amrex::Print() << "GPUCompress VOL initialized (ratio-only policy)\n";
++    }
++
++    /* Read algorithm and verify flag from input */
++    std::string algo_str = "auto";
++    int gpucompress_verify = 0;
++    {
++        ParmParse pp_algo("nyx");
++        pp_algo.query("gpucompress_algorithm", algo_str);
++        pp_algo.query("gpucompress_verify", gpucompress_verify);
++    }
++    gpucompress_algorithm_t algo = gpucompress_algorithm_from_string(algo_str.c_str());
++
++    /* Write compressed HDF5 via VOL — same pattern as VPIC deck */
++    std::string gpuc_dir = dir_final + "_gpuc";
++    Real t0 = ParallelDescriptor::second();
++    long orig_bytes = gpucompress_nyx_bridge::write_multifab_compressed(
++        gpuc_dir, plotMF, varnames, vol_fapl,
++        4 * 1024 * 1024 /* 4 MiB chunks */,
++        algo, 0.0 /* lossless */,
++        gpucompress_verify != 0 /* verify */);
++    Real elapsed_ms = (ParallelDescriptor::second() - t0) * 1000.0;
++
++    if (ParallelDescriptor::IOProcessor())
++        amrex::Print() << "[GPUCompress] plotfile " << gpuc_dir
++                       << " algo=" << gpucompress_algorithm_name(algo)
++                       << ": " << orig_bytes / (1024*1024) << " MB in "
++                       << elapsed_ms << " ms\n";
++    }
++#endif
++
+ #ifdef AMREX_USE_HDF5
+     if(write_hdf5==1 && parent->finestLevel() == 0)
+     {
+@@ -245,10 +354,6 @@ Nyx::writePlotFile (const std::string& dir,
+     WriteSingleLevelPlotfileHDF5(dir_final,
+                           plotMF, varnames,
+                           Geom(), cur_time, nStep());
+-//                          const std::string &versionName,
+-//                          const std::string &levelPrefix,
+-//                          const std::string &mfPrefix,
+-//                          const Vector<std::string>& extra_dirs)
+     }
+     else
+ #endif

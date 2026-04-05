@@ -16,6 +16,16 @@ target_include_directories(test_vpic_adapter PRIVATE
 target_link_libraries(test_vpic_adapter PRIVATE gpucompress CUDA::cudart m)
 set_target_properties(test_vpic_adapter PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
+# CESM adapter test
+add_executable(test_cesm_adapter tests/unit/test_cesm_adapter.cu)
+set_source_files_properties(tests/unit/test_cesm_adapter.cu PROPERTIES LANGUAGE CUDA)
+target_include_directories(test_cesm_adapter PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_cesm_adapter PRIVATE gpucompress CUDA::cudart m)
+set_target_properties(test_cesm_adapter PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
 # Compression core test suite
 add_executable(test_compression_core
     tests/unit/test_compression_core.cu
