@@ -256,6 +256,7 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
     /* Primary algorithm's actual metrics — saved before exploration may overwrite.
      * Used in chunk diagnostics for fair MAPE reporting. */
     size_t primary_compressed_size = 0;
+    float primary_actual_psnr = -1.0f;  /* -1.0 = lossless (skip PSNR MAPE) */
 
     /* Cost model diagnostics (populated when online learning enabled) */
     double error_pct = 0.0, actual_cost = 0.0, predicted_cost = 0.0;
@@ -512,6 +513,16 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
          * These are used for MAPE reporting in chunk diagnostics so that prediction
          * accuracy reflects the NN's chosen algorithm, not the exploration winner. */
         primary_compressed_size = compressed_size;  /* save before exploration overwrites */
+
+        /* Save primary's actual PSNR before exploration may overwrite d_quantized/quant_result.
+         * Lossless primary → PSNR undefined (-1.0 sentinel, MAPE skips it).
+         * Lossy primary → analytical PSNR from quantization range. */
+        if (d_quantized && quant_result.isValid()) {
+            double range = quant_result.data_max - quant_result.data_min;
+            double psnr = analytical_psnr(range, quant_result.error_bound);
+            if (psnr > 0.0)
+                primary_actual_psnr = static_cast<float>(psnr);
+        }
 
         double ds = static_cast<double>(input_size);
         double bw = static_cast<double>(g_measured_bw_bytes_per_ms);
@@ -934,13 +945,11 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
         di.predicted_comp_time = predicted_comp_time;
         di.predicted_decomp_time = predicted_decomp_time;
         di.predicted_psnr = predicted_psnr;
-        di.actual_psnr = 120.0f;  // lossless default
-        if (d_quantized && quant_result.isValid()) {
-            double range = quant_result.data_max - quant_result.data_min;
-            double psnr = analytical_psnr(range, quant_result.error_bound);
-            if (psnr > 0.0)
-                di.actual_psnr = static_cast<float>(psnr);
-        }
+        /* actual_psnr: uses PRIMARY algorithm's PSNR (for fair MAPE reporting).
+         * The exploration winner's PSNR is computed from the post-swap
+         * d_quantized/quant_result and stored in the public struct as actual_psnr
+         * by recordChunkDiagnostic. */
+        di.actual_psnr = primary_actual_psnr;
         di.error_bound = cfg.error_bound;
         di.d_stats_ptr = d_stats_ptr;
         /* P4 fix: copy stats features to host BEFORE entering the diagnostic
