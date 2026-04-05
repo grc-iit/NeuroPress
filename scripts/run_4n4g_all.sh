@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================
 # 4n4g Full Benchmark: Lossless + Lossy
-# ~139 MB/rank, 25 timesteps, 16 ranks, all 12 phases
+# ~139 MB/rank, 50 timesteps, 16 ranks, all 12 phases
 # Policies: balanced + ratio
 #
 # Usage (interactive): bash scripts/run_4n4g_all.sh
@@ -19,6 +19,7 @@
 #SBATCH --mem=0
 #SBATCH --time=04:00:00
 
+cd /u/$USER/GPUCompress
 _total_start=$(date +%s)
 
 # ── Build hostfile for MPI distribution across all nodes ──
@@ -46,7 +47,7 @@ echo ""
 # ── Run 1: Lossless ──
 echo ">>> [1/2] Lossless benchmark starting..."
 _t0=$(date +%s)
-MPI_NP=16 GPUS_PER_NODE=4 VPIC_NX=320 CHUNK_MB=16 TIMESTEPS=25 \
+MPI_NP=16 GPUS_PER_NODE=4 VPIC_NX=320 CHUNK_MB=32 TIMESTEPS=50 \
 VERIFY=1 POLICIES=balanced,ratio LOSSY=0 \
 bash scripts/run_vpic_scaling.sh
 _t1=$(date +%s)
@@ -56,7 +57,7 @@ echo ""
 # ── Run 2: Lossy ──
 echo ">>> [2/2] Lossy benchmark starting..."
 _t0=$(date +%s)
-MPI_NP=16 GPUS_PER_NODE=4 VPIC_NX=320 CHUNK_MB=16 TIMESTEPS=25 \
+MPI_NP=16 GPUS_PER_NODE=4 VPIC_NX=320 CHUNK_MB=32 TIMESTEPS=50 \
 VERIFY=1 POLICIES=balanced,ratio LOSSY=0.01 \
 bash scripts/run_vpic_scaling.sh
 _t1=$(date +%s)
@@ -71,14 +72,14 @@ echo "  Total wall time: ${_total_elapsed}s ($((_total_elapsed/60))m $((_total_e
 echo "  Finished: $(date)"
 echo ""
 echo "  Lossless results:"
-ls -d benchmarks/vpic-kokkos/results/eval_NX320_chunk16mb_ts25/ 2>/dev/null
-ls -d benchmarks/vpic-kokkos/results/eval_NX320_chunk16mb_ts25/balanced_w1-1-1/ 2>/dev/null
-ls -d benchmarks/vpic-kokkos/results/eval_NX320_chunk16mb_ts25/ratio_only_w0-0-1/ 2>/dev/null
+ls -d benchmarks/vpic-kokkos/results/eval_NX320_chunk32mb_ts50/ 2>/dev/null
+ls -d benchmarks/vpic-kokkos/results/eval_NX320_chunk32mb_ts50/balanced_w1-1-1/ 2>/dev/null
+ls -d benchmarks/vpic-kokkos/results/eval_NX320_chunk32mb_ts50/ratio_only_w0-0-1/ 2>/dev/null
 echo ""
 echo "  Lossy results:"
-ls -d benchmarks/vpic-kokkos/results/eval_NX320_chunk16mb_ts25_lossy0.01/ 2>/dev/null
-ls -d benchmarks/vpic-kokkos/results/eval_NX320_chunk16mb_ts25_lossy0.01/balanced_w1-1-1/ 2>/dev/null
-ls -d benchmarks/vpic-kokkos/results/eval_NX320_chunk16mb_ts25_lossy0.01/ratio_only_w0-0-1/ 2>/dev/null
+ls -d benchmarks/vpic-kokkos/results/eval_NX320_chunk32mb_ts50_lossy0.01/ 2>/dev/null
+ls -d benchmarks/vpic-kokkos/results/eval_NX320_chunk32mb_ts50_lossy0.01/balanced_w1-1-1/ 2>/dev/null
+ls -d benchmarks/vpic-kokkos/results/eval_NX320_chunk32mb_ts50_lossy0.01/ratio_only_w0-0-1/ 2>/dev/null
 echo "============================================================"
 
 # Cleanup hostfile

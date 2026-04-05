@@ -79,7 +79,13 @@ echo "============================================================"
 echo ""
 
 # Back up previous results if they exist, then create fresh directory
-_RESULT_DIR="benchmarks/vpic-kokkos/results/eval_NX${_VPIC_NX}_chunk${_CHUNK_MB}mb_ts${_TIMESTEPS}${_VERIFY_TAG}${_LOSSY_TAG}"
+# Add policy tag when running a single policy (avoids collisions between separate runs)
+_POLICY_TAG=""
+case "$_POLICIES" in
+    balanced) _POLICY_TAG="_balanced" ;;
+    ratio)    _POLICY_TAG="_ratio" ;;
+esac
+_RESULT_DIR="benchmarks/vpic-kokkos/results/eval_NX${_VPIC_NX}_chunk${_CHUNK_MB}mb_ts${_TIMESTEPS}${_VERIFY_TAG}${_LOSSY_TAG}${_POLICY_TAG}"
 if [ -d "$_RESULT_DIR" ]; then
     _BACKUP="${_RESULT_DIR}_backup_$(date +%Y%m%d_%H%M%S)"
     mv "$_RESULT_DIR" "$_BACKUP"
