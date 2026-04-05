@@ -32,6 +32,12 @@ data/
 *.pkl
 *.h5
 *.hdf5
+*.raw
+*.f32
+*.f64
+
+# Benchmark results (generated at runtime)
+benchmarks/Paper_Evaluations/*/results/
 
 # Test / benchmark results
 test_results/
@@ -42,6 +48,7 @@ profiling/
 # Plots / images (generated)
 *.png
 !assets/*.png
+!benchmarks/Paper_Evaluations/*/results/**/*.png
 
 # Logs
 *.log

@@ -16,11 +16,11 @@
 # Usage:
 #   bash benchmarks/Paper_Evaluations/4/4.2.1_eval_vpic_threshold_sweep.sh
 #
-# Environment overrides:
-#   VPIC_NX         64          Grid size (NX^3 cells)
-#   CHUNK_MB        4           Chunk size in MB
+# Fixed configuration:
+#   VPIC_NX         100         Grid size (NX^3 cells)
+#   CHUNK_MB        2           Chunk size in MB
 #   TIMESTEPS       50          Number of VPIC timesteps
-#   VPIC_ERROR_BOUND 0.01      Lossy error bound (0 for lossless)
+#   VPIC_ERROR_BOUND 0.01       Lossy error bound (0 for lossless)
 #   EXPLORE_K       4           Exploration alternatives
 #   SGD_LR          0.2         SGD learning rate
 #   POLICY          balanced    Cost model policy
@@ -33,18 +33,18 @@ command -v bc >/dev/null 2>&1 || { echo "ERROR: bc not found"; exit 1; }
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 GPU_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
-# ── Parameters ──
+# ── Parameters recovered from the known-good run ──
 VPIC_BIN="$GPU_DIR/vpic_benchmark_deck.Linux"
 WEIGHTS="$GPU_DIR/neural_net/weights/model.nnwt"
-VPIC_NX=${VPIC_NX:-100}
-CHUNK_MB=${CHUNK_MB:-4}
-TIMESTEPS=${TIMESTEPS:-50}
-WARMUP_STEPS=${WARMUP_STEPS:-500}
-SIM_INTERVAL=${SIM_INTERVAL:-190}
-VPIC_ERROR_BOUND=${VPIC_ERROR_BOUND:-0.01}
-EXPLORE_K=${EXPLORE_K:-4}
-SGD_LR=${SGD_LR:-0.2}
-POLICY=${POLICY:-balanced}
+VPIC_NX=100
+CHUNK_MB=2
+TIMESTEPS=50
+WARMUP_STEPS=500
+SIM_INTERVAL=190
+VPIC_ERROR_BOUND=0.01
+EXPLORE_K=4
+SGD_LR=0.2
+POLICY=balanced
 DRY_RUN=${DRY_RUN:-0}
 
 # Policy weights

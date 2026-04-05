@@ -49,6 +49,10 @@ class FixGPUCompressKokkos : public Fix {
 
   const char *algo_name;
   int verify;
+  int dump_raw_fields;
+  int log_chunks;         /* 1 if writing per-chunk CSV diagnostics */
+  FILE *tc_csv;           /* timestep_chunks CSV handle */
+  int write_count;        /* running write counter for CSV timestep col */
   int gpuc_ready;
 };
 

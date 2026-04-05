@@ -38,7 +38,7 @@ index fdeda283..6da5c24f 100644
      // Complete all previous async writes on amrex::Finalize()
      amrex::ExecOnFinalize(H5VLasync_waitall);
 diff --git a/Source/IO/Nyx_output.cpp b/Source/IO/Nyx_output.cpp
-index eac9c122..84f9e70e 100644
+index eac9c122..fe31d917 100644
 --- a/Source/IO/Nyx_output.cpp
 +++ b/Source/IO/Nyx_output.cpp
 @@ -9,6 +9,10 @@
@@ -52,7 +52,7 @@ index eac9c122..84f9e70e 100644
  void mt_write(std::ofstream& output);
  
  using namespace amrex;
-@@ -111,6 +115,111 @@ Nyx::writePlotFile (const std::string& dir,
+@@ -111,6 +115,162 @@ Nyx::writePlotFile (const std::string& dir,
                      VisMF::How         how)
  {
  
@@ -129,8 +129,24 @@ index eac9c122..84f9e70e 100644
 +        else /* ratio */
 +            gpucompress_set_ranking_weights(0.0f, 0.0f, 1.0f);
 +
++        /* Enable online SGD learning + exploration for NN-RL+exp phase */
++        gpucompress_enable_online_learning();
++        {
++            float sgd_lr = 0.2f, sgd_mape = 0.10f, explore_thresh = 0.20f;
++            int explore_k = 4;
++            ParmParse pp_rl("nyx");
++            pp_rl.query("sgd_lr", sgd_lr);
++            pp_rl.query("sgd_mape", sgd_mape);
++            pp_rl.query("explore_thresh", explore_thresh);
++            pp_rl.query("explore_k", explore_k);
++            gpucompress_set_reinforcement(1, sgd_lr, sgd_mape, 0.0f);
++            gpucompress_set_exploration(1);
++            gpucompress_set_exploration_k(explore_k);
++            gpucompress_set_exploration_threshold(explore_thresh);
++        }
++
 +        if (ParallelDescriptor::IOProcessor())
-+            amrex::Print() << "GPUCompress VOL initialized (ratio-only policy)\n";
++            amrex::Print() << "GPUCompress VOL initialized (" << policy << " policy, online learning enabled)\n";
 +    }
 +
 +    /* Read algorithm and verify flag from input */
@@ -143,6 +159,38 @@ index eac9c122..84f9e70e 100644
 +    }
 +    gpucompress_algorithm_t algo = gpucompress_algorithm_from_string(algo_str.c_str());
 +
++    /* Per-chunk diagnostic logger for cross-workload regret benchmarks */
++    static gpucompress_nyx_bridge::DiagLogger diag_logger;
++    static int nyx_write_count = 0;
++    if (!diag_logger.enabled) {
++        const char* log_dir = getenv("NYX_LOG_DIR");
++        if (log_dir && log_dir[0]) {
++            /* Estimate total writes from max_step / plot_int */
++            int ms = 100;  /* fallback estimate */
++            int pi = 1;
++            { ParmParse pp_ms("amr");
++              pp_ms.query("max_step", ms);
++              pp_ms.query("plot_int", pi);
++              if (pi <= 0) pi = 1; }
++            int est_writes = (pi > 0) ? (ms / pi + 1) : 10;
++
++            /* Read policy weights */
++            float lw0 = 1, lw1 = 1, lw2 = 1;
++            std::string lpol = "ratio";
++            { ParmParse pp("nyx"); pp.query("gpucompress_policy", lpol); }
++            if (lpol == "speed")    { lw0=1; lw1=0; lw2=0; }
++            else if (lpol == "balanced") { lw0=1; lw1=1; lw2=0.5; }
++            else { lw0=0; lw1=0; lw2=1; }
++
++            if (ParallelDescriptor::IOProcessor()) {
++                amrex::UtilCreateDirectory(log_dir, 0755);
++                diag_logger.open(log_dir, "nyx", est_writes,
++                                 lw0, lw1, lw2, 0.0, 4*1024*1024);
++                amrex::Print() << "[GPUCompress] Chunk CSV logging to " << log_dir << "\n";
++            }
++        }
++    }
++
 +    /* Write compressed HDF5 via VOL — same pattern as VPIC deck */
 +    std::string gpuc_dir = dir_final + "_gpuc";
 +    Real t0 = ParallelDescriptor::second();
@@ -150,7 +198,10 @@ index eac9c122..84f9e70e 100644
 +        gpuc_dir, plotMF, varnames, vol_fapl,
 +        4 * 1024 * 1024 /* 4 MiB chunks */,
 +        algo, 0.0 /* lossless */,
-+        gpucompress_verify != 0 /* verify */);
++        gpucompress_verify != 0 /* verify */,
++        diag_logger.enabled ? &diag_logger : nullptr,
++        "nn-rl+exp50", nyx_write_count);
++    nyx_write_count++;
 +    Real elapsed_ms = (ParallelDescriptor::second() - t0) * 1000.0;
 +
 +    if (ParallelDescriptor::IOProcessor())
@@ -164,7 +215,7 @@ index eac9c122..84f9e70e 100644
  #ifdef AMREX_USE_HDF5
      if(write_hdf5==1 && parent->finestLevel() == 0)
      {
-@@ -245,10 +354,6 @@ Nyx::writePlotFile (const std::string& dir,
+@@ -245,10 +405,6 @@ Nyx::writePlotFile (const std::string& dir,
      WriteSingleLevelPlotfileHDF5(dir_final,
                            plotMF, varnames,
                            Geom(), cur_time, nStep());

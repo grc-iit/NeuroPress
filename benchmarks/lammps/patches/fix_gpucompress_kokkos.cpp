@@ -19,9 +19,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <sys/stat.h>
+#include <cuda_runtime.h>
 
 /* GPUCompress bridge — linked via cmake */
 #include "lammps_gpucompress_udf.h"
+#include "gpucompress.h"
 
 using namespace LAMMPS_NS;
 using namespace FixConst;
@@ -62,6 +64,14 @@ FixGPUCompressKokkos::FixGPUCompressKokkos(LAMMPS *lmp, int narg, char **arg) :
   const char *venv = getenv("GPUCOMPRESS_VERIFY");
   verify = (venv && atoi(venv)) ? 1 : 0;
 
+  const char *denv = getenv("LAMMPS_DUMP_FIELDS");
+  dump_raw_fields = (denv && atoi(denv)) ? 1 : 0;
+
+  const char *lcenv = getenv("LAMMPS_LOG_CHUNKS");
+  log_chunks = (lcenv && atoi(lcenv)) ? 1 : 0;
+  tc_csv = NULL;
+  write_count = 0;
+
   gpuc_ready = 0;
 }
 
@@ -95,11 +105,54 @@ void FixGPUCompressKokkos::init()
     int rc = gpucompress_lammps_init(weights, policy);
     if (rc == 0) {
       gpuc_ready = 1;
+
+      /* Enable online SGD learning + exploration for NN-RL phase */
+      if (strcmp(algo_name, "auto") == 0) {
+        const char *lr_env = getenv("GPUCOMPRESS_LR");
+        const char *mape_env = getenv("GPUCOMPRESS_MAPE");
+        const char *ek_env = getenv("GPUCOMPRESS_EXPLORE_K");
+        const char *et_env = getenv("GPUCOMPRESS_EXPLORE_THRESH");
+        float lr   = lr_env   ? (float)atof(lr_env)   : 0.2f;
+        float mape = mape_env ? (float)atof(mape_env)  : 0.10f;
+        int   ek   = ek_env   ? atoi(ek_env)           : 4;
+        float et   = et_env   ? (float)atof(et_env)    : 0.20f;
+
+        gpucompress_enable_online_learning();
+        gpucompress_set_reinforcement(1, lr, mape, 0.0f);
+        gpucompress_set_exploration(1);
+        gpucompress_set_exploration_k(ek);
+        gpucompress_set_exploration_threshold(et);
+
+        if (comm->me == 0)
+          fprintf(stdout, "[GPUCompress-LAMMPS] Online learning: lr=%.2f mape=%.2f explore_k=%d explore_thresh=%.2f\n",
+                  lr, mape, ek, et);
+      }
+
       if (comm->me == 0) {
         fprintf(stdout, "[GPUCompress-LAMMPS] Initialized: algo=%s policy=%s verify=%d\n",
                 algo_name, policy, verify);
         fprintf(stdout, "[GPUCompress-LAMMPS] Fields: pos=%d vel=%d force=%d every=%d\n",
                 dump_positions, dump_velocities, dump_forces, dump_every);
+
+        /* Open per-chunk CSV if requested */
+        if (log_chunks && !tc_csv) {
+          const char *csv_dir = getenv("LAMMPS_LOG_DIR");
+          if (!csv_dir) csv_dir = ".";
+          mkdir(csv_dir, 0755);
+          char csv_path[700];
+          snprintf(csv_path, sizeof(csv_path),
+                   "%s/benchmark_lammps_timestep_chunks.csv", csv_dir);
+          tc_csv = fopen(csv_path, "w");
+          if (tc_csv) {
+            fprintf(tc_csv, "rank,phase,timestep,chunk,"
+                    "predicted_ratio,actual_ratio,"
+                    "predicted_comp_ms,actual_comp_ms_raw,"
+                    "mape_ratio,mape_comp,"
+                    "sgd_fired,exploration_triggered,"
+                    "cost_model_error_pct,actual_cost,predicted_cost\n");
+            fprintf(stdout, "[GPUCompress-LAMMPS] Chunk CSV: %s\n", csv_path);
+          }
+        }
         fflush(stdout);
       }
     } else {
@@ -150,6 +203,66 @@ void FixGPUCompressKokkos::end_of_step()
   /* Sync device views to ensure data is current */
   atomKK->sync(LAMMPS_NS::Device, X_MASK | V_MASK | F_MASK);
 
+  /* Dump raw binary fields for cross-workload regret benchmarks */
+  if (dump_raw_fields) {
+    const char *raw_dir = getenv("LAMMPS_DUMP_DIR");
+    if (!raw_dir) raw_dir = ".";
+
+    auto write_raw = [&](const char *tag, const void *d_ptr, size_t n_elem) {
+      size_t nbytes = n_elem * elem_bytes;
+      void *h_buf = malloc(nbytes);
+      if (!h_buf) return;
+      cudaError_t cerr = cudaMemcpy(h_buf, d_ptr, nbytes, cudaMemcpyDeviceToHost);
+      if (cerr != cudaSuccess) {
+        fprintf(stderr, "[GPUCompress-LAMMPS] cudaMemcpy failed: %s\n",
+                cudaGetErrorString(cerr));
+        free(h_buf);
+        return;
+      }
+      char rpath[700];
+      snprintf(rpath, sizeof(rpath), "%s/%s_step%010lld.f32",
+               raw_dir, tag, (long long)ntimestep);
+      FILE *fp = fopen(rpath, "wb");
+      if (fp) {
+        if (elem_bytes == 4) {
+          fwrite(h_buf, sizeof(float), n_elem, fp);
+        } else {
+          /* KK_FLOAT is double — downcast to float32 for generic_benchmark */
+          float *f32 = (float *)malloc(n_elem * sizeof(float));
+          if (f32) {
+            const double *src = (const double *)h_buf;
+            for (size_t i = 0; i < n_elem; i++) f32[i] = (float)src[i];
+            fwrite(f32, sizeof(float), n_elem, fp);
+            free(f32);
+          }
+        }
+        fclose(fp);
+      }
+      free(h_buf);
+    };
+
+    if (dump_positions) {
+      auto d_x = atomKK->k_x.view_device();
+      write_raw("positions", d_x.data(), (size_t)nlocal * 3);
+    }
+    if (dump_velocities) {
+      auto d_v = atomKK->k_v.view_device();
+      write_raw("velocities", d_v.data(), (size_t)nlocal * 3);
+    }
+    if (dump_forces) {
+      auto d_f = atomKK->k_f.view_device();
+      write_raw("forces", d_f.data(), (size_t)nlocal * 3);
+    }
+    if (comm->me == 0) {
+      fprintf(stdout, "[GPUCompress-LAMMPS] Step %lld: dumped raw fields to %s\n",
+              (long long)ntimestep, raw_dir);
+      fflush(stdout);
+    }
+  }
+
+  /* Reset chunk history so per-write diagnostics are clean */
+  gpucompress_reset_chunk_history();
+
   if (dump_positions) {
     /* Get raw CUDA device pointer from KOKKOS view
      * k_x is a DualView; view_device() returns the device Kokkos::View
@@ -191,6 +304,35 @@ void FixGPUCompressKokkos::end_of_step()
     if (comm->me == 0 && rc != 0)
       fprintf(stderr, "[GPUCompress-LAMMPS] forces write failed\n");
   }
+
+  /* Log per-chunk diagnostics to CSV */
+  if (log_chunks && tc_csv && comm->me == 0) {
+    int n_hist = gpucompress_get_chunk_history_count();
+    const char *phase = (strcmp(algo_name, "auto") == 0) ? "nn-rl+exp50" : algo_name;
+    for (int ci = 0; ci < n_hist; ci++) {
+      gpucompress_chunk_diag_t dd;
+      if (gpucompress_get_chunk_diag(ci, &dd) != 0) continue;
+      double mr = 0, mc = 0;
+      if (dd.actual_ratio > 0)
+        mr = fabs(dd.predicted_ratio - dd.actual_ratio) / fabs(dd.actual_ratio) * 100.0;
+      if (dd.compression_ms > 0)
+        mc = fabs(dd.predicted_comp_time - dd.compression_ms) / fabs(dd.compression_ms) * 100.0;
+      fprintf(tc_csv,
+              "0,%s,%d,%d,"
+              "%.4f,%.4f,%.4f,%.4f,"
+              "%.2f,%.2f,%d,%d,"
+              "%.4f,%.4f,%.4f\n",
+              phase, write_count, ci,
+              (double)dd.predicted_ratio, (double)dd.actual_ratio,
+              (double)dd.predicted_comp_time, (double)dd.compression_ms_raw,
+              mr, mc, dd.sgd_fired, dd.exploration_triggered,
+              (double)dd.cost_model_error_pct,
+              (double)dd.actual_cost, (double)dd.predicted_cost);
+    }
+    fflush(tc_csv);
+    write_count++;
+  }
+  gpucompress_reset_chunk_history();
 
   if (comm->me == 0) {
     int nfields = dump_positions + dump_velocities + dump_forces;

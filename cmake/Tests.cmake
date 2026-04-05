@@ -42,6 +42,7 @@ set_source_files_properties(benchmarks/warpx/warpx_hyperparameter_study.cu PROPE
 target_include_directories(warpx_hyperparameter_study PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
 )
 target_link_libraries(warpx_hyperparameter_study PRIVATE gpucompress CUDA::cudart m)
 set_target_properties(warpx_hyperparameter_study PROPERTIES CUDA_SEPARABLE_COMPILATION ON)

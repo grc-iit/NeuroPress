@@ -13,6 +13,13 @@
 #include "gpucompress.h"
 #include "gpucompress_hdf5_vol.h"
 #include "gpucompress_hdf5.h"
+/* Kendall tau profiler for ranking CSV — path relative to GPUCompress root.
+ * The build must add GPUCompress/benchmarks to the include path. */
+#ifndef KENDALL_TAU_PROFILER_PATH
+#include "kendall_tau_profiler.cuh"
+#else
+#include KENDALL_TAU_PROFILER_PATH
+#endif
 
 #include <AMReX_MultiFab.H>
 #include <AMReX_FArrayBox.H>
@@ -24,8 +31,167 @@
 #include <cuda_runtime.h>
 #include <string>
 #include <cstdio>
+#include <cmath>
 
 namespace gpucompress_nyx_bridge {
+
+/* ── Per-chunk CSV diagnostic logger ─────────────────────────────
+ * Mirrors the VPIC benchmark CSV format so the cross-workload
+ * regret plotter can consume them uniformly.
+ * ─────────────────────────────────────────────────────────────── */
+
+static inline void action_to_str(int action, char *buf, size_t bufsz) {
+    static const char* algo_names[] = {"lz4","snappy","deflate","gdeflate","zstd","ans","cascaded","bitcomp"};
+    int algo = action % 8;
+    int quant = (action / 8) % 2;
+    int shuf  = (action / 16) % 2;
+    const char* a = (algo < 8) ? algo_names[algo] : "?";
+    if (quant && shuf) snprintf(buf, bufsz, "%s+shuf+quant", a);
+    else if (quant)    snprintf(buf, bufsz, "%s+quant", a);
+    else if (shuf)     snprintf(buf, bufsz, "%s+shuf", a);
+    else               snprintf(buf, bufsz, "%s", a);
+}
+
+struct DiagLogger {
+    FILE* tc_csv;           /* timestep_chunks CSV */
+    FILE* ranking_csv;      /* ranking CSV (top1_regret) */
+    FILE* ranking_costs_csv;
+    int   total_writes;     /* total expected writes (for milestone check) */
+    float w0, w1, w2;       /* cost model weights */
+    double error_bound;
+    size_t chunk_bytes;
+    bool  enabled;
+
+    DiagLogger() : tc_csv(NULL), ranking_csv(NULL), ranking_costs_csv(NULL),
+                   total_writes(0), w0(1), w1(1), w2(1), error_bound(0),
+                   chunk_bytes(4*1024*1024), enabled(false) {}
+
+    void open(const char* results_dir, const char* prefix,
+              int n_writes, float cw0, float cw1, float cw2,
+              double eb, size_t cb) {
+        total_writes = n_writes;
+        w0 = cw0; w1 = cw1; w2 = cw2;
+        error_bound = eb;
+        chunk_bytes = cb;
+        enabled = true;
+
+        char path[600];
+        snprintf(path, sizeof(path), "%s/benchmark_%s_timestep_chunks.csv",
+                 results_dir, prefix);
+        tc_csv = fopen(path, "w");
+        if (tc_csv) {
+            fprintf(tc_csv, "rank,phase,timestep,chunk,action,action_orig,"
+                    "predicted_ratio,actual_ratio,"
+                    "predicted_comp_ms,actual_comp_ms_raw,"
+                    "predicted_decomp_ms,actual_decomp_ms_raw,"
+                    "predicted_psnr_db,actual_psnr_db,"
+                    "mape_ratio,mape_comp,mape_decomp,mape_psnr,"
+                    "sgd_fired,exploration_triggered,"
+                    "cost_model_error_pct,actual_cost,predicted_cost,"
+                    "explore_n_alt");
+            for (int ei = 0; ei < 31; ei++)
+                fprintf(tc_csv, ",explore_alt_%d,explore_ratio_%d,"
+                        "explore_comp_ms_%d,explore_cost_%d", ei, ei, ei, ei);
+            fprintf(tc_csv, ",feat_entropy,feat_mad,feat_deriv\n");
+        }
+
+        snprintf(path, sizeof(path), "%s/benchmark_%s_ranking.csv",
+                 results_dir, prefix);
+        ranking_csv = fopen(path, "w");
+        if (ranking_csv) write_ranking_csv_header(ranking_csv);
+
+        snprintf(path, sizeof(path), "%s/benchmark_%s_ranking_costs.csv",
+                 results_dir, prefix);
+        ranking_costs_csv = fopen(path, "w");
+        if (ranking_costs_csv) write_ranking_costs_csv_header(ranking_costs_csv);
+    }
+
+    void close() {
+        if (tc_csv) { fclose(tc_csv); tc_csv = NULL; }
+        if (ranking_csv) { fclose(ranking_csv); ranking_csv = NULL; }
+        if (ranking_costs_csv) { fclose(ranking_costs_csv); ranking_costs_csv = NULL; }
+    }
+
+    /* Write per-chunk diagnostics after H5Dwrite completes */
+    void log_chunks(const char* phase, int timestep) {
+        if (!tc_csv) return;
+        int n_hist = gpucompress_get_chunk_history_count();
+        for (int ci = 0; ci < n_hist; ci++) {
+            gpucompress_chunk_diag_t dd;
+            if (gpucompress_get_chunk_diag(ci, &dd) != 0) continue;
+
+            double mr = 0, mc = 0, md = 0, mp = 0;
+            if (dd.actual_ratio > 0)
+                mr = fmin(200.0, fabs(dd.predicted_ratio - dd.actual_ratio)
+                          / fabs(dd.actual_ratio) * 100.0);
+            if (dd.compression_ms > 0)
+                mc = fmin(200.0, fabs(dd.predicted_comp_time - dd.compression_ms)
+                          / fabs(dd.compression_ms) * 100.0);
+            if (dd.decompression_ms > 0)
+                md = fmin(200.0, fabs(dd.predicted_decomp_time - dd.decompression_ms)
+                          / fabs(dd.decompression_ms) * 100.0);
+            if (dd.actual_psnr > 0.0f && std::isfinite(dd.actual_psnr)
+                && dd.predicted_psnr > 0.0f)
+                mp = fmin(200.0, fabs(dd.predicted_psnr - dd.actual_psnr)
+                          / fabs(dd.actual_psnr) * 100.0);
+
+            char action_str[40], orig_str[40];
+            action_to_str(dd.nn_action, action_str, sizeof(action_str));
+            action_to_str(dd.nn_original_action, orig_str, sizeof(orig_str));
+
+            fprintf(tc_csv,
+                    "0,%s,%d,%d,%s,%s,"
+                    "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
+                    "%.2f,%.2f,"
+                    "%.2f,%.2f,%.2f,%.2f,%d,%d,"
+                    "%.4f,%.4f,%.4f,%d",
+                    phase, timestep, ci, action_str, orig_str,
+                    (double)dd.predicted_ratio, (double)dd.actual_ratio,
+                    (double)dd.predicted_comp_time, (double)dd.compression_ms_raw,
+                    (double)dd.predicted_decomp_time, (double)dd.decompression_ms_raw,
+                    (double)dd.predicted_psnr, (double)dd.actual_psnr,
+                    mr, mc, md, mp,
+                    dd.sgd_fired, dd.exploration_triggered,
+                    (double)dd.cost_model_error_pct,
+                    (double)dd.actual_cost, (double)dd.predicted_cost,
+                    dd.explore_n_alternatives);
+
+            for (int ei = 0; ei < 31; ei++) {
+                if (ei < dd.explore_n_alternatives) {
+                    char ea_str[40];
+                    action_to_str(dd.explore_alternatives[ei], ea_str, sizeof(ea_str));
+                    fprintf(tc_csv, ",%s,%.4f,%.4f,%.4f",
+                            ea_str, (double)dd.explore_ratios[ei],
+                            (double)dd.explore_comp_ms[ei],
+                            (double)dd.explore_costs[ei]);
+                } else {
+                    fprintf(tc_csv, ",,,,");
+                }
+            }
+            fprintf(tc_csv, ",%.4f,%.6f,%.6f\n",
+                    (double)dd.feat_entropy, (double)dd.feat_mad,
+                    (double)dd.feat_deriv);
+        }
+        fflush(tc_csv);
+    }
+
+    /* Run ranking profiler at milestone timesteps */
+    void log_ranking(const void* d_data, size_t total_bytes,
+                     const char* phase, int timestep) {
+        if (!ranking_csv) return;
+        if (!is_ranking_milestone(timestep, total_writes)) return;
+
+        float bw = gpucompress_get_bandwidth_bytes_per_ms();
+        RankingMilestoneResult result = {};
+        run_ranking_profiler(d_data, total_bytes, chunk_bytes,
+                             error_bound, w0, w1, w2, bw,
+                             3, ranking_csv, ranking_costs_csv,
+                             phase, timestep, &result);
+        fprintf(stderr, "    [ranking] T=%d: tau=%.3f regret=%.3fx (%.0fms)\n",
+                timestep, result.mean_tau, result.mean_regret,
+                result.profiling_ms);
+    }
+};
 
 /**
  * Initialize GPUCompress + HDF5 VOL connector. Call once.
@@ -149,7 +315,10 @@ inline long write_multifab_compressed(
     size_t chunk_bytes = 4 * 1024 * 1024,
     gpucompress_algorithm_t algo = GPUCOMPRESS_ALGO_AUTO,
     double error_bound = 0.0,
-    bool verify = false)
+    bool verify = false,
+    DiagLogger* logger = nullptr,
+    const char* phase = "nn-rl+exp50",
+    int timestep = -1)
 {
     amrex::Gpu::streamSynchronize();
 
@@ -178,6 +347,7 @@ inline long write_multifab_compressed(
         char fname[256];
         snprintf(fname, sizeof(fname), "%s/fab_%04d.h5", dir.c_str(), fab_idx);
 
+        gpucompress_reset_chunk_history();
         H5VL_gpucompress_reset_stats();
         write_gpu_to_hdf5(fname, "data", d_ptr, n_elements,
                           h5type, chunk_elems, fapl, algo, error_bound);
@@ -187,6 +357,13 @@ inline long write_multifab_compressed(
 
         int n_comp_chunks = 0;
         H5VL_gpucompress_get_stats(NULL, NULL, &n_comp_chunks, NULL);
+
+        /* Log per-chunk diagnostics + ranking profiler at milestones */
+        if (logger && logger->enabled && amrex::ParallelDescriptor::IOProcessor()) {
+            int ts = (timestep >= 0) ? timestep : fab_idx;
+            logger->log_chunks(phase, ts);
+            logger->log_ranking(d_ptr, fab_bytes, phase, ts);
+        }
 
         /* Verify: read back, decompress, compare bitwise against original */
         if (verify) {
