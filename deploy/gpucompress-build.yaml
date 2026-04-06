@@ -1,0 +1,96 @@
+# GPUCompress Core Library Build Configuration
+# Usage: ./run.sh build [--cuda-arch 80] [--build-type Release]
+
+project:
+  name: GPUCompression
+  languages: [CXX, CUDA, C]
+  standards: { cxx: 14, cuda: 14 }
+
+requirements:
+  cuda: ">=12.0"
+  cmake: ">=3.18"
+  gcc: ">=9"
+  gpu_architectures:
+    volta70: V100
+    ampere80: A100
+    hopper90: H100
+
+dependencies:
+  nvcomp:
+    version: "5.x"
+    default_prefix: /tmp
+  hdf5:
+    version: ">=1.14"
+    default_root: /tmp/hdf5-install
+    optional: true
+  mpi:
+    default: openmpi
+    optional: true
+  cuda_toolkit:
+    required: true
+
+build:
+  source_dir: "."
+  build_dir: build
+  cmake_args:
+    CMAKE_BUILD_TYPE: "${BUILD_TYPE:-Release}"
+    CMAKE_CUDA_ARCHITECTURES: "${CUDA_ARCH:-80}"
+    NVCOMP_PREFIX: "${NVCOMP_PREFIX:-/tmp}"
+    HDF5_ROOT: "${HDF5_ROOT:-/tmp/hdf5-install}"
+  steps:
+    - name: Configure
+      run: |
+        cmake -B build -S . \
+          -DCMAKE_BUILD_TYPE=${BUILD_TYPE:-Release} \
+          -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH:-80} \
+          -DNVCOMP_PREFIX=${NVCOMP_PREFIX:-/tmp} \
+          -DHDF5_ROOT=${HDF5_ROOT:-/tmp/hdf5-install}
+    - name: Compile
+      run: cmake --build build -j$(nproc)
+
+outputs:
+  libraries:
+    - libgpucompress.so
+    - libH5Zgpucompress.so
+    - libH5VLgpucompress.so
+  executables:
+    - gpu_compress
+    - gpu_decompress
+    - generic_benchmark
+  weights:
+    - neural_net/weights/model.nnwt
+
+bridge_libraries:
+  lammps_udf:
+    source: examples/lammps_gpucompress_udf.cpp
+    output: examples/liblammps_gpucompress_udf.so
+    build: |
+      g++ -shared -fPIC -o examples/liblammps_gpucompress_udf.so \
+        examples/lammps_gpucompress_udf.cpp \
+        -Iinclude -I${HDF5_ROOT}/include -I/usr/local/cuda/include \
+        -Lbuild -lgpucompress -lH5VLgpucompress -lH5Zgpucompress \
+        -L${HDF5_ROOT}/lib -lhdf5 -L/usr/local/cuda/lib64 -lcudart \
+        -Wl,-rpath,$(pwd)/build -Wl,-rpath,${HDF5_ROOT}/lib
+  nekrs_udf:
+    source: examples/nekrs_gpucompress_udf.cpp
+    output: examples/libnekrs_gpucompress_udf.so
+    build: |
+      g++ -shared -fPIC -o examples/libnekrs_gpucompress_udf.so \
+        examples/nekrs_gpucompress_udf.cpp \
+        -Iinclude -I${HDF5_ROOT}/include -I/usr/local/cuda/include \
+        -Lbuild -lgpucompress -lH5VLgpucompress -lH5Zgpucompress \
+        -L${HDF5_ROOT}/lib -lhdf5 -L/usr/local/cuda/lib64 -lcudart \
+        -Wl,-rpath,$(pwd)/build -Wl,-rpath,${HDF5_ROOT}/lib
+
+environment:
+  LD_LIBRARY_PATH: "${GPUC_DIR}/build:${GPUC_DIR}/examples:${HDF5_ROOT}/lib:${NVCOMP_PREFIX}/lib:/usr/local/cuda/lib64"
+  GPUCOMPRESS_WEIGHTS: "${GPUC_DIR}/neural_net/weights/model.nnwt"
+  GPUCOMPRESS_ALGO: auto
+  GPUCOMPRESS_POLICY: ratio
+  GPUCOMPRESS_VERIFY: "0"
+  # Online learning knobs (used by benchmark scripts as SGD_LR etc.,
+  # and by LAMMPS fix as GPUCOMPRESS_LR etc.)
+  SGD_LR: "0.2"
+  SGD_MAPE: "0.10"
+  EXPLORE_K: "4"
+  EXPLORE_THRESH: "0.20"

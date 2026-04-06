@@ -1,0 +1,291 @@
+# GPUCompress Simulation Deployments
+# Usage: ./run.sh setup <simulation>   -- clone, patch, build
+#        ./run.sh bench <simulation>   -- run benchmark
+#        ./run.sh all                  -- build everything + run all benchmarks
+#
+# Simulations: lammps, nyx, warpx, nekrs, vpic
+
+# ============================================================================
+# LAMMPS — Molecular Dynamics (Kokkos GPU backend)
+# ============================================================================
+lammps:
+  description: "LAMMPS molecular dynamics with Kokkos GPU fix for in-situ compression"
+
+  source:
+    url: https://github.com/lammps/lammps.git
+    branch: stable
+    clone_dir: "${SIMS_DIR}/lammps"
+
+  prerequisites:
+    - gpucompress_core
+    - bridge:lammps_udf
+
+  patch:
+    method: git-apply
+    file: benchmarks/lammps/patches/lammps-gpucompress.patch
+    copy:
+      - src: benchmarks/lammps/patches/fix_gpucompress_kokkos.h
+        dst: src/KOKKOS/fix_gpucompress_kokkos.h
+      - src: benchmarks/lammps/patches/fix_gpucompress_kokkos.cpp
+        dst: src/KOKKOS/fix_gpucompress_kokkos.cpp
+
+  build:
+    dir: build
+    configure: |
+      cmake ../cmake \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DPKG_KOKKOS=ON \
+        -DKokkos_ENABLE_CUDA=ON \
+        -DKokkos_ARCH_AMPERE80=ON \
+        -DBUILD_MPI=ON \
+        -DCMAKE_CXX_FLAGS="-I${GPUC_DIR}/include -I${GPUC_DIR}/examples -I${HDF5_ROOT}/include -I/usr/local/cuda/include" \
+        -DCMAKE_EXE_LINKER_FLAGS="-L${GPUC_DIR}/examples -llammps_gpucompress_udf -L${GPUC_DIR}/build -lgpucompress -lH5VLgpucompress -lH5Zgpucompress -L${HDF5_ROOT}/lib -lhdf5 -L/usr/local/cuda/lib64 -lcudart -Wl,-rpath,${GPUC_DIR}/build -Wl,-rpath,${GPUC_DIR}/examples -Wl,-rpath,${HDF5_ROOT}/lib"
+    compile: make -j$(nproc)
+    binary: build/lmp
+
+  # Override Kokkos GPU arch per system:
+  #   LAMMPS_KOKKOS_ARCH=VOLTA70   (V100)
+  #   LAMMPS_KOKKOS_ARCH=AMPERE80  (A100, default)
+  #   LAMMPS_KOKKOS_ARCH=HOPPER90  (H100)
+  gpu_arch_flag: "-DKokkos_ARCH_${LAMMPS_KOKKOS_ARCH:-AMPERE80}=ON"
+
+  benchmark:
+    script: benchmarks/lammps/run_lammps_vpic_benchmark.sh
+    defaults:
+      LMP_ATOMS: 80          # atoms per dimension (~2M total for 80^3)
+      TIMESTEPS: 10           # number of dump timesteps
+      SIM_INTERVAL: 50        # physics steps between dumps
+      WARMUP_STEPS: 100
+      CHUNK_MB: 4
+      ERROR_BOUND: "0.0"      # lossless
+      POLICIES: "balanced,ratio,speed"
+    env:
+      LMP_BIN: "${SIM_INSTALL}/build/lmp"
+      GPUC_DIR: "${GPUC_DIR}"
+    results_dir: results/lammps
+    output_format: "benchmark_lammps_*.csv"
+
+# ============================================================================
+# Nyx — Cosmological Hydrodynamics (AMReX GPU backend)
+# ============================================================================
+nyx:
+  description: "Nyx cosmological hydro with AMReX GPU backend, Sedov blast wave benchmark"
+
+  source:
+    url: https://github.com/AMReX-Astro/Nyx.git
+    branch: development
+    recursive: true
+    clone_dir: "${SIMS_DIR}/Nyx"
+    post_clone: |
+      cd subprojects/amrex && git checkout development
+
+  prerequisites:
+    - gpucompress_core
+
+  patch:
+    method: git-apply
+    file: benchmarks/nyx/patches/nyx-gpucompress.patch
+
+  build:
+    dir: build-gpucompress
+    configure: |
+      cmake -S .. -B . \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DNyx_MPI=YES \
+        -DNyx_OMP=NO \
+        -DNyx_HYDRO=YES \
+        -DNyx_HEATCOOL=NO \
+        -DNyx_GPU_BACKEND=CUDA \
+        -DAMReX_CUDA_ARCH=Ampere \
+        -DAMReX_PRECISION=SINGLE \
+        -DAMReX_PARTICLES_PRECISION=SINGLE \
+        -DCMAKE_C_COMPILER=$(which gcc) \
+        -DCMAKE_CXX_COMPILER=$(which g++) \
+        -DCMAKE_CUDA_HOST_COMPILER=$(which g++) \
+        "-DCMAKE_CXX_FLAGS=-DAMREX_USE_GPUCOMPRESS -I${GPUC_DIR}/include -I${GPUC_DIR}/examples -I${HDF5_ROOT}/include" \
+        "-DCMAKE_CUDA_FLAGS=-DAMREX_USE_GPUCOMPRESS -I${GPUC_DIR}/include -I${GPUC_DIR}/examples -I${HDF5_ROOT}/include" \
+        "-DCMAKE_EXE_LINKER_FLAGS=-L${GPUC_DIR}/build -L${HDF5_ROOT}/lib -L${NVCOMP_PREFIX}/lib -Wl,--no-as-needed -lgpucompress -lH5VLgpucompress -lH5Zgpucompress -lhdf5 -lnvcomp -Wl,--as-needed" \
+        "-DCMAKE_SHARED_LINKER_FLAGS=-L${HDF5_ROOT}/lib -lhdf5"
+    compile: cmake --build . --target nyx_HydroTests -j$(nproc)
+    binary: Exec/HydroTests/nyx_HydroTests
+
+  benchmark:
+    script: benchmarks/nyx/run_nyx_benchmark.sh
+    defaults:
+      NYX_NCELL: 128          # grid cells per dimension (128^3 = 2M cells)
+      NYX_MAX_STEP: 200
+      NYX_PLOT_INT: 10        # ~20 output timesteps
+      CHUNK_MB: 4
+      ERROR_BOUND: "0.0"
+      POLICIES: "balanced,ratio,speed"
+    env:
+      NYX_BIN: "${SIM_INSTALL}/build-gpucompress/Exec/HydroTests/nyx_HydroTests"
+      GPUC_DIR: "${GPUC_DIR}"
+    results_dir: results/nyx
+    output_format: "benchmark_nyx_*.csv"
+
+# ============================================================================
+# WarpX — Electromagnetic Particle-in-Cell (AMReX GPU backend)
+# ============================================================================
+warpx:
+  description: "WarpX laser wakefield acceleration with AMReX, field-level compression"
+
+  source:
+    url: https://github.com/BLAST-WarpX/warpx.git
+    branch: development
+    clone_dir: "${SIMS_DIR}/warpx"
+
+  prerequisites:
+    - gpucompress_core
+
+  patch:
+    method: git-apply
+    file: benchmarks/warpx/patches/warpx-gpucompress.patch
+
+  build:
+    dir: build-gpucompress
+    env:
+      CC: gcc
+      CXX: g++
+      CUDACXX: nvcc
+      CUDAHOSTCXX: g++
+    configure: |
+      cmake -S .. -B . \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DWarpX_COMPUTE=CUDA \
+        -DWarpX_MPI=ON \
+        -DWarpX_DIMS=3 \
+        -DWarpX_GPUCOMPRESS=ON \
+        "-DCMAKE_PREFIX_PATH=${GPUC_DIR}/build;${HDF5_ROOT}" \
+        "-DCMAKE_CXX_FLAGS=-I${GPUC_DIR}/include -I${GPUC_DIR}/examples -I${HDF5_ROOT}/include" \
+        "-DCMAKE_EXE_LINKER_FLAGS=-L${GPUC_DIR}/build -lgpucompress -lH5VLgpucompress -lH5Zgpucompress -L${HDF5_ROOT}/lib -lhdf5 -L/usr/local/cuda/lib64 -lcudart"
+    compile: cmake --build . -j$(nproc)
+    binary: bin/warpx.3d
+
+  benchmark:
+    script: benchmarks/warpx/run_warpx_benchmark.sh
+    defaults:
+      WARPX_NCELL: "32 32 256"
+      WARPX_MAX_STEP: 200
+      WARPX_DIAG_INT: 10
+      CHUNK_MB: 4
+      ERROR_BOUND: "0.01"    # lossy by default for WarpX
+      POLICIES: "balanced,ratio"
+    env:
+      WARPX_BIN: "${SIM_INSTALL}/build-gpucompress/bin/warpx.3d"
+      GPUC_DIR: "${GPUC_DIR}"
+    results_dir: results/warpx
+    output_format: "benchmark_warpx_*.csv"
+
+# ============================================================================
+# nekRS — Spectral Element CFD (OCCA GPU backend)
+# ============================================================================
+nekrs:
+  description: "nekRS Taylor-Green vortex with OCCA backend, case-level integration (zero source mods)"
+
+  source:
+    url: https://github.com/Nek5000/nekRS.git
+    branch: master
+    clone_dir: "${SIMS_DIR}/nekRS"
+
+  prerequisites:
+    - gpucompress_core
+    - bridge:nekrs_udf
+
+  extra_dependencies:
+    - "gfortran (Fortran compiler for nekRS)"
+
+  patch:
+    method: copy-case-files
+    note: "nekRS needs zero source modifications; integration is at case level"
+    copy:
+      - src: benchmarks/nekrs/patches/tgv.udf
+        dst: "${NEKRS_CASE_DIR}/tgv.udf"
+      - src: benchmarks/nekrs/patches/tgv.par
+        dst: "${NEKRS_CASE_DIR}/tgv.par"
+      - src: benchmarks/nekrs/patches/udf.cmake
+        dst: "${NEKRS_CASE_DIR}/udf.cmake"
+
+  build:
+    dir: build
+    env:
+      CC: mpicc
+      CXX: mpic++
+      FC: mpif77
+    configure: |
+      cmake -S .. -B . \
+        -DCMAKE_INSTALL_PREFIX=${NEKRS_HOME:-$HOME/.local/nekrs} \
+        -DCMAKE_BUILD_TYPE=RelWithDebInfo
+    compile: cmake --build . --target install -j$(nproc)
+    binary: "${NEKRS_HOME:-$HOME/.local/nekrs}/bin/nekrs-fp32"
+    note: "First run JIT-compiles OCCA kernels (~5-10 min); cached thereafter"
+
+  benchmark:
+    script: benchmarks/nekrs/run_nekrs_benchmark.sh
+    defaults:
+      NP: 2                   # MPI ranks (minimum 2 for nekRS/HYPRE)
+      NUM_STEPS: 20
+      CHECKPOINT_INT: 10
+      USE_FP32: 1             # use fp32 binary for compression benchmarks
+      POLICIES: "balanced,ratio,speed"
+    env:
+      NEKRS_HOME: "${NEKRS_HOME:-$HOME/.local/nekrs}"
+      CASE_DIR: "${NEKRS_CASE_DIR:-$HOME/tgv_gpucompress}"
+      GPUC_DIR: "${GPUC_DIR}"
+    results_dir: results/nekrs
+    output_format: "benchmark_nekrs_*.csv"
+
+# ============================================================================
+# VPIC-Kokkos — Particle-in-Cell Plasma Physics
+# ============================================================================
+vpic:
+  description: "VPIC-Kokkos plasma physics with custom deck compilation and ranking profiler"
+
+  source:
+    url: https://github.com/lanl/vpic-kokkos.git
+    branch: master
+    clone_dir: "${SIMS_DIR}/vpic-kokkos"
+
+  prerequisites:
+    - gpucompress_core
+
+  patch:
+    method: none
+    note: "VPIC uses link-time integration via benchmark deck; no source patches"
+
+  build:
+    note: "VPIC itself must be pre-built with Kokkos CUDA; then the benchmark deck links against it"
+    vpic_build:
+      configure: |
+        cmake -S . -B build-compress \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DENABLE_KOKKOS_CUDA=ON \
+          -DKokkos_ARCH_AMPERE80=ON \
+          -DCMAKE_CXX_COMPILER=$(pwd)/kokkos/bin/nvcc_wrapper
+      compile: cmake --build build-compress -j$(nproc)
+    deck_build:
+      script: benchmarks/vpic-kokkos/build_vpic_pm.sh
+      env:
+        VPIC_DIR: "${SIMS_DIR}/vpic-kokkos"
+        GPU_DIR: "${GPUC_DIR}"
+        VPIC_BUILD: "${SIMS_DIR}/vpic-kokkos/build-compress"
+        HDF5_PREFIX: "${HDF5_ROOT:-/tmp/hdf5-install}"
+        NVCOMP_LIB: "${NVCOMP_PREFIX:-/tmp}/lib"
+        CUDA_ARCH: "${CUDA_ARCH:-80}"
+      binary: benchmarks/vpic-kokkos/vpic_benchmark_deck.Linux
+
+  benchmark:
+    binary: benchmarks/vpic-kokkos/vpic_benchmark_deck.Linux
+    run: |
+      mpirun -np 1 ./vpic_benchmark_deck.Linux
+    defaults:
+      CHUNK_MB: 4
+      ERROR_BOUND: "0.0"
+      VPIC_NX: 200             # grid cells per dim (~520MB at 200^3)
+      VPIC_TIMESTEPS: 10
+      VPIC_WARMUP_STEPS: 100
+      VPIC_SIM_INTERVAL: 10
+      VPIC_CHUNK_MB: 4
+      VPIC_POLICIES: "balanced,ratio,speed"
+    results_dir: results/vpic
+    output_format: "benchmark_vpic_*.csv"
