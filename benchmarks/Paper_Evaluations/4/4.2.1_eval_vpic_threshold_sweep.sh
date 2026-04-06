@@ -34,17 +34,17 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 GPU_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 # ── Parameters recovered from the known-good run ──
-VPIC_BIN="$GPU_DIR/vpic_benchmark_deck.Linux"
-WEIGHTS="$GPU_DIR/neural_net/weights/model.nnwt"
-VPIC_NX=100
-CHUNK_MB=2
-TIMESTEPS=50
-WARMUP_STEPS=500
-SIM_INTERVAL=190
-VPIC_ERROR_BOUND=0.01
-EXPLORE_K=4
-SGD_LR=0.2
-POLICY=balanced
+VPIC_BIN="${VPIC_BIN:-$GPU_DIR/vpic_benchmark_deck.Linux}"
+WEIGHTS="${GPUCOMPRESS_WEIGHTS:-$GPU_DIR/neural_net/weights/model.nnwt}"
+VPIC_NX=${VPIC_NX:-100}
+CHUNK_MB=${CHUNK_MB:-2}
+TIMESTEPS=${TIMESTEPS:-50}
+WARMUP_STEPS=${WARMUP_STEPS:-500}
+SIM_INTERVAL=${SIM_INTERVAL:-190}
+VPIC_ERROR_BOUND=${VPIC_ERROR_BOUND:-0.01}
+EXPLORE_K=${EXPLORE_K:-4}
+SGD_LR=${SGD_LR:-0.2}
+POLICY=${POLICY:-balanced}
 DRY_RUN=${DRY_RUN:-0}
 
 # Policy weights
