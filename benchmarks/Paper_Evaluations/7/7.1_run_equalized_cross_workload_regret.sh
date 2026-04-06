@@ -1,43 +1,25 @@
 #!/bin/bash
 # ============================================================
-# 7.1 Cross-Workload Convergence: Regret + Compression Time MAPE
+# 7.1 Cross-Workload Regret + MAPE Convergence
 #
-# Produces two figures from a single benchmark run:
-#   Figure 7a: "Regret Converges Within ~X Chunks Across All Workloads"
-#   Figure 7b: "Compression Time MAPE follows a similar trajectory"
+# Runs live simulations (VPIC, NYX, WarpX, LAMMPS) with nn-rl phase,
+# collecting per-chunk diagnostics and ranking profiler data during
+# runtime. Produces two figures:
+#   Figure 7a: Top-1 Regret (%) — how close NN picks are to oracle
+#   Figure 7b: Compression Time MAPE (%) — NN prediction accuracy
 #
-# generic_benchmark writes both _ranking.csv (regret per chunk) and
-# _chunks.csv / _timestep_chunks.csv (mape_comp per chunk) in the
-# same invocation, so running once gives both plots.
-#
-# Two modes:
-#
-#   MODE=snapshot  (default)
-#     Uses pre-existing SDRBench snapshot files + AI checkpoint
-#     tensors.  No simulation binaries required.
-#     Workloads: Hurricane Isabel, NYX, CESM-ATM, AI Checkpoint (ViT-B)
-#
-#   MODE=simulation
-#     Runs live simulations, dumps raw fields, then benchmarks.
-#     Requires simulation binaries on the system.
-#     Workloads: VPIC, WarpX, LAMMPS, AI Checkpoint (ViT-B)
-#
-# All workloads are fed through generic_benchmark --phase nn-rl+exp50
-# so regret is measured with identical methodology.
+# Workloads: VPIC, NYX (Sedov), WarpX (LWFA), LAMMPS (MD)
+# Each simulation uses the GPUCompress NN-RL pipeline with online
+# SGD learning. Per-chunk CSV + ranking profiler run during simulation.
 #
 # Usage:
-#   # Snapshot mode (default) — no simulation binaries needed
 #   bash benchmarks/Paper_Evaluations/7/7.1_run_equalized_cross_workload_regret.sh
-#
-#   # Simulation mode
-#   MODE=simulation bash benchmarks/Paper_Evaluations/7/7.1_run_equalized_cross_workload_regret.sh
 #
 # Overrides:
 #   RUN_NAME=paper_fig7a
-#   POLICY=balanced ERROR_BOUND=0.01 CHUNK_MB=4
-#   SKIP_HURRICANE=1 SKIP_NYX=1 SKIP_CESM=1 SKIP_AI=1
-#   SKIP_VPIC=1 SKIP_WARPX=1 SKIP_LAMMPS=1
-#   PLOT_ONLY=1          # just regenerate figure from existing CSVs
+#   POLICY=ratio CHUNK_MB=4 SGD_LR=0.1
+#   SKIP_VPIC=1 SKIP_NYX=1 SKIP_WARPX=1 SKIP_LAMMPS=1
+#   PLOT_ONLY=1          # just regenerate figures from existing CSVs
 # ============================================================
 
 set -euo pipefail
@@ -46,11 +28,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 cd "$PROJECT_DIR"
 
-# ── Mode selection ────────────────────────────────────────────
-MODE="${MODE:-snapshot}"  # "snapshot" or "simulation"
-
 # ── Run configuration ─────────────────────────────────────────
-RUN_NAME="${RUN_NAME:-cross_workload_${MODE}_$(date +%Y%m%d_%H%M%S)}"
+RUN_NAME="${RUN_NAME:-cross_workload_$(date +%Y%m%d_%H%M%S)}"
 RESULTS_DIR="$SCRIPT_DIR/results/$RUN_NAME"
 
 POLICY="${POLICY:-ratio}"
@@ -65,37 +44,13 @@ EXPLORE_THRESH="${EXPLORE_THRESH:-0.20}"
 PLOT_ONLY="${PLOT_ONLY:-0}"
 
 # ── Skip flags (per workload) ────────────────────────────────
-# Snapshot mode workloads
-SKIP_HURRICANE="${SKIP_HURRICANE:-0}"
-SKIP_NYX="${SKIP_NYX:-0}"
-SKIP_CESM="${SKIP_CESM:-0}"
-SKIP_AI="${SKIP_AI:-0}"
-# Simulation mode workloads
 SKIP_VPIC="${SKIP_VPIC:-0}"
+SKIP_NYX="${SKIP_NYX:-0}"
 SKIP_WARPX="${SKIP_WARPX:-0}"
 SKIP_LAMMPS="${SKIP_LAMMPS:-0}"
 
 # ── Binaries / paths ─────────────────────────────────────────
 WEIGHTS="${GPUCOMPRESS_WEIGHTS:-$PROJECT_DIR/neural_net/weights/model.nnwt}"
-GENERIC_BIN="${GENERIC_BIN:-$PROJECT_DIR/build/generic_benchmark}"
-
-# Snapshot mode data paths
-HURRICANE_DIR="${HURRICANE_DIR:-$PROJECT_DIR/data/sdrbench/hurricane_isabel/100x500x500}"
-HURRICANE_DIMS="${HURRICANE_DIMS:-100,500,500}"
-HURRICANE_EXT="${HURRICANE_EXT:-.bin.f32}"
-
-NYX_DATA_DIR="${NYX_DATA_DIR:-$PROJECT_DIR/data/sdrbench/nyx/SDRBENCH-EXASKY-NYX-512x512x512}"
-NYX_DIMS="${NYX_DIMS:-512,512,512}"
-
-CESM_DATA_DIR="${CESM_DATA_DIR:-$PROJECT_DIR/data/sdrbench/cesm_atm/SDRBENCH-CESM-ATM-cleared-1800x3600}"
-CESM_DIMS="${CESM_DIMS:-1800,3600}"
-CESM_EXT="${CESM_EXT:-.dat}"
-
-AI_MODEL="${AI_MODEL:-vit_b_16}"
-AI_EPOCHS="${AI_EPOCHS:-20}"
-AI_DATA_DIR="${AI_DATA_DIR:-}"
-
-# Simulation mode binaries / settings
 VPIC_BIN_A="$PROJECT_DIR/benchmarks/vpic-kokkos/vpic_benchmark_deck.Linux"
 VPIC_BIN_B="$PROJECT_DIR/vpic_benchmark_deck.Linux"
 VPIC_BIN="${VPIC_BIN:-}"
@@ -166,7 +121,7 @@ VPIC_TI_TE="${VPIC_TI_TE:-5}"
 #      SGD fires:  0 → 42    (accelerates as data diversifies)
 #      Chunk std:  0 → 19    (continuous increase in data diversity)
 #
-NYX_NCELL="${NYX_NCELL:-220}"
+NYX_NCELL="${NYX_NCELL:-128}"
 NYX_MAX_STEP="${NYX_MAX_STEP:-200}"
 NYX_PLOT_INT="${NYX_PLOT_INT:-25}"
 
@@ -269,60 +224,6 @@ note() { echo "[$(date +%H:%M:%S)] $*"; }
 die()  { echo "ERROR: $*" >&2; exit 1; }
 require_file() { [ -f "$1" ] || die "required file not found: $1"; }
 
-# ── Progress monitor ─────────────────────────────────────────
-# Monitors a CSV file in the background, prints progress bar to stderr.
-# Usage: monitor_progress "VPIC" csv_file expected_rows pid
-# Call stop_monitor to clean up.
-MONITOR_PID=""
-monitor_progress() {
-    local sim_name="$1"
-    local csv_file="$2"
-    local expected="$3"
-    local sim_pid="$4"
-    local chunks_per_ts="${5:-50}"
-
-    (
-        local prev_rows=0
-        while kill -0 "$sim_pid" 2>/dev/null; do
-            if [ -f "$csv_file" ]; then
-                local rows
-                rows=$(tail -n +2 "$csv_file" 2>/dev/null | wc -l | tr -d ' ')
-                if [ "$rows" -gt "$prev_rows" ]; then
-                    local pct=$((rows * 100 / expected))
-                    [ "$pct" -gt 100 ] && pct=100
-                    local ts=$((rows / chunks_per_ts))
-                    local total_ts=$((expected / chunks_per_ts))
-                    # Build progress bar (20 chars)
-                    local filled=$((pct / 5))
-                    local empty=$((20 - filled))
-                    local bar=""
-                    for ((i=0; i<filled; i++)); do bar+="█"; done
-                    for ((i=0; i<empty; i++)); do bar+="░"; done
-                    printf "\r[%s] ▶ %-7s [%s] T=%d/%d  (%3d%%)  %d chunks" \
-                        "$(date +%H:%M:%S)" "$sim_name" "$bar" "$ts" "$total_ts" "$pct" "$rows" >&2
-                    prev_rows=$rows
-                fi
-            fi
-            sleep 2
-        done
-        # Final line
-        if [ -f "$csv_file" ]; then
-            local final_rows
-            final_rows=$(tail -n +2 "$csv_file" 2>/dev/null | wc -l | tr -d ' ')
-            printf "\r[%s] ✓ %-7s [████████████████████] T=done        %d chunks\n" \
-                "$(date +%H:%M:%S)" "$sim_name" "$final_rows" >&2
-        fi
-    ) &
-    MONITOR_PID=$!
-}
-
-stop_monitor() {
-    if [ -n "$MONITOR_PID" ] && kill -0 "$MONITOR_PID" 2>/dev/null; then
-        kill "$MONITOR_PID" 2>/dev/null
-        wait "$MONITOR_PID" 2>/dev/null
-    fi
-    MONITOR_PID=""
-}
 
 check_binary() {
     local name="$1" path="$2"
@@ -333,125 +234,8 @@ check_binary() {
     return 0
 }
 
-check_data_dir() {
-    local name="$1" dir="$2" ext="$3"
-    if [ ! -d "$dir" ]; then
-        note "SKIP $name: directory not found at $dir"
-        return 1
-    fi
-    local n
-    n=$(find "$dir" -maxdepth 1 -type f -name "*${ext}" | wc -l)
-    if [ "$n" -lt 1 ]; then
-        note "SKIP $name: no ${ext} files in $dir"
-        return 1
-    fi
-    note "$name: $n fields in $dir"
-    return 0
-}
-
-# ── Run generic_benchmark on a data directory ─────────────────
-run_regret_benchmark() {
-    local workload="$1"
-    local data_dir="$2"
-    local dims="$3"
-    local ext="${4:-.f32}"
-    local out_dir="$RESULTS_DIR/$workload"
-
-    mkdir -p "$out_dir"
-    note "Running generic_benchmark for $workload (dims=$dims, ext=$ext)"
-
-    "$GENERIC_BIN" "$WEIGHTS" \
-        --data-dir "$data_dir" \
-        --dims "$dims" \
-        --ext "$ext" \
-        --chunk-mb "$CHUNK_MB" \
-        --error-bound "$ERROR_BOUND" \
-        --phase "$PHASE" \
-        --mape "$SGD_MAPE" \
-        --explore-thresh "$EXPLORE_THRESH" \
-        --lr "$SGD_LR" \
-        --explore-k "$EXPLORE_K" \
-        --w0 "$W0" --w1 "$W1" --w2 "$W2" \
-        --out-dir "$out_dir" \
-        --name "$workload" \
-        --no-verify \
-        > "$out_dir/benchmark.log" 2>&1
-
-    local ranking_csv="$out_dir/benchmark_${workload}_ranking.csv"
-    if [ ! -f "$ranking_csv" ]; then
-        note "WARNING: no ranking CSV produced for $workload"
-        return 1
-    fi
-    local n_rows
-    n_rows=$(tail -n +2 "$ranking_csv" | wc -l)
-    note "$workload: $n_rows ranking rows in $ranking_csv"
-    return 0
-}
-
 # ════════════════════════════════════════════════════════════════
-# SNAPSHOT MODE WORKLOADS
-# ════════════════════════════════════════════════════════════════
-
-run_hurricane() {
-    [ "$SKIP_HURRICANE" = "1" ] && { note "SKIP Hurricane (SKIP_HURRICANE=1)"; return 0; }
-    check_data_dir "Hurricane" "$HURRICANE_DIR" "$HURRICANE_EXT" || return 0
-    run_regret_benchmark "hurricane" "$HURRICANE_DIR" "$HURRICANE_DIMS" "$HURRICANE_EXT"
-}
-
-run_nyx_snapshot() {
-    [ "$SKIP_NYX" = "1" ] && { note "SKIP NYX (SKIP_NYX=1)"; return 0; }
-    check_data_dir "NYX" "$NYX_DATA_DIR" ".f32" || return 0
-    run_regret_benchmark "nyx" "$NYX_DATA_DIR" "$NYX_DIMS" ".f32"
-}
-
-run_cesm() {
-    [ "$SKIP_CESM" = "1" ] && { note "SKIP CESM (SKIP_CESM=1)"; return 0; }
-    check_data_dir "CESM-ATM" "$CESM_DATA_DIR" "$CESM_EXT" || return 0
-    run_regret_benchmark "cesm" "$CESM_DATA_DIR" "$CESM_DIMS" "$CESM_EXT"
-}
-
-run_ai_checkpoint() {
-    [ "$SKIP_AI" = "1" ] && { note "SKIP AI (SKIP_AI=1)"; return 0; }
-
-    if [ -z "$AI_DATA_DIR" ]; then
-        AI_DATA_DIR="$RESULTS_DIR/raw_ai_checkpoint/${AI_MODEL}_checkpoints"
-    fi
-
-    local n_f32
-    n_f32=$(find "$AI_DATA_DIR" -maxdepth 1 -name "*.f32" 2>/dev/null | wc -l)
-
-    if [ "$n_f32" -lt 2 ]; then
-        note "Exporting $AI_MODEL checkpoint tensors (epochs=$AI_EPOCHS)"
-        mkdir -p "$AI_DATA_DIR"
-        python3 "$PROJECT_DIR/scripts/train_and_export_checkpoints.py" \
-            --model "$AI_MODEL" \
-            --epochs "$AI_EPOCHS" \
-            --checkpoint-epochs "$(seq -s, 1 "$AI_EPOCHS")" \
-            --outdir "$AI_DATA_DIR" \
-            --data-root "$PROJECT_DIR/data" \
-            > "$AI_DATA_DIR/export.log" 2>&1
-        n_f32=$(find "$AI_DATA_DIR" -maxdepth 1 -name "*.f32" | wc -l)
-    fi
-
-    if [ "$n_f32" -lt 2 ]; then
-        note "WARNING: AI checkpoint export produced only $n_f32 files"
-        return 0
-    fi
-    note "AI Checkpoint: $n_f32 .f32 files"
-
-    # Auto-detect dimensions from first file
-    local first_f32
-    first_f32=$(find "$AI_DATA_DIR" -maxdepth 1 -name "*.f32" | sort | head -1)
-    local file_bytes
-    file_bytes=$(stat -c %s "$first_f32")
-    local n_floats=$((file_bytes / 4))
-    local dims="1,${n_floats}"
-
-    run_regret_benchmark "ai_checkpoint" "$AI_DATA_DIR" "$dims" ".f32"
-}
-
-# ════════════════════════════════════════════════════════════════
-# SIMULATION MODE WORKLOADS
+# SIMULATION WORKLOADS
 # ════════════════════════════════════════════════════════════════
 
 run_nyx_sim() {
@@ -503,13 +287,9 @@ NYXEOF
     cd "$nyx_work"
     GPUCOMPRESS_WEIGHTS="$WEIGHTS" \
     NYX_LOG_DIR="$nyx_out" \
-    "$NYX_BIN" inputs > "$nyx_out/nyx_sim.log" 2>&1 &
-    local sim_pid=$!
-    local nyx_writes=$(( NYX_MAX_STEP / NYX_PLOT_INT + 1 ))
-    local nyx_est_chunks=50
-    monitor_progress "NYX" "$nyx_out/benchmark_nyx_ranking.csv" $(( nyx_writes * nyx_est_chunks )) "$sim_pid" "$nyx_est_chunks"
-    wait "$sim_pid" 2>/dev/null
-    stop_monitor
+    "$NYX_BIN" inputs > "$nyx_out/nyx_sim.log" 2>&1 || {
+        note "WARNING: NYX exited with error (check $nyx_out/nyx_sim.log)"
+    }
     cd "$PROJECT_DIR"
 
     # Check if ranking CSV was produced by the DiagLogger
@@ -559,15 +339,9 @@ run_vpic_sim() {
     VPIC_EXPLORE_K="$EXPLORE_K" \
     VPIC_VERIFY="0" \
     VPIC_RESULTS_DIR="$vpic_out" \
-    "$VPIC_BIN" > "$vpic_out/vpic_sim.log" 2>&1 &
-    local sim_pid=$!
+    "$VPIC_BIN" > "$vpic_out/vpic_sim.log" 2>&1
 
     # Estimate: ~50 chunks/field × timesteps ranking rows
-    local est_chunks=$(( (VPIC_NX + 2) * (VPIC_NX + 2) * (VPIC_NX + 2) * 16 * 4 / (CHUNK_MB * 1024 * 1024) ))
-    local est_total=$(( VPIC_TIMESTEPS * est_chunks ))
-    monitor_progress "VPIC" "$vpic_out/benchmark_vpic_deck_ranking.csv" "$est_total" "$sim_pid" "$est_chunks"
-    wait "$sim_pid" 2>/dev/null
-    stop_monitor
 
     # VPIC writes benchmark_vpic_deck_ranking.csv and _timestep_chunks.csv
     # Symlink to the names the plotter expects
@@ -638,13 +412,9 @@ WARPXEOF
     WARPX_LOG_DIR="$warpx_out" \
     WARPX_MAX_STEP="$WARPX_MAX_STEP" \
     WARPX_DIAG_INTERVAL="$WARPX_DIAG_INTERVAL" \
-    "$WARPX_BIN" inputs > "$warpx_out/warpx_sim.log" 2>&1 &
-    local sim_pid=$!
-    local warpx_writes=$(( WARPX_MAX_STEP / WARPX_DIAG_INTERVAL ))
-    local warpx_est_chunks=50
-    monitor_progress "WarpX" "$warpx_out/benchmark_warpx_ranking.csv" $(( warpx_writes * warpx_est_chunks )) "$sim_pid" "$warpx_est_chunks"
-    wait "$sim_pid" 2>/dev/null
-    stop_monitor
+    "$WARPX_BIN" inputs > "$warpx_out/warpx_sim.log" 2>&1 || {
+        note "WARNING: WarpX exited with error (check $warpx_out/warpx_sim.log)"
+    }
     cd "$PROJECT_DIR"
 
     # Check if per-chunk CSV was produced
@@ -712,12 +482,9 @@ LMPEOF
     GPUCOMPRESS_TOTAL_WRITES="$LMP_TIMESTEPS" \
     LAMMPS_LOG_CHUNKS="1" \
     LAMMPS_LOG_DIR="$lammps_out" \
-    "$LMP_BIN" -k on g 1 -sf kk -in input.lmp > "$lammps_out/lammps_sim.log" 2>&1 &
-    local sim_pid=$!
-    local lmp_est_chunks=50
-    monitor_progress "LAMMPS" "$lammps_out/benchmark_lammps_ranking.csv" $(( LMP_TIMESTEPS * lmp_est_chunks )) "$sim_pid" "$lmp_est_chunks"
-    wait "$sim_pid" 2>/dev/null
-    stop_monitor
+    "$LMP_BIN" -k on g 1 -sf kk -in input.lmp > "$lammps_out/lammps_sim.log" 2>&1 || {
+        note "WARNING: LAMMPS exited with error (check $lammps_out/lammps_sim.log)"
+    }
     cd "$PROJECT_DIR"
 
     # Check per-chunk CSV produced during runtime
@@ -737,7 +504,7 @@ LMPEOF
 
 plot_cross_workload_regret() {
     note "Plotting cross-workload regret convergence figure"
-    RESULTS_DIR="$RESULTS_DIR" PHASE="$PHASE" MODE="$MODE" python3 - <<'PY'
+    RESULTS_DIR="$RESULTS_DIR" PHASE="$PHASE" python3 - <<'PY'
 import csv, os, sys
 
 import matplotlib
@@ -747,45 +514,18 @@ import numpy as np
 
 results_dir = os.environ["RESULTS_DIR"]
 phase_prefix = os.environ["PHASE"].split("/")[0]
-mode = os.environ.get("MODE", "snapshot")
 
-# All possible workload keys — the plotter discovers which ones produced data
-snapshot_workloads = [
-    ("hurricane",     "Hurricane",     "#e41a1c"),
-    ("nyx",           "NYX",           "#377eb8"),
-    ("cesm",          "CESM-ATM",      "#4daf4a"),
-    ("ai_checkpoint", "AI Checkpoint", "#984ea3"),
-]
-simulation_workloads = [
+workloads = [
     ("vpic",          "VPIC",          "#e41a1c"),
     ("nyx",           "NYX",           "#377eb8"),
     ("warpx",         "WarpX",         "#4daf4a"),
     ("lammps",        "LAMMPS",        "#ff7f00"),
-    ("ai_checkpoint", "AI Checkpoint", "#984ea3"),
 ]
 
-# Auto-detect: try ALL possible keys regardless of mode
-all_keys = {}
-for key, label, color in snapshot_workloads + simulation_workloads:
-    all_keys[key] = (label, color)
-
-# Maintain order: mode-specific list first, then anything extra
-if mode == "simulation":
-    ordered = simulation_workloads
-else:
-    ordered = snapshot_workloads
-
-seen = set()
 workload_order = []
-for key, label, color in ordered:
-    if key not in seen:
-        workload_order.append((key, label, color))
-        seen.add(key)
-# Add any others found on disk
-for key, (label, color) in all_keys.items():
-    if key not in seen:
-        workload_order.append((key, label, color))
-        seen.add(key)
+seen = set()
+for key, label, color in workloads:
+    workload_order.append((key, label, color))
 
 png_path = os.path.join(results_dir, "cross_workload_regret.png")
 combined_csv = os.path.join(results_dir, "cross_workload_regret.csv")
@@ -925,7 +665,7 @@ PY
 
 plot_cross_workload_mape() {
     note "Plotting cross-workload compression time MAPE convergence (Figure 7b)"
-    RESULTS_DIR="$RESULTS_DIR" PHASE="$PHASE" MODE="$MODE" python3 - <<'PY'
+    RESULTS_DIR="$RESULTS_DIR" PHASE="$PHASE" python3 - <<'PY'
 import csv, os, sys
 
 import matplotlib
@@ -935,41 +675,13 @@ import numpy as np
 
 results_dir = os.environ["RESULTS_DIR"]
 phase_prefix = os.environ["PHASE"].split("/")[0]
-mode = os.environ.get("MODE", "snapshot")
 
-snapshot_workloads = [
-    ("hurricane",     "Hurricane",     "#e41a1c"),
-    ("nyx",           "NYX",           "#377eb8"),
-    ("cesm",          "CESM-ATM",      "#4daf4a"),
-    ("ai_checkpoint", "AI Checkpoint", "#984ea3"),
-]
-simulation_workloads = [
+workload_order = [
     ("vpic",          "VPIC",          "#e41a1c"),
     ("nyx",           "NYX",           "#377eb8"),
     ("warpx",         "WarpX",         "#4daf4a"),
     ("lammps",        "LAMMPS",        "#ff7f00"),
-    ("ai_checkpoint", "AI Checkpoint", "#984ea3"),
 ]
-
-all_keys = {}
-for key, label, color in snapshot_workloads + simulation_workloads:
-    all_keys[key] = (label, color)
-
-if mode == "simulation":
-    ordered = simulation_workloads
-else:
-    ordered = snapshot_workloads
-
-seen = set()
-workload_order = []
-for key, label, color in ordered:
-    if key not in seen:
-        workload_order.append((key, label, color))
-        seen.add(key)
-for key, (label, color) in all_keys.items():
-    if key not in seen:
-        workload_order.append((key, label, color))
-        seen.add(key)
 
 png_path = os.path.join(results_dir, "cross_workload_comp_mape.png")
 combined_csv = os.path.join(results_dir, "cross_workload_comp_mape.csv")
@@ -1000,9 +712,19 @@ for key, label, color in workload_order:
     if not rows_by_ts:
         continue
 
+    # If a simulation writes multiple fields per timestep (e.g. LAMMPS:
+    # positions+velocities+forces), keep only the first field's chunks
+    # to match the ranking profiler which uses positions only.
+    chunks_per_ts = len(next(iter(rows_by_ts.values())))
+    expected_chunks = 50  # approximate single-field chunk count
+    if chunks_per_ts > expected_chunks * 2:
+        keep = chunks_per_ts // 3  # 3 fields → take first field
+    else:
+        keep = chunks_per_ts
+
     rows = []
     for ts in sorted(rows_by_ts.keys()):
-        for chunk_idx, mape in rows_by_ts[ts]:
+        for chunk_idx, mape in rows_by_ts[ts][:keep]:
             rows.append((ts, chunk_idx, mape))
 
     xs = list(range(len(rows)))
@@ -1084,7 +806,6 @@ print_banner() {
     echo "============================================================"
     echo "Section 7.1: Cross-Workload Regret + MAPE Convergence"
     echo "============================================================"
-    echo "Mode          : $MODE"
     echo "Run name      : $RUN_NAME"
     echo "Results dir   : $RESULTS_DIR"
     echo "Weights       : $WEIGHTS"
@@ -1095,18 +816,10 @@ print_banner() {
     echo "SGD LR        : $SGD_LR  MAPE thresh: $SGD_MAPE"
     echo "Explore K     : $EXPLORE_K  thresh: $EXPLORE_THRESH"
     echo "------------------------------------------------------------"
-    if [ "$MODE" = "snapshot" ]; then
-        echo "Hurricane     : $([ "$SKIP_HURRICANE" = "1" ] && echo "SKIP" || echo "$HURRICANE_DIR")"
-        echo "NYX           : $([ "$SKIP_NYX" = "1" ] && echo "SKIP" || echo "$NYX_DATA_DIR")"
-        echo "CESM-ATM      : $([ "$SKIP_CESM" = "1" ] && echo "SKIP" || echo "$CESM_DATA_DIR")"
-        echo "AI Checkpoint : $([ "$SKIP_AI" = "1" ] && echo "SKIP" || echo "model=$AI_MODEL epochs=$AI_EPOCHS")"
-    else
-        echo "VPIC          : $([ "$SKIP_VPIC" = "1" ] && echo "SKIP" || echo "NX=$VPIC_NX ts=$VPIC_TIMESTEPS")"
-        echo "NYX           : $([ "$SKIP_NYX" = "1" ] && echo "SKIP" || echo "$NYX_DATA_DIR")"
-        echo "WarpX         : $([ "$SKIP_WARPX" = "1" ] && echo "SKIP" || echo "ncell=$WARPX_NCELL max_step=$WARPX_MAX_STEP")"
-        echo "LAMMPS        : $([ "$SKIP_LAMMPS" = "1" ] && echo "SKIP" || echo "atoms=${LMP_ATOMS}^3 ts=$LMP_TIMESTEPS")"
-        echo "AI Checkpoint : $([ "$SKIP_AI" = "1" ] && echo "SKIP" || echo "model=$AI_MODEL epochs=$AI_EPOCHS")"
-    fi
+    echo "VPIC          : $([ "$SKIP_VPIC" = "1" ] && echo "SKIP" || echo "NX=$VPIC_NX ts=$VPIC_TIMESTEPS mi_me=$VPIC_MI_ME int=$VPIC_SIM_INTERVAL")"
+    echo "NYX           : $([ "$SKIP_NYX" = "1" ] && echo "SKIP" || echo "NC=$NYX_NCELL max_step=$NYX_MAX_STEP plot_int=$NYX_PLOT_INT")"
+    echo "WarpX         : $([ "$SKIP_WARPX" = "1" ] && echo "SKIP" || echo "ncell=$WARPX_NCELL max_step=$WARPX_MAX_STEP diag_int=$WARPX_DIAG_INTERVAL")"
+    echo "LAMMPS        : $([ "$SKIP_LAMMPS" = "1" ] && echo "SKIP" || echo "atoms=${LMP_ATOMS}^3 T_hot=$LMP_T_HOT T_cold=$LMP_T_COLD int=$LMP_SIM_INTERVAL")"
     echo "============================================================"
 }
 
@@ -1114,25 +827,14 @@ print_banner() {
 main() {
     mkdir -p "$RESULTS_DIR"
     require_file "$WEIGHTS"
-    require_file "$GENERIC_BIN"
 
     print_banner | tee "$RESULTS_DIR/config.txt"
 
     if [ "$PLOT_ONLY" != "1" ]; then
-        if [ "$MODE" = "snapshot" ]; then
-            run_hurricane
-            run_nyx_snapshot
-            run_cesm
-            run_ai_checkpoint
-        elif [ "$MODE" = "simulation" ]; then
-            run_vpic_sim
-            run_nyx_sim
-            run_warpx_sim
-            run_lammps_sim
-            run_ai_checkpoint
-        else
-            die "Unknown MODE=$MODE (use 'snapshot' or 'simulation')"
-        fi
+        run_vpic_sim
+        run_nyx_sim
+        run_warpx_sim
+        run_lammps_sim
     fi
 
     plot_cross_workload_regret
