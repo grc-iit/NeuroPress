@@ -236,7 +236,7 @@ srun --account=bekn-delta-gpu --partition=gpuA100x4-interactive \
   '
 ```
 
-Results are written to `benchmarks/vpic-kokkos/results/`.
+Results are written to `benchmarks/vpic-kokkos/results/`. See [`deltaRunVPICParameters.md`](deltaRunVPICParameters.md) for recommended production parameters on Delta (NX=320, 4n×4g, physics tuning).
 
 #### Run SDRBench (scientific datasets)
 
@@ -524,6 +524,7 @@ python3 benchmarks/visualize.py --view summary --view timesteps
 
 ## Documentation
 
+- [`deltaRunVPICParameters.md`](deltaRunVPICParameters.md) — Recommended VPIC parameters for Delta (4n×4g production config)
 - [`docs/multi_gpu_guide.md`](docs/multi_gpu_guide.md) — Multi-GPU/multi-node execution guide
 - [`neural_net/docs/ARCHITECTURE.md`](neural_net/docs/ARCHITECTURE.md) — NN architecture details
 - [`neural_net/docs/NN_EXECUTION_FLOW.md`](neural_net/docs/NN_EXECUTION_FLOW.md) — 5-timestep execution walkthrough
