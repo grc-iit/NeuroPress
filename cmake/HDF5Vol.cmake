@@ -183,3 +183,8 @@ if(MPI_FOUND)
         endif()
     endforeach()
 endif()
+
+# ── EMA reset integration test (requires H5VLgpucompress) ──
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/test_ema_reset.cu")
+    add_vol_demo(test_ema_reset tests/unit/test_ema_reset.cu)
+endif()

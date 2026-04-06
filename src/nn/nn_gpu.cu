@@ -1488,6 +1488,14 @@ bool loadNNFromBinary(const char* filepath) {
     }
     allocSGDBuffers();
 
+    /* Reset EMA gradient buffers to prevent stale momentum from a prior
+     * training phase contaminating the anti-flip damping of this phase.
+     * Must happen after syncAllCompContextStreams (no in-flight SGD). */
+    gpucompress::resetAllSGDEMABuffers();
+    if (d_sgd_grad_buffer)
+        cudaMemset(d_sgd_grad_buffer + 2 * SGD_REGION, 0,
+                   SGD_REGION * sizeof(float));
+
     size_t total_params = NN_HIDDEN_DIM * NN_INPUT_DIM + NN_HIDDEN_DIM +
                           NN_HIDDEN_DIM * NN_HIDDEN_DIM + NN_HIDDEN_DIM +
                           NN_OUTPUT_DIM * NN_HIDDEN_DIM + NN_OUTPUT_DIM;

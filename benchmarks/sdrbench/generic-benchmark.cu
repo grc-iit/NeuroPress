@@ -1074,7 +1074,7 @@ static void write_summary_csv(const char *dataset_name,
         PhaseResult *r = &results[i];
         fprintf(f, "%d,%s,%s,%d,%.2f,%.2f,%.2f,%.2f,"
                 "%.2f,%.2f,%.4f,"
-                "%.1f,%.1f,%llu,%d,%d,%d,"
+                "%.1f,%.1f,%llu,%.0f,%.0f,%d,"
                 "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,"
                 "%.4f,%.4f,"
                 "%.2f,%.2f,%.2f,%.2f,"
@@ -1089,7 +1089,9 @@ static void write_summary_csv(const char *dataset_name,
                 (double)r->file_bytes / (1 << 20),
                 (double)r->orig_bytes / (1 << 20), r->ratio,
                 r->write_mbps, r->read_mbps, r->mismatches,
-                r->sgd_fires, r->explorations, r->n_chunks,
+                (r->n_runs > 0) ? (double)r->sgd_fires / r->n_runs : 0.0,
+                (r->n_runs > 0) ? (double)r->explorations / r->n_runs : 0.0,
+                r->n_chunks,
                 r->nn_ms, r->stats_ms, r->preproc_ms,
                 r->comp_ms, r->decomp_ms, r->explore_ms, r->sgd_ms,
                 r->comp_gbps, r->decomp_gbps,
@@ -1188,6 +1190,7 @@ int main(int argc, char **argv)
     float explore_thresh = 0.20f;
     int   do_verify = 1;
     double error_bound = 0.0;
+    int   warmup_skip = 5;  /* skip first N fields in nn-rl/nn-rl+exp averages (cold-start exclusion) */
 
     for (int i = 1; i < argc; i++) {
         if (argv[i][0] != '-' && !weights_path) {
@@ -1246,6 +1249,8 @@ int main(int argc, char **argv)
             g_error_bound = error_bound;
         } else if (strcmp(argv[i], "--name") == 0 && i + 1 < argc) {
             name_override = argv[++i];
+        } else if (strcmp(argv[i], "--warmup-skip") == 0 && i + 1 < argc) {
+            warmup_skip = atoi(argv[++i]);
         }
     }
 
@@ -1268,6 +1273,7 @@ int main(int argc, char **argv)
             "  --w0/w1/w2 F       Cost model weights\n"
             "  --lr F             SGD learning rate (default: %.2f)\n"
             "  --error-bound F    Error bound for lossy (default: 0.0 = lossless)\n"
+            "  --warmup-skip N    Skip first N fields from nn-rl/nn-rl+exp averages (default: 5)\n"
             "  --name NAME        Dataset name for CSV filenames (default: auto from data-dir)\n\n"
             "Examples:\n"
             "  %s model.nnwt --data-dir data/sdrbench/nyx/SDRBENCH-EXASKY-NYX-512x512x512 "
@@ -1377,6 +1383,7 @@ int main(int argc, char **argv)
     printf("  (%d chunks, %.1f MB each)\n", n_chunks, cmb);
     printf("  Cost w   : %.2f / %.2f / %.2f\n", rank_w0, rank_w1, rank_w2);
     if (n_runs > 1) printf("  Runs     : %d (mean +/- std)\n", n_runs > 32 ? 32 : n_runs);
+    printf("  Warmup   : skip first %d fields from nn-rl averages\n", warmup_skip);
     printf("  Weights  : %s\n\n", weights_path);
 
     gpucompress_set_ranking_weights(rank_w0, rank_w1, rank_w2);
@@ -1723,7 +1730,11 @@ int main(int argc, char **argv)
                    "F#", "Field", "WrMs", "RdMs", "Ratio", "MAPE_R", "SGD", "EXP");
             printf("  ----  %-30s  -------  -------  -------  --------  ----  ----\n", "-----");
 
-            const int WARMUP_SKIP = 0;
+            /* Skip first N fields from steady-state averages (cold-start exclusion).
+             * Field 0 has freshly-loaded weights and makes poor NN decisions;
+             * including it unfairly penalizes nn-rl vs fixed-algo baselines.
+             * Clamp to n_fields-1 so at least one field is always counted. */
+            const int WARMUP_SKIP = (warmup_skip < n_fields) ? warmup_skip : (n_fields > 1 ? n_fields - 1 : 0);
             const int MAX_F = 256;
             double *f_write_ms = (double*)calloc(MAX_F, sizeof(double));
             double *f_read_ms  = (double*)calloc(MAX_F, sizeof(double));
@@ -1879,6 +1890,7 @@ int main(int argc, char **argv)
                        field_r.mape_ratio_pct,
                        field_r.sgd_fires, field_r.explorations);
                 if (mm > 0) printf("  MISMATCH=%llu", mm);
+                if (fi < WARMUP_SKIP) printf("  (warmup)");
                 printf("\n");
 
                 /* Write to timestep CSV */

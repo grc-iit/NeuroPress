@@ -121,7 +121,11 @@ int gpucompress_lammps_write_field(const char* filename,
     H5Pclose(dcpl);
     H5Sclose(space);
     H5Fclose(fid);
-    cudaDeviceSynchronize();
+    /* NOTE: cudaDeviceSynchronize() was removed here. It was called inside a
+     * KOKKOS END_OF_STEP fix, which corrupts KOKKOS::Cuda's internal stream-
+     * ordering bookkeeping (event fences). The crash manifests one timestep later
+     * as a silent SIGABRT from KOKKOS's error handler. H5Fclose() already flushes
+     * the VOL pipeline; no additional global sync is needed. */
 
     /* Verification */
     if (verify && rc == 0) {

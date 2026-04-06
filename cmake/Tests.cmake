@@ -39,6 +39,9 @@ set_target_properties(bench_warpx_policies PROPERTIES CUDA_SEPARABLE_COMPILATION
 # WarpX hyperparameter study: uses generic_benchmark via run_warpx_benchmark.sh
 # (see benchmarks/warpx/run_warpx_benchmark.sh)
 
+# EMA gradient buffer reset test (verifies CRITICAL-2 fix)
+# NOTE: linked to HDF5 VOL in cmake/HDF5Vol.cmake (needs H5VLgpucompress target)
+
 # Compression core test suite
 add_executable(test_compression_core
     tests/unit/test_compression_core.cu

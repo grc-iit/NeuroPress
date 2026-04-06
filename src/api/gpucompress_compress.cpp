@@ -877,9 +877,10 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
             if (efill > 0) {
                 std::lock_guard<std::mutex> sgd_lk(g_sgd_mutex);
                 float gn = 0; int gc = 0, gs = 0;
-                gpucompress::runNNSGDCtx(d_stats_ptr, explore_sgd,
+                int rc = gpucompress::runNNSGDCtx(d_stats_ptr, explore_sgd,
                     efill, input_size, cfg.error_bound, g_reinforce_lr, ctx,
                     &gn, &gc, &gs);
+                if (rc == 0) sgd_fired = true;
             }
         }
         /* Bug fix: sgd_ms now measures Phase 1 + Phase 2 only,

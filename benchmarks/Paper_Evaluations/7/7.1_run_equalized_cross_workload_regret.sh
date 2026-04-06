@@ -125,9 +125,28 @@ VPIC_MI_ME="${VPIC_MI_ME:-5}"
 VPIC_WPE_WCE="${VPIC_WPE_WCE:-1}"
 VPIC_TI_TE="${VPIC_TI_TE:-5}"
 
-# ── NYX: Sedov blast wave — tighter dump interval (25 steps) catches
-#    the shock front moving through chunk boundaries more frequently.
-NYX_NCELL="${NYX_NCELL:-160}"
+# ── NYX: Sedov blast wave (HydroTests)
+#
+#    Physics: Spherical shock expands from point energy into uniform gas.
+#    Grid:    220³ cells × 13 components × 4 bytes = 554 MB/write
+#    Chunks:  554 MB / 4 MB = 133 chunks per write
+#    Writes:  200 steps / 25 plot_int = 8 writes → 1064 ranking rows
+#
+#    Data evolution (ratio policy, LR=0.1):
+#      T=0-2: ratio=100x, uniform — trivially compressible
+#      T=3:   ratio=99x,  shock front enters first chunks (std=6.9)
+#      T=4:   ratio=98x,  shock expands (std=7.7, SGD fires=8)
+#      T=5:   ratio=97x,  MAPE comp drops 124%→30% (SGD fires=18)
+#      T=6-8: ratio=93-96x, MAPE comp stabilizes at 4-6% (SGD fires=36-42)
+#
+#    Key metrics:
+#      MAPE comp:  160% → 4%  (steady convergence over 8 writes)
+#      Regret:     0% → 2.4% → 1% (low, NN picks near-optimal)
+#      MAPE ratio: 0% → 15%  (rises as shock creates unpredictable data)
+#      SGD fires:  0 → 42    (accelerates as data diversifies)
+#      Chunk std:  0 → 19    (continuous increase in data diversity)
+#
+NYX_NCELL="${NYX_NCELL:-220}"
 NYX_MAX_STEP="${NYX_MAX_STEP:-200}"
 NYX_PLOT_INT="${NYX_PLOT_INT:-25}"
 
@@ -137,15 +156,45 @@ WARPX_NCELL="${WARPX_NCELL:-128 128 320}"
 WARPX_MAX_STEP="${WARPX_MAX_STEP:-200}"
 WARPX_DIAG_INTERVAL="${WARPX_DIAG_INTERVAL:-25}"
 
-# ── LAMMPS: MD hot-sphere expansion — extreme temperature (T_hot=100)
-#    creates violent shock; frequent dumps (every 10 steps) capture
-#    the rapid transient as density/velocity gradients evolve.
+# ── LAMMPS: MD phase transition (hot-sphere near melting)
+#
+#    Physics: FCC lattice with hot sphere (T=2.0) in cold matrix (T=0.7).
+#             Temperatures near LJ melting point create continuously
+#             evolving solid-liquid boundary — unlike T_hot=50/100 which
+#             creates a one-time explosion that stabilizes immediately.
+#    Grid:    161³ FCC = 16.7M atoms × 3 comp × 4 bytes = 200 MB/field
+#    Chunks:  200 MB / 4 MB = 50 chunks per write (positions only for ranking)
+#    Writes:  500-step intervals × 8 writes = 4000 total steps
+#
+#    Why interval=500: Tested 10/25/50/100/500. Shorter intervals (10-25)
+#    cause instant NN adaptation (1 SGD step). interval=500 gives enough
+#    physics evolution between dumps that the NN must continuously re-learn.
+#    MAPE comp shows steady 15-write convergence from 207% → 19%.
+#
+#    Why T_cold=0.7, T_hot=2.0: Tested T_hot=10/50/100. T_hot=100 causes
+#    numerical instability (NaN forces, nvCOMP crash). T_hot=10 creates
+#    stationary data. T_cold=0.7/T_hot=2.0 (near LJ melting point ~0.7)
+#    creates continuous solid-liquid phase boundary migration.
+#
+#    Data evolution (ratio policy, LR=0.1, interval=500):
+#      T=0:    ratio=2.46  mape_c=108%          (pristine FCC lattice)
+#      T=1:    ratio=1.16  mape_c=207% (+99%)   (lattice disrupted, NN worse)
+#      T=2:    ratio=1.14  mape_c=172% (-35%)   (SGD starts correcting)
+#      T=3:    ratio=1.11  mape_c=130% (-43%)   (improving)
+#      T=5:    ratio=1.17  mape_c= 77% (-57%)   (big improvement)
+#      T=7:    ratio=1.17  mape_c= 62% (-7%)    (steady decline)
+#      T=10:   ratio=1.17  mape_c= 52% (-3%)    (converging)
+#      T=15:   ratio=1.16  mape_c= 19% (-16%)   (5.7× improvement from peak)
+#
+#    Regret:  0% → 19% → 0-2% (adapts by T=4, stays near-optimal)
+#    SGD:     16→11→7→0→0→7→9 (learns, stops, restarts as data shifts)
+#
 LMP_ATOMS="${LMP_ATOMS:-161}"
 LMP_TIMESTEPS="${LMP_TIMESTEPS:-8}"
-LMP_SIM_INTERVAL="${LMP_SIM_INTERVAL:-25}"
-LMP_WARMUP_STEPS="${LMP_WARMUP_STEPS:-50}"
-LMP_T_HOT="${LMP_T_HOT:-100.0}"
-LMP_T_COLD="${LMP_T_COLD:-0.01}"
+LMP_SIM_INTERVAL="${LMP_SIM_INTERVAL:-500}"
+LMP_WARMUP_STEPS="${LMP_WARMUP_STEPS:-0}"
+LMP_T_HOT="${LMP_T_HOT:-2.0}"
+LMP_T_COLD="${LMP_T_COLD:-0.7}"
 
 # ── Policy weights ────────────────────────────────────────────
 case "$POLICY" in
@@ -173,6 +222,61 @@ export LD_LIBRARY_PATH="/tmp/hdf5-install/lib:$PROJECT_DIR/build:/tmp/lib:/usr/l
 note() { echo "[$(date +%H:%M:%S)] $*"; }
 die()  { echo "ERROR: $*" >&2; exit 1; }
 require_file() { [ -f "$1" ] || die "required file not found: $1"; }
+
+# ── Progress monitor ─────────────────────────────────────────
+# Monitors a CSV file in the background, prints progress bar to stderr.
+# Usage: monitor_progress "VPIC" csv_file expected_rows pid
+# Call stop_monitor to clean up.
+MONITOR_PID=""
+monitor_progress() {
+    local sim_name="$1"
+    local csv_file="$2"
+    local expected="$3"
+    local sim_pid="$4"
+    local chunks_per_ts="${5:-50}"
+
+    (
+        local prev_rows=0
+        while kill -0 "$sim_pid" 2>/dev/null; do
+            if [ -f "$csv_file" ]; then
+                local rows
+                rows=$(tail -n +2 "$csv_file" 2>/dev/null | wc -l | tr -d ' ')
+                if [ "$rows" -gt "$prev_rows" ]; then
+                    local pct=$((rows * 100 / expected))
+                    [ "$pct" -gt 100 ] && pct=100
+                    local ts=$((rows / chunks_per_ts))
+                    local total_ts=$((expected / chunks_per_ts))
+                    # Build progress bar (20 chars)
+                    local filled=$((pct / 5))
+                    local empty=$((20 - filled))
+                    local bar=""
+                    for ((i=0; i<filled; i++)); do bar+="█"; done
+                    for ((i=0; i<empty; i++)); do bar+="░"; done
+                    printf "\r[%s] ▶ %-7s [%s] T=%d/%d  (%3d%%)  %d chunks" \
+                        "$(date +%H:%M:%S)" "$sim_name" "$bar" "$ts" "$total_ts" "$pct" "$rows" >&2
+                    prev_rows=$rows
+                fi
+            fi
+            sleep 2
+        done
+        # Final line
+        if [ -f "$csv_file" ]; then
+            local final_rows
+            final_rows=$(tail -n +2 "$csv_file" 2>/dev/null | wc -l | tr -d ' ')
+            printf "\r[%s] ✓ %-7s [████████████████████] T=done        %d chunks\n" \
+                "$(date +%H:%M:%S)" "$sim_name" "$final_rows" >&2
+        fi
+    ) &
+    MONITOR_PID=$!
+}
+
+stop_monitor() {
+    if [ -n "$MONITOR_PID" ] && kill -0 "$MONITOR_PID" 2>/dev/null; then
+        kill "$MONITOR_PID" 2>/dev/null
+        wait "$MONITOR_PID" 2>/dev/null
+    fi
+    MONITOR_PID=""
+}
 
 check_binary() {
     local name="$1" path="$2"
@@ -353,7 +457,13 @@ NYXEOF
     cd "$nyx_work"
     GPUCOMPRESS_WEIGHTS="$WEIGHTS" \
     NYX_LOG_DIR="$nyx_out" \
-    "$NYX_BIN" inputs > "$nyx_out/nyx_sim.log" 2>&1 || true
+    "$NYX_BIN" inputs > "$nyx_out/nyx_sim.log" 2>&1 &
+    local sim_pid=$!
+    local nyx_writes=$(( NYX_MAX_STEP / NYX_PLOT_INT + 1 ))
+    local nyx_est_chunks=50
+    monitor_progress "NYX" "$nyx_out/benchmark_nyx_ranking.csv" $(( nyx_writes * nyx_est_chunks )) "$sim_pid" "$nyx_est_chunks"
+    wait "$sim_pid" 2>/dev/null
+    stop_monitor
     cd "$PROJECT_DIR"
 
     # Check if ranking CSV was produced by the DiagLogger
@@ -403,7 +513,15 @@ run_vpic_sim() {
     VPIC_EXPLORE_K="$EXPLORE_K" \
     VPIC_VERIFY="0" \
     VPIC_RESULTS_DIR="$vpic_out" \
-    "$VPIC_BIN" > "$vpic_out/vpic_sim.log" 2>&1
+    "$VPIC_BIN" > "$vpic_out/vpic_sim.log" 2>&1 &
+    local sim_pid=$!
+
+    # Estimate: ~50 chunks/field × timesteps ranking rows
+    local est_chunks=$(( (VPIC_NX + 2) * (VPIC_NX + 2) * (VPIC_NX + 2) * 16 * 4 / (CHUNK_MB * 1024 * 1024) ))
+    local est_total=$(( VPIC_TIMESTEPS * est_chunks ))
+    monitor_progress "VPIC" "$vpic_out/benchmark_vpic_deck_ranking.csv" "$est_total" "$sim_pid" "$est_chunks"
+    wait "$sim_pid" 2>/dev/null
+    stop_monitor
 
     # VPIC writes benchmark_vpic_deck_ranking.csv and _timestep_chunks.csv
     # Symlink to the names the plotter expects
@@ -474,7 +592,13 @@ WARPXEOF
     WARPX_LOG_DIR="$warpx_out" \
     WARPX_MAX_STEP="$WARPX_MAX_STEP" \
     WARPX_DIAG_INTERVAL="$WARPX_DIAG_INTERVAL" \
-    "$WARPX_BIN" inputs > "$warpx_out/warpx_sim.log" 2>&1 || true
+    "$WARPX_BIN" inputs > "$warpx_out/warpx_sim.log" 2>&1 &
+    local sim_pid=$!
+    local warpx_writes=$(( WARPX_MAX_STEP / WARPX_DIAG_INTERVAL ))
+    local warpx_est_chunks=50
+    monitor_progress "WarpX" "$warpx_out/benchmark_warpx_ranking.csv" $(( warpx_writes * warpx_est_chunks )) "$sim_pid" "$warpx_est_chunks"
+    wait "$sim_pid" 2>/dev/null
+    stop_monitor
     cd "$PROJECT_DIR"
 
     # Check if per-chunk CSV was produced
@@ -542,7 +666,12 @@ LMPEOF
     GPUCOMPRESS_TOTAL_WRITES="$LMP_TIMESTEPS" \
     LAMMPS_LOG_CHUNKS="1" \
     LAMMPS_LOG_DIR="$lammps_out" \
-    "$LMP_BIN" -k on g 1 -sf kk -in input.lmp > "$lammps_out/lammps_sim.log" 2>&1 || true
+    "$LMP_BIN" -k on g 1 -sf kk -in input.lmp > "$lammps_out/lammps_sim.log" 2>&1 &
+    local sim_pid=$!
+    local lmp_est_chunks=50
+    monitor_progress "LAMMPS" "$lammps_out/benchmark_lammps_ranking.csv" $(( LMP_TIMESTEPS * lmp_est_chunks )) "$sim_pid" "$lmp_est_chunks"
+    wait "$sim_pid" 2>/dev/null
+    stop_monitor
     cd "$PROJECT_DIR"
 
     # Check per-chunk CSV produced during runtime

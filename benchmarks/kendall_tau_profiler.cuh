@@ -425,7 +425,11 @@ static int run_ranking_profiler(
     /* ── 9. Cleanup ── */
     cudaFree(d_comp_buf);
     cudaFree(d_decomp_buf);
-    gpucompress_flush_manager_cache();
+    /* NOTE: gpucompress_flush_manager_cache() was removed here. It deleted all
+     * nvcomp manager objects across all CompContext pool slots, whose destructors
+     * issue cudaStreamSynchronize calls that corrupt KOKKOS's stream-ordering
+     * state when called from inside a KOKKOS fix. The pool's LRU eviction handles
+     * manager lifecycle correctly without explicit flushing after profiling. */
 
     return 0;
 }

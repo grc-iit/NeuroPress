@@ -196,6 +196,20 @@ void syncAllCompContextStreams() {
         cudaStreamSynchronize(::g_sgd_stream);
 }
 
+void resetAllSGDEMABuffers() {
+    std::lock_guard<std::mutex> lk(g_pool_mutex);
+    /* Zero region 2 (EMA gradient) of every context's SGD grad buffer.
+     * Called on weight reload to prevent stale EMA from a prior phase
+     * contaminating the anti-flip damping of the new phase. */
+    size_t ema_offset = 2 * NN_SGD_GRAD_REGION * sizeof(float);
+    size_t ema_bytes  = NN_SGD_GRAD_REGION * sizeof(float);
+    for (int i = 0; i < N_COMP_CTX; i++) {
+        if (g_comp_pool[i].d_sgd_grad_buffer)
+            cudaMemset(g_comp_pool[i].d_sgd_grad_buffer + 2 * NN_SGD_GRAD_REGION,
+                       0, ema_bytes);
+    }
+}
+
 std::unique_ptr<nvcomp::nvcompManagerBase> createCompManagerForCtx(CompContext* ctx, CompressionAlgorithm algo) {
     int idx = static_cast<int>(algo);
     if (idx < 0 || idx >= CompContext::N_COMP_ALGOS) return nullptr;

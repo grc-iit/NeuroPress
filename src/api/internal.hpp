@@ -355,6 +355,11 @@ void         releaseCompContext(CompContext*);
  *  Used by NN load/cleanup to ensure no in-flight kernels reference old weights. */
 void         syncAllCompContextStreams();
 
+/** Zero the EMA gradient region (region 2) of every CompContext's SGD buffer.
+ *  Called on weight reload to prevent stale EMA from a prior training phase
+ *  contaminating the anti-flip damping of the new phase. */
+void         resetAllSGDEMABuffers();
+
 /** Create a fresh compression manager for this context+algorithm.
  *  Caller owns the returned unique_ptr.  Used for exploration alternatives. */
 std::unique_ptr<nvcomp::nvcompManagerBase> createCompManagerForCtx(CompContext* ctx, CompressionAlgorithm algo);
