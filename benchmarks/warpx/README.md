@@ -129,3 +129,156 @@ WarpX uses a staggered Yee grid with separate MultiFabs per component:
 
 Particle data is stored in AMReX Structure-of-Arrays (SoA) format:
 x, y, z, ux, uy, uz, w (7 real components per particle).
+
+## VPIC-Compatible Multi-Phase Benchmark
+
+The `run_warpx_benchmark.sh` script runs a full 12-phase compression benchmark
+using a laser wakefield acceleration (LWFA) simulation. Electromagnetic fields
+evolve as the laser pulse creates a plasma wake, providing diverse compression
+characteristics across timesteps.
+
+### How it works
+
+**Phase 1 — Simulation dump:**
+Run WarpX with `WARPX_DUMP_FIELDS=1`. The patched `FlushFormatGPUCompress.cpp`
+writes raw `.f32` binary files for each field component (Ex, Ey, Ez, Bx, By,
+Bz, jx, jy, jz, rho) × each FArrayBox at each diagnostic interval. If
+`amrex::Real` is double, values are downcast to float32. The LWFA physics
+creates evolving electromagnetic fields — from smooth initial conditions
+through laser-driven oscillations to complex wake structure.
+
+**Phase 2 — Compression sweep:**
+The `generic_benchmark` binary loads the `.f32` files in chronological order
+(zero-padded `diag00000_`, `diag00020_`, ... ensures alphabetical = temporal).
+All 12 phases (no-comp, lz4, snappy, deflate, gdeflate, zstd, ans, cascaded,
+bitcomp, nn, nn-rl, nn-rl+exp50) run on each field. NN weights are reloaded
+per phase for clean isolation. Runs once per cost-model policy.
+
+### Quick start
+
+```bash
+cd /path/to/GPUCompress
+
+# Set paths
+export WARPX_BIN=$HOME/src/warpx/build-gpucompress/bin/warpx.3d
+export GPUCOMPRESS_WEIGHTS=neural_net/weights/model.nnwt
+
+# Run benchmark (32x32x256 LWFA, 20 timesteps, lossy eb=0.01)
+WARPX_MAX_STEP=200 \
+WARPX_DIAG_INT=10 \
+WARPX_NCELL="32 32 256" \
+CHUNK_MB=4 \
+ERROR_BOUND=0.01 \
+POLICIES="balanced,ratio" \
+bash benchmarks/warpx/run_warpx_benchmark.sh
+```
+
+### Environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WARPX_BIN` | auto-detect | Path to `warpx.3d` binary |
+| `WARPX_INPUTS` | LWFA example | Path to WarpX inputs file |
+| `WARPX_MAX_STEP` | `200` | Total simulation steps |
+| `WARPX_DIAG_INT` | `10` | Steps between diagnostics (200/10 = 20 timesteps) |
+| `WARPX_NCELL` | `32 32 256` | Grid cells (nx ny nz) |
+| `CHUNK_MB` | `4` | HDF5 chunk size in MB |
+| `POLICIES` | `balanced,ratio` | Cost-model policies to sweep |
+| `ERROR_BOUND` | `0.01` | Lossy error bound (WarpX fields benefit from lossy) |
+| `RESULTS_DIR` | auto | Output directory |
+
+### Data evolution
+
+LWFA creates electromagnetic field evolution:
+
+| Stage | Physical state | E-field character | Compression |
+|-------|---------------|-------------------|-------------|
+| Initial | Uniform plasma + laser seed | Smooth, sinusoidal | High (~77x vacuum FABs) |
+| Early | Laser entering plasma | Oscillatory in wake region | Moderate |
+| Mid | Bubble forming | Complex wake structure | Lower (~8x active FABs) |
+| Late | Electron trapping | Shear layers, fine features | Lowest (~1.2x active FABs) |
+
+The mix of vacuum FABs (high compression) and active-physics FABs (low
+compression) within each timestep creates diverse chunk statistics — ideal
+for NN algorithm selection benchmarking.
+
+### Raw field dump format
+
+With `WARPX_DUMP_FIELDS=1`, each diagnostic creates:
+
+```
+raw_fields/
+  diag00000/
+    lev0_Ex_fab0000.f32    # Level 0, Ex component, FAB 0
+    lev0_Ex_fab0001.f32    # Level 0, Ex component, FAB 1
+    ...
+    lev0_rho_fab0003.f32   # Level 0, rho component, FAB 3
+  diag00020/
+    lev0_Ex_fab0000.f32
+    ...
+```
+
+Each file contains `ncells` float32 values (one FAB × one component).
+For a 32×32×256 grid with `max_grid_size=64`, there are 4 FABs.
+
+### WarpX-specific notes
+
+- **Staggered Yee grid**: Different field components (E, B, J, rho) have
+  slightly different grid sizes due to edge/face/node centering. The benchmark
+  handles this by measuring each file's size independently.
+- **Single precision**: WarpX is typically built with `WarpX_PRECISION=SINGLE`
+  for GPU performance. The dump writes float32 directly in this case.
+- **Lossy compression**: WarpX electromagnetic fields compress very well with
+  lossy modes (`ERROR_BOUND=0.01`). The Pareto plot shows the ratio-throughput
+  tradeoff across algorithms.
+
+### Manual two-step run
+
+```bash
+# Step 1: Run WarpX with field dumping
+export WARPX_DUMP_FIELDS=1
+export WARPX_DUMP_DIR=/tmp/warpx_fields
+$WARPX_BIN inputs_3d_lwfa \
+    max_step=200 \
+    amr.n_cell="32 32 256" \
+    diagnostics.diags_names=diag1 \
+    diag1.intervals=10 \
+    diag1.diag_type=Full \
+    diag1.format=gpucompress \
+    gpucompress.weights_path=neural_net/weights/model.nnwt \
+    gpucompress.algorithm=auto
+
+# Step 2: Flatten and benchmark
+mkdir -p /tmp/warpx_flat
+for d in /tmp/warpx_fields/diag*; do
+    for f in $d/*.f32; do
+        ln -sf "$f" "/tmp/warpx_flat/$(basename $d)_$(basename $f)"
+    done
+done
+
+N_FLOATS=$(( $(stat -c%s /tmp/warpx_flat/diag00000_lev0_Ex_fab0000.f32) / 4 ))
+./build/generic_benchmark neural_net/weights/model.nnwt \
+    --data-dir /tmp/warpx_flat \
+    --dims ${N_FLOATS},1 \
+    --ext .f32 \
+    --chunk-mb 4 \
+    --out-dir /tmp/warpx_results \
+    --name "warpx_lwfa" \
+    --w0 1.0 --w1 1.0 --w2 1.0 \
+    --error-bound 0.01
+```
+
+### Generate figures
+
+```bash
+SDR_DIR=/tmp/warpx_results \
+python3 benchmarks/plots/generate_dataset_figures.py --dataset warpx_lwfa
+```
+
+### Scaling
+
+| Grid | Cells | Components | FABs (msg=64) | Data/timestep |
+|------|-------|------------|---------------|---------------|
+| 32×32×256 | 262K | 10 | 4 | 40 MB |
+| 64×64×512 | 2.1M | 10 | 32 | 320 MB |
+| 128×128×1024 | 16.8M | 10 | 256 | 2.5 GB |

@@ -443,3 +443,149 @@ modified file.
 | `AMReX HDF5 CUDA error 700` | AMReX's own HDF5 writer conflicts with CUDA | Use GPUCompress path (`nyx.use_gpucompress=1`) instead of `nyx.write_hdf5=1`. Do not enable both |
 | `Forcing with device memory not implemented` | DrivenTurbulence forcing not GPU-ready | Use HydroTests (Sedov) or MiniSB instead |
 | AMReX submodule too old | `checkPointNow()` API mismatch | `cd subprojects/amrex && git checkout development` |
+
+## VPIC-Compatible Multi-Phase Benchmark
+
+The `run_nyx_benchmark.sh` script runs a full 12-phase compression benchmark
+using the Sedov blast wave test problem. Data evolves dramatically across
+timesteps (compression ratio drops from ~369x to ~141x as the shock expands),
+making it ideal for evaluating NN algorithm selection.
+
+### How it works
+
+**Phase 1 — Simulation dump:**
+Run Nyx HydroTests (Sedov blast) with `NYX_DUMP_FIELDS=1`. The patched
+`Nyx_output.cpp` writes raw `.f32` binary files for each FArrayBox component
+(density, xmom, ymom, zmom, rho_E, rho_e, Temp, Ne, species, pressure) at
+each plot interval. If `amrex::Real` is double, values are downcast to float32
+for the dump. Data evolves as the Sedov shock expands from a point explosion
+into uniform background.
+
+**Phase 2 — Compression sweep:**
+The `generic_benchmark` binary loads the `.f32` files in chronological order
+(zero-padded `plt00000_`, `plt00001_`, ... ensures alphabetical = temporal).
+All 12 phases run on each field. NN weights are reloaded per phase for clean
+isolation. The sweep runs once per cost-model policy.
+
+### Quick start
+
+```bash
+cd /path/to/GPUCompress
+
+# Set paths
+export NYX_BIN=$HOME/Nyx/build-gpucompress/Exec/HydroTests/nyx_HydroTests
+export GPUCOMPRESS_WEIGHTS=neural_net/weights/model.nnwt
+
+# Run benchmark (128^3 Sedov, 20 timesteps, balanced+ratio)
+NYX_NCELL=128 \
+NYX_MAX_STEP=200 \
+NYX_PLOT_INT=10 \
+CHUNK_MB=4 \
+POLICIES="balanced,ratio" \
+bash benchmarks/nyx/run_nyx_benchmark.sh
+```
+
+### Environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `NYX_BIN` | auto-detect | Path to `nyx_HydroTests` binary |
+| `NYX_NCELL` | `128` | Grid cells per dimension (128 = 2M cells, ~25 MB/component) |
+| `NYX_MAX_STEP` | `200` | Total simulation steps |
+| `NYX_PLOT_INT` | `10` | Steps between diagnostic dumps (200/10 = 20 timesteps) |
+| `CHUNK_MB` | `4` | HDF5 chunk size in MB |
+| `POLICIES` | `balanced,ratio` | Cost-model policies to sweep |
+| `ERROR_BOUND` | `0.0` | Lossy error bound (0.0 = lossless) |
+| `NO_RANKING` | `1` | Disable ranking profiler (recommended for large grids) |
+| `RESULTS_DIR` | auto | Output directory |
+
+### Data evolution
+
+The Sedov blast wave creates excellent data diversity:
+
+| Timestep | Physical state | Density ratio | Character |
+|----------|---------------|---------------|-----------|
+| 0 | Uniform background + point energy | ~370x | Highly compressible |
+| 50 | Shock forming | ~340x | Slightly less |
+| 100 | Developed shock, ~10% domain | ~250x | Mixed compressibility |
+| 150 | Shock propagating, ~20% domain | ~190x | Diverse chunk types |
+| 200 | Late time, ~30% domain | ~140x | Least compressible |
+
+Behind the shock: turbulent mixing develops (high entropy, low compression).
+Ahead of the shock: still uniform (high compression). This mix of high/low
+compressibility chunks within each timestep is ideal for NN algorithm selection.
+
+### Raw field dump format
+
+With `NYX_DUMP_FIELDS=1`, each plot interval creates:
+
+```
+raw_fields/
+  plt00000/
+    fab0000_comp00_density.f32    # FArrayBox 0, component 0
+    fab0000_comp01_xmom.f32       # FArrayBox 0, component 1
+    ...
+    fab0000_comp12_pressure.f32   # FArrayBox 0, component 12
+  plt00001/
+    fab0000_comp00_density.f32
+    ...
+```
+
+Each file contains `ncells` float32 values (one FAB × one component).
+For a 128^3 grid with `max_grid_size=128`, there is 1 FAB per file
+(2,097,152 cells = 8 MB). For 256^3 with `max_grid_size=128`, there
+are 8 FABs per timestep.
+
+### Manual two-step run
+
+```bash
+# Step 1: Run Nyx with field dumping
+export NYX_DUMP_FIELDS=1
+export NYX_DUMP_DIR=/tmp/nyx_fields
+$NYX_BIN inputs.sedov \
+    nyx.use_gpucompress=1 \
+    nyx.gpucompress_weights=neural_net/weights/model.nnwt \
+    amr.n_cell="128 128 128" \
+    amr.max_step=200 \
+    amr.plot_int=10
+
+# Step 2: Flatten and benchmark
+mkdir -p /tmp/nyx_flat
+for d in /tmp/nyx_fields/plt*; do
+    for f in $d/*.f32; do
+        ln -sf "$f" "/tmp/nyx_flat/$(basename $d)_$(basename $f)"
+    done
+done
+
+N_FLOATS=$(( $(stat -c%s /tmp/nyx_flat/plt00000_fab0000_comp00_density.f32) / 4 ))
+NO_RANKING=1 ./build/generic_benchmark neural_net/weights/model.nnwt \
+    --data-dir /tmp/nyx_flat \
+    --dims ${N_FLOATS},1 \
+    --ext .f32 \
+    --chunk-mb 4 \
+    --out-dir /tmp/nyx_results \
+    --name "nyx_sedov" \
+    --w0 1.0 --w1 1.0 --w2 1.0
+```
+
+### Generate figures
+
+```bash
+SDR_DIR=/tmp/nyx_results \
+python3 benchmarks/plots/generate_dataset_figures.py --dataset nyx_sedov
+```
+
+### Performance note
+
+For grids >= 256^3, the ranking profiler becomes expensive (~2 min per
+milestone at 200 chunks × 16 configs × 3 repeats). Use `NO_RANKING=1`
+(default in the script) to disable it, or run ranking separately on a
+single timestep.
+
+### Scaling
+
+| Grid | Cells | Components | Data/timestep | Dump files/timestep |
+|------|-------|------------|---------------|---------------------|
+| 64^3 | 262K | 13 | 13 MB | 13 |
+| 128^3 | 2.1M | 13 | 104 MB | 13 |
+| 256^3 | 16.8M | 13 | 832 MB | 104 (8 FABs × 13) |

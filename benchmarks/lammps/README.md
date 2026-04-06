@@ -360,3 +360,134 @@ The fix is a new KOKKOS-only style (`fix gpucompress`). It requires 2 new source
 | `Not running with KOKKOS!` | Missing `-k on g 1 -sf kk` flags | Always use KOKKOS runtime flags |
 | Segfault at end of run | GPUCompress finalize after CUDA teardown | Fixed in latest version (skip finalize in destructor) |
 | Low compression ratios | MD data is inherently high-entropy | Expected for lossless; try lossy with `GPUCOMPRESS_ERROR_BOUND=0.01` |
+
+## VPIC-Compatible Multi-Phase Benchmark
+
+The `run_lammps_vpic_benchmark.sh` script runs a full 12-phase compression
+benchmark that produces the same CSV schema and figure suite as the VPIC
+benchmark deck. This enables apple-to-apple comparison across simulations.
+
+### How it works
+
+The benchmark uses a two-phase approach:
+
+**Phase 1 — Simulation dump:**
+Run LAMMPS once with `LAMMPS_DUMP_FIELDS=1`. The fix writes raw `.f32` binary
+files (positions, velocities, forces) at each dump interval. The simulation
+uses a hot-sphere explosion (hot region velocity=10.0, cold=0.01) to create
+evolving density fronts across timesteps — data is never static.
+
+**Phase 2 — Compression sweep:**
+The `generic_benchmark` binary loads each `.f32` file into GPU memory and
+sweeps all 12 compression phases (no-comp, 8 fixed algorithms, nn, nn-rl,
+nn-rl+exp50) on the same data. Files are read in chronological order
+(zero-padded filenames ensure alphabetical = temporal). NN weights are
+reloaded between phases for clean isolation. The sweep runs once per
+cost-model policy (balanced, ratio).
+
+### Quick start
+
+```bash
+cd /path/to/GPUCompress
+
+# Set paths
+export LMP_BIN=$HOME/lammps/build/lmp
+export GPUCOMPRESS_WEIGHTS=neural_net/weights/model.nnwt
+
+# Run benchmark (2M atoms, 10 timesteps, balanced+ratio policies)
+LMP_ATOMS=80 \
+TIMESTEPS=10 \
+SIM_INTERVAL=50 \
+WARMUP_STEPS=100 \
+CHUNK_MB=4 \
+POLICIES="balanced,ratio" \
+bash benchmarks/lammps/run_lammps_vpic_benchmark.sh
+```
+
+### Environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LMP_BIN` | `$HOME/lammps/build/lmp` | Path to LAMMPS binary |
+| `LMP_ATOMS` | `80` | Box size per dimension (80 = ~2M atoms) |
+| `TIMESTEPS` | `10` | Number of benchmark write cycles |
+| `SIM_INTERVAL` | `50` | Physics steps between each dump (data evolution) |
+| `WARMUP_STEPS` | `100` | Physics steps before first benchmark dump |
+| `CHUNK_MB` | `4` | HDF5 chunk size in MB |
+| `POLICIES` | `balanced,ratio` | Cost-model policies to sweep |
+| `ERROR_BOUND` | `0.0` | Lossy error bound (0.0 = lossless) |
+| `RESULTS_DIR` | auto | Output directory |
+
+### NN phase control
+
+The fix supports `GPUCOMPRESS_SGD` and `GPUCOMPRESS_EXPLORE` env vars to
+distinguish the three NN phases:
+
+| Phase | `GPUCOMPRESS_SGD` | `GPUCOMPRESS_EXPLORE` | Behavior |
+|-------|-------------------|-----------------------|----------|
+| `nn` | `0` | `0` | Inference only (frozen weights) |
+| `nn-rl` | `1` | `0` | Online SGD learning, no exploration |
+| `nn-rl+exp50` | `1` | `1` | Online SGD + exploration (default) |
+
+### Manual two-step run
+
+```bash
+# Step 1: Dump fields
+export LAMMPS_DUMP_FIELDS=1
+export LAMMPS_DUMP_DIR=/tmp/lammps_fields
+export GPUCOMPRESS_ALGO=lz4
+export GPUCOMPRESS_SGD=0
+export GPUCOMPRESS_EXPLORE=0
+$LMP_BIN -k on g 1 -sf kk -in in.melt_gpuc
+
+# Step 2: Benchmark one field type
+N_FLOATS=$(( $(stat -c%s /tmp/lammps_fields/positions_step0000000000.f32) / 4 ))
+./build/generic_benchmark neural_net/weights/model.nnwt \
+    --data-dir /tmp/lammps_fields \
+    --dims ${N_FLOATS},1 \
+    --ext .f32 \
+    --chunk-mb 4 \
+    --out-dir /tmp/lammps_results \
+    --name "lammps_positions" \
+    --w0 1.0 --w1 1.0 --w2 1.0
+```
+
+### Output files
+
+```
+results/
+  balanced/
+    positions/
+      benchmark_lammps_positions.csv              # Aggregate (1 row per phase)
+      benchmark_lammps_positions_timesteps.csv    # Per-timestep (52 columns)
+      benchmark_lammps_positions_timestep_chunks.csv  # Per-chunk at milestones
+      benchmark_lammps_positions_ranking.csv      # Kendall tau quality
+      benchmark_lammps_positions_ranking_costs.csv
+    velocities/
+      ...
+    forces/
+      ...
+  ratio/
+    ...
+```
+
+### Generate figures
+
+```bash
+# Point plotter at results directory
+SDR_DIR=benchmarks/lammps/results/vpic_eval_box80_chunk4mb_ts10/balanced \
+python3 benchmarks/plots/generate_dataset_figures.py --dataset lammps_positions
+```
+
+Produces the full figure suite: summary bar charts, SGD convergence, algorithm
+evolution heatmap, predicted-vs-actual scatter, ranking quality, pipeline
+waterfall — identical to VPIC/Gray-Scott figures.
+
+### Scaling
+
+| Box size | Atoms | Data/field (fp32) | Data/dump (3 fields) |
+|----------|-------|-------------------|----------------------|
+| 40^3 | 256K | 2.9 MB | 8.8 MB |
+| 80^3 | 2.0M | 23.4 MB | 70.3 MB |
+| 120^3 | 6.9M | 79 MB | 237 MB |
+| 160^3 | 16.4M | 188 MB | 563 MB |

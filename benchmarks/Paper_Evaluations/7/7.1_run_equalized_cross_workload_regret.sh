@@ -113,9 +113,6 @@ LMP_BIN="${LMP_BIN:-$HOME/lammps/build/lmp}"
 # ── NYX: cosmological simulation — grid size controls data per write.
 #    64^3 = ~3 MB/write (fast), 128^3 = ~25 MB, 256^3 = ~200 MB.
 #    plot_int controls dumps per simulation step.
-NYX_NCELL="${NYX_NCELL:-64}"
-NYX_MAX_STEP="${NYX_MAX_STEP:-500}"
-NYX_PLOT_INT="${NYX_PLOT_INT:-100}"
 
 # ── VPIC: plasma PIC — fast reconnection (mi_me=5) reaches nonlinear
 #    phase within ~500 steps. Perturbation=0.30 seeds instability faster.
