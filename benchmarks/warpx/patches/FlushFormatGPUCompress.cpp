@@ -32,9 +32,17 @@
 #include <sys/stat.h>
 
 #ifdef WARPX_USE_GPUCOMPRESS
+#include "kendall_tau_profiler.cuh"
+
 /* Per-chunk CSV logger state — persists across WriteToFile calls */
 static FILE* s_tc_csv = nullptr;
+static FILE* s_ranking_csv = nullptr;
+static FILE* s_ranking_costs_csv = nullptr;
 static int   s_write_count = 0;
+static int   s_total_writes = 0;  /* estimated, for milestone check */
+static float s_w0 = 1, s_w1 = 1, s_w2 = 1;
+static double s_error_bound = 0.0;
+static int   s_chunk_bytes = 4 * 1024 * 1024;
 static bool  s_learning_initialized = false;
 
 static void action_to_str_warpx(int action, char *buf, size_t bufsz) {
@@ -99,10 +107,27 @@ FlushFormatGPUCompress::FlushFormatGPUCompress ()
                            << " explore_thresh=" << explore_thresh << "\n";
         }
 
-        /* Open per-chunk CSV if WARPX_LOG_DIR is set */
+        /* Open per-chunk CSV + ranking CSV if WARPX_LOG_DIR is set */
         const char* log_dir = std::getenv("WARPX_LOG_DIR");
         if (log_dir && log_dir[0] && !s_tc_csv && amrex::ParallelDescriptor::IOProcessor()) {
             mkdir(log_dir, 0755);
+
+            /* Save cost model params for ranking profiler */
+            double eb = 0.0;
+            pp.query("error_bound", eb);
+            s_error_bound = eb;
+            pp.query("chunk_bytes", s_chunk_bytes);
+            if (policy == "speed")         { s_w0=1; s_w1=0; s_w2=0; }
+            else if (policy == "balanced") { s_w0=1; s_w1=1; s_w2=1; }
+            else                           { s_w0=0; s_w1=0; s_w2=1; }
+
+            /* Estimate total writes for milestone check */
+            const char* ms_env = std::getenv("WARPX_MAX_STEP");
+            const char* di_env = std::getenv("WARPX_DIAG_INTERVAL");
+            int est_ms = ms_env ? atoi(ms_env) : 100;
+            int est_di = di_env ? atoi(di_env) : 10;
+            s_total_writes = (est_di > 0) ? (est_ms / est_di + 1) : 10;
+
             char csv_path[700];
             snprintf(csv_path, sizeof(csv_path),
                      "%s/benchmark_warpx_timestep_chunks.csv", log_dir);
@@ -114,8 +139,19 @@ FlushFormatGPUCompress::FlushFormatGPUCompress ()
                         "mape_ratio,mape_comp,"
                         "sgd_fired,exploration_triggered,"
                         "cost_model_error_pct,actual_cost,predicted_cost\n");
-                amrex::Print() << "[GPUCompress] Chunk CSV: " << csv_path << "\n";
             }
+
+            snprintf(csv_path, sizeof(csv_path),
+                     "%s/benchmark_warpx_ranking.csv", log_dir);
+            s_ranking_csv = fopen(csv_path, "w");
+            if (s_ranking_csv) write_ranking_csv_header(s_ranking_csv);
+
+            snprintf(csv_path, sizeof(csv_path),
+                     "%s/benchmark_warpx_ranking_costs.csv", log_dir);
+            s_ranking_costs_csv = fopen(csv_path, "w");
+            if (s_ranking_costs_csv) write_ranking_costs_csv_header(s_ranking_costs_csv);
+
+            amrex::Print() << "[GPUCompress] Chunk + ranking CSV logging to " << log_dir << "\n";
         }
     } else {
         amrex::Print() << "[GPUCompress] WARNING: init failed (error "
@@ -349,6 +385,32 @@ FlushFormatGPUCompress::WriteToFile (
         double orig_mb = total_original / (1024.0 * 1024.0);
         amrex::Print() << "[GPUCompress] Wrote " << orig_mb
                        << " MB original data to " << dirname << "\n";
+    }
+
+    /* Run ranking profiler at milestone writes */
+    if (s_ranking_csv && amrex::ParallelDescriptor::IOProcessor()
+        && is_ranking_milestone(s_write_count, s_total_writes)) {
+        /* Use the last FAB's data for ranking (representative of this write) */
+        for (int lev = 0; lev < nlev; ++lev) {
+            for (amrex::MFIter mfi(mf[lev]); mfi.isValid(); ++mfi) {
+                const amrex::FArrayBox& fab = mf[lev][mfi];
+                long ncells = mfi.validbox().numPts();
+                size_t fab_bytes = (size_t)ncells * mf[lev].nComp() * elem_size;
+                const void* d_ptr = static_cast<const void*>(fab.dataPtr());
+                float bw = gpucompress_get_bandwidth_bytes_per_ms();
+                RankingMilestoneResult result = {};
+                run_ranking_profiler(d_ptr, fab_bytes, (size_t)s_chunk_bytes,
+                                     s_error_bound, s_w0, s_w1, s_w2, bw,
+                                     3, s_ranking_csv, s_ranking_costs_csv,
+                                     "nn-rl+exp50", s_write_count, &result);
+                amrex::Print() << "    [ranking] T=" << s_write_count
+                               << ": tau=" << result.mean_tau
+                               << " regret=" << result.mean_regret << "x"
+                               << " (" << result.profiling_ms << "ms)\n";
+                break; /* one FAB is enough for ranking */
+            }
+            break; /* level 0 only */
+        }
     }
 
     s_write_count++;

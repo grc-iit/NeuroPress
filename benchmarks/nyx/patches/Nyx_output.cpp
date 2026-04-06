@@ -253,10 +253,16 @@ Nyx::writePlotFile (const std::string& dir,
     /* Write compressed HDF5 via VOL — same pattern as VPIC deck */
     std::string gpuc_dir = dir_final + "_gpuc";
     Real t0 = ParallelDescriptor::second();
+    double gpuc_error_bound = 0.0;
+    { ParmParse pp_eb("nyx"); pp_eb.query("gpucompress_error_bound", gpuc_error_bound); }
+
     long orig_bytes = gpucompress_nyx_bridge::write_multifab_compressed(
         gpuc_dir, plotMF, varnames, vol_fapl,
-        4 * 1024 * 1024 /* 4 MiB chunks */,
-        algo, 0.0 /* lossless */,
+        [&]() -> size_t {
+            int cmb = 4; ParmParse pp_cb("nyx"); pp_cb.query("gpucompress_chunk_mb", cmb);
+            return (size_t)cmb * 1024 * 1024;
+        }() /* chunk bytes from nyx.gpucompress_chunk_mb */,
+        algo, gpuc_error_bound,
         gpucompress_verify != 0 /* verify */,
         diag_logger.enabled ? &diag_logger : nullptr,
         "nn-rl+exp50", nyx_write_count);

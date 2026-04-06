@@ -25,6 +25,17 @@
 #include "lammps_gpucompress_udf.h"
 #include "gpucompress.h"
 
+/* Ranking profiler (CUDA, linked from lammps_ranking_profiler.cu) */
+struct RankingMilestoneResult { double mean_tau, std_tau, mean_regret, profiling_ms; };
+extern "C" int lammps_run_ranking_profiler(
+    const void* d_data, size_t total_bytes, size_t chunk_bytes,
+    double error_bound, float w0, float w1, float w2, float bw_bytes_per_ms,
+    int n_repeats, FILE* csv, FILE* costs_csv,
+    const char* phase_name, int timestep, RankingMilestoneResult* out);
+extern "C" int lammps_is_ranking_milestone(int t, int total);
+extern "C" void lammps_write_ranking_csv_header(FILE* csv);
+extern "C" void lammps_write_ranking_costs_csv_header(FILE* csv);
+
 using namespace LAMMPS_NS;
 using namespace FixConst;
 
@@ -70,7 +81,12 @@ FixGPUCompressKokkos::FixGPUCompressKokkos(LAMMPS *lmp, int narg, char **arg) :
   const char *lcenv = getenv("LAMMPS_LOG_CHUNKS");
   log_chunks = (lcenv && atoi(lcenv)) ? 1 : 0;
   tc_csv = NULL;
+  ranking_csv = NULL;
+  ranking_costs_csv = NULL;
   write_count = 0;
+  const char *tw_env = getenv("GPUCOMPRESS_TOTAL_WRITES");
+  total_writes = tw_env ? atoi(tw_env) : 10;
+  cw0 = 1; cw1 = 1; cw2 = 1;
 
   gpuc_ready = 0;
 }
@@ -150,8 +166,25 @@ void FixGPUCompressKokkos::init()
                     "mape_ratio,mape_comp,"
                     "sgd_fired,exploration_triggered,"
                     "cost_model_error_pct,actual_cost,predicted_cost\n");
-            fprintf(stdout, "[GPUCompress-LAMMPS] Chunk CSV: %s\n", csv_path);
           }
+
+          /* Ranking CSV (top1_regret from oracle comparison) */
+          snprintf(csv_path, sizeof(csv_path),
+                   "%s/benchmark_lammps_ranking.csv", csv_dir);
+          ranking_csv = fopen(csv_path, "w");
+          if (ranking_csv) lammps_write_ranking_csv_header(ranking_csv);
+
+          snprintf(csv_path, sizeof(csv_path),
+                   "%s/benchmark_lammps_ranking_costs.csv", csv_dir);
+          ranking_costs_csv = fopen(csv_path, "w");
+          if (ranking_costs_csv) lammps_write_ranking_costs_csv_header(ranking_costs_csv);
+
+          /* Cost model weights for ranking profiler */
+          if (strcmp(policy, "speed") == 0)    { cw0=1; cw1=0; cw2=0; }
+          else if (strcmp(policy, "balanced") == 0) { cw0=1; cw1=1; cw2=1; }
+          else { cw0=0; cw1=0; cw2=1; }
+
+          fprintf(stdout, "[GPUCompress-LAMMPS] Chunk + ranking CSV: %s/\n", csv_dir);
         }
         fflush(stdout);
       }
@@ -330,6 +363,25 @@ void FixGPUCompressKokkos::end_of_step()
               (double)dd.actual_cost, (double)dd.predicted_cost);
     }
     fflush(tc_csv);
+
+    /* Ranking profiler at milestone writes */
+    if (ranking_csv && lammps_is_ranking_milestone(write_count, total_writes)) {
+      auto d_x = atomKK->k_x.view_device();
+      const void *rank_ptr = (const void *)d_x.data();
+      size_t rank_bytes = (size_t)nlocal * 3 * elem_bytes;
+      float bw = gpucompress_get_bandwidth_bytes_per_ms();
+      RankingMilestoneResult result = {};
+      size_t chunk_bytes = 4 * 1024 * 1024; /* 4 MiB default */
+      const char *cb_env = getenv("GPUCOMPRESS_CHUNK_MB");
+      if (cb_env) chunk_bytes = (size_t)atoi(cb_env) * 1024 * 1024;
+      lammps_run_ranking_profiler(rank_ptr, rank_bytes, chunk_bytes,
+                                   0.0, cw0, cw1, cw2, bw,
+                                   3, ranking_csv, ranking_costs_csv,
+                                   phase, write_count, &result);
+      fprintf(stdout, "    [ranking] T=%d: tau=%.3f regret=%.3fx (%.0fms)\n",
+              write_count, result.mean_tau, result.mean_regret, result.profiling_ms);
+      fflush(stdout);
+    }
     write_count++;
   }
   gpucompress_reset_chunk_history();

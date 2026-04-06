@@ -326,6 +326,12 @@ nyx.gpucompress_weights = $WEIGHTS
 nyx.gpucompress_policy = $POLICY
 nyx.gpucompress_algorithm = auto
 nyx.gpucompress_verify = 0
+nyx.gpucompress_error_bound = $ERROR_BOUND
+nyx.gpucompress_chunk_mb = $CHUNK_MB
+nyx.sgd_lr = $SGD_LR
+nyx.sgd_mape = $SGD_MAPE
+nyx.explore_k = $EXPLORE_K
+nyx.explore_thresh = $EXPLORE_THRESH
 NYXEOF
 
     cd "$nyx_work"
@@ -357,44 +363,53 @@ run_vpic_sim() {
     [ "$SKIP_VPIC" = "1" ] && { note "SKIP VPIC (SKIP_VPIC=1)"; return 0; }
     check_binary "VPIC" "$VPIC_BIN" || return 0
 
-    local raw_dir="$RESULTS_DIR/raw_vpic"
-    mkdir -p "$raw_dir"
+    local vpic_out="$RESULTS_DIR/vpic"
+    mkdir -p "$vpic_out"
 
-    note "Running VPIC simulation with DUMP_FIELDS=1 (NX=$VPIC_NX, timesteps=$VPIC_TIMESTEPS)"
+    note "Running VPIC simulation with nn-rl+exp50 (NX=$VPIC_NX, timesteps=$VPIC_TIMESTEPS)"
+
+    # VPIC_PHASE restricts to nn-rl+exp50 only (skip fixed + nn + nn-rl)
     GPUCOMPRESS_WEIGHTS="$WEIGHTS" \
     VPIC_TIMESTEPS="$VPIC_TIMESTEPS" \
     VPIC_WARMUP_STEPS="$VPIC_WARMUP_STEPS" \
     VPIC_SIM_INTERVAL="$VPIC_SIM_INTERVAL" \
     VPIC_POLICIES="$POLICY" \
-    VPIC_PHASE="no-comp" \
+    VPIC_PHASE="nn-rl+exp50" \
     VPIC_NX="$VPIC_NX" \
     VPIC_CHUNK_MB="$CHUNK_MB" \
-    VPIC_ERROR_BOUND="0.0" \
+    VPIC_ERROR_BOUND="$ERROR_BOUND" \
     VPIC_LR="$SGD_LR" \
     VPIC_MAPE_THRESHOLD="$SGD_MAPE" \
     VPIC_EXPLORE_THRESH="$EXPLORE_THRESH" \
     VPIC_EXPLORE_K="$EXPLORE_K" \
     VPIC_VERIFY="0" \
-    VPIC_DUMP_FIELDS="1" \
-    VPIC_RESULTS_DIR="$raw_dir" \
-    "$VPIC_BIN" > "$raw_dir/vpic_dump.log" 2>&1
+    VPIC_RESULTS_DIR="$vpic_out" \
+    "$VPIC_BIN" > "$vpic_out/vpic_sim.log" 2>&1
 
-    local n_raw
-    n_raw=$(find "$raw_dir" -maxdepth 1 -name "*.raw" | wc -l)
-    if [ "$n_raw" -lt 1 ]; then
-        note "WARNING: VPIC produced no raw field dumps"
-        return 0
+    # VPIC writes benchmark_vpic_deck_ranking.csv and _timestep_chunks.csv
+    # Symlink to the names the plotter expects
+    for csv in "$vpic_out"/benchmark_vpic_deck_ranking*.csv "$vpic_out"/benchmark_vpic_deck_timestep_chunks.csv; do
+        [ -f "$csv" ] || continue
+        local target
+        target="$(echo "$(basename "$csv")" | sed 's/vpic_deck/vpic/')"
+        [ ! -f "$vpic_out/$target" ] && ln -sf "$(basename "$csv")" "$vpic_out/$target"
+    done
+
+    local ranking_csv="$vpic_out/benchmark_vpic_ranking.csv"
+    if [ -f "$ranking_csv" ]; then
+        local n_rows
+        n_rows=$(tail -n +2 "$ranking_csv" | wc -l)
+        note "VPIC: $n_rows ranking rows (live simulation)"
+    else
+        note "WARNING: VPIC produced no ranking CSV"
     fi
-    note "VPIC: $n_raw raw field dumps"
 
-    local first_raw
-    first_raw=$(find "$raw_dir" -maxdepth 1 -name "*.raw" | sort | head -1)
-    local file_bytes
-    file_bytes=$(stat -c %s "$first_raw")
-    local n_floats=$((file_bytes / 4))
-    local dims="1,${n_floats}"
-
-    run_regret_benchmark "vpic" "$raw_dir" "$dims" ".raw"
+    local tc_csv="$vpic_out/benchmark_vpic_timestep_chunks.csv"
+    if [ -f "$tc_csv" ]; then
+        local n_tc
+        n_tc=$(tail -n +2 "$tc_csv" | wc -l)
+        note "VPIC: $n_tc chunk rows in timestep_chunks CSV"
+    fi
 }
 
 run_warpx_sim() {
@@ -414,6 +429,8 @@ run_warpx_sim() {
 
 # Override for cross-workload regret evaluation
 amr.n_cell = $WARPX_NCELL
+amr.max_grid_size = 512
+amr.blocking_factor = 32
 max_step = $WARPX_MAX_STEP
 
 # GPUCompress diagnostic output
@@ -425,7 +442,7 @@ gpuc_diag.fields_to_plot = Ex Ey Ez Bx By Bz jx jy jz rho
 gpucompress.weights_path = $WEIGHTS
 gpucompress.algorithm = auto
 gpucompress.policy = $POLICY
-gpucompress.error_bound = 0.0
+gpucompress.error_bound = $ERROR_BOUND
 gpucompress.chunk_bytes = $((CHUNK_MB * 1024 * 1024))
 gpucompress.verify = 0
 gpucompress.sgd_lr = $SGD_LR
@@ -436,6 +453,8 @@ WARPXEOF
 
     cd "$warpx_work"
     WARPX_LOG_DIR="$warpx_out" \
+    WARPX_MAX_STEP="$WARPX_MAX_STEP" \
+    WARPX_DIAG_INTERVAL="$WARPX_DIAG_INTERVAL" \
     "$WARPX_BIN" inputs > "$warpx_out/warpx_sim.log" 2>&1 || true
     cd "$PROJECT_DIR"
 
@@ -454,13 +473,13 @@ run_lammps_sim() {
     [ "$SKIP_LAMMPS" = "1" ] && { note "SKIP LAMMPS (SKIP_LAMMPS=1)"; return 0; }
     check_binary "LAMMPS" "$LMP_BIN" || return 0
 
-    local raw_dir="$RESULTS_DIR/raw_lammps"
+    local lammps_out="$RESULTS_DIR/lammps"
     local work_dir="$RESULTS_DIR/lammps_work"
-    mkdir -p "$raw_dir" "$work_dir"
+    mkdir -p "$lammps_out" "$work_dir"
 
     local total_steps=$((LMP_WARMUP_STEPS + LMP_TIMESTEPS * LMP_SIM_INTERVAL))
 
-    note "Running LAMMPS simulation with DUMP_FIELDS=1 (atoms=$LMP_ATOMS^3, timesteps=$LMP_TIMESTEPS)"
+    note "Running LAMMPS simulation with nn-rl+exp50 (atoms=$LMP_ATOMS^3, timesteps=$LMP_TIMESTEPS)"
 
     cat > "$work_dir/input.lmp" <<LMPEOF
 units           lj
@@ -491,30 +510,29 @@ LMPEOF
 
     cd "$work_dir"
     GPUCOMPRESS_WEIGHTS="$WEIGHTS" \
-    GPUCOMPRESS_ALGO="lz4" \
+    GPUCOMPRESS_ALGO="auto" \
     GPUCOMPRESS_POLICY="$POLICY" \
     GPUCOMPRESS_VERIFY="0" \
-    LAMMPS_DUMP_FIELDS="1" \
-    LAMMPS_DUMP_DIR="$raw_dir" \
-    "$LMP_BIN" -k on g 1 -sf kk -in input.lmp > "$raw_dir/lammps_dump.log" 2>&1 || true
+    GPUCOMPRESS_LR="$SGD_LR" \
+    GPUCOMPRESS_MAPE="$SGD_MAPE" \
+    GPUCOMPRESS_EXPLORE_K="$EXPLORE_K" \
+    GPUCOMPRESS_EXPLORE_THRESH="$EXPLORE_THRESH" \
+    GPUCOMPRESS_CHUNK_MB="$CHUNK_MB" \
+    GPUCOMPRESS_TOTAL_WRITES="$LMP_TIMESTEPS" \
+    LAMMPS_LOG_CHUNKS="1" \
+    LAMMPS_LOG_DIR="$lammps_out" \
+    "$LMP_BIN" -k on g 1 -sf kk -in input.lmp > "$lammps_out/lammps_sim.log" 2>&1 || true
     cd "$PROJECT_DIR"
 
-    local n_raw
-    n_raw=$(find "$raw_dir" -maxdepth 1 -name "*.f32" | wc -l)
-    if [ "$n_raw" -lt 1 ]; then
-        note "WARNING: LAMMPS produced no raw field dumps"
-        return 0
+    # Check per-chunk CSV produced during runtime
+    local tc_csv="$lammps_out/benchmark_lammps_timestep_chunks.csv"
+    if [ -f "$tc_csv" ]; then
+        local n_tc
+        n_tc=$(tail -n +2 "$tc_csv" | wc -l)
+        note "LAMMPS: $n_tc chunk rows (live simulation)"
+    else
+        note "WARNING: LAMMPS produced no per-chunk CSV"
     fi
-    note "LAMMPS: $n_raw raw field dumps"
-
-    local first_f32
-    first_f32=$(find "$raw_dir" -maxdepth 1 -name "*.f32" | sort | head -1)
-    local file_bytes
-    file_bytes=$(stat -c %s "$first_f32")
-    local n_floats=$((file_bytes / 4))
-    local dims="1,${n_floats}"
-
-    run_regret_benchmark "lammps" "$raw_dir" "$dims" ".f32"
 }
 
 # ════════════════════════════════════════════════════════════════
@@ -633,7 +651,8 @@ for key, label, color in workload_order:
     xs = list(range(len(rows)))
     ys = [r[2] for r in rows]
     series.append((label, color, xs, ys, key))
-    print(f"  {label}: {len(rows)} chunks from {os.path.basename(ranking_path if source == 'ranking' else tc_path)}")
+    src_name = os.path.basename(ranking_path if source == "ranking" else tc_path)
+    print(f"  {label}: {len(rows)} chunks from {src_name}")
 
 if not series:
     print("ERROR: no workload data to plot", file=sys.stderr)
@@ -671,23 +690,22 @@ max_convergence = max(convergence_chunks) if convergence_chunks else 0
 # Plot
 fig, ax = plt.subplots(figsize=(5.4, 3.8))
 for label, color, xs, ys, _ in series:
+    # Cap regret at 100% for readability
+    ys_capped = [min(y, 100.0) for y in ys]
     window = min(5, max(1, len(ys) // 3))
     if len(ys) > window:
-        smooth = np.convolve(ys, np.ones(window)/window, mode='valid')
+        smooth = np.convolve(ys_capped, np.ones(window)/window, mode='valid')
         smooth_x = list(range(window - 1, len(ys)))
         ax.plot(smooth_x, smooth, color=color, linewidth=2.0, label=label)
-        ax.plot(xs, ys, color=color, alpha=0.15, linewidth=0.5)
+        ax.plot(xs, ys_capped, color=color, alpha=0.15, linewidth=0.5)
     else:
-        ax.plot(xs, ys, color=color, linewidth=2.0, label=label)
-
-x_val = f"~{max_convergence}" if max_convergence > 0 else "X"
+        ax.plot(xs, ys_capped, color=color, linewidth=2.0, label=label)
 
 ax.set_xlabel("Chunk Index (sequential across profiled fields)")
 ax.set_ylabel("Top-1 Regret (%)")
-ax.set_title(f"Regret Converges Within {x_val} Chunks\nAcross All {len(series)} Workloads")
 ax.grid(True, alpha=0.25)
 ax.legend(frameon=True, fontsize=9)
-ax.set_ylim(bottom=0)
+ax.set_ylim(bottom=0, top=105)
 plt.tight_layout()
 plt.savefig(png_path, dpi=220, bbox_inches="tight")
 print(f"\nSaved: {png_path}")
@@ -695,7 +713,7 @@ print(f"Saved: {combined_csv}")
 
 # Summary stats
 print("\n--- Convergence Summary ---")
-for (label, _, _, ys, _), c in zip(series, convergence_chunks):
+for (label, _, ys, _, _), c in zip(series, convergence_chunks):
     final_avg = np.mean(ys[-min(20, len(ys)):]) if ys else 0
     print(f"  {label:15s}: converges ~chunk {c:4d}, "
           f"final avg regret = {final_avg:.2f}%")
@@ -842,7 +860,6 @@ x_val = f"~{max_convergence}" if max_convergence > 0 else "X"
 
 ax.set_xlabel("Chunk Index (sequential across profiled fields)")
 ax.set_ylabel("Compression Time MAPE (%)")
-ax.set_title(f"Comp. Time MAPE Converges Within {x_val} Chunks\nAcross All {len(series)} Workloads")
 ax.grid(True, alpha=0.25)
 ax.legend(frameon=True, fontsize=9)
 ax.set_ylim(bottom=0)
@@ -856,7 +873,7 @@ print("\n--- Comp. Time MAPE Convergence Summary ---")
 print("Note: high initial MAPE does not translate into proportionally high")
 print("regret -- relative algorithm ranking remains stable even when individual")
 print("metric predictions are inaccurate.")
-for (label, _, _, ys, _), c in zip(series, convergence_chunks):
+for (label, _, xs, ys, _), c in zip(series, convergence_chunks):
     final_avg = np.mean(ys[-min(20, len(ys)):]) if ys else 0
     print(f"  {label:15s}: converges ~chunk {c:4d}, "
           f"final avg comp MAPE = {final_avg:.2f}%")

@@ -52,7 +52,11 @@ class FixGPUCompressKokkos : public Fix {
   int dump_raw_fields;
   int log_chunks;         /* 1 if writing per-chunk CSV diagnostics */
   FILE *tc_csv;           /* timestep_chunks CSV handle */
+  FILE *ranking_csv;      /* ranking CSV (top1_regret) */
+  FILE *ranking_costs_csv;
   int write_count;        /* running write counter for CSV timestep col */
+  int total_writes;       /* estimated total writes for milestone check */
+  float cw0, cw1, cw2;   /* cost model weights for ranking profiler */
   int gpuc_ready;
 };
 
