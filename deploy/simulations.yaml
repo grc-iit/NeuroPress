@@ -283,8 +283,8 @@ vpic:
       ERROR_BOUND: "0.0"
       VPIC_NX: 200             # grid cells per dim (~520MB at 200^3)
       VPIC_TIMESTEPS: 10
-      VPIC_WARMUP_STEPS: 100
-      VPIC_SIM_INTERVAL: 10
+      VPIC_WARMUP_STEPS: 500
+      VPIC_SIM_INTERVAL: 190
       VPIC_CHUNK_MB: 4
       VPIC_POLICIES: "balanced,ratio,speed"
     results_dir: results/vpic

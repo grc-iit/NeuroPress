@@ -8,7 +8,7 @@ Produces 3 charts:
   3. Average MAPE vs Dataset (clustered bar chart with error bars)
 
 Usage:
-    python3 benchmarks/Paper_Evaluations/4/4.2.1_plot_rl_adaptiveness.py [RESULTS_DIR]
+    python3 benchmarks/Paper_Evaluations/4/adaptiveness/4.2.1_plot_rl_adaptiveness.py [RESULTS_DIR]
 
     RESULTS_DIR defaults to benchmarks/Paper_Evaluations/4/results/rl_adaptiveness/
 """

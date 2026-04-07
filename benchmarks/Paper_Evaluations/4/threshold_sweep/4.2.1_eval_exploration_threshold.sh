@@ -22,7 +22,8 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-GPU_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+GPU_DIR="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
+PARENT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # ── Fixed parameters ──
 WEIGHTS="$GPU_DIR/neural_net/weights/model.nnwt"
@@ -51,7 +52,7 @@ if [ "$ERROR_BOUND" = "0" ] || [ "$ERROR_BOUND" = "0.0" ]; then
 else
     EB_TAG="eb${ERROR_BOUND}"
 fi
-SWEEP_DIR="$SCRIPT_DIR/results/threshold_sweep_${POLICY}_${EB_TAG}_lr${SGD_LR}"
+SWEEP_DIR="$PARENT_DIR/results/threshold_sweep_${POLICY}_${EB_TAG}_lr${SGD_LR}"
 
 # ── Validate ──
 if [ ! -f "$BIN" ]; then

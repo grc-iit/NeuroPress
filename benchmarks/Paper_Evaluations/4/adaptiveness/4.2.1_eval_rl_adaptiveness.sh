@@ -10,7 +10,7 @@
 # Ranking profiler: ON (for regret computation)
 #
 # Usage:
-#   bash benchmarks/Paper_Evaluations/4/4.2.1_eval_rl_adaptiveness.sh
+#   bash benchmarks/Paper_Evaluations/4/adaptiveness/4.2.1_eval_rl_adaptiveness.sh
 #
 # Environment overrides:
 #   CHUNK_MB          16        Chunk size in MB
@@ -25,7 +25,8 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-GPU_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+GPU_DIR="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
+PARENT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # ── Fixed parameters ──
 WEIGHTS="$GPU_DIR/neural_net/weights/model.nnwt"
@@ -54,7 +55,7 @@ if [ "$ERROR_BOUND" = "0" ] || [ "$ERROR_BOUND" = "0.0" ]; then
 else
     EB_TAG="eb${ERROR_BOUND}"
 fi
-RESULTS_BASE="$SCRIPT_DIR/results/rl_adaptiveness_${POLICY}_${EB_TAG}_lr${SGD_LR}"
+RESULTS_BASE="$PARENT_DIR/results/rl_adaptiveness_${POLICY}_${EB_TAG}_lr${SGD_LR}"
 DATASETS=${DATASETS:-"nyx,hurricane_isabel,cesm_atm,cesm_atm_26ts"}
 
 # ── Dataset configs ──
@@ -151,5 +152,5 @@ echo "All datasets complete."
 echo "Results: $RESULTS_BASE"
 echo ""
 echo "Generate plots:"
-echo "  python3 benchmarks/Paper_Evaluations/4/4.2.1_plot_rl_adaptiveness.py $RESULTS_BASE"
+echo "  python3 benchmarks/Paper_Evaluations/4/adaptiveness/4.2.1_plot_rl_adaptiveness.py $RESULTS_BASE"
 echo "============================================================"

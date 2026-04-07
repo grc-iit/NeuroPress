@@ -14,7 +14,7 @@
 # Total runs: 7 x 7 = 49
 #
 # Usage:
-#   bash benchmarks/Paper_Evaluations/4/4.2.1_eval_vpic_threshold_sweep.sh
+#   bash benchmarks/Paper_Evaluations/4/threshold_sweep/4.2.1_eval_vpic_threshold_sweep.sh
 #
 # Fixed configuration:
 #   VPIC_NX         100         Grid size (NX^3 cells)
@@ -31,7 +31,8 @@ set -eo pipefail
 command -v bc >/dev/null 2>&1 || { echo "ERROR: bc not found"; exit 1; }
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-GPU_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+GPU_DIR="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
+PARENT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # ── Parameters recovered from the known-good run ──
 VPIC_BIN="${VPIC_BIN:-$GPU_DIR/vpic_benchmark_deck.Linux}"
@@ -61,7 +62,7 @@ if [ "$VPIC_ERROR_BOUND" = "0" ] || [ "$VPIC_ERROR_BOUND" = "0.0" ]; then
 else
     EB_TAG="eb${VPIC_ERROR_BOUND}"
 fi
-SWEEP_DIR="$SCRIPT_DIR/results/vpic_threshold_sweep_${POLICY}_${EB_TAG}_lr${SGD_LR}"
+SWEEP_DIR="$PARENT_DIR/results/vpic_threshold_sweep_${POLICY}_${EB_TAG}_lr${SGD_LR}"
 
 # ── Validate ──
 if [ ! -f "$VPIC_BIN" ]; then

@@ -484,8 +484,10 @@ begin_initialization {
     if (wpe*dt > wpedt_max) dt = wpedt_max/wpe;
 
     // Warmup steps and chunk size configurable via environment
+    // Default 500: with slow-reconnection physics (mi_me=25, wpe_wce=3)
+    // the system needs ~500 steps before fields are well-developed.
     const char* env_steps = getenv("VPIC_WARMUP_STEPS");
-    int warmup = env_steps ? atoi(env_steps) : 100;
+    int warmup = env_steps ? atoi(env_steps) : 500;
     if (warmup < 1) warmup = 1;
 
     const char* env_chunk = getenv("VPIC_CHUNK_MB");
@@ -553,9 +555,12 @@ begin_initialization {
     int   explore_k      = env_ek   ? atoi(env_ek)          : 4;
     float explore_thresh = env_et   ? (float)atof(env_et)   : 0.20f;
 
-    // Simulation interval: N physics steps between each benchmark write
+    // Simulation interval: N physics steps between each benchmark write.
+    // Default 190: ensures successive snapshots differ enough for SGD to
+    // see real adaptation pressure. Smaller intervals produce nearly
+    // identical snapshots under slow-reconnection physics.
     const char* env_sim_int = getenv("VPIC_SIM_INTERVAL");
-    int sim_interval = env_sim_int ? atoi(env_sim_int) : 1;
+    int sim_interval = env_sim_int ? atoi(env_sim_int) : 190;
     if (sim_interval < 1) sim_interval = 1;
 
     // Total VPIC steps: warmup + 1 + timesteps * sim_interval

@@ -7,7 +7,7 @@
 # physics data — the NN must adapt online.
 #
 # Usage:
-#   bash benchmarks/Paper_Evaluations/4/4.2.1_eval_vpic_adaptiveness.sh
+#   bash benchmarks/Paper_Evaluations/4/adaptiveness/4.2.1_eval_vpic_adaptiveness.sh
 #
 # Environment overrides:
 #   VPIC_NX           100       Grid size
@@ -23,7 +23,8 @@
 set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-GPU_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+GPU_DIR="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
+PARENT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # ── Parameters ──
 VPIC_BIN="$GPU_DIR/vpic_benchmark_deck.Linux"
@@ -54,7 +55,7 @@ if [ "$VPIC_ERROR_BOUND" = "0" ] || [ "$VPIC_ERROR_BOUND" = "0.0" ]; then
 else
     EB_TAG="eb${VPIC_ERROR_BOUND}"
 fi
-RESULTS_DIR="$SCRIPT_DIR/results/vpic_adaptiveness_${POLICY}_${EB_TAG}_lr${SGD_LR}"
+RESULTS_DIR="$PARENT_DIR/results/vpic_adaptiveness_${POLICY}_${EB_TAG}_lr${SGD_LR}"
 
 # ── Validate ──
 if [ ! -f "$VPIC_BIN" ]; then

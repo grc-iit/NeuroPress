@@ -254,8 +254,8 @@ setup_nyx() {
         -DCMAKE_C_COMPILER="$(which gcc)" \
         -DCMAKE_CXX_COMPILER="$(which g++)" \
         -DCMAKE_CUDA_HOST_COMPILER="$(which g++)" \
-        "-DCMAKE_CXX_FLAGS=-DAMREX_USE_GPUCOMPRESS -I${GPUC_DIR}/include -I${GPUC_DIR}/examples -I${HDF5_ROOT}/include" \
-        "-DCMAKE_CUDA_FLAGS=-DAMREX_USE_GPUCOMPRESS -I${GPUC_DIR}/include -I${GPUC_DIR}/examples -I${HDF5_ROOT}/include" \
+        "-DCMAKE_CXX_FLAGS=-DAMREX_USE_GPUCOMPRESS -I${GPUC_DIR}/include -I${GPUC_DIR}/examples -I${GPUC_DIR}/benchmarks -I${HDF5_ROOT}/include" \
+        "-DCMAKE_CUDA_FLAGS=-DAMREX_USE_GPUCOMPRESS -I${GPUC_DIR}/include -I${GPUC_DIR}/examples -I${GPUC_DIR}/benchmarks -I${HDF5_ROOT}/include" \
         "-DCMAKE_EXE_LINKER_FLAGS=-L${GPUC_DIR}/build -L${HDF5_ROOT}/lib -L${NVCOMP_PREFIX}/lib -Wl,--no-as-needed -lgpucompress -lH5VLgpucompress -lH5Zgpucompress -lhdf5 -lnvcomp -Wl,--as-needed" \
         "-DCMAKE_SHARED_LINKER_FLAGS=-L${HDF5_ROOT}/lib -lhdf5"
     cmake --build . --target nyx_HydroTests -j"$(nproc)"
@@ -300,6 +300,8 @@ setup_warpx() {
         -DWarpX_MPI=ON \
         -DWarpX_DIMS=3 \
         -DWarpX_GPUCOMPRESS=ON \
+        -DGPUCOMPRESS_PREFIX="${GPUC_DIR}/build" \
+        "-DCMAKE_PREFIX_PATH=${HDF5_ROOT}" \
         "-DCMAKE_CXX_FLAGS=-I${GPUC_DIR}/include -I${GPUC_DIR}/examples -I${HDF5_ROOT}/include" \
         "-DCMAKE_EXE_LINKER_FLAGS=-L${GPUC_DIR}/build -lgpucompress -lH5VLgpucompress -lH5Zgpucompress -L${HDF5_ROOT}/lib -lhdf5 -L/usr/local/cuda/lib64 -lcudart"
     cmake --build . -j"$(nproc)"
@@ -355,7 +357,13 @@ setup_vpic() {
     # Clone
     if [ ! -d "$src" ]; then
         info "Cloning VPIC-Kokkos..."
-        git clone https://github.com/lanl/vpic-kokkos.git "$src"
+        git clone --recursive https://github.com/lanl/vpic-kokkos.git "$src"
+    fi
+
+    # Ensure submodules (kokkos) are initialized even if the clone pre-existed
+    if [ ! -f "$src/kokkos/bin/nvcc_wrapper" ]; then
+        info "Initializing VPIC submodules..."
+        ( cd "$src" && git submodule update --init --recursive )
     else
         info "VPIC-Kokkos source exists at $src"
     fi
@@ -367,6 +375,7 @@ setup_vpic() {
         cmake -S . -B build-compress \
             -DCMAKE_BUILD_TYPE=Release \
             -DENABLE_KOKKOS_CUDA=ON \
+            -DBUILD_INTERNAL_KOKKOS=ON \
             -DKokkos_ARCH_AMPERE80=ON \
             -DCMAKE_CXX_COMPILER="$(pwd)/kokkos/bin/nvcc_wrapper"
         cmake --build build-compress -j"$(nproc)"
@@ -507,8 +516,8 @@ bench_vpic() {
 
     export VPIC_NX="${VPIC_NX:-200}"
     export VPIC_TIMESTEPS="${VPIC_TIMESTEPS:-10}"
-    export VPIC_WARMUP_STEPS="${VPIC_WARMUP_STEPS:-100}"
-    export VPIC_SIM_INTERVAL="${VPIC_SIM_INTERVAL:-10}"
+    export VPIC_WARMUP_STEPS="${VPIC_WARMUP_STEPS:-500}"
+    export VPIC_SIM_INTERVAL="${VPIC_SIM_INTERVAL:-190}"
     export VPIC_CHUNK_MB="${VPIC_CHUNK_MB:-${CHUNK_MB:-4}}"
     export VPIC_POLICIES="${VPIC_POLICIES:-${POLICIES:-balanced,ratio,speed}}"
     export RESULTS_DIR="${RESULTS_BASE}/vpic"

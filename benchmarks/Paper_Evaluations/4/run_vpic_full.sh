@@ -20,8 +20,8 @@ echo "============================================================"
 echo ""
 echo ">>> Step 1: Threshold Sweep (2MB chunks, NX=100)"
 rm -rf benchmarks/Paper_Evaluations/4/results/vpic_threshold_sweep_balanced_eb0.01_lr0.2
-CHUNK_MB=2 bash benchmarks/Paper_Evaluations/4/4.2.1_eval_vpic_threshold_sweep.sh
-python3 benchmarks/Paper_Evaluations/4/4.2.1_plot_threshold_sweep.py \
+CHUNK_MB=2 bash benchmarks/Paper_Evaluations/4/threshold_sweep/4.2.1_eval_vpic_threshold_sweep.sh
+python3 benchmarks/Paper_Evaluations/4/threshold_sweep/4.2.1_plot_threshold_sweep.py \
     benchmarks/Paper_Evaluations/4/results/vpic_threshold_sweep_balanced_eb0.01_lr0.2
 
 # ── Step 2: Full Benchmark ──

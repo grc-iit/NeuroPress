@@ -11,7 +11,7 @@
 # across training epochs.
 #
 # Usage:
-#   bash benchmarks/Paper_Evaluations/4/4.2.1_eval_ai_workloads.sh
+#   bash benchmarks/Paper_Evaluations/4/adaptiveness/4.2.1_eval_ai_workloads.sh
 #
 # Environment overrides:
 #   AI_MODEL          vit_b_16    Model: vit_b_16 (86M), resnet18 (11M)
@@ -28,7 +28,8 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-GPU_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+GPU_DIR="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
+PARENT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # ── Parameters ──
 WEIGHTS="$GPU_DIR/neural_net/weights/model.nnwt"
@@ -58,7 +59,7 @@ ALL_EPOCHS=$(seq -s, 1 "$AI_EPOCHS")
 
 # Data and results directories
 DATA_DIR="$GPU_DIR/data/ai_training/${AI_MODEL}_checkpoints"
-RESULTS_BASE="$SCRIPT_DIR/results/ai_workloads_${AI_MODEL}_${POLICY}_lr${SGD_LR}"
+RESULTS_BASE="$PARENT_DIR/results/ai_workloads_${AI_MODEL}_${POLICY}_lr${SGD_LR}"
 
 # ── Validate ──
 if [ ! -f "$BIN" ]; then
@@ -188,5 +189,5 @@ echo "AI workload evaluation complete."
 echo "Results: $RESULTS_BASE"
 echo ""
 echo "Generate plots:"
-echo "  python3 benchmarks/Paper_Evaluations/4/4.2.1_plot_rl_adaptiveness.py $RESULTS_BASE"
+echo "  python3 benchmarks/Paper_Evaluations/4/adaptiveness/4.2.1_plot_rl_adaptiveness.py $RESULTS_BASE"
 echo "============================================================"

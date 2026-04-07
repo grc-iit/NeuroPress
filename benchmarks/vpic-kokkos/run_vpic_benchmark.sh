@@ -16,8 +16,8 @@
 #   VPIC_NX            Grid size per dimension [200]
 #   VPIC_CHUNK_MB      HDF5 chunk size in MB [4]
 #   VPIC_TIMESTEPS     Benchmark write cycles [20]
-#   VPIC_WARMUP_STEPS  Physics warmup steps [100]
-#   VPIC_SIM_INTERVAL  Physics steps between writes [1]
+#   VPIC_WARMUP_STEPS  Physics warmup steps [500]
+#   VPIC_SIM_INTERVAL  Physics steps between writes [190]
 #   POLICIES           NN policies [balanced,ratio,speed]
 #   ERROR_BOUND        Lossy error bound [0.0 = lossless]
 #   SGD_LR             SGD learning rate [0.2]
@@ -38,8 +38,12 @@ VPIC_DECK="${VPIC_DECK:-$SCRIPT_DIR/vpic_benchmark_deck.Linux}"
 VPIC_NX="${VPIC_NX:-200}"
 VPIC_CHUNK_MB="${VPIC_CHUNK_MB:-${CHUNK_MB:-4}}"
 VPIC_TIMESTEPS="${VPIC_TIMESTEPS:-20}"
-VPIC_WARMUP_STEPS="${VPIC_WARMUP_STEPS:-100}"
-VPIC_SIM_INTERVAL="${VPIC_SIM_INTERVAL:-1}"
+# Paper-grade defaults: 500 warmup ensures fields are well-developed and
+# 190 sim_interval ensures consecutive snapshots differ enough for SGD to
+# see meaningful adaptation pressure. With slow-reconnection physics
+# (mi_me=25, wpe_wce=3) shorter values produce nearly-identical snapshots.
+VPIC_WARMUP_STEPS="${VPIC_WARMUP_STEPS:-500}"
+VPIC_SIM_INTERVAL="${VPIC_SIM_INTERVAL:-190}"
 ERROR_BOUND="${ERROR_BOUND:-0.0}"
 SGD_LR="${SGD_LR:-0.2}"
 SGD_MAPE="${SGD_MAPE:-0.10}"
