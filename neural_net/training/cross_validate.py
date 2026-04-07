@@ -20,7 +20,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from neural_net.core.data import encode_and_split, ALGORITHM_NAMES, CONTINUOUS_FEATURES, OUTPUT_COLUMNS, OUTPUT_INVERSE
+from neural_net.core.data import encode_and_split, ALGORITHM_NAMES, CONTINUOUS_FEATURES, OUTPUT_COLUMNS, OUTPUT_INVERSE, LOSSY_ONLY_OUTPUTS
 from neural_net.core.data import inverse_transform_outputs
 from neural_net.core.model import CompressionPredictor
 
@@ -217,6 +217,9 @@ def main():
 
         train_X, train_Y, val_X, val_Y, y_means, y_stds, output_cols = prepare_fold(df_train, df_val)
 
+        # Lossy-only mask, aligned with df_val row order (which prepare_fold preserves)
+        lossy_mask = (df_val['quantization'] == 'linear').values
+
         if output_col_names is None:
             output_col_names = output_cols
             report_names = [OUTPUT_INVERSE.get(c, (c, 'identity'))[0] for c in output_cols]
@@ -235,6 +238,15 @@ def main():
         for name in report_names:
             p = pred_orig[name]
             a = actual_orig[name]
+            # Quality outputs (PSNR/MAE/SSIM) are constant on lossless rows
+            # (PSNR=120, MAE=0, SSIM=1). Restrict their metrics to the lossy
+            # slice so the report reflects actual prediction quality.
+            if name in LOSSY_ONLY_OUTPUTS:
+                p = p[lossy_mask]
+                a = a[lossy_mask]
+                tag = ' [lossy-only]'
+            else:
+                tag = ''
             mae = np.mean(np.abs(p - a))
             ss_res = np.sum((a - p) ** 2)
             ss_tot = np.sum((a - a.mean()) ** 2)
@@ -246,7 +258,7 @@ def main():
             all_metrics[name]['r2'].append(r2)
             all_metrics[name]['mape'].append(mape)
 
-            print(f"  {name:30s}  MAE={mae:8.4f}  R²={r2:.4f}  MAPE={mape:5.1f}%")
+            print(f"  {name:30s}  MAE={mae:8.4f}  R²={r2:.4f}  MAPE={mape:5.1f}%{tag}")
 
     # ---- Summary ----
     print(f"\n{'='*65}")
@@ -261,9 +273,10 @@ def main():
         r2_std = np.std(all_metrics[name]['r2'])
         mape_mean = np.mean(all_metrics[name]['mape'])
         mape_std = np.std(all_metrics[name]['mape'])
+        tag = ' [lossy-only]' if name in LOSSY_ONLY_OUTPUTS else ''
         print(f"  {name:<28s}  {mae_mean:>6.4f}±{mae_std:.4f}  "
               f"{r2_mean:>6.4f}±{r2_std:.4f}  "
-              f"{mape_mean:>5.1f}±{mape_std:.1f}%")
+              f"{mape_mean:>5.1f}±{mape_std:.1f}%{tag}")
 
 
 if __name__ == '__main__':

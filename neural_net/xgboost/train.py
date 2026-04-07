@@ -19,7 +19,7 @@ from sklearn.model_selection import KFold
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import xgboost as xgb
-from neural_net.core.data import inverse_transform_outputs, OUTPUT_COLUMNS, ALGORITHM_NAMES, CONTINUOUS_FEATURES
+from neural_net.core.data import inverse_transform_outputs, OUTPUT_COLUMNS, ALGORITHM_NAMES, CONTINUOUS_FEATURES, OUTPUT_INVERSE, LOSSY_ONLY_OUTPUTS
 
 # Human-readable labels for features
 FEATURE_LABELS = {
@@ -89,8 +89,16 @@ def _aggregate_shap(feature_names, shap_matrix):
     return labels, np.array(values)
 
 
-def collect_feature_importance(models, val_X, feature_names, output_dir):
-    """Compute SHAP values and save heatmap plot."""
+def collect_feature_importance(models, val_X, feature_names, output_dir, lossy_mask=None):
+    """Compute SHAP values and save heatmap plot.
+
+    Args:
+        lossy_mask: optional boolean mask aligned with val_X rows. When
+            provided, SHAP for quality outputs (PSNR/MAE/SSIM, whose targets
+            are constants on lossless rows) is computed on the lossy slice
+            only, so feature importances reflect actual quality prediction
+            rather than the trivial lossless branch.
+    """
     import shap
     import matplotlib.pyplot as plt
 
@@ -100,20 +108,36 @@ def collect_feature_importance(models, val_X, feature_names, output_dir):
     output_names_ordered = [n for n in models.keys() if n not in SHAP_EXCLUDE_OUTPUTS]
     output_labels = [OUTPUT_LABELS.get(n, n) for n in output_names_ordered]
 
+    # Map internal name -> raw target name to look up LOSSY_ONLY_OUTPUTS
+    def _is_lossy_only(internal_name):
+        raw, _ = OUTPUT_INVERSE.get(internal_name, (internal_name, 'identity'))
+        return raw in LOSSY_ONLY_OUTPUTS
+
     max_shap_samples = 5000
-    if val_X.shape[0] > max_shap_samples:
-        idx = np.random.RandomState(42).choice(val_X.shape[0], max_shap_samples, replace=False)
-        X_shap = val_X[idx]
+    rng = np.random.RandomState(42)
+
+    def _sample(X):
+        if X.shape[0] > max_shap_samples:
+            idx = rng.choice(X.shape[0], max_shap_samples, replace=False)
+            return X[idx]
+        return X
+
+    X_shap_full = _sample(val_X)
+    if lossy_mask is not None:
+        X_shap_lossy = _sample(val_X[lossy_mask])
+        print(f"  SHAP samples: full={X_shap_full.shape[0]}  lossy={X_shap_lossy.shape[0]}")
     else:
-        X_shap = val_X
+        X_shap_lossy = X_shap_full
 
     # Compute SHAP for all outputs in parallel (threads to avoid pickling)
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     def _shap_one(out_name):
+        X = X_shap_lossy if _is_lossy_only(out_name) else X_shap_full
         explainer = shap.TreeExplainer(models[out_name])
-        sv = explainer.shap_values(X_shap)
-        print(f"    SHAP done: {out_name}")
+        sv = explainer.shap_values(X)
+        tag = ' [lossy-only]' if _is_lossy_only(out_name) else ''
+        print(f"    SHAP done: {out_name}{tag}")
         return out_name, _aggregate_shap(feature_names, sv)
 
     shap_matrix = np.zeros((len(DISPLAY_FEATURES), len(output_names_ordered)))
@@ -188,9 +212,22 @@ def train_and_evaluate(data):
     print("XGBOOST VALIDATION METRICS")
     print(f"{'='*65}")
 
+    # Lossy-only mask (aligned with val rows from data['df_val'])
+    df_val = data.get('df_val')
+    val_lossy_mask = None
+    if df_val is not None and 'quantization' in df_val.columns:
+        val_lossy_mask = (df_val['quantization'] == 'linear').values
+
     for i, name in enumerate(output_names):
-        p = val_preds[:, i]
-        a = val_Y[:, i]
+        raw_name, _ = OUTPUT_INVERSE.get(name, (name, 'identity'))
+        if raw_name in LOSSY_ONLY_OUTPUTS and val_lossy_mask is not None:
+            p = val_preds[val_lossy_mask, i]
+            a = val_Y[val_lossy_mask, i]
+            tag = ' [lossy-only]'
+        else:
+            p = val_preds[:, i]
+            a = val_Y[:, i]
+            tag = ''
         mae = np.mean(np.abs(p - a))
         ss_res = np.sum((a - p) ** 2)
         ss_tot = np.sum((a - a.mean()) ** 2)
@@ -199,7 +236,7 @@ def train_and_evaluate(data):
         mape = np.mean(np.abs((a[mask] - p[mask]) / a[mask])) * 100 if mask.sum() > 0 else 0.0
         label = OUTPUT_LABELS.get(name, name).replace('\n', ' ')
 
-        print(f"\n  {label}:")
+        print(f"\n  {label}:{tag}")
         print(f"    MAE:  {mae:.4f}")
         print(f"    R²:   {r2:.4f}")
         print(f"    MAPE: {mape:.1f}%")
@@ -219,9 +256,10 @@ def train_and_evaluate(data):
         }, f)
     print(f"\nModels saved to {save_path}")
 
-    # Feature importance
+    # Feature importance (quality outputs computed on lossy slice only)
     print(f"\nCollecting feature importance...")
-    collect_feature_importance(models, data['val_X'], data['feature_names'], weights_dir)
+    collect_feature_importance(models, data['val_X'], data['feature_names'],
+                               weights_dir, lossy_mask=val_lossy_mask)
 
     return models
 
@@ -252,6 +290,9 @@ def cross_validate(csv_paths, n_folds=5, seed=42):
 
         train_X, train_Y, val_X, val_Y, y_means, y_stds, output_cols = prepare_fold(df_train, df_val)
 
+        # Lossy-only mask (aligned with df_val row order)
+        lossy_mask = (df_val['quantization'] == 'linear').values
+
         if report_names is None:
             report_names = [OUTPUT_INVERSE.get(c, (c, 'identity'))[0] for c in output_cols]
             all_metrics = {name: {'mae': [], 'r2': [], 'mape': []} for name in report_names}
@@ -273,6 +314,12 @@ def cross_validate(csv_paths, n_folds=5, seed=42):
         for name in report_names:
             p = pred_orig[name]
             a = actual_orig[name]
+            if name in LOSSY_ONLY_OUTPUTS:
+                p = p[lossy_mask]
+                a = a[lossy_mask]
+                tag = ' [lossy-only]'
+            else:
+                tag = ''
             mae = np.mean(np.abs(p - a))
             ss_res = np.sum((a - p) ** 2)
             ss_tot = np.sum((a - a.mean()) ** 2)
@@ -282,7 +329,7 @@ def cross_validate(csv_paths, n_folds=5, seed=42):
             all_metrics[name]['mae'].append(mae)
             all_metrics[name]['r2'].append(r2)
             all_metrics[name]['mape'].append(mape)
-            print(f"  {name:30s}  MAE={mae:8.4f}  R²={r2:.4f}  MAPE={mape:5.1f}%")
+            print(f"  {name:30s}  MAE={mae:8.4f}  R²={r2:.4f}  MAPE={mape:5.1f}%{tag}")
 
     # Summary
     print(f"\n{'='*65}")
@@ -297,9 +344,10 @@ def cross_validate(csv_paths, n_folds=5, seed=42):
         r2_s = np.std(all_metrics[name]['r2'])
         mape_m = np.mean(all_metrics[name]['mape'])
         mape_s = np.std(all_metrics[name]['mape'])
+        tag = ' [lossy-only]' if name in LOSSY_ONLY_OUTPUTS else ''
         print(f"  {name:<28s}  {mae_m:>6.4f}±{mae_s:.4f}  "
               f"{r2_m:>6.4f}±{r2_s:.4f}  "
-              f"{mape_m:>5.1f}±{mape_s:.1f}%")
+              f"{mape_m:>5.1f}±{mape_s:.1f}%{tag}")
 
 
 if __name__ == '__main__':

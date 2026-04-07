@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""Plot NN vs XGBoost 5-fold CV comparison bar chart.
+"""Plot NN 5-fold CV MAPE and R² bar charts.
 
 Parses the full-pipeline output file automatically, or accepts hardcoded values.
+Produces two PNGs:
+    neural_net/weights/cv_comparison.png   - MAPE per output
+    neural_net/weights/cv_r2.png           - R² per output
 
 Usage:
     python scripts/plot_cv_comparison.py                          # uses latest full-pipeline-*.out
@@ -16,25 +19,38 @@ import re
 
 
 def parse_cv_summary(filepath):
-    """Parse NN and XGBoost CV summaries from pipeline output file."""
+    """Parse NN CV summary from pipeline output file.
+
+    Returns dict: results['nn'][output_name] = {
+        'mape': (mean, std), 'r2': (mean, std), 'mae': (mean, std)
+    }
+    """
     with open(filepath) as f:
         text = f.read()
 
     results = {}
-    for model, header in [('nn', 'NN 5-FOLD'), ('xgb', 'XGBOOST 5-FOLD')]:
-        idx = text.find(header)
-        if idx < 0:
-            continue
-        block = text[idx:idx+2000]
-        results[model] = {}
-        for line in block.split('\n'):
-            # Match lines like: compression_time_ms     4.3761±0.0570  0.3986±0.1146   71.4±1.5%
-            m = re.match(r'\s+(\S+)\s+[\d.]+±[\d.]+\s+[\d.]+±[\d.]+\s+([\d.]+)±([\d.]+)%', line)
-            if m:
-                name = m.group(1)
-                mape = float(m.group(2))
-                std = float(m.group(3))
-                results[model][name] = (mape, std)
+    idx = text.find('NN 5-FOLD')
+    if idx < 0:
+        return results
+    block = text[idx:idx+2000]
+    results['nn'] = {}
+    for line in block.split('\n'):
+        # Match lines like: compression_time_ms     4.3761±0.0570  0.3986±0.1146   71.4±1.5%
+        # Trailing tag like " [lossy-only]" is ignored.
+        m = re.match(
+            r'\s+(\S+)\s+'
+            r'([\d.]+)±([\d.]+)\s+'   # MAE
+            r'([\d.]+)±([\d.]+)\s+'   # R²
+            r'([\d.]+)±([\d.]+)%',    # MAPE
+            line,
+        )
+        if m:
+            name = m.group(1)
+            results['nn'][name] = {
+                'mae': (float(m.group(2)), float(m.group(3))),
+                'r2': (float(m.group(4)), float(m.group(5))),
+                'mape': (float(m.group(6)), float(m.group(7))),
+            }
     return results
 
 
@@ -61,50 +77,55 @@ else:
 print(f"Parsing: {logfile}")
 results = parse_cv_summary(logfile)
 
-if 'nn' not in results or 'xgb' not in results:
-    print("Could not find both NN and XGBoost CV summaries in the file.")
+if 'nn' not in results:
+    print("Could not find NN CV summary in the file.")
     sys.exit(1)
 
 # Build arrays
 labels = []
-nn_mape, nn_std, xgb_mape, xgb_std = [], [], [], []
+nn_mape, mape_std, nn_r2, r2_std = [], [], [], []
 for key, label in OUTPUT_ORDER:
-    if key in results['nn'] and key in results['xgb']:
+    if key in results['nn']:
+        row = results['nn'][key]
         labels.append(label)
-        nn_mape.append(results['nn'][key][0])
-        nn_std.append(results['nn'][key][1])
-        xgb_mape.append(results['xgb'][key][0])
-        xgb_std.append(results['xgb'][key][1])
+        nn_mape.append(row['mape'][0])
+        mape_std.append(row['mape'][1])
+        nn_r2.append(row['r2'][0])
+        r2_std.append(row['r2'][1])
 
 x = np.arange(len(labels))
-width = 0.35
+width = 0.55
 
-fig, ax = plt.subplots(figsize=(16, 6))
-bars1 = ax.bar(x - width/2, nn_mape, width, label='Neural Network',
-               color='#AEC7E8', edgecolor='#4C72B0', linewidth=1.2, hatch='///')
-bars2 = ax.bar(x + width/2, xgb_mape, width, label='XGBoost',
-               color='#FFBE7A', edgecolor='#DD8452', linewidth=1.2, hatch='...')
 
-ax.set_ylabel('MAPE (%)', fontsize=12)
-ax.set_title('')
-ax.set_xticks(x)
-ax.set_xticklabels(labels, fontsize=9)
-ax.legend(fontsize=11, loc='upper right')
+def _bar_chart(values, errs, ylabel, value_fmt, out_path,
+               color, edge, hatch, ypad):
+    fig, ax = plt.subplots(figsize=(16, 6))
+    bars = ax.bar(x, values, width, yerr=errs, capsize=4,
+                  label='Neural Network',
+                  color=color, edgecolor=edge, linewidth=1.2, hatch=hatch)
+    ax.set_ylabel(ylabel, fontsize=12)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=9)
+    ax.legend(fontsize=11, loc='upper right')
+    for bar in bars:
+        h = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width()/2, h + ypad,
+                value_fmt.format(h),
+                ha='center', va='bottom', fontsize=8, color=edge)
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"Saved: {out_path}")
 
-# Add MAPE values on bars
-for bar in bars1:
-    h = bar.get_height()
-    if h > 0.05:
-        ax.text(bar.get_x() + bar.get_width()/2, h + 1.0, f'{h:.1f}%',
-                ha='center', va='bottom', fontsize=7, color='#4C72B0')
-for bar in bars2:
-    h = bar.get_height()
-    if h > 0.05:
-        ax.text(bar.get_x() + bar.get_width()/2, h + 1.0, f'{h:.1f}%',
-                ha='center', va='bottom', fontsize=7, color='#DD8452')
 
-plt.tight_layout()
-out_path = 'neural_net/weights/cv_comparison.png'
-fig.savefig(out_path, dpi=150, bbox_inches='tight')
-plt.close(fig)
-print(f"Saved: {out_path}")
+# MAPE chart (lower is better)
+_bar_chart(nn_mape, mape_std,
+           ylabel='MAPE (%)', value_fmt='{:.1f}%',
+           out_path='neural_net/weights/cv_comparison.png',
+           color='#AEC7E8', edge='#4C72B0', hatch='///', ypad=1.0)
+
+# R² chart (higher is better, capped at 1.0)
+_bar_chart(nn_r2, r2_std,
+           ylabel='R² (coefficient of determination)', value_fmt='{:.3f}',
+           out_path='neural_net/weights/cv_r2.png',
+           color='#C7E9C0', edge='#2CA02C', hatch='\\\\\\', ypad=0.02)

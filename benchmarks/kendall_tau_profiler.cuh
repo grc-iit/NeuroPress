@@ -89,9 +89,30 @@ static inline double compute_kendall_tau_b(
 
 /* ════════════════════════════════════════════════════════════════
  * Milestone check
+ *
+ * Default: profile EVERY timestep so Figure 7a has the same per-chunk
+ * resolution as Figure 7b. The ranking profiler is expensive (~500 ms
+ * per chunk because it exhaustively compresses all 32 algorithm ×
+ * preprocessing configs to compute the oracle), so older versions
+ * gated this to ~13 milestones for runs ≥ 10 timesteps. That left
+ * Figure 7a with much coarser resolution than Figure 7b.
+ *
+ * Set RANKING_PROFILE_MILESTONES_ONLY=1 in the environment to restore
+ * the old sparse behavior (T0, T5, T10, then every 10%) — useful for
+ * very long runs (≥ 100 timesteps) where full per-step profiling
+ * would dominate wall time.
  * ════════════════════════════════════════════════════════════════ */
 
 static inline bool is_ranking_milestone(int t, int total) {
+    static int milestones_only = -1;
+    if (milestones_only < 0) {
+        const char* env = getenv("RANKING_PROFILE_MILESTONES_ONLY");
+        milestones_only = (env && atoi(env) != 0) ? 1 : 0;
+    }
+    /* New default: profile every timestep regardless of total. */
+    if (!milestones_only) return true;
+
+    /* Legacy behavior, opt-in via RANKING_PROFILE_MILESTONES_ONLY=1 */
     if (total < 10) return true;  /* profile every timestep for short runs */
     int last = total - 1;
     /* T0, T5, T10 (early learning) */

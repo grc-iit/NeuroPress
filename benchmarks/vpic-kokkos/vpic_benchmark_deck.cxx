@@ -1770,9 +1770,20 @@ begin_diagnostics {
                 fflush(global->ts_csv);
             }
 
-            /* Per-chunk milestone CSV at 0%, 25%, 50%, 75%, 100% of timesteps */
+            /* Per-chunk diagnostic CSV: write every timestep so the
+             * Section 7.1 plotter has the full convergence trajectory.
+             * Previously gated on 5 milestones (0%, 25%, 50%, 75%, 100%)
+             * which left Figure 7b under-sampled relative to the ranking
+             * CSV (which always writes every timestep). Set the env var
+             * VPIC_TC_MILESTONES_ONLY=1 to restore the old behavior. */
             if (global->tc_csv) {
-                bool is_milestone = (t == 0 ||
+                static int tc_milestones_only = -1;
+                if (tc_milestones_only < 0) {
+                    const char* mo = getenv("VPIC_TC_MILESTONES_ONLY");
+                    tc_milestones_only = (mo && atoi(mo)) ? 1 : 0;
+                }
+                bool is_milestone = !tc_milestones_only ||
+                                    (t == 0 ||
                                      t == global->timesteps / 4 ||
                                      t == global->timesteps / 2 ||
                                      t == (global->timesteps * 3) / 4 ||

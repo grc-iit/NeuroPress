@@ -40,6 +40,13 @@ OUTPUT_INVERSE = {
 
 CONTINUOUS_FEATURES = ['error_bound_enc', 'data_size_enc', 'entropy', 'mad', 'second_derivative']
 
+# Quality-of-reconstruction outputs whose values are trivially saturated on
+# lossless rows (PSNR=120, MAE=0, SSIM=1). MAPE/R²/SHAP for these targets
+# should be computed on the lossy slice (quantization='linear') only;
+# otherwise the lossless rows' constant-target branch artificially inflates
+# accuracy and feature-importance numbers.
+LOSSY_ONLY_OUTPUTS = {'psnr_db', 'mean_abs_err', 'ssim'}
+
 
 def encode_and_split(df: pd.DataFrame, val_fraction: float = 0.2,
                      seed: int = 42) -> Dict:
