@@ -374,22 +374,60 @@ inline long write_multifab_compressed(
         int n_comp_chunks = 0;
         H5VL_gpucompress_get_stats(NULL, NULL, &n_comp_chunks, NULL);
 
-        /* Log per-chunk diagnostics + ranking profiler at milestones */
+        /* ── Always read back for decomp-time profiling ──
+         *
+         * Reopen the file and H5Dread it. The read routes through the
+         * GPUCompress VOL, which times the nvCOMP decompress kernel and
+         * updates decompression_ms_raw / decompression_ms in the same
+         * chunk-history slots that H5Dwrite filled. Without this, the
+         * mape_decomp column in the chunks CSV is permanently zero.
+         * Same pattern as VPIC (vpic_benchmark_deck.cxx:1584), the
+         * WarpX FlushFormat patch, and the LAMMPS udf. Must run BEFORE
+         * logger->log_chunks() so the slots are populated when the
+         * logger walks the chunk history. */
+        {
+            hid_t rfid = H5Fopen(fname, H5F_ACC_RDONLY, fapl);
+            if (rfid >= 0) {
+                hid_t rdset = H5Dopen2(rfid, "data", H5P_DEFAULT);
+                if (rdset >= 0) {
+                    void* d_readback = nullptr;
+                    cudaMalloc(&d_readback, fab_bytes);
+                    H5Dread(rdset, h5type, H5S_ALL, H5S_ALL,
+                            H5P_DEFAULT, d_readback);
+                    cudaDeviceSynchronize();
+
+                    if (verify) {
+                        std::vector<char> h_orig(fab_bytes);
+                        std::vector<char> h_read(fab_bytes);
+                        cudaMemcpy(h_orig.data(), d_ptr, fab_bytes,
+                                   cudaMemcpyDeviceToHost);
+                        cudaMemcpy(h_read.data(), d_readback, fab_bytes,
+                                   cudaMemcpyDeviceToHost);
+                        if (memcmp(h_orig.data(), h_read.data(),
+                                   fab_bytes) != 0) {
+                            amrex::Print()
+                                << "[GPUCompress] VERIFY FAILED: fab_"
+                                << fab_idx << " bitwise mismatch!\n";
+                            cudaFree(d_readback);
+                            H5Dclose(rdset);
+                            H5Fclose(rfid);
+                            amrex::Abort("GPUCompress lossless verification failed");
+                        }
+                    }
+                    cudaFree(d_readback);
+                    H5Dclose(rdset);
+                }
+                H5Fclose(rfid);
+            }
+        }
+
+        /* Log per-chunk diagnostics + ranking profiler at milestones.
+         * Must come AFTER the read-back above so dd.decompression_ms_raw
+         * is populated when log_chunks() walks the chunk history. */
         if (logger && logger->enabled && amrex::ParallelDescriptor::IOProcessor()) {
             int ts = (timestep >= 0) ? timestep : fab_idx;
             logger->log_chunks(phase, ts);
             logger->log_ranking(d_ptr, fab_bytes, phase, ts);
-        }
-
-        /* Verify: read back, decompress, compare bitwise against original */
-        if (verify) {
-            int vrc = verify_gpu_hdf5(fname, "data", d_ptr, n_elements,
-                                       h5type, fapl);
-            if (vrc != 0) {
-                amrex::Print() << "[GPUCompress] VERIFY FAILED: fab_"
-                               << fab_idx << " bitwise mismatch!\n";
-                amrex::Abort("GPUCompress lossless verification failed");
-            }
         }
 
         total_original += fab_bytes;

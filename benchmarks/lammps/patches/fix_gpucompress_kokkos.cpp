@@ -196,7 +196,8 @@ void FixGPUCompressKokkos::init()
             fprintf(tc_csv, "rank,phase,timestep,chunk,"
                     "predicted_ratio,actual_ratio,"
                     "predicted_comp_ms,actual_comp_ms_raw,"
-                    "mape_ratio,mape_comp,"
+                    "predicted_decomp_ms,actual_decomp_ms_raw,"
+                    "mape_ratio,mape_comp,mape_decomp,"
                     "sgd_fired,exploration_triggered,"
                     "cost_model_error_pct,actual_cost,predicted_cost,"
                     "predicted_psnr_db,actual_psnr_db,mape_psnr\n");
@@ -386,11 +387,20 @@ void FixGPUCompressKokkos::end_of_step()
     for (int ci = 0; ci < n_hist; ci++) {
       gpucompress_chunk_diag_t dd;
       if (gpucompress_get_chunk_diag(ci, &dd) != 0) continue;
-      double mr = 0, mc = 0;
+      double mr = 0, mc = 0, md = 0;
       if (dd.actual_ratio > 0)
         mr = fabs(dd.predicted_ratio - dd.actual_ratio) / fabs(dd.actual_ratio) * 100.0;
       if (dd.compression_ms > 0)
         mc = fabs(dd.predicted_comp_time - dd.compression_ms) / fabs(dd.compression_ms) * 100.0;
+      /* mape_decomp uses the unclamped raw decomp wall-clock as the gate
+       * but the clamped value as the denominator, matching the WarpX/NYX
+       * patches. Both NN heads clamp at 5 ms (training artifact); without
+       * this floor MAPE explodes on sub-millisecond actuals. */
+      if (dd.decompression_ms_raw > 0) {
+        double clamped = fmax((double)dd.decompression_ms_raw, 5.0);
+        md = fabs((double)dd.predicted_decomp_time - clamped) / clamped * 100.0;
+        if (md > 200.0) md = 200.0;
+      }
       /* PSNR MAPE: lossless filter via the actual_psnr = -1.0 sentinel set in
        * gpucompress_compress.cpp:259. For lossless chunks emit NaN (not 0) so
        * cross-timestep aggregators using nanmean skip them. The compression-side
@@ -414,13 +424,15 @@ void FixGPUCompressKokkos::end_of_step()
       fprintf(tc_csv,
               "0,%s,%d,%d,"
               "%.4f,%.4f,%.4f,%.4f,"
-              "%.2f,%.2f,%d,%d,"
+              "%.4f,%.4f,"
+              "%.2f,%.2f,%.2f,%d,%d,"
               "%.4f,%.4f,%.4f,"
               "%.4f,%.4f,%.2f\n",
               phase, write_count, ci,
               (double)dd.predicted_ratio, (double)dd.actual_ratio,
               (double)dd.predicted_comp_time, (double)dd.compression_ms_raw,
-              mr, mc, dd.sgd_fired, dd.exploration_triggered,
+              (double)dd.predicted_decomp_time, (double)dd.decompression_ms_raw,
+              mr, mc, md, dd.sgd_fired, dd.exploration_triggered,
               (double)dd.cost_model_error_pct,
               (double)dd.actual_cost, (double)dd.predicted_cost,
               pred_psnr_out, actual_psnr_out, mp);

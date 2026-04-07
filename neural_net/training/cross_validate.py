@@ -25,7 +25,7 @@ from neural_net.core.data import inverse_transform_outputs
 from neural_net.core.model import CompressionPredictor
 
 
-def prepare_fold(df_train, df_val):
+def prepare_fold(df_train, df_val, add_size_interactions=False):
     """Run the same encoding/normalization as encode_and_split but on pre-split DataFrames."""
 
     for sub_df in [df_train, df_val]:
@@ -55,6 +55,21 @@ def prepare_fold(df_train, df_val):
     feature_cols = algo_cols + ['quant_enc', 'shuffle_enc',
                                 'error_bound_enc', 'data_size_enc',
                                 'entropy', 'mad', 'second_derivative']
+
+    if add_size_interactions:
+        # Capture size-dependent algorithm effects for comp/decomp timing.
+        interaction_cols = []
+        for alg_col in algo_cols:
+            col = f"size_x_{alg_col}"
+            df_train[col] = df_train['data_size_enc'] * df_train[alg_col]
+            df_val[col] = df_val['data_size_enc'] * df_val[alg_col]
+            interaction_cols.append(col)
+        for base_col in ['quant_enc', 'shuffle_enc']:
+            col = f"size_x_{base_col}"
+            df_train[col] = df_train['data_size_enc'] * df_train[base_col]
+            df_val[col] = df_val['data_size_enc'] * df_val[base_col]
+            interaction_cols.append(col)
+        feature_cols.extend(interaction_cols)
 
     output_cols = ['comp_time_log', 'decomp_time_log', 'ratio_log', 'psnr_clamped']
     for extra in ['log_mae', 'ssim_val']:
@@ -91,7 +106,8 @@ def prepare_fold(df_train, df_val):
 
 
 def train_one_fold(train_X, train_Y, val_X, val_Y, epochs=100, batch_size=512,
-                   lr=1e-3, patience=15, hidden_dim=128):
+                   lr=1e-3, patience=15, hidden_dim=128, model_variant="shared",
+                   num_hidden_layers=2, head_hidden_dim=64):
     """Train model on one fold, return best val predictions (normalized)."""
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -107,7 +123,9 @@ def train_one_fold(train_X, train_Y, val_X, val_Y, epochs=100, batch_size=512,
     input_dim = train_X.shape[1]
     output_dim = train_Y.shape[1]
     model = CompressionPredictor(input_dim=input_dim, hidden_dim=hidden_dim,
-                                  output_dim=output_dim).to(device)
+                                  output_dim=output_dim, model_variant=model_variant,
+                                  num_hidden_layers=num_hidden_layers,
+                                  head_hidden_dim=head_hidden_dim).to(device)
 
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
@@ -183,6 +201,13 @@ def main():
     parser.add_argument('--folds', type=int, default=5)
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--hidden-dim', type=int, default=128)
+    parser.add_argument('--model-variant', choices=['shared', 'split_heads'], default='shared')
+    parser.add_argument('--num-hidden-layers', type=int, default=2,
+                        help='Used when model-variant=shared')
+    parser.add_argument('--head-hidden-dim', type=int, default=64,
+                        help='Used when model-variant=split_heads')
+    parser.add_argument('--add-size-interactions', action='store_true',
+                        help='Add data_size x (algorithm/quant/shuffle) interaction features')
     parser.add_argument('--seed', type=int, default=42)
     args = parser.parse_args()
 
@@ -191,6 +216,9 @@ def main():
     df = pd.concat(frames, ignore_index=True)
     df = df[df['success'] == True].copy()
     print(f"Loaded {len(df)} successful rows from {len(args.csv)} CSV file(s)")
+    print(f"Model variant: {args.model_variant}  hidden_dim={args.hidden_dim}  "
+          f"num_hidden_layers={args.num_hidden_layers}  head_hidden_dim={args.head_hidden_dim}")
+    print(f"Feature option: add_size_interactions={args.add_size_interactions}")
 
     # Split by file
     files = sorted(df['file'].unique())
@@ -215,7 +243,8 @@ def main():
               f"val: {len(df_val)} rows / {len(val_files)} files)")
         print(f"{'='*65}")
 
-        train_X, train_Y, val_X, val_Y, y_means, y_stds, output_cols = prepare_fold(df_train, df_val)
+        train_X, train_Y, val_X, val_Y, y_means, y_stds, output_cols = prepare_fold(
+            df_train, df_val, add_size_interactions=args.add_size_interactions)
 
         # Lossy-only mask, aligned with df_val row order (which prepare_fold preserves)
         lossy_mask = (df_val['quantization'] == 'linear').values
@@ -227,7 +256,10 @@ def main():
 
         val_pred_norm, best_loss, last_epoch = train_one_fold(
             train_X, train_Y, val_X, val_Y,
-            epochs=args.epochs, hidden_dim=args.hidden_dim)
+            epochs=args.epochs, hidden_dim=args.hidden_dim,
+            model_variant=args.model_variant,
+            num_hidden_layers=args.num_hidden_layers,
+            head_hidden_dim=args.head_hidden_dim)
 
         print(f"  Best val loss: {best_loss:.6f} (stopped at epoch {last_epoch})")
 

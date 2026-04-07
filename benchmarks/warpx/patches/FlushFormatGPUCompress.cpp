@@ -338,7 +338,15 @@ FlushFormatGPUCompress::WriteToFile (
                      * src/hdf5/H5VLgpucompress.cu:2181 and
                      * src/api/gpucompress_diagnostics.cpp:74. This is the
                      * same pattern VPIC and sdrbench use. */
-                    if (m_initialized && (s_profile_decomp || verify)) {
+                    /* Always read back so decompression_ms is recorded for
+                     * every chunk. The bitwise verify gate (if true) is
+                     * applied inside the block on the host-side memcmp
+                     * only. Same pattern as VPIC (vpic_benchmark_deck.cxx
+                     * line 1584: "Always read back for timing"). The
+                     * s_profile_decomp env knob is now redundant and only
+                     * kept for backward compat with the threshold sweep
+                     * scripts that still set it. */
+                    if (m_initialized) {
                         cudaDeviceSynchronize();
                         /* Close the writer's handles so the file is fully
                          * flushed before we reopen it. */

@@ -127,8 +127,18 @@ int gpucompress_lammps_write_field(const char* filename,
      * as a silent SIGABRT from KOKKOS's error handler. H5Fclose() already flushes
      * the VOL pipeline; no additional global sync is needed. */
 
-    /* Verification */
-    if (verify && rc == 0) {
+    /* ── Always read back for decomp-time profiling ──
+     *
+     * Reopen the file we just wrote and H5Dread it. The read routes through
+     * the GPUCompress VOL, which times the nvCOMP decompress kernel with
+     * cudaEventRecord and updates decompression_ms_raw / decompression_ms in
+     * the same chunk-history slots that H5Dwrite filled. After this block
+     * the per-chunk diagnostics in the caller will see populated decomp
+     * timing — without it, mape_decomp is permanently zero. Same pattern
+     * VPIC and WarpX use (vpic_benchmark_deck.cxx:1584,
+     * FlushFormatGPUCompress.cpp:341). The bitwise comparison below remains
+     * gated on `verify` because it's incompatible with lossy compression. */
+    if (rc == 0) {
         hid_t vfid = H5Fopen(filename, H5F_ACC_RDONLY, g_fapl);
         if (vfid < 0) return -1;
 
@@ -144,17 +154,19 @@ int gpucompress_lammps_write_field(const char* filename,
         H5Dclose(vdset);
         H5Fclose(vfid);
 
-        std::vector<char> h_orig(total_bytes);
-        std::vector<char> h_read(total_bytes);
-        cudaMemcpy(h_orig.data(), d_ptr, total_bytes, cudaMemcpyDeviceToHost);
-        cudaMemcpy(h_read.data(), d_readback, total_bytes, cudaMemcpyDeviceToHost);
-        cudaFree(d_readback);
+        if (verify) {
+            std::vector<char> h_orig(total_bytes);
+            std::vector<char> h_read(total_bytes);
+            cudaMemcpy(h_orig.data(), d_ptr, total_bytes, cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_read.data(), d_readback, total_bytes, cudaMemcpyDeviceToHost);
 
-        if (memcmp(h_orig.data(), h_read.data(), total_bytes) != 0) {
-            fprintf(stderr, "[GPUCompress-LAMMPS] VERIFY FAILED: %s/%s mismatch!\n",
-                    filename, dset_name);
-            rc = -1;
+            if (memcmp(h_orig.data(), h_read.data(), total_bytes) != 0) {
+                fprintf(stderr, "[GPUCompress-LAMMPS] VERIFY FAILED: %s/%s mismatch!\n",
+                        filename, dset_name);
+                rc = -1;
+            }
         }
+        cudaFree(d_readback);
     }
 
     return rc;
