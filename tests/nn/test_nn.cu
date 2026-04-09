@@ -63,8 +63,8 @@ static bool write_synthetic_nnwt(const char* path, uint32_t version = 2,
     std::ofstream file(path, std::ios::binary);
     if (!file.is_open()) return false;
 
-    // Header
-    uint32_t n_layers = 3;
+    // Header — all dimensions come from nn_weights.h so tests stay in sync
+    uint32_t n_layers  = NN_NUM_LAYERS;
     uint32_t input_dim = NN_INPUT_DIM;
     uint32_t hidden_dim = NN_HIDDEN_DIM;
     uint32_t output_dim = NN_OUTPUT_DIM;
@@ -88,27 +88,35 @@ static bool write_synthetic_nnwt(const char* path, uint32_t version = 2,
         w.y_stds[i] = 1.0f;
     }
 
-    // Small weights (0.01) for all layers so outputs are bounded
-    for (int i = 0; i < NN_HIDDEN_DIM * NN_INPUT_DIM; i++) w.w1[i] = 0.01f;
+    // Small weights for all layers so outputs are bounded
+    for (int i = 0; i < NN_HIDDEN_DIM * NN_INPUT_DIM;  i++) w.w1[i] = 0.01f;
     for (int i = 0; i < NN_HIDDEN_DIM; i++) w.b1[i] = 0.1f;
     for (int i = 0; i < NN_HIDDEN_DIM * NN_HIDDEN_DIM; i++) w.w2[i] = 0.001f;
     for (int i = 0; i < NN_HIDDEN_DIM; i++) w.b2[i] = 0.1f;
-    for (int i = 0; i < NN_OUTPUT_DIM * NN_HIDDEN_DIM; i++) w.w3[i] = 0.01f;
-    for (int i = 0; i < NN_OUTPUT_DIM; i++) w.b3[i] = 0.0f;
+    for (int i = 0; i < NN_HIDDEN_DIM * NN_HIDDEN_DIM; i++) w.w3[i] = 0.001f;
+    for (int i = 0; i < NN_HIDDEN_DIM; i++) w.b3[i] = 0.1f;
+    for (int i = 0; i < NN_HIDDEN_DIM * NN_HIDDEN_DIM; i++) w.w4[i] = 0.001f;
+    for (int i = 0; i < NN_HIDDEN_DIM; i++) w.b4[i] = 0.1f;
+    for (int i = 0; i < NN_OUTPUT_DIM * NN_HIDDEN_DIM; i++) w.w5[i] = 0.01f;
+    for (int i = 0; i < NN_OUTPUT_DIM; i++) w.b5[i] = 0.0f;
 
     // Write normalization
     file.write(reinterpret_cast<const char*>(w.x_means), NN_INPUT_DIM * sizeof(float));
-    file.write(reinterpret_cast<const char*>(w.x_stds), NN_INPUT_DIM * sizeof(float));
+    file.write(reinterpret_cast<const char*>(w.x_stds),  NN_INPUT_DIM * sizeof(float));
     file.write(reinterpret_cast<const char*>(w.y_means), NN_OUTPUT_DIM * sizeof(float));
-    file.write(reinterpret_cast<const char*>(w.y_stds), NN_OUTPUT_DIM * sizeof(float));
+    file.write(reinterpret_cast<const char*>(w.y_stds),  NN_OUTPUT_DIM * sizeof(float));
 
-    // Write layer weights
-    file.write(reinterpret_cast<const char*>(w.w1), NN_HIDDEN_DIM * NN_INPUT_DIM * sizeof(float));
+    // Write all NN_NUM_LAYERS layers
+    file.write(reinterpret_cast<const char*>(w.w1), NN_HIDDEN_DIM * NN_INPUT_DIM  * sizeof(float));
     file.write(reinterpret_cast<const char*>(w.b1), NN_HIDDEN_DIM * sizeof(float));
     file.write(reinterpret_cast<const char*>(w.w2), NN_HIDDEN_DIM * NN_HIDDEN_DIM * sizeof(float));
     file.write(reinterpret_cast<const char*>(w.b2), NN_HIDDEN_DIM * sizeof(float));
-    file.write(reinterpret_cast<const char*>(w.w3), NN_OUTPUT_DIM * NN_HIDDEN_DIM * sizeof(float));
-    file.write(reinterpret_cast<const char*>(w.b3), NN_OUTPUT_DIM * sizeof(float));
+    file.write(reinterpret_cast<const char*>(w.w3), NN_HIDDEN_DIM * NN_HIDDEN_DIM * sizeof(float));
+    file.write(reinterpret_cast<const char*>(w.b3), NN_HIDDEN_DIM * sizeof(float));
+    file.write(reinterpret_cast<const char*>(w.w4), NN_HIDDEN_DIM * NN_HIDDEN_DIM * sizeof(float));
+    file.write(reinterpret_cast<const char*>(w.b4), NN_HIDDEN_DIM * sizeof(float));
+    file.write(reinterpret_cast<const char*>(w.w5), NN_OUTPUT_DIM * NN_HIDDEN_DIM * sizeof(float));
+    file.write(reinterpret_cast<const char*>(w.b5), NN_OUTPUT_DIM * sizeof(float));
 
     // v2: feature bounds
     if (version >= 2) {

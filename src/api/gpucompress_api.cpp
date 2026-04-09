@@ -239,6 +239,20 @@ extern "C" gpucompress_error_t gpucompress_init(const char* weights_path) {
         }
     }
 
+    /* MAPE thresholds for exploration mode (used in trace CSV and SGD trigger) */
+    {
+        const char* lo = getenv("GPUCOMPRESS_MAPE_LOW_THRESH");
+        if (lo) {
+            float v = (float)atof(lo);
+            if (v > 0.0f) g_reinforce_mape_threshold = v;
+        }
+        const char* hi = getenv("GPUCOMPRESS_MAPE_HIGH_THRESH");
+        if (hi) {
+            double v = atof(hi);
+            if (v > 0.0) g_exploration_threshold = v;
+        }
+    }
+
     /* Check debug env var */
     const char* dbg_env = getenv("GPUCOMPRESS_DEBUG_NN");
     if (dbg_env && (dbg_env[0] == '1' || dbg_env[0] == 'y' || dbg_env[0] == 'Y'))

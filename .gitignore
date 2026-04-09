@@ -19,6 +19,7 @@ libs/
 /gpu_decompress
 /*_benchmark
 /*_example
+/*_replay
 
 # CMake
 CMakeCache.txt
@@ -37,6 +38,9 @@ data/
 *.raw
 *.f32
 *.f64
+
+# Runtime output directories
+output/
 
 # Benchmark results (generated at runtime)
 benchmarks/Paper_Evaluations/*/results/

@@ -1,4 +1,23 @@
 # ============================================================
+# Helper: register a test target with CTest
+#   gpucompress_add_test(<target> <label> [timeout_seconds])
+# Working directory is always the project root so tests can
+# find neural_net/weights/model.nnwt via relative path.
+# ============================================================
+macro(gpucompress_add_test target label)
+    set(_timeout 60)
+    if(${ARGC} GREATER 2)
+        set(_timeout ${ARGV2})
+    endif()
+    add_test(NAME ${target}
+             COMMAND ${target}
+             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    set_tests_properties(${target} PROPERTIES
+        LABELS   "${label}"
+        TIMEOUT  ${_timeout})
+endmacro()
+
+# ============================================================
 # Unit Tests (no HDF5 dependency)
 # ============================================================
 
@@ -485,4 +504,63 @@ target_include_directories(explore_algo_patterns PRIVATE
 )
 target_link_libraries(explore_algo_patterns PRIVATE gpucompress CUDA::cudart m)
 set_target_properties(explore_algo_patterns PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+# ============================================================
+# CTest registrations
+# ============================================================
+
+# Unit
+gpucompress_add_test(test_vpic_adapter          unit)
+gpucompress_add_test(test_warpx_adapter         unit)
+gpucompress_add_test(test_compression_core      unit)
+gpucompress_add_test(test_preprocessing         unit)
+gpucompress_add_test(test_stats                 unit)
+gpucompress_add_test(test_xfer_stats_init       unit)
+gpucompress_add_test(test_compress_gpu_delegation unit)
+gpucompress_add_test(test_shuffle               unit)
+gpucompress_add_test(test_quantization          unit)
+gpucompress_add_test(test_quantization_cub      unit)
+gpucompress_add_test(test_shuffle_quant_effect  unit)
+
+# NN
+gpucompress_add_test(test_nn                    nn  120)
+gpucompress_add_test(test_nn_reinforce          nn  120)
+gpucompress_add_test(test_nn_cost_ranking       nn  120)
+gpucompress_add_test(test_sgd_weight_update     nn  120)
+
+# Regression (no HDF5)
+gpucompress_add_test(test_bug3_sgd_gradients    regression)
+gpucompress_add_test(test_bug5_truncated_nnwt   regression)
+gpucompress_add_test(test_bug8_sgd_concurrent   regression)
+gpucompress_add_test(test_m1m2_global_races     regression)
+gpucompress_add_test(test_m4_chunk_history_realloc regression)
+gpucompress_add_test(test_m6_integer_overflow   regression)
+gpucompress_add_test(test_m7_header_async       regression)
+gpucompress_add_test(test_h8_pool_partial_leak  regression)
+gpucompress_add_test(test_c2_learning_flag_race regression)
+gpucompress_add_test(test_h14_cleanup_order     regression)
+gpucompress_add_test(test_h1_sgd_inference_race regression)
+gpucompress_add_test(test_c4_int32_clamp        regression)
+gpucompress_add_test(test_c1_exploration_header regression)
+gpucompress_add_test(test_error_handling_fixes  regression)
+gpucompress_add_test(test_nn_preproc_debug      regression)
+gpucompress_add_test(test_h9_int8_error_bound   regression)
+gpucompress_add_test(test_h6_cub_int_overflow   regression)
+gpucompress_add_test(test_explore_lossless_skip regression)
+gpucompress_add_test(test_sgd_target_clamping   regression)
+gpucompress_add_test(test_h6_size_overflow      regression)
+
+# Perf
+gpucompress_add_test(test_perf2_sort_speedup    perf  120)
+if(TARGET test_perf4_batched_dh)
+    gpucompress_add_test(test_perf4_batched_dh  perf  120)
+endif()
+gpucompress_add_test(test_perf14_atomic_double  perf  120)
+gpucompress_add_test(test_nn_ratio_prediction   perf  120)
+gpucompress_add_test(test_nn_timing_inflation   perf  120)
+gpucompress_add_test(test_nn_inference_profile  perf  120)
+gpucompress_add_test(test_p1_preproc_correctness perf 120)
+gpucompress_add_test(test_p4_diag_overhead      perf  120)
+gpucompress_add_test(test_perf_optimizations    perf  120)
+gpucompress_add_test(test_k4_shuffle_throughput perf  120)
 

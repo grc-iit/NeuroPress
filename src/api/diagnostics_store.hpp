@@ -202,43 +202,103 @@ public:
             return;
         }
         fprintf(trace_file_,
-                "chunk_id,action_id,comp_lib,chosen,"
-                "pred_cost,real_ratio,real_comp_ms,real_decomp_ms\n");
+                "chunk_id,action_id,comp_lib,chosen,chunk_bytes,"
+                "pred_cost,pred_ratio,pred_comp_ms,pred_decomp_ms,pred_psnr,pred_ssim,pred_max_error,"
+                "real_cost,real_ratio,real_comp_ms,real_decomp_ms,real_psnr,real_ssim,real_max_error,"
+                "mape_cost,mape_ratio,mape_comp_ms,mape_decomp_ms,"
+                "explore_mode\n");
         fflush(trace_file_);
     }
 
     /**
      * Append one row to the trace CSV.
      *
-     * @param chunk_id     Global chunk ID from nextChunkId()
-     * @param action_id    Action encoding (0-31): algo + quant*8 + shuf*16
-     * @param comp_lib     Human-readable config name (e.g. "lz4+shuf")
-     * @param chosen       true if this action was the NN's selected winner
-     * @param pred_cost    NN-predicted composite cost (0 if not available)
-     * @param real_ratio   Measured compression ratio (input/compressed)
-     * @param real_comp_ms Measured compression time (ms)
+     * @param chunk_id       Global chunk ID from nextChunkId()
+     * @param action_id      64-config encoding: algo*8 + shuf_idx*4 + quant_idx
+     * @param comp_lib       Human-readable config name (e.g. "lz4+shuf")
+     * @param chosen         true if this action was the NN's selected winner
+     * @param chunk_bytes    Uncompressed chunk size in bytes
+     * @param pred_cost      NN-predicted composite cost (0 if not available)
+     * @param pred_ratio     NN-predicted compression ratio (0 if not available)
+     * @param pred_comp_ms   NN-predicted compression time ms (0 if not available)
+     * @param pred_decomp_ms NN-predicted decompression time ms (0 if not available)
+     * @param real_ratio     Measured compression ratio (input/compressed)
+     * @param real_comp_ms   Measured compression time (ms)
      * @param real_decomp_ms Measured decompression time (ms); 0 if skipped
      */
     void writeTraceRow(int chunk_id, int action_id, const char* comp_lib,
-                       bool chosen, float pred_cost,
-                       float real_ratio, float real_comp_ms, float real_decomp_ms) {
+                       bool chosen, size_t chunk_bytes,
+                       float pred_cost, float pred_ratio,
+                       float pred_comp_ms, float pred_decomp_ms,
+                       float pred_psnr, float pred_ssim, float pred_max_error,
+                       float real_cost, float real_ratio,
+                       float real_comp_ms, float real_decomp_ms,
+                       float real_psnr, float real_ssim, float real_max_error,
+                       float mape_low_thresh, float mape_high_thresh,
+                       float bw_bytes_per_ms, float w0, float w1, float w2) {
+        /* Clamp comp/decomp time (floor 5ms) and ratio (cap 100x) before MAPE.
+         * Matching the same floors applied during NN training. */
+        static constexpr float TIME_FLOOR = 5.0f;
+        static constexpr float RATIO_CAP  = 100.0f;
+
+        float p_ct  = std::max(TIME_FLOOR, pred_comp_ms);
+        float p_dt  = std::max(TIME_FLOOR, pred_decomp_ms);
+        float p_r   = std::min(RATIO_CAP,  pred_ratio);
+        float r_ct  = std::max(TIME_FLOOR, real_comp_ms);
+        float r_dt  = std::max(TIME_FLOOR, real_decomp_ms);
+        float r_r   = std::min(RATIO_CAP,  real_ratio);
+
+        /* Recompute costs from clamped values */
+        float bw     = std::max(1.0f, bw_bytes_per_ms);
+        float io_div = bw * RATIO_CAP;   /* worst-case denominator for safety */
+        float p_cost = w0 * p_ct + w1 * p_dt
+                     + w2 * static_cast<float>(chunk_bytes) / (p_r * bw);
+        float r_cost = w0 * r_ct + w1 * r_dt
+                     + w2 * static_cast<float>(chunk_bytes) / (r_r * bw);
+        (void)io_div;
+
+        auto mape_of = [](float pred, float real) -> float {
+            return (real > 1e-6f) ? std::abs(pred - real) / real : 0.0f;
+        };
+        float mape_cost   = mape_of(p_cost, r_cost);
+        float mape_ratio  = mape_of(p_r,    r_r);
+        float mape_comp   = mape_of(p_ct,   r_ct);
+        float mape_decomp = mape_of(p_dt,   r_dt);
+
+        /* explore_mode based on clamped cost MAPE */
+        int explore_mode = 2;
+        if      (mape_cost < mape_low_thresh)  explore_mode = 0;
+        else if (mape_cost < mape_high_thresh) explore_mode = 1;
+
         std::lock_guard<std::mutex> lk(trace_mtx_);
         if (!trace_file_) return;
         fprintf(trace_file_,
-                "%d,%d,%s,%d,%.6f,%.4f,%.4f,%.4f\n",
-                chunk_id, action_id, comp_lib, chosen ? 1 : 0,
-                (double)pred_cost,
-                (double)real_ratio, (double)real_comp_ms, (double)real_decomp_ms);
+                "%d,%d,%s,%d,%zu,"
+                "%.6f,%.4f,%.4f,%.4f,%.4f,%.6f,%.6f,"
+                "%.6f,%.4f,%.4f,%.4f,%.4f,%.6f,%.6f,"
+                "%.4f,%.4f,%.4f,%.4f,"
+                "%d\n",
+                chunk_id, action_id, comp_lib, chosen ? 1 : 0, chunk_bytes,
+                (double)p_cost,    (double)p_r,
+                (double)p_ct,      (double)p_dt,
+                (double)pred_psnr, (double)pred_ssim, (double)pred_max_error,
+                (double)r_cost,    (double)r_r,
+                (double)r_ct,      (double)r_dt,
+                (double)real_psnr, (double)real_ssim, (double)real_max_error,
+                (double)mape_cost, (double)mape_ratio,
+                (double)mape_comp, (double)mape_decomp,
+                explore_mode);
     }
 
-    /** Flush and close the trace CSV. */
+    /**
+     * Flush the trace CSV to disk.
+     * Does NOT close the file — the singleton destructor closes it at exit.
+     * This matters when the caller is an HDF5 file_close callback that fires
+     * once per FAB (e.g. WarpX): closing here would silence all subsequent rows.
+     */
     void flushTrace() {
         std::lock_guard<std::mutex> lk(trace_mtx_);
-        if (trace_file_) {
-            fflush(trace_file_);
-            fclose(trace_file_);
-            trace_file_ = nullptr;
-        }
+        if (trace_file_) fflush(trace_file_);
     }
 
 private:

@@ -143,6 +143,10 @@ int recordChunkDiagnostic(const ChunkDiagInput& d)
     h.predicted_comp_time   = d.predicted_comp_time;
     h.predicted_decomp_time = d.predicted_decomp_time;
     h.predicted_psnr        = d.predicted_psnr;
+    h.predicted_rmse        = d.predicted_rmse;
+    h.predicted_max_error   = d.predicted_max_error;
+    h.predicted_mae         = d.predicted_mae;
+    h.predicted_ssim        = d.predicted_ssim;
     h.actual_psnr           = d.actual_psnr;
 
     h.cost_model_error_pct  = d.cost_model_error_pct;

@@ -634,6 +634,10 @@ typedef struct {
     float  predicted_comp_time;  /* NN-predicted compression time ms      */
     float  predicted_decomp_time;/* NN-predicted decompression time ms    */
     float  predicted_psnr;       /* NN-predicted PSNR in dB               */
+    float  predicted_rmse;       /* NN-predicted RMSE (0 if not AUTO)     */
+    float  predicted_max_error;  /* NN-predicted max pointwise error      */
+    float  predicted_mae;        /* NN-predicted mean absolute error      */
+    float  predicted_ssim;       /* NN-predicted SSIM in [0,1]            */
     float  actual_psnr;          /* analytical PSNR: 10*log10(3*range²/eb²), 120 lossless */
 
     /* Filled during read (decompression) — 0 until VOL read completes   */
@@ -672,8 +676,8 @@ typedef struct {
     float  feat_entropy;         /* Shannon entropy */
     float  feat_mad;             /* normalized MAD */
     float  feat_deriv;           /* normalized 2nd derivative */
-    float  feat_eb_enc;          /* log10(clip(error_bound, 1e-7)) */
-    float  feat_ds_enc;          /* log2(max(data_size, 1)) */
+    float  feat_eb_enc;          /* raw error_bound (used as NN input feature) */
+    float  feat_ds_enc;          /* raw data_size in bytes (used as NN input feature) */
 
     /* NN predicted ranking (sorted by predicted cost, best first) */
     int    predicted_ranking[32]; /* action IDs sorted by predicted cost   */

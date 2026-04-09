@@ -138,7 +138,12 @@ gpucompress_error_t gpucompress_infer_gpu(
     float* out_predicted_decomp_time,
     float* out_predicted_psnr,
     int* out_top_actions,
-    float* out_predicted_costs)
+    float* out_predicted_costs,
+    float* out_predicted_rmse,
+    float* out_predicted_max_error,
+    float* out_predicted_mae,
+    float* out_predicted_ssim,
+    NNDebugPerConfig* out_per_config)
 {
     if (!g_initialized.load()) return GPUCOMPRESS_ERROR_NOT_INITIALIZED;
     if (!d_input || !out_action) return GPUCOMPRESS_ERROR_INVALID_INPUT;
@@ -152,6 +157,10 @@ gpucompress_error_t gpucompress_infer_gpu(
     if (out_predicted_comp_time)   *out_predicted_comp_time = 0.0f;
     if (out_predicted_decomp_time) *out_predicted_decomp_time = 0.0f;
     if (out_predicted_psnr)        *out_predicted_psnr = 0.0f;
+    if (out_predicted_rmse)        *out_predicted_rmse = 0.0f;
+    if (out_predicted_max_error)   *out_predicted_max_error = 0.0f;
+    if (out_predicted_mae)         *out_predicted_mae = 0.0f;
+    if (out_predicted_ssim)        *out_predicted_ssim = 0.0f;
 
     size_t num_elements = input_size / sizeof(float);
     if (num_elements == 0 || !gpucompress_nn_is_loaded_impl())
@@ -171,6 +180,7 @@ gpucompress_error_t gpucompress_infer_gpu(
 
 
     float pred_ratio = 0.0f, pred_ct = 0.0f, pred_dt = 0.0f, pred_psnr = 0.0f;
+    float pred_rmse = 0.0f, pred_max_error = 0.0f, pred_mae = 0.0f, pred_ssim = 0.0f;
 
     int local_top[32] = {0};
     float local_costs[32] = {0};
@@ -180,7 +190,9 @@ gpucompress_error_t gpucompress_infer_gpu(
         d_stats_ptr, input_size, cfg.error_bound, stream, ctx,
         &action, &pred_ratio, &pred_ct, &pred_dt, &pred_psnr,
         local_top, local_costs,
-        ctx->nn_stop);
+        ctx->nn_stop,
+        &pred_rmse, &pred_max_error, &pred_mae, &pred_ssim,
+        out_per_config);
 
     /* runNNFusedInferenceCtx does internal cudaStreamSynchronize */
 
@@ -188,10 +200,14 @@ gpucompress_error_t gpucompress_infer_gpu(
         return GPUCOMPRESS_ERROR_NN_NOT_LOADED;
 
     *out_action = action;
-    if (out_predicted_ratio)       *out_predicted_ratio = pred_ratio;
-    if (out_predicted_comp_time)   *out_predicted_comp_time = pred_ct;
+    if (out_predicted_ratio)       *out_predicted_ratio       = pred_ratio;
+    if (out_predicted_comp_time)   *out_predicted_comp_time   = pred_ct;
     if (out_predicted_decomp_time) *out_predicted_decomp_time = pred_dt;
-    if (out_predicted_psnr)        *out_predicted_psnr = pred_psnr;
+    if (out_predicted_psnr)        *out_predicted_psnr        = pred_psnr;
+    if (out_predicted_rmse)        *out_predicted_rmse        = pred_rmse;
+    if (out_predicted_max_error)   *out_predicted_max_error   = pred_max_error;
+    if (out_predicted_mae)         *out_predicted_mae         = pred_mae;
+    if (out_predicted_ssim)        *out_predicted_ssim        = pred_ssim;
     if (out_top_actions)           memcpy(out_top_actions, local_top, sizeof(local_top));
     if (out_predicted_costs)       memcpy(out_predicted_costs, local_costs, sizeof(local_costs));
 
@@ -228,7 +244,11 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
     float stage1_nn_ms,
     float stage1_stats_ms,
     AutoStatsGPU* d_precomputed_stats,
-    int* out_diag_slot)
+    int* out_diag_slot,
+    float predicted_rmse,
+    float predicted_max_error,
+    float predicted_mae,
+    float predicted_ssim)
 {
     if (!g_initialized.load()) return GPUCOMPRESS_ERROR_NOT_INITIALIZED;
     if (!d_input || !d_output || !output_size) return GPUCOMPRESS_ERROR_INVALID_INPUT;
@@ -961,6 +981,10 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
         di.predicted_comp_time = predicted_comp_time;
         di.predicted_decomp_time = predicted_decomp_time;
         di.predicted_psnr = predicted_psnr;
+        di.predicted_rmse = predicted_rmse;
+        di.predicted_max_error = predicted_max_error;
+        di.predicted_mae = predicted_mae;
+        di.predicted_ssim = predicted_ssim;
         /* actual_psnr: uses PRIMARY algorithm's PSNR (for fair MAPE reporting).
          * The exploration winner's PSNR is computed from the post-swap
          * d_quantized/quant_result and stored in the public struct as actual_psnr
