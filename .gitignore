@@ -1,3 +1,6 @@
+# Simulation sources (built by postCreateCommand, persisted in workspace)
+sims/
+
 # Build
 build/
 libs/
@@ -12,7 +15,6 @@ libs/
 .deps/
 # Build executables (in-tree builds at repo root)
 /test_*
-/bench_*
 /gpu_compress
 /gpu_decompress
 /*_benchmark
