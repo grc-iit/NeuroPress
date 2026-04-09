@@ -22,8 +22,9 @@ mkdir -p "$AI_DIR"
 
 export LD_LIBRARY_PATH="/opt/hdf5/lib:/opt/nvcomp/lib:/usr/local/cuda/lib64:$GPUC_DIR/build:$GPUC_DIR/examples${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export GPUCOMPRESS_WEIGHTS="$GPUC_DIR/neural_net/weights/model.nnwt"
-export GPUCOMPRESS_VOL_MODE=bypass
+export GPUCOMPRESS_VOL_MODE=trace
 export GPUCOMPRESS_TIMING_OUTPUT="$AI_DIR/timing.csv"
+export GPUCOMPRESS_TRACE_OUTPUT="$AI_DIR/trace.csv"
 
 # Epochs and batches per epoch — tune MAX_BATCHES to hit ~70/30 compute/IO
 EPOCHS=${EPOCHS:-40}
