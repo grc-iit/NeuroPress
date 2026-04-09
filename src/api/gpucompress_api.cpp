@@ -459,3 +459,23 @@ extern "C" int gpucompress_is_device_ptr(const void* ptr) {
     return (attrs.type == cudaMemoryTypeDevice) ? 1 : 0;
 }
 
+/* Reset the process-level start timer to now.  Call this at the start of the
+ * simulation/training loop (after model loading, CUDA init, data setup) so
+ * that e2e_ms reflects only the active workload, not process startup overhead.
+ * Safe to call multiple times — each call resets the timer. */
+extern "C" void gpucompress_record_process_start() {
+    gpucompress::DiagnosticsStore::instance().resetProcessStart();
+}
+
+/* Explicitly dump e2e+vol timing CSV — for callers (e.g. Python ctypes) that
+ * cannot rely on C atexit ordering.  Marks process end at call time.
+ * path: output file path; if NULL uses GPUCOMPRESS_TIMING_OUTPUT or
+ *       "gpucompress_io_timing.csv". */
+extern "C" void gpucompress_dump_timing(const char* path) {
+    auto& s = gpucompress::DiagnosticsStore::instance();
+    s.recordProcessEnd();
+    if (!path) path = getenv("GPUCOMPRESS_TIMING_OUTPUT");
+    if (!path) path = "gpucompress_io_timing.csv";
+    s.dumpIoTiming(path);
+}
+

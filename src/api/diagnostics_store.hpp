@@ -177,6 +177,13 @@ public:
         process_start_us_.compare_exchange_strong(expected, now);
     }
 
+    /* Force-reset the start timer to now, ignoring whether it was already set.
+     * Use this to exclude startup overhead (model loading, CUDA init, etc.)
+     * from e2e_ms by calling it just before the training/simulation loop. */
+    void resetProcessStart() {
+        process_start_us_.store(nowUs());
+    }
+
     /**
      * Compute and store end-to-end duration (VOL init → VOL term).
      * Called once per process from H5VL_gpucompress_term.

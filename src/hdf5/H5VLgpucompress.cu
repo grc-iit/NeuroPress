@@ -559,6 +559,34 @@ static inline cudaError_t vol_memcpy(void *dst, const void *src,
     return cudaMemcpy(dst, src, bytes, kind);
 }
 
+/* ── Timing helpers callable from Python via ctypes (libH5VLgpucompress.so) ──
+ * These operate on the DiagnosticsStore instance inside THIS library, which
+ * is the correct singleton for vol_ms accumulation and e2e tracking.
+ * Do NOT call the equivalents in libgpucompress.so — that is a separate DSO
+ * with its own singleton instance. */
+
+/* Reset the e2e start timer to now.  Call just before the training/simulation
+ * loop begins so that e2e_ms excludes startup overhead (CUDA init, data load,
+ * model loading). */
+extern "C" void
+H5VL_gpucompress_record_process_start(void)
+{
+    gpucompress::DiagnosticsStore::instance().resetProcessStart();
+}
+
+/* Dump e2e + vol timing CSV.  Call explicitly from Python after all writes
+ * complete; do not rely on C atexit ordering through ctypes.
+ * path: file path, or NULL to use GPUCOMPRESS_TIMING_OUTPUT env var. */
+extern "C" void
+H5VL_gpucompress_dump_timing(const char *path)
+{
+    auto& s = gpucompress::DiagnosticsStore::instance();
+    s.recordProcessEnd();
+    if (!path) path = getenv("GPUCOMPRESS_TIMING_OUTPUT");
+    if (!path) path = "gpucompress_io_timing.csv";
+    s.dumpIoTiming(path);
+}
+
 extern "C" void
 H5VL_gpucompress_reset_stats(void)
 {
@@ -2534,6 +2562,9 @@ gpu_bypass_dh_write(H5VL_gpucompress_t *o,
     if (need_close) H5Sclose(actual_space_id);
 
     size_t total_bytes = (size_t)n_elems * elem_sz;
+
+    double t0 = _now_ms();  /* time the full bypass: D→H memcpy + disk write */
+
     void *h_tmp = nullptr;
     if (cudaMallocHost(&h_tmp, total_bytes) != cudaSuccess) return -1;
     if (cudaMemcpy(h_tmp, d_buf, total_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
@@ -2546,6 +2577,17 @@ gpu_bypass_dh_write(H5VL_gpucompress_t *o,
                                    &mem_type_id, &mem_space_id, &file_space_id,
                                    dxpl_id, &h_ptr, req);
     cudaFreeHost(h_tmp);
+
+    double elapsed = _now_ms() - t0;
+    gpucompress::DiagnosticsStore::instance().accumulateIoMs(elapsed);
+    g_life_writes++;
+    std::call_once(g_atexit_flag, []{
+        const char *dir = getenv("GPUCOMPRESS_RESULTS_DIR");
+        if (!dir) dir = getenv("VPIC_RESULTS_DIR");
+        if (dir) snprintf(g_life_output_dir, sizeof(g_life_output_dir), "%s", dir);
+        std::atexit(gpucompress_vol_atexit);
+    });
+
     return ret;
 }
 
