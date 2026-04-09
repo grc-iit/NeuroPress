@@ -14,10 +14,12 @@
  * The singleton also tracks aggregate I/O time (all modes) and owns the
  * Trace-mode CSV file handle.  The VOL calls:
  *
+ *   recordFileOpen()        — from file_create / file_open on success
+ *   recordFileClose()       — from file_close before dumpIoTiming()
  *   accumulateIoMs(ms)      — from dataset_write / dataset_read entry/exit
  *   nextChunkId()           — once per chunk in Trace mode
  *   writeTraceRow(...)      — once per (chunk × config) in Trace mode
- *   dumpIoTiming(path)      — from file_close (all modes)
+ *   dumpIoTiming(path)      — from file_close (all modes); writes CSV e2e_ms,vol_ms
  *   openTraceFile(path)     — from VOL init when mode == TRACE
  *   flushTrace()            — from file_close when mode == TRACE
  */
@@ -162,11 +164,43 @@ public:
         return static_cast<double>(total_io_us_.load()) / 1000.0;
     }
 
+    /* ── End-to-end file timing ────────────────────────────────────── */
+
     /**
-     * Write total I/O time to a file.
-     * Called from H5VL_gpucompress_file_close.
-     * File format (plain text, easy to parse):
-     *   total_io_ms=<value>
+     * Record the wall-clock instant when the HDF5 file was opened (or created).
+     * Also resets total_io_us_ so that vol_ms in the timing CSV reflects only
+     * I/O performed against the current file.
+     * Called from H5VL_gpucompress_file_create and H5VL_gpucompress_file_open.
+     */
+    void recordFileOpen() {
+        total_io_us_.store(0);
+        file_open_us_.store(nowUs());
+    }
+
+    /**
+     * Compute and store the end-to-end duration (file_open → file_close).
+     * Called from H5VL_gpucompress_file_close before dumpIoTiming().
+     */
+    void recordFileClose() {
+        int64_t open_us = file_open_us_.load();
+        if (open_us == 0) return;          /* no matching open recorded */
+        e2e_us_.store(nowUs() - open_us);
+    }
+
+    double totalE2eMs() const {
+        return static_cast<double>(e2e_us_.load()) / 1000.0;
+    }
+
+    /**
+     * Write end-to-end and VOL I/O timing to a CSV file.
+     * Called from H5VL_gpucompress_file_close (all modes).
+     *
+     * CSV format (two rows — header + data):
+     *   e2e_ms,vol_ms
+     *   <e2e>,<vol>
+     *
+     * e2e_ms  = H5Fcreate/H5Fopen → H5Fclose wall-clock time
+     * vol_ms  = sum of all H5Dwrite / H5Dread callback wall-clock times
      */
     void dumpIoTiming(const char* path) const {
         if (!path || path[0] == '\0') return;
@@ -175,7 +209,8 @@ public:
             fprintf(stderr, "gpucompress VOL: cannot write timing file '%s'\n", path);
             return;
         }
-        fprintf(f, "total_io_ms=%.6f\n", totalIoMs());
+        fprintf(f, "e2e_ms,vol_ms\n");
+        fprintf(f, "%.6f,%.6f\n", totalE2eMs(), totalIoMs());
         fclose(f);
     }
 
@@ -308,6 +343,13 @@ private:
         if (trace_file_) fclose(trace_file_);
     }
 
+    static int64_t nowUs() {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        return static_cast<int64_t>(ts.tv_sec) * 1000000LL
+             + static_cast<int64_t>(ts.tv_nsec) / 1000LL;
+    }
+
     /* Chunk history */
     mutable std::mutex           mutex_;
     gpucompress_chunk_diag_t*    history_      = nullptr;
@@ -318,8 +360,12 @@ private:
     std::atomic<int>             cache_hits_{0};
     std::atomic<int>             cache_misses_{0};
 
-    /* Aggregate I/O timing — int64 microseconds avoids float CAS */
+    /* Aggregate VOL I/O timing — int64 microseconds avoids float CAS */
     std::atomic<int64_t>         total_io_us_{0};
+
+    /* End-to-end file timing */
+    std::atomic<int64_t>         file_open_us_{0};  /* timestamp at H5Fopen/create */
+    std::atomic<int64_t>         e2e_us_{0};        /* close - open duration */
 
     /* Global chunk ID counter */
     std::atomic<int>             next_chunk_id_{0};

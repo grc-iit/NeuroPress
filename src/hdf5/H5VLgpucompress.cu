@@ -119,9 +119,23 @@ typedef struct H5VL_gpucompress_wrap_ctx_t {
  * Forward declarations — all callbacks
  * ============================================================ */
 
+struct TraceConfigResult {
+    int   action_id;       /* 0-63 in 8×2×4 trace space */
+    int   nn_idx;          /* 0-31 in NN 8×2×2 space */
+    float real_ratio;
+    float real_comp_ms;
+    float real_decomp_ms;
+    float real_psnr;
+    float real_cost;
+    float pred_cost;       /* from per_config[nn_idx], 0 if per_config==nullptr */
+    bool  valid;           /* false if compression failed */
+};
+
 /* Helper functions */
 static void run_trace_exhaustive_chunk(const void*, size_t, int, double,
-                                        const NNDebugPerConfig*);
+                                        const NNDebugPerConfig*,
+                                        TraceConfigResult* /* [64], may be nullptr */);
+static herr_t gpu_trace_chunked_write(H5VL_gpucompress_t*, hid_t, hid_t, hid_t, const void*);
 static herr_t gpu_bypass_dh_write(H5VL_gpucompress_t*, hid_t, hid_t, hid_t, hid_t, const void*, void**);
 static herr_t gpu_bypass_hd_read(H5VL_gpucompress_t*, hid_t, hid_t, hid_t, hid_t, void*, void**);
 
@@ -1151,6 +1165,329 @@ read_chunk_from_native(void *under_object, hid_t under_vol_id,
 }
 
 /* ============================================================
+ * gpu_trace_chunked_write
+ *
+ * Trace mode write path: sequential (no worker threads, no I/O thread).
+ * For every chunk, runs exhaustive profiling across all 64 configs, then
+ * picks the cheapest by predicted cost and writes that to file.
+ * Also fires SGD + exploration from the measured results.
+ * ============================================================ */
+
+static herr_t
+gpu_trace_chunked_write(H5VL_gpucompress_t *o,
+                        hid_t               mem_type_id,
+                        hid_t               file_space_id,
+                        hid_t               dxpl_id,
+                        const void         *d_buf)
+{
+    herr_t ret = -1;
+    hid_t  actual_space_id = H5I_INVALID_HID;
+    int    need_close_space = 0;
+
+    /* ---- Resolve H5S_ALL → actual dataset space ---- */
+    if (file_space_id == H5S_ALL) {
+        H5VL_dataset_get_args_t get_args;
+        memset(&get_args, 0, sizeof(get_args));
+        get_args.op_type                 = H5VL_DATASET_GET_SPACE;
+        get_args.args.get_space.space_id = H5I_INVALID_HID;
+        if (H5VLdataset_get(o->under_object, o->under_vol_id,
+                            &get_args, dxpl_id, NULL) < 0) goto done_trace;
+        actual_space_id  = get_args.args.get_space.space_id;
+        need_close_space = 1;
+    } else {
+        actual_space_id = file_space_id;
+    }
+
+    {
+        int ndims = H5Sget_simple_extent_ndims(actual_space_id);
+        if (ndims <= 0 || ndims > 32) goto done_trace;
+
+        hsize_t dset_dims[32];
+        H5Sget_simple_extent_dims(actual_space_id, dset_dims, NULL);
+
+        hsize_t chunk_dims[32] = {0};
+        if (H5Pget_chunk(o->dcpl_id, ndims, chunk_dims) < 0) goto done_trace;
+
+        size_t elem_size = H5Tget_size(mem_type_id);
+        if (elem_size == 0) goto done_trace;
+
+        gpucompress_config_t cfg;
+        if (get_gpucompress_config_from_dcpl(o->dcpl_id, &cfg) != 0) goto done_trace;
+
+        size_t chunk_elems = 1;
+        for (int d = 0; d < ndims; d++) chunk_elems *= (size_t)chunk_dims[d];
+        size_t chunk_bytes = chunk_elems * elem_size;
+        size_t max_comp    = gpucompress_max_compressed_size(chunk_bytes);
+
+        /* Single device compression buffer */
+        void* d_comp = nullptr;
+        if (cudaMalloc(&d_comp, max_comp) != cudaSuccess) goto done_trace;
+
+        /* Single pinned host buffer for D→H */
+        void* h_comp = nullptr;
+        if (cudaMallocHost(&h_comp, max_comp) != cudaSuccess) {
+            cudaFree(d_comp); goto done_trace;
+        }
+
+        /* CompContext for NN inference */
+        CompContext* infer_ctx = nullptr;
+        bool use_nn = (cfg.algorithm == GPUCOMPRESS_ALGO_AUTO);
+        if (use_nn) {
+            infer_ctx = gpucompress::acquireCompContext();
+            if (!infer_ctx) {
+                fprintf(stderr, "gpucompress VOL trace: failed to acquire inference CompContext\n");
+                cudaFree(d_comp); cudaFreeHost(h_comp); goto done_trace;
+            }
+        }
+
+        /* Chunk iteration setup */
+        hsize_t num_chunks[32];
+        for (int d = 0; d < ndims; d++)
+            num_chunks[d] = (dset_dims[d] + chunk_dims[d] - 1) / chunk_dims[d];
+        size_t total_chunks = 1;
+        for (int d = 0; d < ndims; d++) total_chunks *= (size_t)num_chunks[d];
+
+        bool contiguous = true;
+        for (int d = 1; d < ndims; d++) {
+            if (chunk_dims[d] != dset_dims[d]) { contiguous = false; break; }
+        }
+
+        hsize_t *d_dset_dims = NULL, *d_chunk_dims_d = NULL, *d_chunk_start_d = NULL;
+        cudaStream_t gather_stream = nullptr;
+        cudaStreamCreate(&gather_stream);
+
+        ret = 0;
+
+        for (size_t ci = 0; ci < total_chunks && ret == 0; ci++) {
+            /* ---- Compute N-D chunk coordinates ---- */
+            hsize_t chunk_idx[32];
+            size_t  remaining = ci;
+            for (int d = ndims - 1; d >= 0; d--) {
+                chunk_idx[d] = (hsize_t)(remaining % (size_t)num_chunks[d]);
+                remaining   /= (size_t)num_chunks[d];
+            }
+            hsize_t chunk_start[32];
+            for (int d = 0; d < ndims; d++)
+                chunk_start[d] = chunk_idx[d] * chunk_dims[d];
+
+            hsize_t actual_chunk[32];
+            size_t  actual_elems = 1;
+            for (int d = 0; d < ndims; d++) {
+                actual_chunk[d] = chunk_dims[d];
+                if (chunk_start[d] + actual_chunk[d] > dset_dims[d])
+                    actual_chunk[d] = dset_dims[d] - chunk_start[d];
+                actual_elems *= (size_t)actual_chunk[d];
+            }
+            size_t actual_bytes = actual_elems * elem_size;
+
+            /* ---- Gather chunk data to a device pointer (src) ---- */
+            const uint8_t* src = nullptr;
+            uint8_t* d_owned = nullptr;
+
+            if (contiguous) {
+                size_t off = 0, stride = elem_size;
+                for (int d = ndims - 1; d >= 0; d--) {
+                    off    += (size_t)chunk_start[d] * stride;
+                    stride *= (size_t)dset_dims[d];
+                }
+                const uint8_t *raw = static_cast<const uint8_t*>(d_buf) + off;
+                if (actual_bytes == chunk_bytes) {
+                    src     = raw;
+                    d_owned = NULL;
+                } else {
+                    if (cudaMalloc(&d_owned, actual_bytes) != cudaSuccess)
+                        { ret = -1; break; }
+                    vol_memcpy(d_owned, raw, actual_bytes, cudaMemcpyDeviceToDevice);
+                    src     = d_owned;
+                }
+            } else {
+                if (cudaMalloc(&d_owned, chunk_bytes) != cudaSuccess)
+                    { ret = -1; break; }
+                if (!d_dset_dims) {
+                    if (alloc_dim_arrays(ndims, dset_dims, actual_chunk, chunk_start,
+                                        &d_dset_dims, &d_chunk_dims_d, &d_chunk_start_d) < 0)
+                        { cudaFree(d_owned); ret = -1; break; }
+                } else {
+                    vol_memcpy(d_chunk_dims_d,  actual_chunk, (size_t)ndims * sizeof(hsize_t),
+                               cudaMemcpyHostToDevice);
+                    vol_memcpy(d_chunk_start_d, chunk_start,  (size_t)ndims * sizeof(hsize_t),
+                               cudaMemcpyHostToDevice);
+                }
+                int threads = 256;
+                int blocks  = (int)((actual_elems + threads - 1) / threads);
+                gather_chunk_kernel<<<blocks, threads, 0, gather_stream>>>(
+                    static_cast<const uint8_t*>(d_buf), d_owned,
+                    ndims, elem_size, actual_elems,
+                    d_dset_dims, d_chunk_dims_d, d_chunk_start_d);
+                if (cudaGetLastError() != cudaSuccess ||
+                    cudaStreamSynchronize(gather_stream) != cudaSuccess)
+                    { cudaFree(d_owned); ret = -1; break; }
+                src = d_owned;
+            }
+
+            if (!src) { ret = -1; break; }
+
+            /* ---- NN inference: get action + per_config[32] ---- */
+            int chosen_nn_action = 0;
+            float infer_ratio = 0, infer_ct = 0, infer_dt = 0, infer_psnr = 0;
+            float infer_rmse = 0, infer_max_err = 0, infer_mae = 0, infer_ssim = 0;
+            int top_actions[32] = {};
+            float pred_costs[32] = {};
+            NNDebugPerConfig per_config[32] = {};
+            bool has_inference = false;
+            float infer_nn_ms = 0, infer_stats_ms = 0;
+
+            if (use_nn && infer_ctx) {
+                gpucompress_error_t ie = gpucompress_infer_gpu(
+                    src, actual_bytes, &cfg, nullptr, infer_ctx,
+                    &chosen_nn_action, &infer_ratio, &infer_ct, &infer_dt, &infer_psnr,
+                    top_actions, pred_costs,
+                    &infer_rmse, &infer_max_err, &infer_mae, &infer_ssim,
+                    per_config);
+                if (ie == GPUCOMPRESS_SUCCESS && chosen_nn_action >= 0) {
+                    has_inference = true;
+                    cudaEventElapsedTime(&infer_nn_ms, infer_ctx->nn_start, infer_ctx->nn_stop);
+                    cudaEventElapsedTime(&infer_stats_ms, infer_ctx->stats_start, infer_ctx->stats_stop);
+                }
+            }
+
+            /* ---- Exhaustive trace: all 64 configs ---- */
+            TraceConfigResult results[64] = {};
+            run_trace_exhaustive_chunk(
+                src, actual_bytes,
+                has_inference ? chosen_nn_action : -1,
+                cfg.error_bound,
+                has_inference ? per_config : nullptr,
+                results);
+
+            /* ---- Choose action by lowest predicted cost among valid results ---- */
+            int chosen_trace_action = has_inference ? chosen_nn_action : 0;
+            {
+                float best_pred = 1e30f;
+                for (int i = 0; i < 64; i++) {
+                    if (results[i].valid && results[i].pred_cost > 0.0f
+                            && results[i].pred_cost < best_pred) {
+                        best_pred = results[i].pred_cost;
+                        chosen_trace_action = results[i].action_id;
+                    }
+                }
+            }
+
+            /* ---- Find the chosen result ---- */
+            const TraceConfigResult* chosen_result = nullptr;
+            for (int i = 0; i < 64; i++) {
+                if (results[i].valid && results[i].action_id == chosen_trace_action) {
+                    chosen_result = &results[i]; break;
+                }
+            }
+
+            /* ---- Compress the chosen config and write to file ---- */
+            {
+                static const float s_quant_ebs[4] = { 0.0f, 0.1f, 0.01f, 0.001f };
+                int algo_idx  = chosen_trace_action / 8;
+                int shuf_idx  = (chosen_trace_action % 8) / 4;
+                int quant_idx = chosen_trace_action % 4;
+
+                gpucompress_config_t chosen_cfg = cfg;
+                chosen_cfg.algorithm   = static_cast<gpucompress_algorithm_t>(algo_idx + 1);
+                chosen_cfg.error_bound = (double)s_quant_ebs[quant_idx];
+                chosen_cfg.preprocessing = 0;
+                if (shuf_idx > 0)  chosen_cfg.preprocessing |= GPUCOMPRESS_PREPROC_SHUFFLE_4;
+                if (quant_idx > 0) chosen_cfg.preprocessing |= GPUCOMPRESS_PREPROC_QUANTIZE;
+
+                size_t comp_sz = max_comp;
+                gpucompress_error_t ce = gpucompress_compress_gpu(
+                    src, actual_bytes, d_comp, &comp_sz, &chosen_cfg, nullptr, nullptr);
+
+                if (ce == GPUCOMPRESS_SUCCESS && comp_sz > 0) {
+                    if (cudaMemcpy(h_comp, d_comp, comp_sz,
+                                   cudaMemcpyDeviceToHost) == cudaSuccess) {
+                        write_chunk_to_native(o->under_object, o->under_vol_id,
+                                              chunk_start, h_comp, comp_sz, dxpl_id);
+                    }
+                }
+            }
+
+            /* ---- SGD / Exploration using trace measurements ---- */
+            if (has_inference && infer_ctx && infer_ctx->d_stats && chosen_result
+                    && !g_best_mode.load() && g_online_learning_enabled) {
+
+                float w0 = g_rank_w0, w1 = g_rank_w1, w2 = g_rank_w2;
+                float bw = fmaxf(1.0f, g_measured_bw_bytes_per_ms);
+                static constexpr float TIME_FLOOR = 5.0f, RATIO_CAP = 100.0f;
+                float r_ct   = fmaxf(TIME_FLOOR, chosen_result->real_comp_ms);
+                float r_dt   = fmaxf(TIME_FLOOR, chosen_result->real_decomp_ms);
+                float r_r    = fminf(RATIO_CAP,  chosen_result->real_ratio);
+                float r_cost = w0*r_ct + w1*r_dt + w2*(float)actual_bytes/(r_r*bw);
+                float p_cost = chosen_result->pred_cost;
+                float mape   = (r_cost > 1e-6f) ? fabsf(p_cost - r_cost) / r_cost : 0.0f;
+
+                /* SGD: proportional update */
+                if (mape > g_reinforce_mape_threshold) {
+                    SGDSample sample{};
+                    sample.action             = chosen_result->nn_idx;
+                    sample.actual_ratio       = chosen_result->real_ratio;
+                    sample.actual_comp_time   = chosen_result->real_comp_ms;
+                    sample.actual_decomp_time = chosen_result->real_decomp_ms;
+                    sample.actual_psnr        = chosen_result->real_psnr;
+                    std::lock_guard<std::mutex> sgd_lk(g_sgd_mutex);
+                    gpucompress::runNNSGDCtx(infer_ctx->d_stats, &sample, 1,
+                        actual_bytes, cfg.error_bound, g_reinforce_lr, infer_ctx);
+                }
+
+                /* Exploration: randomly pick N from the 64 measured configs */
+                bool do_explore = (mape > (float)g_exploration_threshold) || g_best_mode.load();
+                if (do_explore) {
+                    int n_explore = (g_exploration_k_override > 0) ? g_exploration_k_override : 3;
+                    /* Collect valid non-chosen results */
+                    int valid_idxs[64]; int n_valid = 0;
+                    for (int i = 0; i < 64; i++) {
+                        if (results[i].valid && results[i].action_id != chosen_trace_action)
+                            valid_idxs[n_valid++] = i;
+                    }
+                    /* Fisher-Yates shuffle */
+                    for (int i = n_valid - 1; i > 0; i--) {
+                        int j = rand() % (i + 1);
+                        int tmp = valid_idxs[i]; valid_idxs[i] = valid_idxs[j]; valid_idxs[j] = tmp;
+                    }
+                    int n = (n_explore < n_valid) ? n_explore : n_valid;
+                    if (n > 0) {
+                        SGDSample explore_samples[64];
+                        for (int k = 0; k < n; k++) {
+                            const TraceConfigResult& er = results[valid_idxs[k]];
+                            SGDSample& s = explore_samples[k];
+                            s.action             = er.nn_idx;
+                            s.actual_ratio       = er.real_ratio;
+                            s.actual_comp_time   = er.real_comp_ms;
+                            s.actual_decomp_time = er.real_decomp_ms;
+                            s.actual_psnr        = er.real_psnr;
+                        }
+                        std::lock_guard<std::mutex> sgd_lk(g_sgd_mutex);
+                        gpucompress::runNNSGDCtx(infer_ctx->d_stats, explore_samples, n,
+                            actual_bytes, cfg.error_bound, g_reinforce_lr, infer_ctx);
+                    }
+                }
+            }
+
+            /* Free owned gather buffer */
+            if (d_owned) { cudaFree(d_owned); d_owned = nullptr; }
+        } /* chunk loop */
+
+        if (d_dset_dims) free_dim_arrays(d_dset_dims, d_chunk_dims_d, d_chunk_start_d);
+        if (infer_ctx) gpucompress::releaseCompContext(infer_ctx);
+        cudaStreamDestroy(gather_stream);
+        gpucompress::DiagnosticsStore::instance().flushTrace();
+
+        cudaFree(d_comp);
+        cudaFreeHost(h_comp);
+    }
+
+done_trace:
+    if (need_close_space) H5Sclose(actual_space_id);
+    return ret;
+}
+
+/* ============================================================
  * gpu_aware_chunked_write
  * ============================================================ */
 
@@ -1711,7 +2048,7 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                                 &infer_action, &infer_ratio, &infer_ct, &infer_dt, &infer_psnr,
                                 infer_top, infer_costs,
                                 &infer_rmse, &infer_max_err, &infer_mae, &infer_ssim,
-                                (s_vol_mode == VOLMode::TRACE) ? wi.per_config : nullptr);
+                                nullptr);
                             if (ie == GPUCOMPRESS_SUCCESS && infer_action >= 0) {
                                 wi.has_inference       = true;
                                 wi.action              = infer_action;
@@ -1763,15 +2100,6 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                                 wi.d_stats_ring_managed = (d_stats_ring != nullptr && ci < d_stats_ring_count);
                             }
                         }
-                    }
-
-                    /* ---- Trace mode: exhaustive per-chunk profiling ---- */
-                    if (s_vol_mode == VOLMode::TRACE && wi.src && wi.sz > 0) {
-                        run_trace_exhaustive_chunk(
-                            wi.src, wi.sz,
-                            wi.action,
-                            cfg.error_bound,
-                            wi.has_inference ? wi.per_config : nullptr);
                     }
 
                     /* ---- Post WorkItem to bounded work queue ---- */
@@ -2000,7 +2328,8 @@ static void run_trace_exhaustive_chunk(
     size_t                    chunk_bytes,
     int                       nn_action,
     double                    error_bound,
-    const NNDebugPerConfig*   per_config)  /* [32] NN predictions per action; may be nullptr */
+    const NNDebugPerConfig*   per_config,   /* [32] NN predictions per action; may be nullptr */
+    TraceConfigResult*        out_results)  /* [64], may be nullptr */
 {
     size_t max_comp  = gpucompress_max_compressed_size(chunk_bytes);
     int    n_elems   = (int)(chunk_bytes / sizeof(float));
@@ -2127,6 +2456,20 @@ static void run_trace_exhaustive_chunk(
             g_reinforce_mape_threshold,
             static_cast<float>(g_exploration_threshold),
             bw, w0, w1, w2);
+
+        if (out_results) {
+            int ridx = algo_idx * 8 + shuf_idx * 4 + quant_idx;
+            TraceConfigResult& r  = out_results[ridx];
+            r.action_id           = action;
+            r.nn_idx              = nn_idx;
+            r.real_ratio          = real_ratio;
+            r.real_comp_ms        = comp_ms;
+            r.real_decomp_ms      = decomp_ms;
+            r.real_psnr           = real_psnr;
+            r.real_cost           = real_cost;
+            r.pred_cost           = pred_cost;
+            r.valid               = true;
+        }
 
         } /* quant_idx */
       } /* shuf_idx */
@@ -2628,7 +2971,7 @@ gpu_aware_chunked_read(H5VL_gpucompress_t *o,
             }
         } /* chunk loop */
 
-        /* Batched deferred decomp SGD: one update from all chunks' decomp times */
+        /* Batched deferred decomp SGD: one update from all chunks' decomp times. */
         if (ret == 0) gpucompress_batched_decomp_sgd();
 
 done_read:
@@ -2799,11 +3142,17 @@ H5VL_gpucompress_dataset_write(size_t count, void *dset[],
                                           file_space_id[i], plist_id,
                                           buf[i], req);
             } else if (get_gpucompress_config_from_dcpl(o->dcpl_id, &cfg) == 0) {
-                VOL_TRACE("dataset_write[%zu]: buf=%p → GPU path (gpucompress filter)", i, buf[i]);
-                /* RELEASE / TRACE: compress+write chunk by chunk */
-                ret = gpu_aware_chunked_write(o, mem_type_id[i],
-                                              file_space_id[i], plist_id,
-                                              buf[i]);
+                if (s_vol_mode == VOLMode::TRACE) {
+                    VOL_TRACE("dataset_write[%zu]: buf=%p → trace path (exhaustive)", i, buf[i]);
+                    ret = gpu_trace_chunked_write(o, mem_type_id[i],
+                                                  file_space_id[i], plist_id,
+                                                  buf[i]);
+                } else {
+                    VOL_TRACE("dataset_write[%zu]: buf=%p → release path (gpucompress filter)", i, buf[i]);
+                    ret = gpu_aware_chunked_write(o, mem_type_id[i],
+                                                  file_space_id[i], plist_id,
+                                                  buf[i]);
+                }
             } else {
                 VOL_TRACE("dataset_write[%zu]: buf=%p → fallback D→H (no gpucompress filter)", i, buf[i]);
                 ret = gpu_fallback_dh_write(o, mem_type_id[i], mem_space_id[i],
@@ -3003,6 +3352,7 @@ H5VL_gpucompress_file_create(const char *name, unsigned flags,
     if (req && *req) *req = new_obj(*req, info->under_vol_id);
     H5Pclose(under_fapl);
     H5VL_gpucompress_info_free(info);
+    if (file) gpucompress::DiagnosticsStore::instance().recordFileOpen();
     return file;
 }
 
@@ -3027,6 +3377,7 @@ H5VL_gpucompress_file_open(const char *name, unsigned flags,
     if (req && *req) *req = new_obj(*req, info->under_vol_id);
     H5Pclose(under_fapl);
     H5VL_gpucompress_info_free(info);
+    if (file) gpucompress::DiagnosticsStore::instance().recordFileOpen();
     return file;
 }
 
@@ -3120,10 +3471,11 @@ H5VL_gpucompress_file_close(void *file, hid_t dxpl_id, void **req)
     /* ---- Flush per-mode outputs ---- */
     auto& store = gpucompress::DiagnosticsStore::instance();
 
-    /* All modes: write total I/O timing to file */
+    /* All modes: record end-to-end time then write timing CSV */
+    store.recordFileClose();
     {
         const char* timing_path = getenv("GPUCOMPRESS_TIMING_OUTPUT");
-        store.dumpIoTiming(timing_path ? timing_path : "gpucompress_io_timing.txt");
+        store.dumpIoTiming(timing_path ? timing_path : "gpucompress_io_timing.csv");
     }
 
     /* Trace: flush and close the CSV */
