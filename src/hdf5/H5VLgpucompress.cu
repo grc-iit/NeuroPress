@@ -46,6 +46,29 @@
 #define H5Z_FILTER_GPUCOMPRESS 305
 
 /* ============================================================
+ * VOL Operating Mode
+ *
+ * Controlled by GPUCOMPRESS_VOL_MODE environment variable:
+ *   bypass   — D→H passthrough to native HDF5, no GPU compression.
+ *              Measures I/O baseline; writes timing file on file_close.
+ *   release  — Full NN autoselection + online learning (default).
+ *   trace    — Everything in release, plus exhaustive per-chunk profiling
+ *              of all 32 compression configs. Writes a per-row CSV.
+ *
+ * All three modes accumulate total I/O wall time in DiagnosticsStore.
+ * ============================================================ */
+enum class VOLMode { BYPASS, RELEASE, TRACE };
+static VOLMode s_vol_mode = VOLMode::RELEASE;
+
+static VOLMode detect_vol_mode() {
+    const char* env = getenv("GPUCOMPRESS_VOL_MODE");
+    if (!env) return VOLMode::RELEASE;
+    if (strcasecmp(env, "bypass") == 0) return VOLMode::BYPASS;
+    if (strcasecmp(env, "trace")  == 0) return VOLMode::TRACE;
+    return VOLMode::RELEASE;
+}
+
+/* ============================================================
  * Typedefs / object structs
  * ============================================================ */
 
@@ -95,6 +118,11 @@ typedef struct H5VL_gpucompress_wrap_ctx_t {
 /* ============================================================
  * Forward declarations — all callbacks
  * ============================================================ */
+
+/* Helper functions */
+static void run_trace_exhaustive_chunk(const void*, size_t, int, const float*, double);
+static herr_t gpu_bypass_dh_write(H5VL_gpucompress_t*, hid_t, hid_t, hid_t, hid_t, const void*, void**);
+static herr_t gpu_bypass_hd_read(H5VL_gpucompress_t*, hid_t, hid_t, hid_t, hid_t, void*, void**);
 
 /* Management */
 static herr_t H5VL_gpucompress_init(hid_t vipl_id);
@@ -658,7 +686,20 @@ free_obj(H5VL_gpucompress_t *o)
  * Management callbacks
  * ============================================================ */
 
-static herr_t H5VL_gpucompress_init(hid_t /*vipl_id*/) { return 0; }
+static herr_t H5VL_gpucompress_init(hid_t /*vipl_id*/) {
+    s_vol_mode = detect_vol_mode();
+    const char* mode_str =
+        (s_vol_mode == VOLMode::BYPASS)  ? "bypass"  :
+        (s_vol_mode == VOLMode::TRACE)   ? "trace"   : "release";
+    fprintf(stderr, "gpucompress VOL: mode=%s\n", mode_str);
+
+    if (s_vol_mode == VOLMode::TRACE) {
+        const char* path = getenv("GPUCOMPRESS_TRACE_OUTPUT");
+        gpucompress::DiagnosticsStore::instance().openTraceFile(
+            path ? path : "gpucompress_trace.csv");
+    }
+    return 0;
+}
 static herr_t H5VL_gpucompress_term(void)               { return 0; }
 
 /* ============================================================
@@ -1705,6 +1746,15 @@ gpu_aware_chunked_write(H5VL_gpucompress_t *o,
                         }
                     }
 
+                    /* ---- Trace mode: exhaustive per-chunk profiling ---- */
+                    if (s_vol_mode == VOLMode::TRACE && wi.src && wi.sz > 0) {
+                        run_trace_exhaustive_chunk(
+                            wi.src, wi.sz,
+                            wi.action,
+                            wi.predicted_costs,
+                            cfg.error_bound);
+                    }
+
                     /* ---- Post WorkItem to bounded work queue ---- */
                     /* E3 fix: allow 2x workers in work queue so Stage 1 can
                      * pre-queue chunks while workers are posting to I/O. */
@@ -1817,6 +1867,188 @@ done_write:
 
 done:
     if (need_close_space) H5Sclose(actual_space_id);
+    return ret;
+}
+
+/* ============================================================
+ * Trace Mode: exhaustive per-chunk profiling
+ *
+ * Called in Stage 1 after NN inference when mode == TRACE.
+ * Iterates all 32 action IDs, compresses with each config, decompresses,
+ * and writes one CSV row per config per chunk to DiagnosticsStore.
+ *
+ * This is intentionally sequential and slow — Trace mode is for offline
+ * analysis only.
+ * ============================================================ */
+static const char* s_algo_names_trace[] = {
+    "lz4","snappy","deflate","gdeflate","zstd","ans","cascaded","bitcomp"};
+
+static void run_trace_exhaustive_chunk(
+    const void*               d_src,
+    size_t                    chunk_bytes,
+    int                       nn_action,
+    const float*              pred_costs,   /* [32] indexed by action_id; may be nullptr */
+    double                    error_bound)
+{
+    size_t max_comp = gpucompress_max_compressed_size(chunk_bytes);
+    void*  d_comp   = nullptr;
+    void*  d_decomp = nullptr;
+
+    if (cudaMalloc(&d_comp,   max_comp)    != cudaSuccess) return;
+    if (cudaMalloc(&d_decomp, chunk_bytes) != cudaSuccess) {
+        cudaFree(d_comp); return;
+    }
+
+    cudaEvent_t ev_start, ev_stop;
+    cudaEventCreate(&ev_start);
+    cudaEventCreate(&ev_stop);
+
+    /* One stream for all 32 sequential trace compressions */
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
+
+    int chunk_id = gpucompress::DiagnosticsStore::instance().nextChunkId();
+
+    for (int action = 0; action < 32; action++) {
+        int  algo_idx  = action % 8;
+        bool use_quant = (action / 8)  % 2;
+        bool use_shuf  = (action / 16) % 2;
+
+        char comp_lib[64];
+        snprintf(comp_lib, sizeof(comp_lib), "%s%s%s",
+                 s_algo_names_trace[algo_idx],
+                 use_shuf  ? "+shuf"  : "",
+                 use_quant ? "+quant" : "");
+
+        gpucompress_config_t cfg{};
+        cfg.algorithm   = static_cast<gpucompress_algorithm_t>(algo_idx + 1); /* 0=AUTO */
+        cfg.error_bound = error_bound;
+        cfg.preprocessing = 0;
+        if (use_shuf)  cfg.preprocessing |= GPUCOMPRESS_PREPROC_SHUFFLE_4;
+        if (use_quant) cfg.preprocessing |= GPUCOMPRESS_PREPROC_QUANTIZE;
+
+        /* Compress — gpucompress_compress_gpu is synchronous on stream */
+        size_t comp_sz = max_comp;
+        cudaEventRecord(ev_start, stream);
+        gpucompress_error_t ce = gpucompress_compress_gpu(
+            d_src, chunk_bytes, d_comp, &comp_sz, &cfg, nullptr, stream);
+        cudaEventRecord(ev_stop, stream);
+        cudaStreamSynchronize(stream);
+
+        if (ce != GPUCOMPRESS_SUCCESS || comp_sz == 0) continue;
+
+        float comp_ms = 0.0f;
+        cudaEventElapsedTime(&comp_ms, ev_start, ev_stop);
+        float ratio = static_cast<float>(chunk_bytes) / static_cast<float>(comp_sz);
+
+        /* Decompress */
+        size_t decomp_sz = chunk_bytes;
+        float  decomp_ms = 0.0f;
+        cudaEventRecord(ev_start, stream);
+        ce = gpucompress_decompress_gpu(
+            d_comp, comp_sz, d_decomp, &decomp_sz, stream);
+        cudaEventRecord(ev_stop, stream);
+        cudaStreamSynchronize(stream);
+        if (ce == GPUCOMPRESS_SUCCESS)
+            cudaEventElapsedTime(&decomp_ms, ev_start, ev_stop);
+
+        float pred_cost = (pred_costs) ? pred_costs[action] : 0.0f;
+
+        gpucompress::DiagnosticsStore::instance().writeTraceRow(
+            chunk_id, action, comp_lib,
+            (action == nn_action),
+            pred_cost, ratio, comp_ms, decomp_ms);
+    }
+
+    cudaStreamDestroy(stream);
+    cudaEventDestroy(ev_start);
+    cudaEventDestroy(ev_stop);
+    cudaFree(d_comp);
+    cudaFree(d_decomp);
+}
+
+/* ============================================================
+ * Bypass Mode: silent D→H write / H→D read
+ *
+ * Like gpu_fallback_dh_write / gpu_fallback_hd_read but without
+ * the "no gpucompress filter" warning — in Bypass mode the filter
+ * is intentionally skipped by VOL policy, not missing from the DCPL.
+ * ============================================================ */
+static herr_t
+gpu_bypass_dh_write(H5VL_gpucompress_t *o,
+                    hid_t mem_type_id, hid_t mem_space_id,
+                    hid_t file_space_id, hid_t dxpl_id,
+                    const void *d_buf, void **req)
+{
+    hid_t actual_space_id = H5I_INVALID_HID;
+    int   need_close = 0;
+    if (file_space_id == H5S_ALL) {
+        H5VL_dataset_get_args_t ga{};
+        ga.op_type                 = H5VL_DATASET_GET_SPACE;
+        ga.args.get_space.space_id = H5I_INVALID_HID;
+        if (H5VLdataset_get(o->under_object, o->under_vol_id, &ga, dxpl_id, NULL) < 0)
+            return -1;
+        actual_space_id = ga.args.get_space.space_id;
+        need_close = 1;
+    } else {
+        actual_space_id = file_space_id;
+    }
+
+    hsize_t n_elems = (hsize_t)H5Sget_simple_extent_npoints(actual_space_id);
+    size_t  elem_sz = H5Tget_size(mem_type_id);
+    if (need_close) H5Sclose(actual_space_id);
+
+    size_t total_bytes = (size_t)n_elems * elem_sz;
+    void *h_tmp = nullptr;
+    if (cudaMallocHost(&h_tmp, total_bytes) != cudaSuccess) return -1;
+    if (cudaMemcpy(h_tmp, d_buf, total_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        cudaFreeHost(h_tmp); return -1;
+    }
+
+    void       *under_obj = o->under_object;
+    const void *h_ptr     = h_tmp;
+    herr_t ret = H5VLdataset_write(1, &under_obj, o->under_vol_id,
+                                   &mem_type_id, &mem_space_id, &file_space_id,
+                                   dxpl_id, &h_ptr, req);
+    cudaFreeHost(h_tmp);
+    return ret;
+}
+
+static herr_t
+gpu_bypass_hd_read(H5VL_gpucompress_t *o,
+                   hid_t mem_type_id, hid_t mem_space_id,
+                   hid_t file_space_id, hid_t dxpl_id,
+                   void *d_buf, void **req)
+{
+    hid_t actual_space_id = H5I_INVALID_HID;
+    int   need_close = 0;
+    if (file_space_id == H5S_ALL) {
+        H5VL_dataset_get_args_t ga{};
+        ga.op_type                 = H5VL_DATASET_GET_SPACE;
+        ga.args.get_space.space_id = H5I_INVALID_HID;
+        if (H5VLdataset_get(o->under_object, o->under_vol_id, &ga, dxpl_id, NULL) < 0)
+            return -1;
+        actual_space_id = ga.args.get_space.space_id;
+        need_close = 1;
+    } else {
+        actual_space_id = file_space_id;
+    }
+
+    hsize_t n_elems = (hsize_t)H5Sget_simple_extent_npoints(actual_space_id);
+    size_t  elem_sz = H5Tget_size(mem_type_id);
+    if (need_close) H5Sclose(actual_space_id);
+
+    size_t total_bytes = (size_t)n_elems * elem_sz;
+    void *h_tmp = nullptr;
+    if (cudaMallocHost(&h_tmp, total_bytes) != cudaSuccess) return -1;
+
+    void  *under_obj = o->under_object;
+    herr_t ret = H5VLdataset_read(1, &under_obj, o->under_vol_id,
+                                  &mem_type_id, &mem_space_id, &file_space_id,
+                                  dxpl_id, &h_tmp, req);
+    if (ret >= 0)
+        cudaMemcpy(d_buf, h_tmp, total_bytes, cudaMemcpyHostToDevice);
+    cudaFreeHost(h_tmp);
     return ret;
 }
 
@@ -2308,6 +2540,7 @@ H5VL_gpucompress_dataset_read(size_t count, void *dset[],
     hid_t mem_type_id[], hid_t mem_space_id[], hid_t file_space_id[],
     hid_t plist_id, void *buf[], void **req)
 {
+    double _t0 = _now_ms();
     herr_t ret;
 
     /* For each dataset, check if buf is a GPU pointer */
@@ -2318,15 +2551,19 @@ H5VL_gpucompress_dataset_read(size_t count, void *dset[],
             gpucompress_is_device_ptr(buf[i])) {
 
             gpucompress_config_t cfg;
-            if (get_gpucompress_config_from_dcpl(o->dcpl_id, &cfg) == 0) {
+            if (s_vol_mode == VOLMode::BYPASS) {
+                VOL_TRACE("dataset_read[%zu]: buf=%p → bypass (native + H→D)", i, buf[i]);
+                ret = gpu_bypass_hd_read(o, mem_type_id[i], mem_space_id[i],
+                                         file_space_id[i], plist_id,
+                                         buf[i], req);
+            } else if (get_gpucompress_config_from_dcpl(o->dcpl_id, &cfg) == 0) {
                 VOL_TRACE("dataset_read[%zu]: buf=%p → GPU path (gpucompress filter)", i, buf[i]);
-                /* GPU path: read+decompress chunk by chunk */
+                /* RELEASE / TRACE: decompress chunk by chunk */
                 ret = gpu_aware_chunked_read(o, mem_type_id[i],
                                              file_space_id[i], plist_id,
                                              buf[i]);
             } else {
                 VOL_TRACE("dataset_read[%zu]: buf=%p → fallback native+H→D (no gpucompress filter)", i, buf[i]);
-                /* No gpucompress filter — native one-shot read then H→D copy */
                 ret = gpu_fallback_hd_read(o, mem_type_id[i], mem_space_id[i],
                                            file_space_id[i], plist_id,
                                            buf[i], req);
@@ -2342,6 +2579,7 @@ H5VL_gpucompress_dataset_read(size_t count, void *dset[],
         }
     }
 
+    gpucompress::DiagnosticsStore::instance().accumulateIoMs(_now_ms() - _t0);
     if (req && *req && count > 0)
         *req = new_obj(*req, ((H5VL_gpucompress_t*)dset[0])->under_vol_id);
     return 0;
@@ -2352,6 +2590,7 @@ H5VL_gpucompress_dataset_write(size_t count, void *dset[],
     hid_t mem_type_id[], hid_t mem_space_id[], hid_t file_space_id[],
     hid_t plist_id, const void *buf[], void **req)
 {
+    double _t0 = _now_ms();
     herr_t ret;
 
     for (size_t i = 0; i < count; i++) {
@@ -2361,15 +2600,19 @@ H5VL_gpucompress_dataset_write(size_t count, void *dset[],
             gpucompress_is_device_ptr(buf[i])) {
 
             gpucompress_config_t cfg;
-            if (get_gpucompress_config_from_dcpl(o->dcpl_id, &cfg) == 0) {
+            if (s_vol_mode == VOLMode::BYPASS) {
+                VOL_TRACE("dataset_write[%zu]: buf=%p → bypass (D→H + native)", i, buf[i]);
+                ret = gpu_bypass_dh_write(o, mem_type_id[i], mem_space_id[i],
+                                          file_space_id[i], plist_id,
+                                          buf[i], req);
+            } else if (get_gpucompress_config_from_dcpl(o->dcpl_id, &cfg) == 0) {
                 VOL_TRACE("dataset_write[%zu]: buf=%p → GPU path (gpucompress filter)", i, buf[i]);
-                /* GPU path: compress+write chunk by chunk */
+                /* RELEASE / TRACE: compress+write chunk by chunk */
                 ret = gpu_aware_chunked_write(o, mem_type_id[i],
                                               file_space_id[i], plist_id,
                                               buf[i]);
             } else {
                 VOL_TRACE("dataset_write[%zu]: buf=%p → fallback D→H (no gpucompress filter)", i, buf[i]);
-                /* No gpucompress filter — D→H copy then native one-shot write */
                 ret = gpu_fallback_dh_write(o, mem_type_id[i], mem_space_id[i],
                                             file_space_id[i], plist_id,
                                             buf[i], req);
@@ -2385,6 +2628,7 @@ H5VL_gpucompress_dataset_write(size_t count, void *dset[],
         }
     }
 
+    gpucompress::DiagnosticsStore::instance().accumulateIoMs(_now_ms() - _t0);
     if (req && *req && count > 0)
         *req = new_obj(*req, ((H5VL_gpucompress_t*)dset[0])->under_vol_id);
     return 0;
@@ -2679,6 +2923,21 @@ H5VL_gpucompress_file_close(void *file, hid_t dxpl_id, void **req)
     herr_t rv = H5VLfile_close(o->under_object, o->under_vol_id, dxpl_id, req);
     if (req && *req) *req = new_obj(*req, o->under_vol_id);
     if (rv >= 0) free_obj(o);
+
+    /* ---- Flush per-mode outputs ---- */
+    auto& store = gpucompress::DiagnosticsStore::instance();
+
+    /* Bypass: write total I/O timing to file */
+    if (s_vol_mode == VOLMode::BYPASS) {
+        const char* timing_path = getenv("GPUCOMPRESS_TIMING_OUTPUT");
+        store.dumpIoTiming(timing_path ? timing_path : "gpucompress_io_timing.txt");
+    }
+
+    /* Trace: flush and close the CSV */
+    if (s_vol_mode == VOLMode::TRACE) {
+        store.flushTrace();
+    }
+
     return rv;
 }
 
