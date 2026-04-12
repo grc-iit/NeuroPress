@@ -1,56 +1,61 @@
-###############################################################################
-# GPUCompress 4n4g Simulation Docker Image
-#
-# CUDA-enabled runtime image with MPI + SSH for multi-node simulation.
-# Bind-mounts the host GPUCompress and vpic-kokkos directories at runtime.
-###############################################################################
+# Base image
+FROM nvidia/cuda:12.6.0-devel-ubuntu24.04                                             
 
-FROM nvidia/cuda:12.6.0-devel-ubuntu24.04
+# System packages
+RUN apt-get update && apt-get install -y --no-install-recommends \                  
+    build-essential cmake curl wget git python3 python3-pip \                         
+    openmpi-bin libopenmpi-dev \                                                      
+    && rm -rf /var/lib/apt/lists/* 
 
-ENV DEBIAN_FRONTEND=noninteractive
+                                                                                       
+RUN mkdir -p /tmp/include /tmp/lib \
+    && curl -L -o /tmp/nvcomp.tar.xz \                                               
+    ...      
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential \
-        cmake \
-        gfortran \
-        openmpi-bin \
-        libopenmpi-dev \
-        openssh-server \
-        openssh-client \
-        python3 \
-        python3-pip \
-        ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+# nvCOMP
+RUN curl -L -o /tmp/nvcomp.tar.xz \
+    "https://developer.download.nvidia.com/compute/nvcomp/redist/nvcomp/linux-x86_64/nvcomp-linux-x86_64-5.1.0.21_cuda12-archive.tar.xz" \
+    && cd /tmp && tar -xf nvcomp.tar.xz \
+    && cp -r nvcomp-linux-x86_64-*/include/* /tmp/include/ \
+    && cp -r nvcomp-linux-x86_64-*/lib/* /tmp/lib/ \
+    && rm -rf /tmp/nvcomp.tar.xz /tmp/nvcomp-linux-x86_64-*
 
-# ---- SSH setup for MPI communication between containers ----
-RUN mkdir -p /var/run/sshd \
-    && sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config \
-    && sed -i 's/#StrictModes.*/StrictModes no/' /etc/ssh/sshd_config \
-    && echo "StrictHostKeyChecking no" >> /etc/ssh/ssh_config \
-    && echo "UserKnownHostsFile /dev/null" >> /etc/ssh/ssh_config \
-    && echo "LogLevel ERROR" >> /etc/ssh/ssh_config
+# HDF5 2.0.0
+RUN curl -L -o /tmp/hdf5.tar.gz \
+    "https://github.com/HDFGroup/hdf5/releases/download/2.0.0/hdf5-2.0.0.tar.gz" \
+    && cd /tmp && tar xzf hdf5.tar.gz \
+    && mkdir hdf5-build && cd hdf5-build \
+    && cmake /tmp/hdf5-2.0.0 \
+        -DCMAKE_INSTALL_PREFIX=/tmp/hdf5-install \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DHDF5_BUILD_TOOLS=OFF \
+        -DHDF5_BUILD_EXAMPLES=OFF \
+        -DBUILD_TESTING=OFF \
+        -DHDF5_BUILD_CPP_LIB=OFF \
+        -DHDF5_BUILD_FORTRAN=OFF \
+        -DHDF5_BUILD_JAVA=OFF \
+        -DHDF5_BUILD_HL_LIB=ON \
+    && make -j$(nproc) && make install \
+    && rm -rf /tmp/hdf5.tar.gz /tmp/hdf5-2.0.0 /tmp/hdf5-build
 
-# Generate host keys and a shared SSH key pair
-RUN ssh-keygen -A \
-    && mkdir -p /root/.ssh \
-    && ssh-keygen -t rsa -b 2048 -f /root/.ssh/id_rsa -N "" \
-    && cat /root/.ssh/id_rsa.pub >> /root/.ssh/authorized_keys \
-    && chmod 600 /root/.ssh/authorized_keys
 
-# ---- Environment ----
-ENV OMPI_ALLOW_RUN_AS_ROOT=1
-ENV OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
-ENV OMP_NUM_THREADS=1
+# ENV VARIABLE
+ENV LD_LIBRARY_PATH=/tmp/lib:/tmp/hdf5-install/lib
+ENV NVCOMP_INCLUDE_DIR=/tmp/include
+ENV NVCOMP_LIB_DIR=/tmp/lib
+ENV HDF5_VOL_DIR=/tmp/hdf5-install
 
-# Shared workspace for simulation data
-RUN mkdir -p /workspace
-WORKDIR /workspace
+# Copy source + build NeuroPress
 
-COPY entrypoint.sh /entrypoint.sh
-COPY mpirun-wrapper.sh /usr/local/bin/mpirun
-RUN chmod +x /entrypoint.sh /usr/local/bin/mpirun
+COPY . /opt/GPUCompress
+WORKDIR /opt/GPUCompress
 
-EXPOSE 22
+RUN mkdir -p build && cd build \
+    && cmake .. -DCMAKE_CUDA_ARCHITECTURES=80 \
+    && make  -j$(nproc)
 
-ENTRYPOINT ["/entrypoint.sh"]
-CMD ["head"]
+ENV LD_LIBRARY_PATH=/opt/GPUCompress/build:${LD_LIBRARY_PATH}
+ENV HDF5_PLUGIN_PATH=/opt/GPUCompress/build
+ENV GPUCOMPRESS_WEIGHTS=/opt/GPUCompress/neural_net/weights/model.nnwt
+
+CMD ["/bin/bash"]
