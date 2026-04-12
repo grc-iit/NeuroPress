@@ -56,7 +56,7 @@ RESULTS_DIR="${RESULTS_DIR:-$SCRIPT_DIR/results/vpic_eval_NX${VPIC_NX}_chunk${VP
 WEIGHTS="${GPUCOMPRESS_WEIGHTS:-$GPUC_DIR/neural_net/weights/model.nnwt}"
 
 # ── Environment ──
-export LD_LIBRARY_PATH="$GPUC_DIR/build:$GPUC_DIR/examples:/tmp/hdf5-install/lib:/tmp/lib:/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="/opt/hdf5/lib:/opt/nvcomp/lib:/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export GPUCOMPRESS_WEIGHTS="$WEIGHTS"
 export VPIC_NX VPIC_CHUNK_MB VPIC_TIMESTEPS VPIC_WARMUP_STEPS VPIC_SIM_INTERVAL
 export VPIC_POLICIES="$POLICIES"
@@ -217,9 +217,9 @@ for pol in policies:
                 avg_rd = sum(float(x['read_ms']) for x in g) / n
                 wr_var = sum((float(x['write_ms']) - avg_wr)**2 for x in g) / max(n-1, 1)
                 rd_var = sum((float(x['read_ms']) - avg_rd)**2 for x in g) / max(n-1, 1)
-                total_file = sum(int(x['file_bytes']) for x in g)
-                orig_mib = float(g[0]['orig_mib'])
-                avg_file_mib = total_file / n / (1024*1024)
+                total_file = sum(int(x.get('file_bytes', 0)) for x in g)
+                orig_mib = float(g[0].get('orig_mib') or total_file / n / (1024*1024))
+                avg_file_mib = total_file / n / (1024*1024) if n > 0 else 0
                 avg_ratio = (n * orig_mib * 1024*1024) / total_file if total_file > 0 else 1.0
                 wr_mbps = orig_mib / (avg_wr / 1000.0) if avg_wr > 0 else 0
                 rd_mbps = orig_mib / (avg_rd / 1000.0) if avg_rd > 0 else 0

@@ -40,15 +40,7 @@ extern std::atomic<int>  g_last_nn_original_action;
 extern std::atomic<int>  g_last_exploration_triggered;
 extern std::atomic<int>  g_last_sgd_fired;
 
-/* ---- Chunk diagnostic history ---- */
-extern gpucompress_chunk_diag_t* g_chunk_history;
-extern int                       g_chunk_history_cap;
-extern std::atomic<int>          g_chunk_history_count;
-extern std::mutex                g_chunk_history_mutex;
-
-/* ---- nvcomp manager cache stats ---- */
-extern std::atomic<int>  g_mgr_cache_hits;
-extern std::atomic<int>  g_mgr_cache_misses;
+/* ---- Diagnostics: use DiagnosticsStore::instance() (diagnostics_store.hpp) ---- */
 
 /* ---- SGD serialization ---- */
 extern std::mutex        g_sgd_mutex;

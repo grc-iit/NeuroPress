@@ -240,6 +240,31 @@ gpucompress_error_t gpucompress_decompress(
 size_t gpucompress_max_compressed_size(size_t input_size);
 
 /**
+ * Compute data statistics for a GPU buffer (float32).
+ *
+ * Runs the entropy, MAD, and second-derivative kernels on the given
+ * device buffer and copies the results to the host.  This is a
+ * synchronizing call (blocks until results are ready).
+ *
+ * These statistics are properties of the raw data and are independent
+ * of any compression configuration.
+ *
+ * @param d_input              Input buffer (GPU memory, float32)
+ * @param input_size           Size of input in bytes
+ * @param out_entropy          [out] Shannon entropy in bits (0–8)
+ * @param out_mad              [out] Normalized mean absolute deviation (0–1)
+ * @param out_second_deriv     [out] Normalized mean absolute second derivative (0–1)
+ * @return GPUCOMPRESS_SUCCESS or error code
+ */
+gpucompress_error_t gpucompress_compute_stats_gpu(
+    const void* d_input,
+    size_t input_size,
+    double* out_entropy,
+    double* out_mad,
+    double* out_second_deriv
+);
+
+/**
  * Get original (decompressed) size from compressed data header.
  *
  * @param compressed     Compressed data buffer
@@ -434,10 +459,10 @@ int gpucompress_active_learning_enabled(void);
 /**
  * Set the exploration threshold for active learning.
  *
- * When the NN's predicted compression ratio differs from actual ratio
- * by more than this fraction, Level 2 exploration triggers.
+ * Set the X2 threshold: cost MAPE above this triggers full exploration.
+ * Clamping rules apply before MAPE: ct/dt floored at 1ms, ratio capped at 100x.
  *
- * @param threshold Fractional threshold (default 0.20 = 20% MAPE)
+ * @param threshold Fractional threshold (default 0.50 = 50% cost MAPE)
  */
 void gpucompress_set_exploration_threshold(double threshold);
 
@@ -451,11 +476,13 @@ void gpucompress_set_exploration_k(int k);
 
 /**
  * Set SGD reinforcement parameters.
+ * Controls X1: cost MAPE threshold for proportional SGD weight updates.
  * SGD is always active when online learning is on — the enable param is ignored.
+ * Clamping rules apply before MAPE: ct/dt floored at 1ms, ratio capped at 100x.
  *
  * @param enable            Ignored (kept for backward compatibility)
- * @param learning_rate     SGD step size (default 1e-4)
- * @param mape_threshold    Ratio MAPE threshold to trigger reinforcement (default 0.20)
+ * @param learning_rate     SGD step size (default 0.01)
+ * @param mape_threshold    X1: cost MAPE threshold to trigger SGD update (default 0.30 = 30%)
  * @param ct_mape_threshold Ignored (kept for backward compatibility)
  */
 void gpucompress_set_reinforcement(int enable, float learning_rate,
@@ -596,7 +623,7 @@ typedef struct {
     float  nn_inference_ms;      /* NN forward pass kernel + result D→H   */
     float  stats_ms;             /* stats kernels + stats D→H copies      */
     float  preprocessing_ms;     /* quantization + byte shuffle           */
-    float  compression_ms;       /* primary nvCOMP kernel only (clamped to 5ms floor for MAPE) */
+    float  compression_ms;       /* primary nvCOMP kernel only (clamped to 1ms floor for MAPE) */
     float  compression_ms_raw;  /* unclamped nvCOMP kernel time (for latency breakdown)     */
     float  exploration_ms;       /* exploration loop (0 if not triggered) */
     float  sgd_update_ms;        /* SGD weight update (0 if not fired)    */
@@ -607,16 +634,30 @@ typedef struct {
     float  predicted_comp_time;  /* NN-predicted compression time ms      */
     float  predicted_decomp_time;/* NN-predicted decompression time ms    */
     float  predicted_psnr;       /* NN-predicted PSNR in dB               */
+    float  predicted_rmse;       /* NN-predicted RMSE (0 if not AUTO)     */
+    float  predicted_max_error;  /* NN-predicted max pointwise error      */
+    float  predicted_mae;        /* NN-predicted mean absolute error      */
+    float  predicted_ssim;       /* NN-predicted SSIM in [0,1]            */
     float  actual_psnr;          /* analytical PSNR: 10*log10(3*range²/eb²), 120 lossless */
 
     /* Filled during read (decompression) — 0 until VOL read completes   */
-    float  decompression_ms;     /* actual decompression time (clamped to 5ms floor for MAPE) */
+    float  decompression_ms;     /* actual decompression time (clamped to 1ms floor for MAPE) */
     float  decompression_ms_raw; /* unclamped decompression time (for latency breakdown)    */
 
     /* Cost model diagnostics */
-    float  cost_model_error_pct; /* |actual_cost - predicted_cost| / actual_cost */
-    float  actual_cost;          /* cost of primary config (post-clamp)   */
-    float  predicted_cost;       /* NN-predicted cost (post-clamp)        */
+    float  cost_model_error_pct; /* |actual_cost - predicted_cost| / actual_cost            */
+    float  actual_cost;          /* cost of primary config (post-clamp)                     */
+    float  predicted_cost;       /* NN-predicted cost (post-clamp)                          */
+
+    /* Per-statistic MAPE (clamped: ct/dt ≥ 1ms, ratio ≤ 100x)
+     * Only valid when online learning is enabled (0 otherwise).           */
+    float  ratio_mape;           /* |act_ratio - pred_ratio| / act_ratio                    */
+    float  comp_time_mape;       /* |act_ct - pred_ct| / act_ct                             */
+    float  decomp_time_mape;     /* |act_dt - pred_dt| / act_dt  (filled after read)        */
+
+    /* Regret: (primary_cost - best_explored_cost) / best_explored_cost.
+     * -1.0 when exploration was not triggered (no oracle available).      */
+    float  regret;
 
     /* Original config metrics (before exploration replaced it) */
     float  orig_actual_ratio;      /* original config's measured ratio      */
@@ -635,8 +676,8 @@ typedef struct {
     float  feat_entropy;         /* Shannon entropy */
     float  feat_mad;             /* normalized MAD */
     float  feat_deriv;           /* normalized 2nd derivative */
-    float  feat_eb_enc;          /* log10(clip(error_bound, 1e-7)) */
-    float  feat_ds_enc;          /* log2(max(data_size, 1)) */
+    float  feat_eb_enc;          /* raw error_bound (used as NN input feature) */
+    float  feat_ds_enc;          /* raw data_size in bytes (used as NN input feature) */
 
     /* NN predicted ranking (sorted by predicted cost, best first) */
     int    predicted_ranking[32]; /* action IDs sorted by predicted cost   */

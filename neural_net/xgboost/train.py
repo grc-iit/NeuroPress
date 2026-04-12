@@ -44,7 +44,7 @@ OUTPUT_LABELS = {
     'rmse_log': 'RMSE',
     'max_error_log': 'Max Abs.\nError',
     'log_mae': 'Pointwise\nError (MAE)',
-    'ssim_val': 'SSIM',
+    'ssim_nlog': 'SSIM',
 }
 
 # Outputs excluded from SHAP heatmap

@@ -476,6 +476,48 @@ class GPUCompressHDF5Writer:
             })
         return chunks
 
+    def record_process_start(self):
+        """Reset the e2e timer to now (in the VOL library's DiagnosticsStore).
+
+        Call this just before the training/simulation loop begins (after model
+        loading, CUDA init, data preparation) so that e2e_ms excludes startup
+        overhead and reflects only the active compute + I/O time.
+
+        NOTE: Uses H5VL_gpucompress_record_process_start from the VOL .so,
+        which shares the same DiagnosticsStore as accumulateIoMs.
+        """
+        if not self._initialized or not self._vol:
+            return
+        try:
+            fn = self._vol.H5VL_gpucompress_record_process_start
+            fn.argtypes = []
+            fn.restype = None
+            fn()
+        except AttributeError:
+            pass
+
+    def dump_timing(self, path=None):
+        """Write e2e + VOL timing CSV explicitly (from the VOL library).
+
+        Use this instead of relying on C atexit when the library is loaded via
+        ctypes, since Python's shutdown order may unload the .so before atexit
+        handlers run.
+
+        Args:
+            path: Output file path. Falls back to GPUCOMPRESS_TIMING_OUTPUT env
+                  var, then 'gpucompress_io_timing.csv'.
+        """
+        if not self._initialized or not self._vol:
+            return
+        try:
+            fn = self._vol.H5VL_gpucompress_dump_timing
+            fn.argtypes = [ctypes.c_char_p]
+            fn.restype = None
+            c_path = path.encode("utf-8") if path else None
+            fn(c_path)
+        except AttributeError:
+            pass  # older build without this symbol
+
     def cleanup(self):
         """Release gpucompress resources."""
         if self._initialized and self._gc:

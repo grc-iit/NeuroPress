@@ -116,6 +116,7 @@ target_link_libraries(test_m4_write_buffer_reuse PRIVATE H5Zgpucompress)
 add_vol_test(test_s6_parallel_exploration  tests/hdf5/test_s6_parallel_exploration.cu)
 target_link_libraries(test_s6_parallel_exploration PRIVATE H5Zgpucompress)
 # (Removed: test_n3_exploration_alloc — API_CHANGE)
+add_vol_test(test_vol_modes                tests/hdf5/test_vol_modes.cu)
 
 # VOL bypass mode + program wall / compute_ms timing tests
 add_vol_test(test_vol_bypass_roundtrip  tests/hdf5/test_vol_bypass_roundtrip.cu)
@@ -143,6 +144,7 @@ foreach(_demo
     grayscott_vol_demo:examples/grayscott_vol_demo.cu:demo
     vpic_vol_demo:examples/vpic_vol_demo.cu:demo
     minimal_nn_vol_profile:examples/minimal_nn_vol_profile.cu:demo
+    hdf5_replay:examples/hdf5_replay.cu:demo
 )
     string(REPLACE ":" ";" _parts ${_demo})
     list(GET _parts 0 _target)
@@ -195,4 +197,49 @@ endif()
 # ── EMA reset integration test (requires H5VLgpucompress) ──
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/test_ema_reset.cu")
     add_vol_demo(test_ema_reset tests/unit/test_ema_reset.cu)
+endif()
+
+# ============================================================
+# CTest registrations — VOL tests
+# ============================================================
+
+# VOL correctness / roundtrip
+gpucompress_add_test(test_vol_8mb                   vol  180)
+gpucompress_add_test(test_correctness_vol            vol  300)
+gpucompress_add_test(test_vol_xfer_audit             vol  180)
+gpucompress_add_test(test_vol_verify_gpu_path        vol  180)
+gpucompress_add_test(test_vol_2d_chunk_roundtrip     vol  180)
+gpucompress_add_test(test_vol_lossless_stress        vol  300)
+gpucompress_add_test(test_vol_algo_shuffle_verify    vol  180)
+gpucompress_add_test(test_hdf5_compat                vol  180)
+gpucompress_add_test(test_lru1_manager_cache         vol  180)
+gpucompress_add_test(test_vol_exploration            vol  180)
+gpucompress_add_test(test_vol_host_ptr_reject        vol  180)
+gpucompress_add_test(test_vol_c4c8h7_defensive       vol  180)
+
+# VOL + NN
+gpucompress_add_test(test_nn_algo_convergence        vol  180)
+gpucompress_add_test(test_nn_bitcomp                 vol  180)
+gpucompress_add_test(test_nn_predict_vs_actual       vol  180)
+gpucompress_add_test(test_vol_nn_predictions         vol  180)
+gpucompress_add_test(test_nn_vol_correctness         vol  180)
+
+# VOL regression
+gpucompress_add_test(test_bug7_concurrent_quantize   regression  120)
+gpucompress_add_test(test_qw4_atomic_counters        regression  120)
+gpucompress_add_test(test_perf16_gather_stream       perf        120)
+gpucompress_add_test(test_h6_transfer_counter_race   regression  120)
+gpucompress_add_test(test_h1_vol_read_stream_sync    regression  180)
+gpucompress_add_test(test_m4_write_buffer_reuse      regression  180)
+gpucompress_add_test(test_s6_parallel_exploration    regression  180)
+gpucompress_add_test(test_vol_modes                  vol         600)
+
+# sample roundtrip (example, but it's registered as a test target)
+if(TARGET sample_gpu_compress_roundtrip)
+    gpucompress_add_test(sample_gpu_compress_roundtrip vol 180)
+endif()
+
+# EMA reset integration test
+if(TARGET test_ema_reset)
+    gpucompress_add_test(test_ema_reset unit 120)
 endif()

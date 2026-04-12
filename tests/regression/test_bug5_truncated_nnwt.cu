@@ -32,46 +32,54 @@
 #include <cstdint>
 #include <fstream>
 #include "gpucompress.h"
+#include "nn/nn_weights.h"
 
 static const uint32_t NN_MAGIC   = 0x4E4E5754u;
 static const uint32_t NN_VERSION = 2u;
-static const int      INPUT_DIM  = 15;
-static const int      HIDDEN_DIM = 128;
-static const int      OUTPUT_DIM = 4;
 
+/* Old architecture constants — kept intentionally for truncation test cases
+ * (Cases 1–6) that verify the loader rejects wrong dimensions. */
+static const int OLD_INPUT_DIM  = 15;
+static const int OLD_HIDDEN_DIM = 128;
+static const int OLD_OUTPUT_DIM = 4;
+static const int OLD_NUM_LAYERS = 3;
+
+/* Write a valid .nnwt using the *current* architecture from nn_weights.h.
+ * All dimensions are pulled from the header so this stays correct when the
+ * model changes — no hardcoding needed. */
 static bool write_valid_nnwt(const char *path)
 {
     std::ofstream f(path, std::ios::binary);
     if (!f) return false;
 
-    uint32_t hdr[6] = { NN_MAGIC, NN_VERSION, 3,
-                        (uint32_t)INPUT_DIM, (uint32_t)HIDDEN_DIM,
-                        (uint32_t)OUTPUT_DIM };
+    uint32_t hdr[6] = { NN_MAGIC, NN_VERSION, (uint32_t)NN_NUM_LAYERS,
+                        (uint32_t)NN_INPUT_DIM, (uint32_t)NN_HIDDEN_DIM,
+                        (uint32_t)NN_OUTPUT_DIM };
     f.write(reinterpret_cast<char*>(hdr), sizeof(hdr));
 
-    auto write_zeros = [&](int n) {
-        float v = 0.0f;
-        for (int i = 0; i < n; i++) f.write(reinterpret_cast<char*>(&v), 4);
-    };
-    auto write_ones = [&](int n) {
-        float v = 1.0f;
+    auto write_n = [&](int n, float v) {
         for (int i = 0; i < n; i++) f.write(reinterpret_cast<char*>(&v), 4);
     };
 
-    write_zeros(INPUT_DIM);
-    write_ones(INPUT_DIM);    /* x_stds != 0 */
-    write_zeros(OUTPUT_DIM);
-    write_ones(OUTPUT_DIM);   /* y_stds != 0 */
+    write_n(NN_INPUT_DIM,  0.0f);  /* x_means */
+    write_n(NN_INPUT_DIM,  1.0f);  /* x_stds != 0 */
+    write_n(NN_OUTPUT_DIM, 0.0f);  /* y_means */
+    write_n(NN_OUTPUT_DIM, 1.0f);  /* y_stds != 0 */
 
-    write_zeros(HIDDEN_DIM * INPUT_DIM);
-    write_zeros(HIDDEN_DIM);
-    write_zeros(HIDDEN_DIM * HIDDEN_DIM);
-    write_zeros(HIDDEN_DIM);
-    write_zeros(OUTPUT_DIM * HIDDEN_DIM);
-    write_zeros(OUTPUT_DIM);
+    /* NN_NUM_LAYERS linear layers: hidden×input, then (num_layers-1) hidden×hidden, then output×hidden */
+    write_n(NN_HIDDEN_DIM * NN_INPUT_DIM,  0.0f);  /* w1 */
+    write_n(NN_HIDDEN_DIM,                 0.0f);  /* b1 */
+    write_n(NN_HIDDEN_DIM * NN_HIDDEN_DIM, 0.0f);  /* w2 */
+    write_n(NN_HIDDEN_DIM,                 0.0f);  /* b2 */
+    write_n(NN_HIDDEN_DIM * NN_HIDDEN_DIM, 0.0f);  /* w3 */
+    write_n(NN_HIDDEN_DIM,                 0.0f);  /* b3 */
+    write_n(NN_HIDDEN_DIM * NN_HIDDEN_DIM, 0.0f);  /* w4 */
+    write_n(NN_HIDDEN_DIM,                 0.0f);  /* b4 */
+    write_n(NN_OUTPUT_DIM * NN_HIDDEN_DIM, 0.0f);  /* w5 */
+    write_n(NN_OUTPUT_DIM,                 0.0f);  /* b5 */
 
-    write_zeros(INPUT_DIM);   /* x_mins */
-    write_ones(INPUT_DIM);    /* x_maxs */
+    write_n(NN_INPUT_DIM, -1e30f);  /* x_mins */
+    write_n(NN_INPUT_DIM,  1e30f);  /* x_maxs */
 
     return f.good();
 }
@@ -130,16 +138,11 @@ int main(void)
         return 1;
     }
 
-    /* Size breakdown for truncation points:
-     * header:  24 B
-     * norm:    (15+15+4+4)*4 = 152 B
-     * w1+b1:   (128*15+128)*4 = 8192 B
-     * w2+b2:   (128*128+128)*4 = 66048 B
-     * w3+b3:   (4*128+4)*4 = 2064 B  */
+    /* Size breakdown for truncation points (current architecture from nn_weights.h) */
     size_t header_sz = 24;
-    size_t norm_sz   = (INPUT_DIM*2 + OUTPUT_DIM*2) * 4;
-    size_t w1b1_sz   = (HIDDEN_DIM*INPUT_DIM + HIDDEN_DIM) * 4;
-    size_t w2b2_sz   = (HIDDEN_DIM*HIDDEN_DIM + HIDDEN_DIM) * 4;
+    size_t norm_sz   = (NN_INPUT_DIM*2 + NN_OUTPUT_DIM*2) * sizeof(float);
+    size_t w1b1_sz   = (NN_HIDDEN_DIM*NN_INPUT_DIM  + NN_HIDDEN_DIM) * sizeof(float);
+    size_t w2b2_sz   = (NN_HIDDEN_DIM*NN_HIDDEN_DIM + NN_HIDDEN_DIM) * sizeof(float);
 
     int passed = 0, total = 0;
 
@@ -159,9 +162,9 @@ int main(void)
     total++;
     {
         std::ofstream f(bad_path, std::ios::binary);
-        uint32_t hdr[6] = { 0xDEADBEEFu, NN_VERSION, 3,
-                            (uint32_t)INPUT_DIM, (uint32_t)HIDDEN_DIM,
-                            (uint32_t)OUTPUT_DIM };
+        uint32_t hdr[6] = { 0xDEADBEEFu, NN_VERSION, (uint32_t)NN_NUM_LAYERS,
+                            (uint32_t)NN_INPUT_DIM, (uint32_t)NN_HIDDEN_DIM,
+                            (uint32_t)NN_OUTPUT_DIM };
         f.write(reinterpret_cast<char*>(hdr), sizeof(hdr));
         char zeros[4096] = {};
         for (int i = 0; i < 20; i++) f.write(zeros, sizeof(zeros));
@@ -169,23 +172,23 @@ int main(void)
     passed += run_test("Case 3: bad magic (0xDEADBEEF)",
                        bad_path, false);
 
-    /* Case 4: correct magic, wrong hidden_dim */
+    /* Case 4: correct magic, wrong hidden_dim (uses old dims to guarantee mismatch) */
     total++;
     {
         std::ofstream f(bad_path, std::ios::binary);
-        uint32_t hdr[6] = { NN_MAGIC, NN_VERSION, 3,
-                            (uint32_t)INPUT_DIM, 64u, (uint32_t)OUTPUT_DIM };
+        uint32_t hdr[6] = { NN_MAGIC, NN_VERSION, (uint32_t)OLD_NUM_LAYERS,
+                            (uint32_t)OLD_INPUT_DIM, 32u, (uint32_t)OLD_OUTPUT_DIM };
         f.write(reinterpret_cast<char*>(hdr), sizeof(hdr));
         char zeros[4096] = {};
         for (int i = 0; i < 20; i++) f.write(zeros, sizeof(zeros));
     }
-    passed += run_test("Case 4: wrong architecture (hidden_dim=64)",
+    passed += run_test("Case 4: wrong architecture (hidden_dim=32)",
                        bad_path, false);
 
     /* Case 5: truncated in the middle of w2 */
     total++;
     truncate_file(valid_path, trunc_path, header_sz + norm_sz + w1b1_sz + w2b2_sz / 2);
-    passed += run_test("Case 5: truncated mid-w2 (half of 66 KB weights)",
+    passed += run_test("Case 5: truncated mid-w2",
                        trunc_path, false);
 
     /* Case 6: truncated just 4 bytes into w3 */

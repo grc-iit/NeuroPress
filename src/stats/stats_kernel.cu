@@ -263,18 +263,15 @@ __global__ void finalizeStatsOnlyKernel(
     if (threadIdx.x != 0) return;
 
     size_t n = stats->num_elements;
-    double range = static_cast<double>(stats->vmax) - static_cast<double>(stats->vmin);
 
-    // Normalize MAD
     double mad_norm = 0.0;
-    if (range > 0.0 && n > 0) {
-        mad_norm = (stats->mad_sum / static_cast<double>(n)) / range;
+    if (n > 0) {
+        mad_norm = stats->mad_sum / static_cast<double>(n);
     }
 
-    // Normalize second derivative
     double deriv_norm = 0.0;
-    if (range > 0.0 && n > 2) {
-        deriv_norm = (stats->abs_diff_sum / static_cast<double>(n - 2)) / range;
+    if (n > 2) {
+        deriv_norm = stats->abs_diff_sum / static_cast<double>(n - 2);
     }
 
     stats->mad_normalized = mad_norm;

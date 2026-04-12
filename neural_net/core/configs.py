@@ -39,16 +39,14 @@ def build_all_config_features(entropy, mad, second_derivative,
     for algo_idx, algo_name in enumerate(ALGORITHM_NAMES):
         for shuffle in SHUFFLE_OPTIONS:
             for quant, eb in QUANT_OPTIONS:
-                algo_features = [1.0 if i == algo_idx else 0.0
-                                 for i in range(len(ALGORITHM_NAMES))]
                 quant_enc = 1.0 if quant else 0.0
                 shuffle_enc = 1.0 if shuffle > 0 else 0.0
                 eb_val = eb if quant else 1e-7
-                error_bound_enc = math.log10(max(eb_val, 1e-7))
-                data_size_enc = math.log2(max(data_size, 1))
+                error_bound_enc = eb_val
+                data_size_enc = float(data_size)
 
-                feature_vec = algo_features + [
-                    quant_enc, shuffle_enc, error_bound_enc,
+                feature_vec = [
+                    float(algo_idx), quant_enc, shuffle_enc, error_bound_enc,
                     data_size_enc, entropy, mad, second_derivative
                 ]
                 rows.append(feature_vec)

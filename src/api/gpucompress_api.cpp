@@ -13,11 +13,13 @@
 #include <cstring>
 #include <strings.h>
 #include <cstdio>
+#include <cstdlib>
 #include <cinttypes>
 #include <cmath>
 #include <utility>
 #include <vector>
 #include <algorithm>
+#include "diagnostics_store.hpp"
 #include <chrono>
 #include <unistd.h>
 #include <fcntl.h>
@@ -79,7 +81,7 @@ cudaStream_t      g_default_stream = nullptr;
 
 std::atomic<bool> g_online_learning_enabled{false};
 std::atomic<bool> g_exploration_enabled{false};
-double            g_exploration_threshold = 0.20;
+double            g_exploration_threshold = 0.50;  /* X2: full exploration trigger (default 50%) */
 int               g_exploration_k_override = -1;
 
 std::atomic<int>  g_last_nn_action{-1};
@@ -87,13 +89,7 @@ std::atomic<int>  g_last_nn_original_action{-1};
 std::atomic<int>  g_last_exploration_triggered{0};
 std::atomic<int>  g_last_sgd_fired{0};
 
-gpucompress_chunk_diag_t* g_chunk_history      = nullptr;
-int                       g_chunk_history_cap   = 0;
-std::atomic<int>          g_chunk_history_count{0};
-std::mutex                g_chunk_history_mutex;
-
-std::atomic<int>  g_mgr_cache_hits{0};
-std::atomic<int>  g_mgr_cache_misses{0};
+/* Chunk history and cache stats live in DiagnosticsStore singleton. */
 
 std::mutex        g_sgd_mutex;
 
@@ -104,7 +100,7 @@ bool g_debug_nn = false;
 bool g_detailed_timing = false;
 
 float g_reinforce_lr = 0.01f;
-float g_reinforce_mape_threshold = 0.10f;
+float g_reinforce_mape_threshold = 0.30f;  /* X1: proportional SGD update trigger (default 30%) */
 
 /* ============================================================
  * File-Private State (not shared across translation units)
@@ -245,6 +241,20 @@ extern "C" gpucompress_error_t gpucompress_init(const char* weights_path) {
         }
     }
 
+    /* MAPE thresholds for exploration mode (used in trace CSV and SGD trigger) */
+    {
+        const char* lo = getenv("GPUCOMPRESS_MAPE_LOW_THRESH");
+        if (lo) {
+            float v = (float)atof(lo);
+            if (v > 0.0f) g_reinforce_mape_threshold = v;
+        }
+        const char* hi = getenv("GPUCOMPRESS_MAPE_HIGH_THRESH");
+        if (hi) {
+            double v = atof(hi);
+            if (v > 0.0) g_exploration_threshold = v;
+        }
+    }
+
     /* Check debug env var */
     const char* dbg_env = getenv("GPUCOMPRESS_DEBUG_NN");
     if (dbg_env && (dbg_env[0] == '1' || dbg_env[0] == 'y' || dbg_env[0] == 'Y'))
@@ -256,6 +266,7 @@ extern "C" gpucompress_error_t gpucompress_init(const char* weights_path) {
         g_detailed_timing = true;
 
     g_initialized.store(true);
+
     return GPUCOMPRESS_SUCCESS;
 }
 
@@ -292,16 +303,7 @@ extern "C" void gpucompress_cleanup(void) {
         }
         g_initialized.store(false);
         g_ref_count.store(0);
-        /* Free dynamic chunk history */
-        {
-            std::lock_guard<std::mutex> lk(g_chunk_history_mutex);
-            if (g_chunk_history) {
-                free(g_chunk_history);
-                g_chunk_history    = nullptr;
-                g_chunk_history_cap = 0;
-            }
-            g_chunk_history_count.store(0);
-        }
+        /* Chunk history is owned by DiagnosticsStore (singleton, freed at exit). */
     }
 }
 
@@ -317,6 +319,28 @@ extern "C" gpucompress_config_t gpucompress_default_config(void) {
     config.cuda_device = -1;
     config.cuda_stream = nullptr;
     return config;
+}
+
+/* ============================================================
+ * Stats-only API
+ * ============================================================ */
+
+extern "C" gpucompress_error_t gpucompress_compute_stats_gpu(
+    const void* d_input,
+    size_t input_size,
+    double* out_entropy,
+    double* out_mad,
+    double* out_second_deriv
+) {
+    if (!g_initialized.load()) return GPUCOMPRESS_ERROR_NOT_INITIALIZED;
+    if (!d_input || input_size == 0) return GPUCOMPRESS_ERROR_INVALID_INPUT;
+    if (!out_entropy || !out_mad || !out_second_deriv) return GPUCOMPRESS_ERROR_INVALID_INPUT;
+
+    int rc = gpucompress::runStatsOnlyPipeline(
+        d_input, input_size, nullptr,
+        out_entropy, out_mad, out_second_deriv);
+
+    return (rc == 0) ? GPUCOMPRESS_SUCCESS : GPUCOMPRESS_ERROR_CUDA_FAILED;
 }
 
 /* ============================================================
@@ -433,5 +457,25 @@ extern "C" int gpucompress_is_device_ptr(const void* ptr) {
         return 0;
     }
     return (attrs.type == cudaMemoryTypeDevice) ? 1 : 0;
+}
+
+/* Reset the process-level start timer to now.  Call this at the start of the
+ * simulation/training loop (after model loading, CUDA init, data setup) so
+ * that e2e_ms reflects only the active workload, not process startup overhead.
+ * Safe to call multiple times — each call resets the timer. */
+extern "C" void gpucompress_record_process_start() {
+    gpucompress::DiagnosticsStore::instance().resetProcessStart();
+}
+
+/* Explicitly dump e2e+vol timing CSV — for callers (e.g. Python ctypes) that
+ * cannot rely on C atexit ordering.  Marks process end at call time.
+ * path: output file path; if NULL uses GPUCOMPRESS_TIMING_OUTPUT or
+ *       "gpucompress_io_timing.csv". */
+extern "C" void gpucompress_dump_timing(const char* path) {
+    auto& s = gpucompress::DiagnosticsStore::instance();
+    s.recordProcessEnd();
+    if (!path) path = getenv("GPUCOMPRESS_TIMING_OUTPUT");
+    if (!path) path = "gpucompress_io_timing.csv";
+    s.dumpIoTiming(path);
 }
 

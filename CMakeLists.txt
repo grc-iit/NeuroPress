@@ -3,6 +3,8 @@ cmake_minimum_required(VERSION 3.18)
 # Project configuration
 project(GPUCompression LANGUAGES CXX CUDA C)
 
+enable_testing()
+
 # C++ standard
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -63,6 +65,7 @@ include(cmake/Tests.cmake)         # Unit, NN, regression, perf tests
 include(cmake/HDF5Filter.cmake)    # libH5Zgpucompress.so + H5Z tests
 include(cmake/HDF5Vol.cmake)       # libH5VLgpucompress.so + VOL tests/demos/benchmarks
 include(cmake/Install.cmake)       # Installation rules
+add_subdirectory(synthetic)        # GPU synthetic benchmark generator
 
 # ============================================================
 # Build Summary

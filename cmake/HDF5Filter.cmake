@@ -81,3 +81,8 @@ target_link_libraries(test_h5z_8mb PRIVATE
 set_target_properties(test_h5z_8mb PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
 # test_h8_filter_globals_race removed — host-path test, pre-existing failure
+
+# CTest registrations
+gpucompress_add_test(test_hdf5_configs  hdf5)
+gpucompress_add_test(test_f9_transfers  hdf5)
+gpucompress_add_test(test_h5z_8mb      hdf5  120)

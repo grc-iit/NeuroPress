@@ -13,6 +13,7 @@
 #include "gpucompress.h"
 #include "api/internal.hpp"
 #include "api/gpucompress_state.hpp"
+#include "api/diagnostics_store.hpp"
 #include "nn/nn_weights.h"
 
 extern "C" {
@@ -75,11 +76,11 @@ extern "C" void gpucompress_batched_decomp_sgd(void) {
 
     std::vector<DeferredDecompSample> batch;
     {
-        std::lock_guard<std::mutex> lk(g_chunk_history_mutex);
-        int n = g_chunk_history_count.load();
-        if (n > g_chunk_history_cap) n = g_chunk_history_cap;
+        auto& store = gpucompress::DiagnosticsStore::instance();
+        int n = store.count();
         for (int i = 0; i < n; i++) {
-            const gpucompress_chunk_diag_t& h = g_chunk_history[i];
+            gpucompress_chunk_diag_t h;
+            if (store.getDiag(i, &h) != 0) continue;
             if (h.decompression_ms <= 0.0f) continue;
             if (h.feat_ds_enc <= 0.0f) continue;
             DeferredDecompSample s;

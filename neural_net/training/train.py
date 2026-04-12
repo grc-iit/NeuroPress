@@ -28,8 +28,8 @@ from neural_net.core.model import CompressionPredictor
 
 
 def train_model_with_data(data: dict, epochs: int = 200, batch_size: int = 512,
-                          lr: float = 1e-3, patience: int = 20,
-                          hidden_dim: int = 128):
+                          lr: float = 3e-4, patience: int = 20,
+                          hidden_dim: int = 64, num_hidden_layers: int = 4):
     """Train the regression model from a prepared data dict."""
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -53,9 +53,10 @@ def train_model_with_data(data: dict, epochs: int = 200, batch_size: int = 512,
     input_dim = train_X.shape[1]
     output_dim = train_Y.shape[1]
     model = CompressionPredictor(input_dim=input_dim, hidden_dim=hidden_dim,
-                                  output_dim=output_dim).to(device)
+                                  output_dim=output_dim,
+                                  num_hidden_layers=num_hidden_layers).to(device)
 
-    print(f"\nModel: {input_dim} -> {hidden_dim} -> {hidden_dim} -> {output_dim}")
+    print(f"\nModel: {input_dim} -> [{hidden_dim}] x {num_hidden_layers} -> {output_dim}")
     print(f"Parameters: {model.count_parameters():,}")
 
     # ---- Training setup ----
@@ -157,22 +158,30 @@ def train_model_with_data(data: dict, epochs: int = 200, batch_size: int = 512,
         val_pred_norm = model(val_X.to(device)).cpu().numpy()
 
     # Inverse transform predictions and actuals
-    pred_orig = inverse_transform_outputs(val_pred_norm, data['y_means'], data['y_stds'])
-    actual_orig = inverse_transform_outputs(data['val_Y'], data['y_means'], data['y_stds'])
+    output_cols_internal = data.get('output_cols_internal')
+    pred_orig = inverse_transform_outputs(val_pred_norm, data['y_means'], data['y_stds'],
+                                          output_cols_internal)
+    actual_orig = inverse_transform_outputs(data['val_Y'], data['y_means'], data['y_stds'],
+                                            output_cols_internal)
 
-    for name in output_names:
+    lossy_mask = (data['df_val']['quantization'] == 'linear').values
+
+    for name in pred_orig:
+        from neural_net.core.data import LOSSY_ONLY_OUTPUTS
         p = pred_orig[name]
         a = actual_orig[name]
+        tag = ''
+        if name in LOSSY_ONLY_OUTPUTS:
+            p, a = p[lossy_mask], a[lossy_mask]
+            tag = ' [lossy-only]'
         mae = np.mean(np.abs(p - a))
-        # R²
         ss_res = np.sum((a - p) ** 2)
         ss_tot = np.sum((a - a.mean()) ** 2)
         r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
-        # MAPE (only where actual > threshold to avoid division by near-zero)
-        mask = np.abs(a) > 0.1
+        mask = np.abs(a) > 0.01
         mape = np.mean(np.abs((a[mask] - p[mask]) / a[mask])) * 100 if mask.sum() > 0 else 0.0
 
-        print(f"\n  {name}:")
+        print(f"\n  {name}{tag}:")
         print(f"    MAE:  {mae:.4f}")
         print(f"    R²:   {r2:.4f}")
         print(f"    MAPE: {mape:.1f}%")
@@ -197,6 +206,7 @@ def train_model_with_data(data: dict, epochs: int = 200, batch_size: int = 512,
         'output_names': output_names,
         'best_epoch': best_epoch,
         'best_val_loss': best_val_loss,
+        'num_hidden_layers': num_hidden_layers,
     }, save_path)
     print(f"\nModel saved to {save_path}")
 
@@ -216,9 +226,10 @@ if __name__ == '__main__':
                         help='Max .bin files to process')
     parser.add_argument('--epochs', type=int, default=200)
     parser.add_argument('--batch-size', type=int, default=512)
-    parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--patience', type=int, default=20)
-    parser.add_argument('--hidden-dim', type=int, default=128)
+    parser.add_argument('--hidden-dim', type=int, default=64)
+    parser.add_argument('--num-hidden-layers', type=int, default=4)
     args = parser.parse_args()
 
     if args.csv:
@@ -233,4 +244,5 @@ if __name__ == '__main__':
 
     model, data = train_model_with_data(
         data, epochs=args.epochs, batch_size=args.batch_size,
-        lr=args.lr, patience=args.patience, hidden_dim=args.hidden_dim)
+        lr=args.lr, patience=args.patience, hidden_dim=args.hidden_dim,
+        num_hidden_layers=args.num_hidden_layers)

@@ -35,10 +35,10 @@ OUTPUT_INVERSE = {
     'comp_tp_log': ('compression_throughput_mbps', 'expm1'),
     'decomp_tp_log': ('decompression_throughput_mbps', 'expm1'),
     'log_mae': ('mean_abs_err', 'expm1'),
-    'ssim_val': ('ssim', 'identity'),
+    'ssim_nlog': ('ssim', 'ssim_nlog'),
 }
 
-CONTINUOUS_FEATURES = ['error_bound_enc', 'data_size_enc', 'entropy', 'mad', 'second_derivative']
+CONTINUOUS_FEATURES = ['alg_id', 'error_bound_enc', 'data_size_enc', 'entropy', 'mad', 'second_derivative']
 
 # Quality-of-reconstruction outputs whose values are trivially saturated on
 # lossless rows (PSNR=120, MAE=0, SSIM=1). MAPE/R²/SHAP for these targets
@@ -76,9 +76,9 @@ def encode_and_split(df: pd.DataFrame, val_fraction: float = 0.2,
 
     # ---- Encode inputs ----
 
-    # Algorithm: one-hot
-    for alg in ALGORITHM_NAMES:
-        df[f'alg_{alg}'] = (df['algorithm'] == alg).astype(np.float32)
+    # Algorithm: integer label 0..(N-1)
+    alg_index = {name: i for i, name in enumerate(ALGORITHM_NAMES)}
+    df['alg_id'] = df['algorithm'].map(alg_index).astype(np.float32)
 
     # Quantization: binary
     df['quant_enc'] = (df['quantization'] == 'linear').astype(np.float32)
@@ -86,19 +86,17 @@ def encode_and_split(df: pd.DataFrame, val_fraction: float = 0.2,
     # Shuffle: binary
     df['shuffle_enc'] = (df['shuffle'] > 0).astype(np.float32)
 
-    # Error bound: log-scale (handle 0 for lossless)
-    df['error_bound_enc'] = np.log10(df['error_bound'].clip(lower=1e-7)).astype(np.float32)
+    df['error_bound_enc'] = df['error_bound'].astype(np.float32)
 
-    # Data size: log2
-    df['data_size_enc'] = np.log2(df['original_size'].clip(lower=1)).astype(np.float32)
+    df['data_size_enc'] = df['original_size'].astype(np.float32)
 
     # ---- Encode outputs ----
 
-    # Compression time: log1p
-    df['comp_time_log'] = np.log1p(df['compression_time_ms'].clip(lower=0)).astype(np.float32)
+    # Compression time: log1p (floor at 1ms to reduce sub-ms noise)
+    df['comp_time_log'] = np.log1p(df['compression_time_ms'].clip(lower=1)).astype(np.float32)
 
-    # Decompression time: log1p
-    df['decomp_time_log'] = np.log1p(df['decompression_time_ms'].clip(lower=0)).astype(np.float32)
+    # Decompression time: log1p (floor at 1ms)
+    df['decomp_time_log'] = np.log1p(df['decompression_time_ms'].clip(lower=1)).astype(np.float32)
 
     # Compression ratio: log1p
     df['ratio_log'] = np.log1p(df['compression_ratio'].clip(lower=0)).astype(np.float32)
@@ -118,7 +116,9 @@ def encode_and_split(df: pd.DataFrame, val_fraction: float = 0.2,
     if 'mean_abs_err' in df.columns:
         df['log_mae'] = np.log1p(df['mean_abs_err'].clip(lower=0).fillna(0)).astype(np.float32)
     if 'ssim' in df.columns:
-        df['ssim_val'] = df['ssim'].clip(lower=0, upper=1).fillna(1.0).astype(np.float32)
+        # -log(1 - ssim + eps): amplifies differences near 1 (e.g. 0.995 vs 0.999)
+        ssim_clipped = df['ssim'].clip(lower=0, upper=1).fillna(1.0)
+        df['ssim_nlog'] = (-np.log(1.0 - ssim_clipped + 1e-7)).astype(np.float32)
 
     # ---- Split by file ----
     files = sorted(df['file'].unique())
@@ -136,13 +136,12 @@ def encode_and_split(df: pd.DataFrame, val_fraction: float = 0.2,
     print(f"  Val:   {len(df_val)} rows ({len(val_files)} files)")
 
     # ---- Build feature matrix ----
-    algo_cols = [f'alg_{a}' for a in ALGORITHM_NAMES]
-    feature_cols = algo_cols + ['quant_enc', 'shuffle_enc',
-                                'error_bound_enc', 'data_size_enc',
-                                'entropy', 'mad', 'second_derivative']
+    feature_cols = ['alg_id', 'quant_enc', 'shuffle_enc',
+                    'error_bound_enc', 'data_size_enc',
+                    'entropy', 'mad', 'second_derivative']
 
     output_cols = ['comp_time_log', 'decomp_time_log', 'ratio_log', 'psnr_clamped']
-    for extra in ['rmse_log', 'max_error_log', 'comp_tp_log', 'decomp_tp_log', 'log_mae', 'ssim_val']:
+    for extra in ['rmse_log', 'max_error_log', 'comp_tp_log', 'decomp_tp_log', 'log_mae', 'ssim_nlog']:
         if extra in df.columns:
             output_cols.append(extra)
 
@@ -232,14 +231,14 @@ def compute_stats_cpu(raw_bytes, dtype=np.float32):
     if data_range < 1e-30 or len(arr) < 3:
         return entropy, 0.0, 0.0
 
-    # MAD: mean absolute deviation, normalized by range
+    # MAD: mean absolute deviation
     mean_val = np.mean(arr.astype(np.float64))
-    mad = np.mean(np.abs(arr.astype(np.float64) - mean_val)) / data_range
+    mad = np.mean(np.abs(arr.astype(np.float64) - mean_val))
 
-    # Second derivative: mean |x[i+1] - 2*x[i] + x[i-1]|, normalized by range
+    # Second derivative: mean |x[i+1] - 2*x[i] + x[i-1]|
     flat = arr.astype(np.float64)
     second_deriv = flat[2:] - 2.0 * flat[1:-1] + flat[:-2]
-    second_derivative = np.mean(np.abs(second_deriv)) / data_range
+    second_derivative = np.mean(np.abs(second_deriv))
 
     entropy = 0.0 if np.isnan(entropy) else float(entropy)
     mad = 0.0 if np.isnan(mad) else float(mad)
@@ -247,12 +246,42 @@ def compute_stats_cpu(raw_bytes, dtype=np.float32):
     return entropy, mad, second_derivative
 
 
+def normalize_synthetic_csv(df: pd.DataFrame) -> pd.DataFrame:
+    """Map synthetic_benchmark CSV columns to the format expected by encode_and_split."""
+    if 'chunk_id' not in df.columns:
+        return df
+    out = pd.DataFrame()
+    out['file'] = 'chunk_' + df['chunk_id'].astype(str)
+    out['algorithm'] = df['algorithm']
+    out['quantization'] = df['quantized'].apply(
+        lambda x: 'linear' if str(x).lower() in ('true', '1', 'yes') else 'none')
+    out['shuffle'] = df['shuffle_bytes']
+    out['error_bound'] = df['error_bound']
+    out['original_size'] = df['original_bytes']
+    out['entropy'] = df['entropy_bits']
+    out['mad'] = df['mad']
+    out['second_derivative'] = df['second_derivative']
+    out['compression_time_ms'] = df['comp_time_ms']
+    out['decompression_time_ms'] = df['decomp_time_ms']
+    out['compression_ratio'] = df['compression_ratio']
+    out['psnr_db'] = df['psnr_db'].replace([float('inf')], 120.0).fillna(120.0)
+    out['success'] = df['success']
+    for src, dst in [('ssim', 'ssim'), ('rmse', 'rmse'),
+                     ('max_abs_error', 'max_error'),
+                     ('mean_abs_error', 'mean_abs_err'),
+                     ('data_range', 'data_range')]:
+        if src in df.columns:
+            out[dst] = df[src]
+    return out
+
+
 def load_from_csv(csv_paths, val_fraction=0.2, seed=42):
     """Load benchmark data from one or more CSV files and prepare for training.
 
     Each CSV must contain the columns expected by encode_and_split().
+    Synthetic benchmark CSVs (with chunk_id column) are automatically normalized.
     """
-    frames = [pd.read_csv(p) for p in csv_paths]
+    frames = [normalize_synthetic_csv(pd.read_csv(p)) for p in csv_paths]
     df = pd.concat(frames, ignore_index=True)
     print(f"Loaded {len(df)} rows from {len(csv_paths)} CSV file(s)")
     return encode_and_split(df, val_fraction, seed)
@@ -284,6 +313,9 @@ def inverse_transform_outputs(Y_norm: np.ndarray, y_means: np.ndarray,
         raw_name, inv_type = OUTPUT_INVERSE.get(col, (col, 'identity'))
         if inv_type == 'expm1':
             result[raw_name] = np.expm1(Y_raw[:, i])
+        elif inv_type == 'ssim_nlog':
+            # inverse of -log(1 - ssim + eps): ssim = 1 - exp(-x)
+            result[raw_name] = 1.0 - np.exp(-Y_raw[:, i])
         else:
             result[raw_name] = Y_raw[:, i]
     return result

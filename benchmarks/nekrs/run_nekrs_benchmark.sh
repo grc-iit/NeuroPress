@@ -60,7 +60,10 @@ FP_TAG="fp32"
 RESULTS_DIR="${RESULTS_DIR:-$SCRIPT_DIR/results/eval_tgv_${FP_TAG}_np${NP}_ts${NUM_STEPS}${VERIFY_TAG}}"
 
 export PATH="$NEKRS_HOME/bin:$PATH"
-export LD_LIBRARY_PATH="$GPUC_DIR/build:$GPUC_DIR/examples:/tmp/hdf5-install/lib:/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="/opt/hdf5/lib:/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+# udf.cmake needs these to link GPUCompress into the OCCA JIT-compiled UDF
+export GPUCOMPRESS_DIR="${GPUCOMPRESS_DIR:-/usr/local}"
+export HDF5_DIR="${HDF5_DIR:-/opt/hdf5}"
 
 # ── Phases ──
 FIXED_PHASES="no-comp lz4 snappy deflate gdeflate zstd ans cascaded bitcomp"

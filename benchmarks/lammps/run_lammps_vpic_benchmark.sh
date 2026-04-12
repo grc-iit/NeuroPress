@@ -56,7 +56,7 @@ NATOMS_APPROX=$(python3 -c "print(4 * $LMP_ATOMS**3)" 2>/dev/null || echo "unkno
 DATA_MB=$(python3 -c "print(f'{4 * $LMP_ATOMS**3 * 12 / 1048576:.1f}')" 2>/dev/null || echo "unknown")
 RESULTS_DIR="${RESULTS_DIR:-$SCRIPT_DIR/results/lammps_eval_box${LMP_ATOMS}_chunk${CHUNK_MB}mb_ts${TIMESTEPS}}"
 
-export LD_LIBRARY_PATH="$GPUC_DIR/build:$GPUC_DIR/examples:/tmp/hdf5-install/lib:/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="/opt/hdf5/lib:/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 echo "============================================================"
 echo "LAMMPS VPIC-Compatible Benchmark"

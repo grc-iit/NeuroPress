@@ -19,6 +19,7 @@
 #include "gpucompress.h"
 #include "api/internal.hpp"
 #include "api/gpucompress_state.hpp"
+#include "api/diagnostics_store.hpp"
 #include "compression/compression_factory.hpp"
 #include "compression/compression_header.h"
 #include "preprocessing/byte_shuffle.cuh"
@@ -137,7 +138,12 @@ gpucompress_error_t gpucompress_infer_gpu(
     float* out_predicted_decomp_time,
     float* out_predicted_psnr,
     int* out_top_actions,
-    float* out_predicted_costs)
+    float* out_predicted_costs,
+    float* out_predicted_rmse,
+    float* out_predicted_max_error,
+    float* out_predicted_mae,
+    float* out_predicted_ssim,
+    NNDebugPerConfig* out_per_config)
 {
     if (!g_initialized.load()) return GPUCOMPRESS_ERROR_NOT_INITIALIZED;
     if (!d_input || !out_action) return GPUCOMPRESS_ERROR_INVALID_INPUT;
@@ -151,6 +157,10 @@ gpucompress_error_t gpucompress_infer_gpu(
     if (out_predicted_comp_time)   *out_predicted_comp_time = 0.0f;
     if (out_predicted_decomp_time) *out_predicted_decomp_time = 0.0f;
     if (out_predicted_psnr)        *out_predicted_psnr = 0.0f;
+    if (out_predicted_rmse)        *out_predicted_rmse = 0.0f;
+    if (out_predicted_max_error)   *out_predicted_max_error = 0.0f;
+    if (out_predicted_mae)         *out_predicted_mae = 0.0f;
+    if (out_predicted_ssim)        *out_predicted_ssim = 0.0f;
 
     size_t num_elements = input_size / sizeof(float);
     if (num_elements == 0 || !gpucompress_nn_is_loaded_impl())
@@ -170,6 +180,7 @@ gpucompress_error_t gpucompress_infer_gpu(
 
 
     float pred_ratio = 0.0f, pred_ct = 0.0f, pred_dt = 0.0f, pred_psnr = 0.0f;
+    float pred_rmse = 0.0f, pred_max_error = 0.0f, pred_mae = 0.0f, pred_ssim = 0.0f;
 
     int local_top[32] = {0};
     float local_costs[32] = {0};
@@ -179,7 +190,9 @@ gpucompress_error_t gpucompress_infer_gpu(
         d_stats_ptr, input_size, cfg.error_bound, stream, ctx,
         &action, &pred_ratio, &pred_ct, &pred_dt, &pred_psnr,
         local_top, local_costs,
-        ctx->nn_stop);
+        ctx->nn_stop,
+        &pred_rmse, &pred_max_error, &pred_mae, &pred_ssim,
+        out_per_config);
 
     /* runNNFusedInferenceCtx does internal cudaStreamSynchronize */
 
@@ -187,10 +200,14 @@ gpucompress_error_t gpucompress_infer_gpu(
         return GPUCOMPRESS_ERROR_NN_NOT_LOADED;
 
     *out_action = action;
-    if (out_predicted_ratio)       *out_predicted_ratio = pred_ratio;
-    if (out_predicted_comp_time)   *out_predicted_comp_time = pred_ct;
+    if (out_predicted_ratio)       *out_predicted_ratio       = pred_ratio;
+    if (out_predicted_comp_time)   *out_predicted_comp_time   = pred_ct;
     if (out_predicted_decomp_time) *out_predicted_decomp_time = pred_dt;
-    if (out_predicted_psnr)        *out_predicted_psnr = pred_psnr;
+    if (out_predicted_psnr)        *out_predicted_psnr        = pred_psnr;
+    if (out_predicted_rmse)        *out_predicted_rmse        = pred_rmse;
+    if (out_predicted_max_error)   *out_predicted_max_error   = pred_max_error;
+    if (out_predicted_mae)         *out_predicted_mae         = pred_mae;
+    if (out_predicted_ssim)        *out_predicted_ssim        = pred_ssim;
     if (out_top_actions)           memcpy(out_top_actions, local_top, sizeof(local_top));
     if (out_predicted_costs)       memcpy(out_predicted_costs, local_costs, sizeof(local_costs));
 
@@ -227,7 +244,11 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
     float stage1_nn_ms,
     float stage1_stats_ms,
     AutoStatsGPU* d_precomputed_stats,
-    int* out_diag_slot)
+    int* out_diag_slot,
+    float predicted_rmse,
+    float predicted_max_error,
+    float predicted_mae,
+    float predicted_ssim)
 {
     if (!g_initialized.load()) return GPUCOMPRESS_ERROR_NOT_INITIALIZED;
     if (!d_input || !d_output || !output_size) return GPUCOMPRESS_ERROR_INVALID_INPUT;
@@ -274,6 +295,10 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
     float diag_compression_ms   = 0.0f;
     float diag_exploration_ms   = 0.0f;
     float diag_sgd_ms           = 0.0f;
+    double diag_ratio_mape       = 0.0;
+    double diag_comp_time_mape   = 0.0;
+    double diag_decomp_time_mape = 0.0;
+    double diag_regret           = -1.0;  /* -1 = no exploration, no regret available */
 
     gpucompress_algorithm_t algo_to_use;
     unsigned int preproc_to_use = 0;
@@ -428,7 +453,7 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
     if (need_timing) {
         cudaEventElapsedTime(&primary_comp_time_ms, ctx->t_start, ctx->t_stop);
     }
-    diag_compression_ms = std::max(5.0f, primary_comp_time_ms);  /* clamped for MAPE */
+    diag_compression_ms = std::max(1.0f, primary_comp_time_ms);  /* clamped for MAPE */
     float diag_compression_ms_raw = primary_comp_time_ms;       /* unclamped for breakdown */
 
     DT_START(_dt_gcs);
@@ -529,13 +554,13 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
         double w0 = static_cast<double>(g_rank_w0);
         double w1 = static_cast<double>(g_rank_w1);
         double w2 = static_cast<double>(g_rank_w2);
-        /* Policy clamps: ct/dt floor at 5ms, ratio cap at 100x. */
-        double pred_dt = std::max(5.0, static_cast<double>(predicted_decomp_time));
-        double pred_ct = std::max(5.0, static_cast<double>(predicted_comp_time));
+        /* Policy clamps: ct/dt floor at 1ms, ratio cap at 100x. */
+        double pred_dt = std::max(1.0, static_cast<double>(predicted_decomp_time));
+        double pred_ct = std::max(1.0, static_cast<double>(predicted_comp_time));
         double pred_r  = std::min(100.0, static_cast<double>(predicted_ratio));
-        double act_ct  = std::max(5.0, static_cast<double>(primary_comp_time_ms));
+        double act_ct  = std::max(1.0, static_cast<double>(primary_comp_time_ms));
         double act_dt  = (primary_decomp_time_ms > 0.0f)
-                       ? std::max(5.0, static_cast<double>(primary_decomp_time_ms)) : pred_dt;
+                       ? std::max(1.0, static_cast<double>(primary_decomp_time_ms)) : pred_dt;
         double act_r   = std::min(100.0, actual_ratio);
 
         actual_cost = w0 * act_ct + w1 * act_dt
@@ -545,10 +570,15 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
         error_pct = (actual_cost > 0.0)
             ? std::abs(actual_cost - predicted_cost) / actual_cost : 0.0;
 
+        /* Per-statistic MAPE (clamped values) */
+        diag_ratio_mape      = (act_r > 0.0)   ? std::abs(act_r   - pred_r)   / act_r   : 0.0;
+        diag_comp_time_mape  = (act_ct > 0.0)  ? std::abs(act_ct  - pred_ct)  / act_ct  : 0.0;
+        diag_decomp_time_mape= (act_dt > 0.0)  ? std::abs(act_dt  - pred_dt)  / act_dt  : 0.0;
+
         // cost = w0*ct + w1*dt + w2*ds/(ratio*bw) — same formula as NN ranking
-        // Policy clamps applied inside: ct/dt floor 5ms, ratio cap 100x.
+        // Policy clamps applied inside: ct/dt floor 1ms, ratio cap 100x.
         auto compute_cost = [&](double ct, double dt, double r) -> double {
-            double c = std::max(5.0, ct), d = std::max(5.0, dt);
+            double c = std::max(1.0, ct), d = std::max(1.0, dt);
             double rc = std::min(100.0, r);
             return w0 * c + w1 * d + ((rc > 0.0) ? w2 * ds / (rc * bw) : 1e30);
         };
@@ -847,6 +877,11 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
                 if (s.stream)      cudaStreamDestroy(s.stream);
             }
 
+            /* Regret: how much worse was the primary vs. the best explored config?
+             * regret = (primary_cost - best_cost) / best_cost  (0 if primary was optimal) */
+            if (best_cost > 0.0)
+                diag_regret = (primary_cost - best_cost) / best_cost;
+
             if (cuda_err != cudaSuccess) return GPUCOMPRESS_ERROR_COMPRESSION;
         }
 
@@ -946,6 +981,10 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
         di.predicted_comp_time = predicted_comp_time;
         di.predicted_decomp_time = predicted_decomp_time;
         di.predicted_psnr = predicted_psnr;
+        di.predicted_rmse = predicted_rmse;
+        di.predicted_max_error = predicted_max_error;
+        di.predicted_mae = predicted_mae;
+        di.predicted_ssim = predicted_ssim;
         /* actual_psnr: uses PRIMARY algorithm's PSNR (for fair MAPE reporting).
          * The exploration winner's PSNR is computed from the post-swap
          * d_quantized/quant_result and stored in the public struct as actual_psnr
@@ -968,9 +1007,13 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
         }
         /* Cost model diagnostics (only valid when online learning enabled) */
         if (g_online_learning_enabled) {
-            di.cost_model_error_pct = static_cast<float>(error_pct);
-            di.actual_cost = static_cast<float>(actual_cost);
-            di.predicted_cost = static_cast<float>(predicted_cost);
+            di.cost_model_error_pct  = static_cast<float>(error_pct);
+            di.actual_cost           = static_cast<float>(actual_cost);
+            di.predicted_cost        = static_cast<float>(predicted_cost);
+            di.ratio_mape            = static_cast<float>(diag_ratio_mape);
+            di.comp_time_mape        = static_cast<float>(diag_comp_time_mape);
+            di.decomp_time_mape      = static_cast<float>(diag_decomp_time_mape);
+            di.regret                = static_cast<float>(diag_regret);
             /* Original config metrics (explored_samples[0] is the primary) */
             if (!explored_samples.empty()) {
                 di.orig_actual_ratio = static_cast<float>(explored_samples[0].ratio);
@@ -1007,11 +1050,8 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
         DT_START(_dt_diag);
         int diag_slot = gpucompress::recordChunkDiagnostic(di);
         float dt_diag_record = DT_MS(_dt_diag);
-        /* Post-hoc: write diag_record_ms back (mutex for TSan compliance) */
-        if (g_detailed_timing && diag_slot >= 0 && diag_slot < g_chunk_history_cap) {
-            std::lock_guard<std::mutex> lk(g_chunk_history_mutex);
-            g_chunk_history[diag_slot].diag_record_ms = dt_diag_record;
-        }
+        if (g_detailed_timing && diag_slot >= 0)
+            gpucompress::DiagnosticsStore::instance().setDiagRecordMs(diag_slot, dt_diag_record);
         /* Propagate slot index to caller for VOL timing writeback */
         if (out_diag_slot) *out_diag_slot = diag_slot;
     }

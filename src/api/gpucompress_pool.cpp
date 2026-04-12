@@ -13,6 +13,7 @@
 #include "gpucompress.h"
 #include "api/internal.hpp"
 #include "api/gpucompress_state.hpp"
+#include "api/diagnostics_store.hpp"
 #include "compression/compression_factory.hpp"
 #include "nvcomp.hpp"
 #include "nvcomp/nvcompManagerFactory.hpp"
@@ -213,7 +214,7 @@ void resetAllSGDEMABuffers() {
 std::unique_ptr<nvcomp::nvcompManagerBase> createCompManagerForCtx(CompContext* ctx, CompressionAlgorithm algo) {
     int idx = static_cast<int>(algo);
     if (idx < 0 || idx >= CompContext::N_COMP_ALGOS) return nullptr;
-    g_mgr_cache_misses.fetch_add(1);
+    gpucompress::DiagnosticsStore::instance().incrementCacheMiss();
     return createCompressionManager(algo, gpucompress::DEFAULT_CHUNK_SIZE, ctx->stream, nullptr);
 }
 
@@ -224,7 +225,7 @@ nvcomp::nvcompManagerBase* getOrCreateCompManager(CompContext* ctx, CompressionA
     for (int i = 0; i < CompContext::LRU_DEPTH; i++) {
         if (ctx->comp_mgr[i] && ctx->comp_mgr_algo[i] == idx) {
             ctx->comp_mgr_tick[i] = ++ctx->comp_mgr_clock;
-            g_mgr_cache_hits.fetch_add(1);
+            gpucompress::DiagnosticsStore::instance().incrementCacheHit();
             return ctx->comp_mgr[i];
         }
     }
@@ -250,7 +251,7 @@ nvcomp::nvcompManagerBase* getOrCreateCompManager(CompContext* ctx, CompressionA
     ctx->comp_mgr[victim]      = mgr.release();
     ctx->comp_mgr_algo[victim] = idx;
     ctx->comp_mgr_tick[victim] = ++ctx->comp_mgr_clock;
-    g_mgr_cache_misses.fetch_add(1);
+    gpucompress::DiagnosticsStore::instance().incrementCacheMiss();
     return ctx->comp_mgr[victim];
 }
 

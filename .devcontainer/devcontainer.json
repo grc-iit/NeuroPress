@@ -1,0 +1,47 @@
+{
+    "name": "GPUCompress",
+    "build": {
+        "dockerfile": "Dockerfile"
+    },
+    // GPU access + shared memory for CUDA IPC
+    "runArgs": ["--gpus", "all", "--ipc=host"],
+    // Ensure ~/.claude exists on the host before Docker tries to bind-mount it
+    "initializeCommand": "mkdir -p ${localEnv:HOME}/.claude",
+    // Mount host Claude config and SSH keys
+    "mounts": [
+        "source=${localEnv:HOME}/.claude,target=/home/iowarp/.claude,type=bind,consistency=cached",
+        "source=${localEnv:HOME}/.ssh,target=/home/iowarp/.ssh,type=bind,consistency=cached,readonly"
+    ],
+    // Cursor requires an explicit user with a real home dir and SHELL set.
+    "remoteUser": "iowarp",
+    "containerEnv": {
+        "SHELL": "/bin/bash",
+        "HOME": "/home/iowarp"
+    },
+    "remoteEnv": {
+        "HDF5_ROOT": "/opt/hdf5",
+        "NVCOMP_PREFIX": "/opt/nvcomp",
+        "SIMS_DIR": "/opt/sims",
+        "CUDA_ARCH": "80",
+        "LD_LIBRARY_PATH": "/opt/nvcomp/lib:/opt/hdf5/lib:/workspaces/GPUCompress/build:/workspaces/GPUCompress/examples:${containerEnv:LD_LIBRARY_PATH}"
+    },
+    // Build GPUCompress core + bridges only. Run deploy/run.sh setup all separately to install simulations.
+    "postCreateCommand": "HDF5_ROOT=/opt/hdf5 NVCOMP_PREFIX=/opt/nvcomp SIMS_DIR=/opt/sims bash deploy/run.sh build && bash deploy/run.sh bridge all",
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-vscode.cpptools",
+                "nvidia.nsight-vscode-edition"
+            ],
+            "settings": {
+                "C_Cpp.default.includePath": [
+                    "/opt/nvcomp/include",
+                    "/opt/hdf5/include",
+                    "/usr/local/cuda/include",
+                    "${workspaceFolder}/include",
+                    "${workspaceFolder}/src"
+                ]
+            }
+        }
+    }
+}

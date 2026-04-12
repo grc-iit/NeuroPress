@@ -58,7 +58,7 @@ NCELLS_TOTAL=$(python3 -c "print($NYX_NCELL**3)" 2>/dev/null || echo "unknown")
 DATA_MB=$(python3 -c "print(f'{$NYX_NCELL**3 * 6 * 4 / 1048576:.1f}')" 2>/dev/null || echo "unknown")
 RESULTS_DIR="${RESULTS_DIR:-$SCRIPT_DIR/results/vpic_eval_n${NYX_NCELL}_ms${NYX_MAX_STEP}_chunk${CHUNK_MB}mb}"
 
-export LD_LIBRARY_PATH="$GPUC_DIR/build:$GPUC_DIR/examples:/tmp/hdf5-install/lib:/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="/opt/hdf5/lib:/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 echo "============================================================"
 echo "Nyx VPIC-Compatible Benchmark (Sedov Blast Wave)"
@@ -100,33 +100,67 @@ mkdir -p "$RAW_DIR"
 # Generate Nyx inputs file for Sedov blast wave
 INPUT_FILE="$RESULTS_DIR/inputs.sedov"
 cat > "$INPUT_FILE" << EOF
-# Sedov blast wave — creates evolving shock structure
-# Compression ratio drops from ~369x (uniform) to ~141x (shock)
-
+# Sedov blast wave — based on Nyx/Exec/HydroTests/inputs.regtest.sedov
 amr.n_cell         = $NYX_NCELL $NYX_NCELL $NYX_NCELL
 amr.max_level      = 0
 amr.max_grid_size  = $(( NYX_NCELL > 128 ? 128 : NYX_NCELL ))
-
-nyx.do_hydro       = 1
-nyx.initial_z      = 0.0
-nyx.final_z        = 0.0
-nyx.do_santa_barbara = 0
-nyx.ppm_type       = 1
-
+amr.ref_ratio      = 2 2 2 2
+amr.regrid_int     = 2
+amr.blocking_factor = 4
 amr.plot_int       = $NYX_PLOT_INT
-amr.max_step       = $NYX_MAX_STEP
 amr.check_int      = 0
 
-geometry.prob_lo    = 0.0 0.0 0.0
-geometry.prob_hi    = 1.0 1.0 1.0
-geometry.is_periodic = 1 1 1
+max_step           = $NYX_MAX_STEP
+stop_time          = -1
 
+geometry.coord_sys   = 0
+geometry.prob_lo     = 0.0 0.0 0.0
+geometry.prob_hi     = 1.0 1.0 1.0
+geometry.is_periodic = 0 0 0
+
+# Outflow BCs on all faces (2 = outflow)
+nyx.lo_bc          = 2 2 2
+nyx.hi_bc          = 2 2 2
+
+# Hydro
+nyx.do_hydro       = 1
+nyx.do_grav        = 0
+nyx.do_santa_barbara = 0
+nyx.ppm_type       = 0
+nyx.init_shrink    = 0.01
+nyx.cfl            = 0.5
+nyx.dt_cutoff      = 5.e-20
+nyx.change_max     = 1.1
+
+# Comoving (required by Nyx, set for non-cosmological use)
+nyx.comoving_OmM   = 1.0
+nyx.comoving_OmB   = 1.0
+nyx.comoving_h     = 0.0
+nyx.initial_z      = 0.0
+
+# Species
+nyx.h_species      = 0.76
+nyx.he_species     = 0.24
+
+# Problem setup: Sedov blast (prob_type=33)
+prob.prob_type     = 33
+prob.r_init        = 0.01
+prob.p_ambient     = 1.e-5
+prob.dens_ambient  = 1.0
+prob.exp_energy    = 1.0
+prob.nsub          = 10
+
+# GPUCompress integration
 nyx.use_gpucompress       = 1
 nyx.gpucompress_weights   = $WEIGHTS
 nyx.gpucompress_algorithm = auto
 nyx.gpucompress_policy    = ratio
 nyx.gpucompress_verify    = 0
 nyx.gpucompress_chunk_mb  = $CHUNK_MB
+
+# Prevent AMReX from pre-allocating nearly all GPU memory at startup
+amrex.the_arena_init_size = 0
+amrex.the_async_arena_init_size = 0
 EOF
 
 echo "  Running Nyx Sedov: $NYX_MAX_STEP steps, plotting every $NYX_PLOT_INT"

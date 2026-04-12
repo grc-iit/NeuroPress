@@ -1107,9 +1107,9 @@ int main(int argc, char **argv)
             else if (strcmp(p, "nn-rl") == 0)               phase_mask |= P_NNRL;
             else if (strcmp(p, "nn-rl+exp50") == 0)         phase_mask |= P_NNRLEXP;
             else { fprintf(stderr, "Unknown phase: %s\n"
-                           "  Valid: no-comp, fixed-lz4, fixed-snappy, fixed-deflate,\n"
-                           "         fixed-gdeflate, fixed-zstd, fixed-ans, fixed-cascaded,\n"
-                           "         fixed-bitcomp, nn, nn-rl, nn-rl+exp50\n", p);
+                           "  Valid: no-comp, lz4, snappy, deflate,\n"
+                           "         gdeflate, zstd, ans, cascaded,\n"
+                           "         bitcomp, nn, nn-rl, nn-rl+exp50\n", p);
                    return 1; }
         } else if (strcmp(argv[i], "--no-verify") == 0) {
             do_verify = 0;

@@ -14,8 +14,8 @@
 # Options (env vars or flags):
 #   CUDA_ARCH=80            GPU architecture (default: 80 = A100)
 #   BUILD_TYPE=Release      CMake build type
-#   HDF5_ROOT=/tmp/hdf5-install
-#   NVCOMP_PREFIX=/tmp
+#   HDF5_ROOT=/opt/hdf5
+#   NVCOMP_PREFIX=/opt/nvcomp
 #   SIMS_DIR=$HOME/sims     Where simulation sources are cloned
 #   RESULTS_BASE=results    Where benchmark results are collected
 
@@ -28,10 +28,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GPUC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 export GPUC_DIR
-export CUDA_ARCH="${CUDA_ARCH:-80}"
+export CUDA_ARCH="${CUDA_ARCH:-89}"
 export BUILD_TYPE="${BUILD_TYPE:-Release}"
-export HDF5_ROOT="${HDF5_ROOT:-/tmp/hdf5-install}"
-export NVCOMP_PREFIX="${NVCOMP_PREFIX:-/tmp}"
+export HDF5_ROOT="${HDF5_ROOT:-/opt/hdf5}"
+export NVCOMP_PREFIX="${NVCOMP_PREFIX:-/opt/nvcomp}"
 export SIMS_DIR="${SIMS_DIR:-$HOME/sims}"
 export RESULTS_BASE="${RESULTS_BASE:-${GPUC_DIR}/results}"
 
@@ -60,7 +60,8 @@ yaml_val() {
 }
 
 setup_env() {
-    export LD_LIBRARY_PATH="${GPUC_DIR}/build:${GPUC_DIR}/examples:${HDF5_ROOT}/lib:${NVCOMP_PREFIX}/lib:/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    # GPUCompress libraries are installed system-wide (/usr/local/lib) via cmd_build.
+    export LD_LIBRARY_PATH="${HDF5_ROOT}/lib:${NVCOMP_PREFIX}/lib:/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     export GPUCOMPRESS_WEIGHTS="${GPUC_DIR}/neural_net/weights/model.nnwt"
 }
 
@@ -79,7 +80,8 @@ cmd_build() {
         -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
         -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH}" \
         -DNVCOMP_PREFIX="${NVCOMP_PREFIX}" \
-        -DHDF5_ROOT="${HDF5_ROOT}"
+        -DHDF5_ROOT="${HDF5_ROOT}" \
+        -DHDF5_VOL_PREFIX="${HDF5_ROOT}"
 
     info "Compile ($(nproc) jobs)"
     cmake --build build -j"$(nproc)"
@@ -97,7 +99,10 @@ cmd_build() {
         ok "Built generic_benchmark"
     fi
 
-    ok "GPUCompress core build complete"
+    info "Installing to /usr/local (sudo cmake --install)..."
+    sudo cmake --install build
+    sudo ldconfig
+    ok "GPUCompress installed to /usr/local — headers, libs, and HDF5 plugins"
 }
 
 # ---------------------------------------------------------------------------
@@ -113,13 +118,16 @@ cmd_bridge() {
     build_bridge() {
         local bname="$1" src="$2" out="$3"
         info "Building bridge: ${bname}"
+        # GPUCompress headers/libs are in /usr/local after cmd_build install.
         g++ -shared -fPIC -o "$out" "$src" \
-            -Iinclude -I"${HDF5_ROOT}/include" -I/usr/local/cuda/include \
-            -Lbuild -lgpucompress -lH5VLgpucompress -lH5Zgpucompress \
+            -I"${HDF5_ROOT}/include" -I/usr/local/cuda/include \
+            -lgpucompress -lH5VLgpucompress -lH5Zgpucompress \
             -L"${HDF5_ROOT}/lib" -lhdf5 \
             -L/usr/local/cuda/lib64 -lcudart \
-            -Wl,-rpath,"${GPUC_DIR}/build" -Wl,-rpath,"${HDF5_ROOT}/lib"
-        ok "Built ${out}"
+            -Wl,-rpath,"${HDF5_ROOT}/lib"
+        sudo install -m 755 "$out" /usr/local/lib/
+        sudo ldconfig
+        ok "Built and installed ${out}"
     }
 
     case "$name" in
@@ -204,6 +212,21 @@ setup_lammps() {
     cp "${GPUC_DIR}/benchmarks/lammps/patches/lammps_ranking_profiler.cu" src/KOKKOS/
     cp "${GPUC_DIR}/benchmarks/lammps/patches/KOKKOS.cmake"               cmake/Modules/Packages/KOKKOS.cmake
 
+    # Build the Kendall-tau ranking profiler shared lib (KOKKOS.cmake links against it)
+    info "Building liblammps_ranking_profiler.so..."
+    local _gencode="compute_${CUDA_ARCH:-80}"
+    nvcc -O3 -std=c++17 \
+        -gencode "arch=${_gencode},code=sm_${CUDA_ARCH:-80}" \
+        -Xcompiler -fPIC -shared \
+        -I"${GPUC_DIR}/include" \
+        -I"${GPUC_DIR}/benchmarks" \
+        -lgpucompress \
+        -o /tmp/liblammps_ranking_profiler.so \
+        "${GPUC_DIR}/benchmarks/lammps/patches/lammps_ranking_profiler.cu"
+    sudo install -m 755 /tmp/liblammps_ranking_profiler.so /usr/local/lib/
+    sudo ldconfig
+    ok "liblammps_ranking_profiler.so installed"
+
     local kokkos_arch="${LAMMPS_KOKKOS_ARCH:-AMPERE80}"
 
     # Build
@@ -214,9 +237,7 @@ setup_lammps() {
         -DPKG_KOKKOS=ON \
         -DKokkos_ENABLE_CUDA=ON \
         -D"Kokkos_ARCH_${kokkos_arch}=ON" \
-        -DBUILD_MPI=ON \
-        -DCMAKE_CXX_FLAGS="-I${GPUC_DIR}/include -I${GPUC_DIR}/examples -I${HDF5_ROOT}/include -I/usr/local/cuda/include" \
-        -DCMAKE_EXE_LINKER_FLAGS="-L${GPUC_DIR}/examples -llammps_gpucompress_udf -L${GPUC_DIR}/build -lgpucompress -lH5VLgpucompress -lH5Zgpucompress -L${HDF5_ROOT}/lib -lhdf5 -L/usr/local/cuda/lib64 -lcudart -Wl,-rpath,${GPUC_DIR}/build -Wl,-rpath,${GPUC_DIR}/examples -Wl,-rpath,${HDF5_ROOT}/lib"
+        -DBUILD_MPI=ON
     make -j"$(nproc)"
 
     ok "LAMMPS built: ${src}/build/lmp"
@@ -270,9 +291,9 @@ setup_nyx() {
         -DCMAKE_C_COMPILER="$(which gcc)" \
         -DCMAKE_CXX_COMPILER="$(which g++)" \
         -DCMAKE_CUDA_HOST_COMPILER="$(which g++)" \
-        "-DCMAKE_CXX_FLAGS=-DAMREX_USE_GPUCOMPRESS -I${GPUC_DIR}/include -I${GPUC_DIR}/examples -I${GPUC_DIR}/benchmarks -I${HDF5_ROOT}/include" \
-        "-DCMAKE_CUDA_FLAGS=-DAMREX_USE_GPUCOMPRESS -I${GPUC_DIR}/include -I${GPUC_DIR}/examples -I${GPUC_DIR}/benchmarks -I${HDF5_ROOT}/include" \
-        "-DCMAKE_EXE_LINKER_FLAGS=-L${GPUC_DIR}/build -L${HDF5_ROOT}/lib -L${NVCOMP_PREFIX}/lib -Wl,--no-as-needed -lgpucompress -lH5VLgpucompress -lH5Zgpucompress -lhdf5 -lnvcomp -Wl,--as-needed" \
+        "-DCMAKE_CXX_FLAGS=-DAMREX_USE_GPUCOMPRESS -I${HDF5_ROOT}/include" \
+        "-DCMAKE_CUDA_FLAGS=-DAMREX_USE_GPUCOMPRESS -I${HDF5_ROOT}/include" \
+        "-DCMAKE_EXE_LINKER_FLAGS=-L${HDF5_ROOT}/lib -L${NVCOMP_PREFIX}/lib -Wl,--no-as-needed -lgpucompress -lH5VLgpucompress -lH5Zgpucompress -lhdf5 -lnvcomp -Wl,--as-needed" \
         "-DCMAKE_SHARED_LINKER_FLAGS=-L${HDF5_ROOT}/lib -lhdf5"
     cmake --build . --target nyx_HydroTests -j"$(nproc)"
 
@@ -339,11 +360,11 @@ setup_warpx() {
         -DWarpX_PRECISION=SINGLE \
         -DWarpX_PARTICLE_PRECISION=SINGLE \
         -DWarpX_GPUCOMPRESS=ON \
-        -DGPUCOMPRESS_PREFIX="${GPUC_DIR}/build" \
+        -DGPUCOMPRESS_PREFIX="/usr/local" \
         "-DCMAKE_PREFIX_PATH=${HDF5_ROOT}" \
-        "-DCMAKE_CXX_FLAGS=-I${GPUC_DIR}/include -I${GPUC_DIR}/examples -I${GPUC_DIR}/benchmarks -I${HDF5_ROOT}/include" \
-        "-DCMAKE_CUDA_FLAGS=-I${GPUC_DIR}/include -I${GPUC_DIR}/examples -I${GPUC_DIR}/benchmarks -I${HDF5_ROOT}/include" \
-        "-DCMAKE_EXE_LINKER_FLAGS=-L${GPUC_DIR}/build -lgpucompress -lH5VLgpucompress -lH5Zgpucompress -L${HDF5_ROOT}/lib -lhdf5 -L/usr/local/cuda/lib64 -lcudart"
+        "-DCMAKE_CXX_FLAGS=-mcmodel=large -I${HDF5_ROOT}/include" \
+        "-DCMAKE_CUDA_FLAGS=-Xcompiler -mcmodel=large -I${HDF5_ROOT}/include" \
+        "-DCMAKE_EXE_LINKER_FLAGS=-Wl,--no-relax -lgpucompress -lH5VLgpucompress -lH5Zgpucompress -L${HDF5_ROOT}/lib -lhdf5 -L/usr/local/cuda/lib64 -lcudart"
     cmake --build . -j"$(nproc)"
 
     ok "WarpX built: ${src}/build-gpucompress/bin/warpx.3d"
@@ -559,12 +580,13 @@ bench_vpic() {
     export VPIC_WARMUP_STEPS="${VPIC_WARMUP_STEPS:-500}"
     export VPIC_SIM_INTERVAL="${VPIC_SIM_INTERVAL:-190}"
     export VPIC_CHUNK_MB="${VPIC_CHUNK_MB:-${CHUNK_MB:-4}}"
-    export VPIC_POLICIES="${VPIC_POLICIES:-${POLICIES:-balanced,ratio,speed}}"
+    # run_vpic_benchmark.sh reads POLICIES; bridge from VPIC_POLICIES if set
+    export POLICIES="${VPIC_POLICIES:-${POLICIES:-balanced,ratio,speed}}"
     export RESULTS_DIR="${RESULTS_BASE}/vpic"
+    export GPUC_DIR
 
     mkdir -p "$RESULTS_DIR"
-    cd "$RESULTS_DIR"
-    mpirun -np 1 "$vpic_deck"
+    bash "${GPUC_DIR}/benchmarks/vpic-kokkos/run_vpic_benchmark.sh"
 
     ok "VPIC results in ${RESULTS_DIR}/"
 }
@@ -647,8 +669,8 @@ main() {
             echo "Environment variables:"
             echo "  CUDA_ARCH=80           GPU arch (80=A100, 70=V100, 90=H100)"
             echo "  BUILD_TYPE=Release     CMake build type"
-            echo "  HDF5_ROOT              HDF5 install prefix [/tmp/hdf5-install]"
-            echo "  NVCOMP_PREFIX          nvcomp install prefix [/tmp]"
+            echo "  HDF5_ROOT              HDF5 install prefix [/opt/hdf5]"
+            echo "  NVCOMP_PREFIX          nvcomp install prefix [/opt/nvcomp]"
             echo "  SIMS_DIR              Where sims are cloned [\$HOME/sims]"
             echo "  RESULTS_BASE          Results output dir [results/]"
             echo "  POLICIES              Comma-sep policies [balanced,ratio,speed]"

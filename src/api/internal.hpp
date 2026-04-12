@@ -248,6 +248,7 @@ struct ChunkDiagInput {
     float compression_ms, compression_ms_raw, exploration_ms, sgd_ms;
     size_t input_size, primary_compressed_size, compressed_size;
     float predicted_ratio, predicted_comp_time, predicted_decomp_time, predicted_psnr;
+    float predicted_rmse, predicted_max_error, predicted_mae, predicted_ssim;
     float actual_psnr;  // analytical PSNR: 10*log10(3*range²/eb²), 120 for lossless
     double error_bound;
     const AutoStatsGPU* d_stats_ptr;
@@ -258,6 +259,9 @@ struct ChunkDiagInput {
     bool  h_stats_valid;
     /* Cost model */
     float cost_model_error_pct, actual_cost, predicted_cost;
+    /* Per-statistic MAPE and regret */
+    float ratio_mape, comp_time_mape, decomp_time_mape;
+    float regret;  /* -1.0 if no exploration */
     /* Original config metrics (before exploration swap) */
     float orig_actual_ratio, orig_comp_ms, orig_cost;
     /* Exploration results */
@@ -384,7 +388,10 @@ int runNNFusedInferenceCtx(const AutoStatsGPU* d_stats, size_t data_size,
     int* out_action, float* out_ratio = nullptr, float* out_comp_time = nullptr,
     float* out_decomp_time = nullptr, float* out_psnr = nullptr,
     int* out_top_actions = nullptr, float* out_predicted_costs = nullptr,
-    cudaEvent_t nn_stop_event = nullptr);
+    cudaEvent_t nn_stop_event = nullptr,
+    float* out_rmse = nullptr, float* out_max_error = nullptr,
+    float* out_mae = nullptr, float* out_ssim = nullptr,
+    NNDebugPerConfig* out_per_config = nullptr);
 
 /** ctx overload: launches nnSGDKernel on g_sgd_stream (not ctx->stream),
  *  uses ctx->d_sgd_* buffers, records g_sgd_done, syncs g_sgd_stream. */
@@ -456,7 +463,12 @@ gpucompress_error_t gpucompress_infer_gpu(
     float* out_predicted_decomp_time,
     float* out_predicted_psnr,
     int* out_top_actions = nullptr,
-    float* out_predicted_costs = nullptr);
+    float* out_predicted_costs = nullptr,
+    float* out_predicted_rmse = nullptr,
+    float* out_predicted_max_error = nullptr,
+    float* out_predicted_mae = nullptr,
+    float* out_predicted_ssim = nullptr,
+    NNDebugPerConfig* out_per_config = nullptr);
 
 /**
  * Phase B: preprocess + compress + exploration + SGD.
@@ -493,6 +505,10 @@ gpucompress_error_t gpucompress_compress_with_action_gpu(
     float stage1_nn_ms = 0.0f,
     float stage1_stats_ms = 0.0f,
     AutoStatsGPU* d_precomputed_stats = nullptr,
-    int* out_diag_slot = nullptr);
+    int* out_diag_slot = nullptr,
+    float predicted_rmse = 0.0f,
+    float predicted_max_error = 0.0f,
+    float predicted_mae = 0.0f,
+    float predicted_ssim = 0.0f);
 
 #endif /* INTERNAL_HPP */

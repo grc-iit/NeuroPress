@@ -21,58 +21,54 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from neural_net.core.data import encode_and_split, ALGORITHM_NAMES, CONTINUOUS_FEATURES, OUTPUT_COLUMNS, OUTPUT_INVERSE, LOSSY_ONLY_OUTPUTS
-from neural_net.core.data import inverse_transform_outputs
+from neural_net.core.data import inverse_transform_outputs, normalize_synthetic_csv
 from neural_net.core.model import CompressionPredictor
 
 
 def prepare_fold(df_train, df_val, add_size_interactions=False):
     """Run the same encoding/normalization as encode_and_split but on pre-split DataFrames."""
 
+    alg_index = {name: i for i, name in enumerate(ALGORITHM_NAMES)}
     for sub_df in [df_train, df_val]:
-        # Algorithm one-hot
-        for alg in ALGORITHM_NAMES:
-            sub_df[f'alg_{alg}'] = (sub_df['algorithm'] == alg).astype(np.float32)
+        # Algorithm: integer label 0..(N-1)
+        sub_df['alg_id'] = sub_df['algorithm'].map(alg_index).astype(np.float32)
         # Quantization
         sub_df['quant_enc'] = (sub_df['quantization'] == 'linear').astype(np.float32)
         # Shuffle
         sub_df['shuffle_enc'] = (sub_df['shuffle'] > 0).astype(np.float32)
-        # Error bound log-scale
-        sub_df['error_bound_enc'] = np.log10(sub_df['error_bound'].clip(lower=1e-7)).astype(np.float32)
-        # Data size log2
-        sub_df['data_size_enc'] = np.log2(sub_df['original_size'].clip(lower=1)).astype(np.float32)
+        sub_df['error_bound_enc'] = sub_df['error_bound'].astype(np.float32)
+        sub_df['data_size_enc'] = sub_df['original_size'].astype(np.float32)
         # Core output encodings
-        sub_df['comp_time_log'] = np.log1p(sub_df['compression_time_ms'].clip(lower=0)).astype(np.float32)
-        sub_df['decomp_time_log'] = np.log1p(sub_df['decompression_time_ms'].clip(lower=0)).astype(np.float32)
+        sub_df['comp_time_log'] = np.log1p(sub_df['compression_time_ms'].clip(lower=1)).astype(np.float32)
+        sub_df['decomp_time_log'] = np.log1p(sub_df['decompression_time_ms'].clip(lower=1)).astype(np.float32)
         sub_df['ratio_log'] = np.log1p(sub_df['compression_ratio'].clip(lower=0)).astype(np.float32)
         sub_df['psnr_clamped'] = sub_df['psnr_db'].replace([np.inf, -np.inf], 120.0).fillna(120.0).clip(upper=120.0).astype(np.float32)
         # Extended output encodings
         if 'mean_abs_err' in sub_df.columns:
             sub_df['log_mae'] = np.log1p(sub_df['mean_abs_err'].clip(lower=0).fillna(0)).astype(np.float32)
         if 'ssim' in sub_df.columns:
-            sub_df['ssim_val'] = sub_df['ssim'].clip(lower=0, upper=1).fillna(1.0).astype(np.float32)
+            ssim_clipped = sub_df['ssim'].clip(lower=0, upper=1).fillna(1.0)
+            sub_df['ssim_nlog'] = (-np.log(1.0 - ssim_clipped + 1e-7)).astype(np.float32)
+        if 'rmse' in sub_df.columns:
+            sub_df['rmse_log'] = np.log1p(sub_df['rmse'].clip(lower=0).fillna(0)).astype(np.float32)
+        if 'max_error' in sub_df.columns:
+            sub_df['max_error_log'] = np.log1p(sub_df['max_error'].clip(lower=0).fillna(0)).astype(np.float32)
 
-    algo_cols = [f'alg_{a}' for a in ALGORITHM_NAMES]
-    feature_cols = algo_cols + ['quant_enc', 'shuffle_enc',
-                                'error_bound_enc', 'data_size_enc',
-                                'entropy', 'mad', 'second_derivative']
+    feature_cols = ['alg_id', 'quant_enc', 'shuffle_enc',
+                    'error_bound_enc', 'data_size_enc',
+                    'entropy', 'mad', 'second_derivative']
 
     if add_size_interactions:
-        # Capture size-dependent algorithm effects for comp/decomp timing.
         interaction_cols = []
-        for alg_col in algo_cols:
-            col = f"size_x_{alg_col}"
-            df_train[col] = df_train['data_size_enc'] * df_train[alg_col]
-            df_val[col] = df_val['data_size_enc'] * df_val[alg_col]
-            interaction_cols.append(col)
-        for base_col in ['quant_enc', 'shuffle_enc']:
+        for base_col in ['alg_id', 'quant_enc', 'shuffle_enc']:
             col = f"size_x_{base_col}"
             df_train[col] = df_train['data_size_enc'] * df_train[base_col]
-            df_val[col] = df_val['data_size_enc'] * df_val[base_col]
+            df_val[col]   = df_val['data_size_enc']   * df_val[base_col]
             interaction_cols.append(col)
         feature_cols.extend(interaction_cols)
 
     output_cols = ['comp_time_log', 'decomp_time_log', 'ratio_log', 'psnr_clamped']
-    for extra in ['log_mae', 'ssim_val']:
+    for extra in ['rmse_log', 'max_error_log', 'log_mae', 'ssim_nlog']:
         if extra in df_train.columns:
             output_cols.append(extra)
 
@@ -202,10 +198,11 @@ def main():
     parser.add_argument('--csv', type=str, nargs='+', required=True,
                         help='CSV file(s) with benchmark results')
     parser.add_argument('--folds', type=int, default=5)
-    parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--hidden-dim', type=int, default=128)
+    parser.add_argument('--epochs', type=int, default=150)
+    parser.add_argument('--lr', type=float, default=3e-4)
+    parser.add_argument('--hidden-dim', type=int, default=64)
     parser.add_argument('--model-variant', choices=['shared', 'split_heads'], default='shared')
-    parser.add_argument('--num-hidden-layers', type=int, default=2,
+    parser.add_argument('--num-hidden-layers', type=int, default=4,
                         help='Used when model-variant=shared')
     parser.add_argument('--head-hidden-dim', type=int, default=64,
                         help='Used when model-variant=split_heads')
@@ -221,7 +218,7 @@ def main():
     args = parser.parse_args()
 
     # Load data
-    frames = [pd.read_csv(p) for p in args.csv]
+    frames = [normalize_synthetic_csv(pd.read_csv(p)) for p in args.csv]
     df = pd.concat(frames, ignore_index=True)
     df = df[df['success'] == True].copy()
     print(f"Loaded {len(df)} successful rows from {len(args.csv)} CSV file(s)")
@@ -271,7 +268,8 @@ def main():
 
         val_pred_norm, best_loss, last_epoch = train_one_fold(
             train_X, train_Y, val_X, val_Y,
-            epochs=args.epochs, hidden_dim=args.hidden_dim,
+            epochs=args.epochs, lr=args.lr,
+            hidden_dim=args.hidden_dim,
             model_variant=args.model_variant,
             num_hidden_layers=args.num_hidden_layers,
             head_hidden_dim=args.head_hidden_dim,
@@ -300,7 +298,7 @@ def main():
             ss_res = np.sum((a - p) ** 2)
             ss_tot = np.sum((a - a.mean()) ** 2)
             r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
-            mask = np.abs(a) > 0.1
+            mask = np.abs(a) > 0.01
             mape = np.mean(np.abs((a[mask] - p[mask]) / a[mask])) * 100 if mask.sum() > 0 else 0.0
 
             all_metrics[name]['mae'].append(mae)

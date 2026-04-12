@@ -118,6 +118,11 @@ def main():
                         help="Number of exploration alternatives (default: 4)")
     parser.add_argument("--explore-thresh", type=float, default=0.20,
                         help="Cost error threshold for exploration (default: 0.20)")
+    parser.add_argument("--max-batches-per-epoch", type=int, default=None,
+                        help="Limit training to N batches per epoch (makes training dumber/faster, "
+                             "increases I/O fraction). Default: use full dataset.")
+    parser.add_argument("--no-validate", action="store_true",
+                        help="Skip validation loop each epoch (faster, removes ~3s/epoch overhead).")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -286,6 +291,22 @@ def main():
     bench_csv = None
     chunk_csv = None
 
+    # GPU warmup: run one forward pass to trigger CUDA JIT kernel compilation
+    # before starting the e2e timer, so first-epoch compilation overhead is excluded.
+    if hdf5_writer is not None:
+        model.eval()
+        with torch.no_grad():
+            _warmup_images, _ = next(iter(train_loader))
+            _warmup_images = _warmup_images.to(device)
+            _ = model(_warmup_images)
+        torch.cuda.synchronize()
+        model.train()
+
+    # Reset e2e timer AFTER warmup to exclude model loading, CUDA init, and data prep.
+    # This makes e2e_ms reflect only the active training + I/O time.
+    if hdf5_writer is not None:
+        hdf5_writer.record_process_start()
+
     for epoch in range(1, args.epochs + 1):
         model.train()
         epoch_loss = 0.0
@@ -294,6 +315,9 @@ def main():
         epoch_start = time.time()
 
         for batch_idx, (images, labels) in enumerate(train_loader):
+            if args.max_batches_per_epoch is not None and batch_idx >= args.max_batches_per_epoch:
+                break
+
             images, labels = images.to(device), labels.to(device)
 
             with torch.amp.autocast(device_type="cuda", enabled=args.amp):
@@ -322,19 +346,21 @@ def main():
         train_acc = 100.0 * epoch_correct / epoch_total
         avg_loss = epoch_loss / epoch_total
 
-        # Quick validation
-        model.eval()
-        val_correct = 0
-        val_total = 0
-        with torch.no_grad():
-            for images, labels in val_loader:
-                images, labels = images.to(device), labels.to(device)
-                with torch.amp.autocast(device_type="cuda", enabled=args.amp):
-                    outputs = model(images)
-                _, predicted = outputs.max(1)
-                val_correct += predicted.eq(labels).sum().item()
-                val_total += images.size(0)
-        val_acc = 100.0 * val_correct / val_total
+        # Quick validation (skip if --no-validate)
+        val_acc = float("nan")
+        if not args.no_validate:
+            model.eval()
+            val_correct = 0
+            val_total = 0
+            with torch.no_grad():
+                for images, labels in val_loader:
+                    images, labels = images.to(device), labels.to(device)
+                    with torch.amp.autocast(device_type="cuda", enabled=args.amp):
+                        outputs = model(images)
+                    _, predicted = outputs.max(1)
+                    val_correct += predicted.eq(labels).sum().item()
+                    val_total += images.size(0)
+            val_acc = 100.0 * val_correct / val_total
 
         print(f"\r  Epoch {epoch:2d}/{args.epochs}  "
               f"loss={avg_loss:.4f}  train_acc={train_acc:.1f}%  "
@@ -413,7 +439,10 @@ def main():
                         bc["chunk_csv"].write(CHUNK_CSV_HEADER)
 
             for name, tensors in tensor_sets:
-                flat = concat_and_pad_gpu(tensors, target_elements)
+                if hdf5_writer is not None or bench_configs or inline_bench is not None:
+                    flat = concat_and_pad_gpu(tensors, target_elements)
+                else:
+                    flat = None
 
                 if bench_configs:
                     # Multi-config: benchmark same tensor with each config
@@ -486,6 +515,7 @@ def main():
         if bc.get("chunk_csv"):
             bc["chunk_csv"].close()
     if hdf5_writer is not None:
+        hdf5_writer.dump_timing()   # explicit flush before cleanup (atexit unreliable in ctypes)
         hdf5_writer.cleanup()
 
     # ── Auto-generate plots ──

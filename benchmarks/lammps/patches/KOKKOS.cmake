@@ -261,6 +261,29 @@ endif()
 # C++20 + Kokkos nvcc_wrapper toolchain.
 list(APPEND KOKKOS_PKG_SOURCES ${KOKKOS_PKG_SOURCES_DIR}/fix_gpucompress_kokkos.cpp)
 
+# Link GPUCompress libraries into LAMMPS (system-wide install at /usr/local)
+set(_GPUC_HDF5_ROOT "$ENV{HDF5_ROOT}")
+if("${_GPUC_HDF5_ROOT}" STREQUAL "")
+    set(_GPUC_HDF5_ROOT "/opt/hdf5")
+endif()
+target_link_libraries(lammps PRIVATE
+    lammps_gpucompress_udf
+    lammps_ranking_profiler
+    gpucompress
+    H5VLgpucompress
+    H5Zgpucompress
+    "${_GPUC_HDF5_ROOT}/lib/libhdf5.so"
+    cudart
+)
+target_link_directories(lammps PRIVATE
+    "${_GPUC_HDF5_ROOT}/lib"
+    /usr/local/cuda/lib64
+)
+target_include_directories(lammps PRIVATE
+    "${_GPUC_HDF5_ROOT}/include"
+    /usr/local/cuda/include
+)
+
 set_property(GLOBAL PROPERTY "KOKKOS_PKG_SOURCES" "${KOKKOS_PKG_SOURCES}")
 
 # detects styles which have KOKKOS version

@@ -52,7 +52,7 @@ EXPLORE_THRESH="${EXPLORE_THRESH:-0.20}"
 N_TIMESTEPS=$(( WARPX_MAX_STEP / WARPX_DIAG_INT ))
 RESULTS_DIR="${RESULTS_DIR:-$SCRIPT_DIR/results/warpx_eval_ms${WARPX_MAX_STEP}_diag${WARPX_DIAG_INT}_chunk${CHUNK_MB}mb}"
 
-export LD_LIBRARY_PATH="$GPUC_DIR/build:$GPUC_DIR/examples:/tmp/hdf5-install/lib:/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="/opt/hdf5/lib:/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 echo "============================================================"
 echo "WarpX VPIC-Compatible Benchmark (LWFA)"

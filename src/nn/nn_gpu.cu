@@ -6,16 +6,18 @@
  * inference entirely on GPU. Replaces Q-Table lookup with a learned model
  * that predicts compression metrics for all 32 configurations and ranks them.
  *
- * Architecture: 15 → 128 (ReLU) → 128 (ReLU) → 4
- * Inputs:  [algo_onehot(8), quant, shuffle, error_bound, data_size, entropy, mad, deriv]
- * Outputs: [comp_time_log, decomp_time_log, ratio_log, psnr_clamped]
+ * Architecture: 8 → 64 (ReLU) → 64 (ReLU) → 64 (ReLU) → 64 (ReLU) → 8
+ * Inputs:  [alg_id, quant, shuffle, error_bound, data_size, entropy, mad, deriv]
+ * Outputs: [comp_time_log, decomp_time_log, ratio_log, psnr_clamped, rmse_log, max_error_log, mae_log, ssim_nlog]
  *
  * Binary format (.nnwt):
  *   Header: magic(4) version(4) n_layers(4) input_dim(4) hidden_dim(4) output_dim(4)
- *   Normalization: x_means(15×4) x_stds(15×4) y_means(4×4) y_stds(4×4)
- *   Layer 1: W(128×15×4) b(128×4)
- *   Layer 2: W(128×128×4) b(128×4)
- *   Layer 3: W(4×128×4) b(4×4)
+ *   Normalization: x_means(8×4) x_stds(8×4) y_means(8×4) y_stds(8×4)
+ *   Layer 1: W(64×8×4)   b(64×4)
+ *   Layer 2: W(64×64×4)  b(64×4)
+ *   Layer 3: W(64×64×4)  b(64×4)
+ *   Layer 4: W(64×64×4)  b(64×4)
+ *   Layer 5: W(8×64×4)   b(8×4)
  */
 
 #include <atomic>
@@ -98,19 +100,20 @@ static void freeInferenceBuffers() {
  * ============================================================ */
 
 /**
- * 15→128→128→4 forward pass for one (algo, quant, shuffle) config.
+ * 8→64→64→64→64→8 forward pass for one (algo, quant, shuffle) config.
  * Shared by nnInferenceKernel and nnFusedInferenceKernel to eliminate ~125
  * lines of duplication. Stats (entropy/mad/deriv) are passed as scalars so
  * the caller decides whether to read them from registers or device memory.
  *
+ * Computes all 8 outputs: comp_time, decomp_time, ratio, psnr, rmse, max_error, mae, ssim.
  * Outputs rank_val (negated for lower-is-better; -INF for masked lossless),
- * ratio, and comp_time for the shared-memory reduction that follows.
+ * plus all 8 predicted metrics via output pointers (nullable for 4-7).
  */
 __device__ static void nnForwardPass(
     const NNWeightsGPU* __restrict__ weights,
     int   tid,
-    float eb_enc,       // log10(clip(error_bound, 1e-7)) — precomputed by caller
-    float ds_enc,       // log2(max(data_size, 1))        — precomputed by caller
+    float eb_enc,       // raw error_bound — z-score normalized by x_means/x_stds
+    float ds_enc,       // raw data_size (bytes) — z-score normalized by x_means/x_stds
     float entropy_f,    // (float)entropy                  — precomputed by caller
     float mad_f,        // (float)mad_norm                 — precomputed by caller
     float deriv_f,      // (float)deriv_norm               — precomputed by caller
@@ -121,21 +124,28 @@ __device__ static void nnForwardPass(
     float* out_ratio,
     float* out_comp_time,
     float* out_decomp_time,
-    float* out_psnr
+    float* out_psnr,
+    float* out_rmse,        /* nullable */
+    float* out_max_error,   /* nullable */
+    float* out_mae,         /* nullable */
+    float* out_ssim         /* nullable */
 ) {
     int algo_idx = tid % 8;
     int quant    = (tid / 8) % 2;
     int shuffle  = (tid / 16) % 2;
 
+    // Integer encoding: 8 inputs
+    // Error bound: training used 1e-7 sentinel for lossless (quant==0).
+    // Inference must match — do not pass raw 0.0 for lossless configs.
     float input_raw[NN_INPUT_DIM];
-    for (int i = 0; i < 8; i++) input_raw[i] = (i == algo_idx) ? 1.0f : 0.0f;
-    input_raw[8]  = static_cast<float>(quant);
-    input_raw[9]  = static_cast<float>(shuffle);
-    input_raw[10] = eb_enc;
-    input_raw[11] = ds_enc;
-    input_raw[12] = entropy_f;
-    input_raw[13] = mad_f;
-    input_raw[14] = deriv_f;
+    input_raw[0] = static_cast<float>(algo_idx);
+    input_raw[1] = static_cast<float>(quant);
+    input_raw[2] = static_cast<float>(shuffle);
+    input_raw[3] = (quant == 0) ? 1e-7f : eb_enc;
+    input_raw[4] = ds_enc;
+    input_raw[5] = entropy_f;
+    input_raw[6] = mad_f;
+    input_raw[7] = deriv_f;
 
     float input[NN_INPUT_DIM];
     for (int i = 0; i < NN_INPUT_DIM; i++) {
@@ -144,6 +154,7 @@ __device__ static void nnForwardPass(
         input[i] = (input_raw[i] - weights->x_means[i]) / std_val;
     }
 
+    // Layer 1: 8 -> 64, ReLU
     float hidden1[NN_HIDDEN_DIM];
     for (int j = 0; j < NN_HIDDEN_DIM; j++) {
         float sum = weights->b1[j];
@@ -152,6 +163,7 @@ __device__ static void nnForwardPass(
         hidden1[j] = (sum > 0.0f) ? sum : 0.0f;
     }
 
+    // Layer 2: 64 -> 64, ReLU
     float hidden2[NN_HIDDEN_DIM];
     for (int j = 0; j < NN_HIDDEN_DIM; j++) {
         float sum = weights->b2[j];
@@ -160,20 +172,47 @@ __device__ static void nnForwardPass(
         hidden2[j] = (sum > 0.0f) ? sum : 0.0f;
     }
 
-    float comp_time   = weights->b3[0];
-    float decomp_time = weights->b3[1];
-    float ratio       = weights->b3[2];
-    float psnr        = weights->b3[3];
-    for (int i = 0; i < NN_HIDDEN_DIM; i++) {
-        comp_time   += weights->w3[0 * NN_HIDDEN_DIM + i] * hidden2[i];
-        decomp_time += weights->w3[1 * NN_HIDDEN_DIM + i] * hidden2[i];
-        ratio       += weights->w3[2 * NN_HIDDEN_DIM + i] * hidden2[i];
-        psnr        += weights->w3[3 * NN_HIDDEN_DIM + i] * hidden2[i];
+    // Layer 3: 64 -> 64, ReLU
+    float hidden3[NN_HIDDEN_DIM];
+    for (int j = 0; j < NN_HIDDEN_DIM; j++) {
+        float sum = weights->b3[j];
+        for (int i = 0; i < NN_HIDDEN_DIM; i++)
+            sum += weights->w3[j * NN_HIDDEN_DIM + i] * hidden2[i];
+        hidden3[j] = (sum > 0.0f) ? sum : 0.0f;
     }
-    comp_time   = expm1f(comp_time   * weights->y_stds[0] + weights->y_means[0]);
-    decomp_time = expm1f(decomp_time * weights->y_stds[1] + weights->y_means[1]);
-    ratio       = expm1f(ratio       * weights->y_stds[2] + weights->y_means[2]);
-    psnr        =        psnr        * weights->y_stds[3] + weights->y_means[3];
+
+    // Layer 4: 64 -> 64, ReLU
+    float hidden4[NN_HIDDEN_DIM];
+    for (int j = 0; j < NN_HIDDEN_DIM; j++) {
+        float sum = weights->b4[j];
+        for (int i = 0; i < NN_HIDDEN_DIM; i++)
+            sum += weights->w4[j * NN_HIDDEN_DIM + i] * hidden3[i];
+        hidden4[j] = (sum > 0.0f) ? sum : 0.0f;
+    }
+
+    // Layer 5 (output): 64 -> 8, no activation
+    float raw_out[NN_OUTPUT_DIM];
+    for (int o = 0; o < NN_OUTPUT_DIM; o++) {
+        float sum = weights->b5[o];
+        for (int i = 0; i < NN_HIDDEN_DIM; i++)
+            sum += weights->w5[o * NN_HIDDEN_DIM + i] * hidden4[i];
+        raw_out[o] = sum;
+    }
+
+    // Inverse-transform all 8 outputs
+    // Outputs 0-2 (comp_time, decomp_time, ratio): log1p-transformed → expm1
+    // Output 3 (psnr): linear
+    // Outputs 4-6 (rmse, max_error, mae): log1p-transformed → expm1
+    // Output 7 (ssim_nlog): stored as -log(1-ssim) → 1 - exp(-x)
+    float comp_time   = expm1f(raw_out[0] * weights->y_stds[0] + weights->y_means[0]);
+    float decomp_time = expm1f(raw_out[1] * weights->y_stds[1] + weights->y_means[1]);
+    float ratio       = expm1f(raw_out[2] * weights->y_stds[2] + weights->y_means[2]);
+    float psnr        =        raw_out[3] * weights->y_stds[3] + weights->y_means[3];
+    float rmse        = expm1f(raw_out[4] * weights->y_stds[4] + weights->y_means[4]);
+    float max_error   = expm1f(raw_out[5] * weights->y_stds[5] + weights->y_means[5]);
+    float mae         = expm1f(raw_out[6] * weights->y_stds[6] + weights->y_means[6]);
+    float ssim_nlog   =        raw_out[7] * weights->y_stds[7] + weights->y_means[7];
+    float ssim        = 1.0f - expf(-fmaxf(0.0f, ssim_nlog));
 
     /* Clamp expm1f outputs to sane ranges — prevents SGD weight drift
        from producing INF/NaN that corrupt action selection and MAPE. */
@@ -181,10 +220,14 @@ __device__ static void nnForwardPass(
     decomp_time = fmaxf(1e-6f, fminf(decomp_time, 1e6f));
     ratio       = fmaxf(0.1f,  fminf(ratio,        1e5f));
     psnr        = fmaxf(0.0f,  fminf(psnr,         120.0f));
+    rmse        = fmaxf(0.0f,  fminf(rmse,          1e6f));
+    max_error   = fmaxf(0.0f,  fminf(max_error,     1e6f));
+    mae         = fmaxf(0.0f,  fminf(mae,            1e6f));
+    ssim        = fmaxf(0.0f,  fminf(ssim,           1.0f));
 
-    /* Policy clamps: ct/dt floor at 5ms, ratio cap at 100x. */
-    comp_time   = fmaxf(5.0f, comp_time);
-    decomp_time = fmaxf(5.0f, decomp_time);
+    /* Policy clamps: ct/dt floor at 1ms, ratio cap at 100x. */
+    comp_time   = fmaxf(1.0f, comp_time);
+    decomp_time = fmaxf(1.0f, decomp_time);
     ratio       = fminf(100.0f, ratio);
 
     /* Cost = w0*ct + w1*dt + w2*ds/(ratio*bw).
@@ -195,11 +238,15 @@ __device__ static void nnForwardPass(
     if (quant == 1 && error_bound <= 0.0) rank_val = -INFINITY;
     if (min_psnr > 0.0f && psnr < min_psnr) rank_val = -INFINITY;
 
-    *out_rank_val   = rank_val;
-    *out_ratio      = ratio;
-    *out_comp_time  = comp_time;
+    *out_rank_val    = rank_val;
+    *out_ratio       = ratio;
+    *out_comp_time   = comp_time;
     *out_decomp_time = decomp_time;
-    *out_psnr       = psnr;
+    *out_psnr        = psnr;
+    if (out_rmse)      *out_rmse      = rmse;
+    if (out_max_error) *out_max_error = max_error;
+    if (out_mae)       *out_mae       = mae;
+    if (out_ssim)      *out_ssim      = ssim;
 }
 
 /* ============================================================
@@ -215,7 +262,7 @@ __device__ static void nnForwardPass(
  *   quant     = (tid / 8) % 2
  *   shuffle   = (tid / 16) % 2
  *
- * The kernel constructs the 15-feature input vector, runs the full
+ * The kernel constructs the 8-feature input vector, runs the full
  * forward pass, and writes the predicted metric to shared memory.
  * Then a parallel reduction finds the best action.
  *
@@ -248,11 +295,8 @@ __global__ void nnInferenceKernel(
     // ---- Precompute scalars shared across all 32 threads (thread 0 only) ----
     __shared__ float s_enc[5];  // [eb_enc, ds_enc, entropy_f, mad_f, deriv_f]
     if (tid == 0) {
-        double eb_c = (error_bound < 1e-7) ? 1e-7 : error_bound;
-        s_enc[0] = static_cast<float>(log10(eb_c));
-        double ds = static_cast<double>(data_size);
-        if (ds < 1.0) ds = 1.0;
-        s_enc[1] = static_cast<float>(log2(ds));
+        s_enc[0] = static_cast<float>(error_bound);   // raw error_bound
+        s_enc[1] = static_cast<float>(data_size);     // raw data_size in bytes
         s_enc[2] = static_cast<float>(entropy);
         s_enc[3] = static_cast<float>(mad_norm);
         s_enc[4] = static_cast<float>(deriv_norm);
@@ -260,22 +304,31 @@ __global__ void nnInferenceKernel(
     __syncthreads();
 
     // ---- Forward pass via shared device function ----
-    float rank_val, ratio, comp_time, decomp_time, psnr;
+    float rank_val, ratio, comp_time, decomp_time, psnr, rmse, max_error, mae, ssim;
     nnForwardPass(weights, tid,
                   s_enc[0], s_enc[1], s_enc[2], s_enc[3], s_enc[4],
                   error_bound, min_psnr,
                   static_cast<float>(data_size), w0, w1, w2, bw,
-                  &rank_val, &ratio, &comp_time, &decomp_time, &psnr);
+                  &rank_val, &ratio, &comp_time, &decomp_time, &psnr,
+                  &rmse, &max_error, &mae, &ssim);
 
     // ---- Store per-thread predictions for later retrieval ----
     __shared__ float s_ratios[NN_NUM_CONFIGS];
     __shared__ float s_comp_times[NN_NUM_CONFIGS];
     __shared__ float s_decomp_times[NN_NUM_CONFIGS];
     __shared__ float s_psnrs[NN_NUM_CONFIGS];
+    __shared__ float s_rmses[NN_NUM_CONFIGS];
+    __shared__ float s_max_errors[NN_NUM_CONFIGS];
+    __shared__ float s_maes[NN_NUM_CONFIGS];
+    __shared__ float s_ssims[NN_NUM_CONFIGS];
     s_ratios[tid]      = ratio;
     s_comp_times[tid]  = comp_time;
     s_decomp_times[tid] = decomp_time;
     s_psnrs[tid]       = psnr;
+    s_rmses[tid]       = rmse;
+    s_max_errors[tid]  = max_error;
+    s_maes[tid]        = mae;
+    s_ssims[tid]       = ssim;
 
     // ---- Parallel reduction to find best config ----
     __shared__ float s_vals[NN_NUM_CONFIGS];
@@ -314,11 +367,15 @@ __global__ void nnInferenceKernel(
         // All threads write their sorted slot in parallel; thread 0 is the winner.
         out_top_actions[tid] = my_idx;
         if (tid == 0) {
-            out_result->action              = my_idx;
-            out_result->predicted_ratio     = s_ratios[my_idx];
-            out_result->predicted_comp_time = s_comp_times[my_idx];
+            out_result->action                = my_idx;
+            out_result->predicted_ratio       = s_ratios[my_idx];
+            out_result->predicted_comp_time   = s_comp_times[my_idx];
             out_result->predicted_decomp_time = s_decomp_times[my_idx];
-            out_result->predicted_psnr      = s_psnrs[my_idx];
+            out_result->predicted_psnr        = s_psnrs[my_idx];
+            out_result->predicted_rmse        = s_rmses[my_idx];
+            out_result->predicted_max_error   = s_max_errors[my_idx];
+            out_result->predicted_mae         = s_maes[my_idx];
+            out_result->predicted_ssim        = s_ssims[my_idx];
         }
     } else {
         // Tree reduction (32 → 16 → 8 → 4 → 2 → 1)
@@ -335,11 +392,15 @@ __global__ void nnInferenceKernel(
         // Thread 0 writes the result as a single NNInferenceOutput
         if (tid == 0) {
             int winner = s_idxs[0];
-            out_result->action              = winner;
-            out_result->predicted_ratio     = s_ratios[winner];
-            out_result->predicted_comp_time = s_comp_times[winner];
+            out_result->action                = winner;
+            out_result->predicted_ratio       = s_ratios[winner];
+            out_result->predicted_comp_time   = s_comp_times[winner];
             out_result->predicted_decomp_time = s_decomp_times[winner];
-            out_result->predicted_psnr      = s_psnrs[winner];
+            out_result->predicted_psnr        = s_psnrs[winner];
+            out_result->predicted_rmse        = s_rmses[winner];
+            out_result->predicted_max_error   = s_max_errors[winner];
+            out_result->predicted_mae         = s_maes[winner];
+            out_result->predicted_ssim        = s_ssims[winner];
         }
     }
 }
@@ -370,14 +431,11 @@ __global__ void nnFusedInferenceKernel(
     if (tid >= NN_NUM_CONFIGS) return;
 
     // ---- Precompute scalars shared across all 32 threads (thread 0 only) ----
-    // Reads d_stats once, computes log10/log2 once — 31 redundant ops eliminated.
+    // Reads d_stats once — 31 redundant ops eliminated.
     __shared__ float s_enc[5];  // [eb_enc, ds_enc, entropy_f, mad_f, deriv_f]
     if (tid == 0) {
-        double eb_c = (error_bound < 1e-7) ? 1e-7 : error_bound;
-        s_enc[0] = static_cast<float>(log10(eb_c));
-        double ds = static_cast<double>(data_size);
-        if (ds < 1.0) ds = 1.0;
-        s_enc[1] = static_cast<float>(log2(ds));
+        s_enc[0] = static_cast<float>(error_bound);   // raw error_bound
+        s_enc[1] = static_cast<float>(data_size);     // raw data_size in bytes
         s_enc[2] = static_cast<float>(d_stats->entropy);
         s_enc[3] = static_cast<float>(d_stats->mad_normalized);
         s_enc[4] = static_cast<float>(d_stats->deriv_normalized);
@@ -385,20 +443,26 @@ __global__ void nnFusedInferenceKernel(
     __syncthreads();
 
     // ---- Forward pass via shared device function ----
-    float rank_val, ratio, comp_time, decomp_time, psnr;
+    float rank_val, ratio, comp_time, decomp_time, psnr, rmse, max_error, mae, ssim;
     nnForwardPass(weights, tid,
                   s_enc[0], s_enc[1], s_enc[2], s_enc[3], s_enc[4],
                   error_bound, min_psnr,
                   static_cast<float>(data_size), w0, w1, w2, bw,
-                  &rank_val, &ratio, &comp_time, &decomp_time, &psnr);
+                  &rank_val, &ratio, &comp_time, &decomp_time, &psnr,
+                  &rmse, &max_error, &mae, &ssim);
 
     /* Write per-config debug output (each thread writes its own slot) */
     if (out_debug) {
         float io_cost = static_cast<float>(data_size) / (ratio * bw);
-        out_debug[tid].ratio      = ratio;
-        out_debug[tid].comp_time  = comp_time;
+        out_debug[tid].ratio       = ratio;
+        out_debug[tid].comp_time   = comp_time;
         out_debug[tid].decomp_time = decomp_time;
-        out_debug[tid].cost       = w0 * comp_time + w1 * decomp_time + w2 * io_cost;
+        out_debug[tid].cost        = w0 * comp_time + w1 * decomp_time + w2 * io_cost;
+        out_debug[tid].psnr        = psnr;
+        out_debug[tid].rmse        = rmse;
+        out_debug[tid].max_error   = max_error;
+        out_debug[tid].mae         = mae;
+        out_debug[tid].ssim        = ssim;
     }
 
     /* Write per-config predicted cost (always, not debug-only).
@@ -410,10 +474,18 @@ __global__ void nnFusedInferenceKernel(
     __shared__ float s_comp_times[NN_NUM_CONFIGS];
     __shared__ float s_decomp_times[NN_NUM_CONFIGS];
     __shared__ float s_psnrs[NN_NUM_CONFIGS];
+    __shared__ float s_rmses[NN_NUM_CONFIGS];
+    __shared__ float s_max_errors[NN_NUM_CONFIGS];
+    __shared__ float s_maes[NN_NUM_CONFIGS];
+    __shared__ float s_ssims[NN_NUM_CONFIGS];
     s_ratios[tid]      = ratio;
     s_comp_times[tid]  = comp_time;
     s_decomp_times[tid] = decomp_time;
     s_psnrs[tid]       = psnr;
+    s_rmses[tid]       = rmse;
+    s_max_errors[tid]  = max_error;
+    s_maes[tid]        = mae;
+    s_ssims[tid]       = ssim;
 
     __shared__ float s_vals[NN_NUM_CONFIGS];
     __shared__ int   s_idxs[NN_NUM_CONFIGS];
@@ -448,11 +520,15 @@ __global__ void nnFusedInferenceKernel(
         out_top_actions[tid] = my_idx;
         if (tid == 0) {
             int winner = my_idx;
-            out_result->action = winner;
-            out_result->predicted_ratio = s_ratios[winner];
-            out_result->predicted_comp_time = s_comp_times[winner];
+            out_result->action                = winner;
+            out_result->predicted_ratio       = s_ratios[winner];
+            out_result->predicted_comp_time   = s_comp_times[winner];
             out_result->predicted_decomp_time = s_decomp_times[winner];
-            out_result->predicted_psnr = s_psnrs[winner];
+            out_result->predicted_psnr        = s_psnrs[winner];
+            out_result->predicted_rmse        = s_rmses[winner];
+            out_result->predicted_max_error   = s_max_errors[winner];
+            out_result->predicted_mae         = s_maes[winner];
+            out_result->predicted_ssim        = s_ssims[winner];
         }
     } else {
         // Tree reduction
@@ -467,11 +543,15 @@ __global__ void nnFusedInferenceKernel(
         }
         if (tid == 0) {
             int winner = s_idxs[0];
-            out_result->action = winner;
-            out_result->predicted_ratio = s_ratios[winner];
-            out_result->predicted_comp_time = s_comp_times[winner];
+            out_result->action                = winner;
+            out_result->predicted_ratio       = s_ratios[winner];
+            out_result->predicted_comp_time   = s_comp_times[winner];
             out_result->predicted_decomp_time = s_decomp_times[winner];
-            out_result->predicted_psnr = s_psnrs[winner];
+            out_result->predicted_psnr        = s_psnrs[winner];
+            out_result->predicted_rmse        = s_rmses[winner];
+            out_result->predicted_max_error   = s_max_errors[winner];
+            out_result->predicted_mae         = s_maes[winner];
+            out_result->predicted_ssim        = s_ssims[winner];
         }
     }
 }
@@ -509,28 +589,33 @@ static void freeFusedInferenceBuffers() {
  * ============================================================ */
 
 // Total gradient buffer size in floats (from nn_weights.h)
-static constexpr int SGD_GRAD_SIZE = NN_SGD_GRAD_SIZE; // 3 x 19076 floats = ~228KB
-static constexpr int SGD_REGION = NN_SGD_GRAD_REGION;  // 19076 floats per region
+static constexpr int SGD_GRAD_SIZE = NN_SGD_GRAD_SIZE; // 3 x 13576 floats
+static constexpr int SGD_REGION = NN_SGD_GRAD_REGION;  // 13576 floats per region
 static constexpr int EMA_REGION = 2 * SGD_REGION;      // region 2: EMA gradient
 
 // Offsets into gradient buffer (region 0 = accumulator, region 1 = per-output workspace)
+// dW1:512  dB1:64  dW2:4096  dB2:64  dW3:4096  dB3:64  dW4:4096  dB4:64  dW5:512  dB5:8
 static constexpr int SGD_OFF_DW1 = 0;
-static constexpr int SGD_OFF_DB1 = NN_HIDDEN_DIM * NN_INPUT_DIM;                    // 1920
-static constexpr int SGD_OFF_DW2 = SGD_OFF_DB1 + NN_HIDDEN_DIM;                     // 2048
-static constexpr int SGD_OFF_DB2 = SGD_OFF_DW2 + NN_HIDDEN_DIM * NN_HIDDEN_DIM;     // 18432
-static constexpr int SGD_OFF_DW3 = SGD_OFF_DB2 + NN_HIDDEN_DIM;                     // 18560
-static constexpr int SGD_OFF_DB3 = SGD_OFF_DW3 + NN_OUTPUT_DIM * NN_HIDDEN_DIM;     // 19072
+static constexpr int SGD_OFF_DB1 = NN_HIDDEN_DIM * NN_INPUT_DIM;                    // 512
+static constexpr int SGD_OFF_DW2 = SGD_OFF_DB1 + NN_HIDDEN_DIM;                     // 576
+static constexpr int SGD_OFF_DB2 = SGD_OFF_DW2 + NN_HIDDEN_DIM * NN_HIDDEN_DIM;     // 4672
+static constexpr int SGD_OFF_DW3 = SGD_OFF_DB2 + NN_HIDDEN_DIM;                     // 4736
+static constexpr int SGD_OFF_DB3 = SGD_OFF_DW3 + NN_HIDDEN_DIM * NN_HIDDEN_DIM;     // 8832
+static constexpr int SGD_OFF_DW4 = SGD_OFF_DB3 + NN_HIDDEN_DIM;                     // 8896
+static constexpr int SGD_OFF_DB4 = SGD_OFF_DW4 + NN_HIDDEN_DIM * NN_HIDDEN_DIM;     // 12992
+static constexpr int SGD_OFF_DW5 = SGD_OFF_DB4 + NN_HIDDEN_DIM;                     // 13056
+static constexpr int SGD_OFF_DB5 = SGD_OFF_DW5 + NN_OUTPUT_DIM * NN_HIDDEN_DIM;     // 13568
 
 /**
  * GPU SGD kernel: forward + backward pass + weight update, all on GPU.
  *
- * Launch: <<<1, 128>>>
- * Thread t (0-127) owns hidden neuron t.
+ * Launch: <<<1, NN_HIDDEN_DIM>>> = <<<1, 64>>>
+ * Thread t (0-63) owns hidden neuron t.
  *
- * Shared memory layout (~3.6KB):
- *   s_x[15], s_h1[128], s_z1[128], s_h2[128], s_z2[128],
- *   s_y[4], s_d3[4], s_dz2[128], s_reduce[128],
- *   s_d3_all[8][4] (cached per-sample errors for per-output backward)
+ * Shared memory layout:
+ *   s_x[8], s_h1[64], s_z1[64], s_h2[64], s_z2[64], s_h3[64], s_z3[64], s_h4[64], s_z4[64],
+ *   s_y[8], s_d5[8], s_dz4[64], s_reduce[64],
+ *   s_d5_all[8][8] (cached per-sample errors for per-output backward)
  */
 __global__ void nnSGDKernel(
     NNWeightsGPU* __restrict__ weights,
@@ -551,14 +636,20 @@ __global__ void nnSGDKernel(
     __shared__ float s_z1[NN_HIDDEN_DIM];
     __shared__ float s_h2[NN_HIDDEN_DIM];
     __shared__ float s_z2[NN_HIDDEN_DIM];
+    __shared__ float s_h3[NN_HIDDEN_DIM];
+    __shared__ float s_z3[NN_HIDDEN_DIM];
+    __shared__ float s_h4[NN_HIDDEN_DIM];
+    __shared__ float s_z4[NN_HIDDEN_DIM];
     __shared__ float s_y[NN_OUTPUT_DIM];
-    __shared__ float s_d3[NN_OUTPUT_DIM];
-    __shared__ float s_dz2[NN_HIDDEN_DIM];
+    __shared__ float s_d5[NN_OUTPUT_DIM];      // output layer error (was s_d3)
+    __shared__ float s_dz4[NN_HIDDEN_DIM];     // backprop delta at L4 (was s_dz2)
+    __shared__ float s_dz3[NN_HIDDEN_DIM];     // backprop delta at L3
+    __shared__ float s_dz2b[NN_HIDDEN_DIM];    // backprop delta at L2
     __shared__ float s_reduce[NN_HIDDEN_DIM];
-    __shared__ float s_d3_all[NN_MAX_SGD_SAMPLES][NN_OUTPUT_DIM];
-    __shared__ float s_d3_raw[NN_MAX_SGD_SAMPLES][NN_OUTPUT_DIM];  // unclamped errors for UW
+    __shared__ float s_d5_all[NN_MAX_SGD_SAMPLES][NN_OUTPUT_DIM];  // cached per-sample errors
+    __shared__ float s_d5_raw[NN_MAX_SGD_SAMPLES][NN_OUTPUT_DIM];  // unclamped errors for UW
     __shared__ float s_uw[NN_OUTPUT_DIM];  // uncertainty weight: exp(-0.5 * log_var[o])
-    __shared__ float s_dz2_all[NN_OUTPUT_DIM][NN_HIDDEN_DIM];  // per-output L2 grad for PCGrad
+    __shared__ float s_dz4_all[NN_OUTPUT_DIM][NN_HIDDEN_DIM];  // per-output L4 grad for PCGrad
     __shared__ float s_pcgrad_dot[NN_OUTPUT_DIM];  // reduction workspace for dot products
 
     // Read stats once
@@ -566,49 +657,55 @@ __global__ void nnSGDKernel(
     float stat_mad = static_cast<float>(d_stats->mad_normalized);
     float stat_deriv = static_cast<float>(d_stats->deriv_normalized);
 
-    // Encode data_size and error_bound
-    double eb_c = error_bound;
-    if (eb_c < 1e-7) eb_c = 1e-7;
-    float eb_enc = static_cast<float>(log10(eb_c));
-    double ds = static_cast<double>(data_size);
-    if (ds < 1.0) ds = 1.0;
-    float ds_enc = static_cast<float>(log2(ds));
+    // Use raw values for error_bound and data_size (no log encoding)
+    float eb_enc = static_cast<float>(error_bound);   // raw error_bound
+    float ds_enc = static_cast<float>(data_size);     // raw data_size in bytes
 
     // Zero this thread's gradient slice
-    // Thread t owns: dw1[t*15..t*15+14], db1[t],
-    //                dw2[t*128..t*128+127], db2[t],
-    //                dw3[out*128+t] for out=0..3, db3[t] (only t<4)
-    for (int i = 0; i < NN_INPUT_DIM; i++)
-        d_grad_buffer[SGD_OFF_DW1 + t * NN_INPUT_DIM + i] = 0.0f;
-    d_grad_buffer[SGD_OFF_DB1 + t] = 0.0f;
-    for (int i = 0; i < NN_HIDDEN_DIM; i++)
-        d_grad_buffer[SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i] = 0.0f;
-    d_grad_buffer[SGD_OFF_DB2 + t] = 0.0f;
-    for (int out = 0; out < NN_OUTPUT_DIM; out++)
-        d_grad_buffer[SGD_OFF_DW3 + out * NN_HIDDEN_DIM + t] = 0.0f;
-    if (t < NN_OUTPUT_DIM)
+    // Thread t (0..63) owns: dw1[t*8..t*8+7], db1[t],
+    //                        dw2[t*64..t*64+63], db2[t],
+    //                        dw3[t*64..t*64+63], db3[t],
+    //                        dw4[t*64..t*64+63], db4[t],
+    //                        dw5[out*64+t] for out=0..7, db5[t] (only t<8)
+    if (t < NN_HIDDEN_DIM) {
+        for (int i = 0; i < NN_INPUT_DIM; i++)
+            d_grad_buffer[SGD_OFF_DW1 + t * NN_INPUT_DIM + i] = 0.0f;
+        d_grad_buffer[SGD_OFF_DB1 + t] = 0.0f;
+        for (int i = 0; i < NN_HIDDEN_DIM; i++)
+            d_grad_buffer[SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i] = 0.0f;
+        d_grad_buffer[SGD_OFF_DB2 + t] = 0.0f;
+        for (int i = 0; i < NN_HIDDEN_DIM; i++)
+            d_grad_buffer[SGD_OFF_DW3 + t * NN_HIDDEN_DIM + i] = 0.0f;
         d_grad_buffer[SGD_OFF_DB3 + t] = 0.0f;
+        for (int i = 0; i < NN_HIDDEN_DIM; i++)
+            d_grad_buffer[SGD_OFF_DW4 + t * NN_HIDDEN_DIM + i] = 0.0f;
+        d_grad_buffer[SGD_OFF_DB4 + t] = 0.0f;
+        for (int out = 0; out < NN_OUTPUT_DIM; out++)
+            d_grad_buffer[SGD_OFF_DW5 + out * NN_HIDDEN_DIM + t] = 0.0f;
+    }
+    if (t < NN_OUTPUT_DIM)
+        d_grad_buffer[SGD_OFF_DB5 + t] = 0.0f;
     __syncthreads();
 
     // Per-sample loop
     for (int si = 0; si < num_samples; si++) {
         SGDSample sample = samples[si];
 
-        // Thread 0 builds standardized input → s_x[15]
+        // Thread 0 builds standardized input → s_x[8]
         if (t == 0) {
             int algo_idx = sample.action % 8;
             int quant = (sample.action / 8) % 2;
             int shuffle = (sample.action / 16) % 2;
 
             float raw[NN_INPUT_DIM];
-            for (int i = 0; i < 8; i++) raw[i] = (i == algo_idx) ? 1.0f : 0.0f;
-            raw[8] = static_cast<float>(quant);
-            raw[9] = static_cast<float>(shuffle);
-            raw[10] = eb_enc;
-            raw[11] = ds_enc;
-            raw[12] = stat_entropy;
-            raw[13] = stat_mad;
-            raw[14] = stat_deriv;
+            raw[0] = static_cast<float>(algo_idx);
+            raw[1] = static_cast<float>(quant);
+            raw[2] = static_cast<float>(shuffle);
+            raw[3] = eb_enc;
+            raw[4] = ds_enc;
+            raw[5] = stat_entropy;
+            raw[6] = stat_mad;
+            raw[7] = stat_deriv;
 
             for (int i = 0; i < NN_INPUT_DIM; i++) {
                 float std_val = weights->x_stds[i];
@@ -618,39 +715,56 @@ __global__ void nnSGDKernel(
         }
         __syncthreads();
 
-        // Forward L1: thread t computes h1[t]
-        {
+        // Forward L1: thread t computes h1[t] (threads 0..63 active)
+        if (t < NN_HIDDEN_DIM) {
             float sum = weights->b1[t];
-            for (int i = 0; i < NN_INPUT_DIM; i++) {
+            for (int i = 0; i < NN_INPUT_DIM; i++)
                 sum += weights->w1[t * NN_INPUT_DIM + i] * s_x[i];
-            }
             s_z1[t] = sum;
             s_h1[t] = (sum > 0.0f) ? sum : 0.0f;
         }
         __syncthreads();
 
         // Forward L2: thread t computes h2[t]
-        {
+        if (t < NN_HIDDEN_DIM) {
             float sum = weights->b2[t];
-            for (int i = 0; i < NN_HIDDEN_DIM; i++) {
+            for (int i = 0; i < NN_HIDDEN_DIM; i++)
                 sum += weights->w2[t * NN_HIDDEN_DIM + i] * s_h1[i];
-            }
             s_z2[t] = sum;
             s_h2[t] = (sum > 0.0f) ? sum : 0.0f;
         }
         __syncthreads();
 
-        // Forward L3: threads 0-3 compute y[out]
-        if (t < NN_OUTPUT_DIM) {
+        // Forward L3: thread t computes h3[t]
+        if (t < NN_HIDDEN_DIM) {
             float sum = weights->b3[t];
-            for (int i = 0; i < NN_HIDDEN_DIM; i++) {
+            for (int i = 0; i < NN_HIDDEN_DIM; i++)
                 sum += weights->w3[t * NN_HIDDEN_DIM + i] * s_h2[i];
-            }
+            s_z3[t] = sum;
+            s_h3[t] = (sum > 0.0f) ? sum : 0.0f;
+        }
+        __syncthreads();
+
+        // Forward L4: thread t computes h4[t]
+        if (t < NN_HIDDEN_DIM) {
+            float sum = weights->b4[t];
+            for (int i = 0; i < NN_HIDDEN_DIM; i++)
+                sum += weights->w4[t * NN_HIDDEN_DIM + i] * s_h3[i];
+            s_z4[t] = sum;
+            s_h4[t] = (sum > 0.0f) ? sum : 0.0f;
+        }
+        __syncthreads();
+
+        // Forward L5 (output): threads 0..7 compute y[out]
+        if (t < NN_OUTPUT_DIM) {
+            float sum = weights->b5[t];
+            for (int i = 0; i < NN_HIDDEN_DIM; i++)
+                sum += weights->w5[t * NN_HIDDEN_DIM + i] * s_h4[i];
             s_y[t] = sum;
         }
         __syncthreads();
 
-        // Thread 0 computes targets + output errors → s_d3[4]
+        // Thread 0 computes targets + output errors → s_d5[8] (first 4 used)
         if (t == 0) {
             // Clamp actual values to sane ranges BEFORE log1p encoding.
             // This prevents extreme out-of-distribution samples from
@@ -665,24 +779,24 @@ __global__ void nnSGDKernel(
             if (y_std2 < 1e-8f) y_std2 = 1e-8f;
             float target_ratio = (log1pf(clamped_ratio) - weights->y_means[2]) / y_std2;
 
-            s_d3[2] = s_y[2] - target_ratio;
+            s_d5[2] = s_y[2] - target_ratio;
 
             // Comp time (output 0)
             if (sample.actual_comp_time > 0.0f) {
                 float y_std0 = weights->y_stds[0];
                 if (y_std0 < 1e-8f) y_std0 = 1e-8f;
-                s_d3[0] = s_y[0] - (log1pf(clamped_comp_time) - weights->y_means[0]) / y_std0;
+                s_d5[0] = s_y[0] - (log1pf(clamped_comp_time) - weights->y_means[0]) / y_std0;
             } else {
-                s_d3[0] = 0.0f;
+                s_d5[0] = 0.0f;
             }
 
             // Decomp time (output 1)
             if (sample.actual_decomp_time > 0.0f) {
                 float y_std1 = weights->y_stds[1];
                 if (y_std1 < 1e-8f) y_std1 = 1e-8f;
-                s_d3[1] = s_y[1] - (log1pf(clamped_decomp) - weights->y_means[1]) / y_std1;
+                s_d5[1] = s_y[1] - (log1pf(clamped_decomp) - weights->y_means[1]) / y_std1;
             } else {
-                s_d3[1] = 0.0f;
+                s_d5[1] = 0.0f;
             }
 
             // PSNR (output 3) — skip gradient when psnr < 0 (sentinel for
@@ -694,11 +808,14 @@ __global__ void nnSGDKernel(
                     float clamped_psnr = fminf(psnr_val, 120.0f);
                     float y_std3 = weights->y_stds[3];
                     if (y_std3 < 1e-8f) y_std3 = 1e-8f;
-                    s_d3[3] = s_y[3] - (clamped_psnr - weights->y_means[3]) / y_std3;
+                    s_d5[3] = s_y[3] - (clamped_psnr - weights->y_means[3]) / y_std3;
                 } else {
-                    s_d3[3] = 0.0f;  // no PSNR gradient for non-quantized actions
+                    s_d5[3] = 0.0f;  // no PSNR gradient for non-quantized actions
                 }
             }
+
+            // Outputs 4-7 are additional quality metrics — zero gradient for SGD
+            for (int o = 4; o < NN_OUTPUT_DIM; o++) s_d5[o] = 0.0f;
 
             // Clamp per-output error signals (Huber-style gradient clipping).
             //
@@ -715,22 +832,22 @@ __global__ void nnSGDKernel(
             // a real prediction error.  Prevents noisy comp_time gradients from
             // destabilizing shared layers.
             constexpr float NOISE_GATE_THRESH = 0.10f;  // ~10% of a std-dev
-            if (fabsf(s_d3[0]) < NOISE_GATE_THRESH) s_d3[0] = 0.0f;
+            if (fabsf(s_d5[0]) < NOISE_GATE_THRESH) s_d5[0] = 0.0f;
 
             // Cache RAW (unclamped) errors for uncertainty weighting (Phase 1.5).
             // UW needs the true error magnitude to distinguish noisy from clean outputs.
             for (int o = 0; o < NN_OUTPUT_DIM; o++) {
-                s_d3_raw[si][o] = s_d3[o];
+                s_d5_raw[si][o] = s_d5[o];
             }
 
             constexpr float SGD_ERROR_DELTA = 0.5f;
             for (int o = 0; o < NN_OUTPUT_DIM; o++) {
-                s_d3[o] = fmaxf(-SGD_ERROR_DELTA, fminf(s_d3[o], SGD_ERROR_DELTA));
+                s_d5[o] = fmaxf(-SGD_ERROR_DELTA, fminf(s_d5[o], SGD_ERROR_DELTA));
             }
 
             // Cache clamped errors for Phase 2 backward pass.
             for (int o = 0; o < NN_OUTPUT_DIM; o++) {
-                s_d3_all[si][o] = s_d3[o];
+                s_d5_all[si][o] = s_d5[o];
             }
         }
         __syncthreads();
@@ -768,7 +885,7 @@ __global__ void nnSGDKernel(
             // raw error will drive very different log_var updates.
             float raw_mse = 0.0f;
             for (int si = 0; si < num_samples; si++) {
-                float e = s_d3_raw[si][o];
+                float e = s_d5_raw[si][o];
                 raw_mse += e * e;
             }
             raw_mse /= static_cast<float>(num_samples);
@@ -786,21 +903,21 @@ __global__ void nnSGDKernel(
 
             // Scale clamped errors by the uncertainty weight for backprop
             for (int si = 0; si < num_samples; si++)
-                s_d3_all[si][o] *= s_uw[o];
+                s_d5_all[si][o] *= s_uw[o];
         }
     }
     __syncthreads();
 
     // ================================================================
-    // Phase 2: Per-output backward passes through W2/W1
+    // Phase 2: Per-output backward passes through W4/W3/W2/W1
     //
     // Each output's error is backpropagated independently through the
     // shared hidden layers, with per-output gradient clipping.
     // Error signals are already scaled by uncertainty weights (Phase 1.5),
-    // so noisy outputs naturally contribute less to W1/W2 updates.
+    // so noisy outputs naturally contribute less to shared layer updates.
     //
     // Region 0 (d_grad_buffer[0..SGD_REGION-1]) = accumulator for
-    //   clipped weight deltas across all 4 outputs.
+    //   clipped weight deltas across all 8 outputs.
     // Region 1 (d_grad_buffer[SGD_REGION..2*SGD_REGION-1]) = per-output
     //   workspace, zeroed and reused for each output.
     //
@@ -814,21 +931,28 @@ __global__ void nnSGDKernel(
     const int WS = SGD_REGION;
 
     // Region 0 is already zeroed from the initial gradient zero (lines above).
-    // Phase 1 no longer accumulates W3 gradients, so region 0 is clean.
-    // It will accumulate clipped weight deltas from all 4 outputs.
+    // It will accumulate clipped weight deltas from all 8 outputs.
 
     for (int target_out = 0; target_out < NN_OUTPUT_DIM; target_out++) {
 
         // Zero region 1 workspace for this output
-        for (int i = 0; i < NN_INPUT_DIM; i++)
-            d_grad_buffer[WS + SGD_OFF_DW1 + t * NN_INPUT_DIM + i] = 0.0f;
-        d_grad_buffer[WS + SGD_OFF_DB1 + t] = 0.0f;
-        for (int i = 0; i < NN_HIDDEN_DIM; i++)
-            d_grad_buffer[WS + SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i] = 0.0f;
-        d_grad_buffer[WS + SGD_OFF_DB2 + t] = 0.0f;
-        d_grad_buffer[WS + SGD_OFF_DW3 + target_out * NN_HIDDEN_DIM + t] = 0.0f;
+        if (t < NN_HIDDEN_DIM) {
+            for (int i = 0; i < NN_INPUT_DIM; i++)
+                d_grad_buffer[WS + SGD_OFF_DW1 + t * NN_INPUT_DIM + i] = 0.0f;
+            d_grad_buffer[WS + SGD_OFF_DB1 + t] = 0.0f;
+            for (int i = 0; i < NN_HIDDEN_DIM; i++)
+                d_grad_buffer[WS + SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i] = 0.0f;
+            d_grad_buffer[WS + SGD_OFF_DB2 + t] = 0.0f;
+            for (int i = 0; i < NN_HIDDEN_DIM; i++)
+                d_grad_buffer[WS + SGD_OFF_DW3 + t * NN_HIDDEN_DIM + i] = 0.0f;
+            d_grad_buffer[WS + SGD_OFF_DB3 + t] = 0.0f;
+            for (int i = 0; i < NN_HIDDEN_DIM; i++)
+                d_grad_buffer[WS + SGD_OFF_DW4 + t * NN_HIDDEN_DIM + i] = 0.0f;
+            d_grad_buffer[WS + SGD_OFF_DB4 + t] = 0.0f;
+            d_grad_buffer[WS + SGD_OFF_DW5 + target_out * NN_HIDDEN_DIM + t] = 0.0f;
+        }
         if (t == 0)
-            d_grad_buffer[WS + SGD_OFF_DB3 + target_out] = 0.0f;
+            d_grad_buffer[WS + SGD_OFF_DB5 + target_out] = 0.0f;
         __syncthreads();
 
         for (int si = 0; si < num_samples; si++) {
@@ -841,14 +965,14 @@ __global__ void nnSGDKernel(
                 int shuffle = (sample.action / 16) % 2;
 
                 float raw[NN_INPUT_DIM];
-                for (int i = 0; i < 8; i++) raw[i] = (i == algo_idx) ? 1.0f : 0.0f;
-                raw[8] = static_cast<float>(quant);
-                raw[9] = static_cast<float>(shuffle);
-                raw[10] = eb_enc;
-                raw[11] = ds_enc;
-                raw[12] = stat_entropy;
-                raw[13] = stat_mad;
-                raw[14] = stat_deriv;
+                raw[0] = static_cast<float>(algo_idx);
+                raw[1] = static_cast<float>(quant);
+                raw[2] = static_cast<float>(shuffle);
+                raw[3] = eb_enc;
+                raw[4] = ds_enc;
+                raw[5] = stat_entropy;
+                raw[6] = stat_mad;
+                raw[7] = stat_deriv;
 
                 for (int i = 0; i < NN_INPUT_DIM; i++) {
                     float std_val = weights->x_stds[i];
@@ -859,7 +983,7 @@ __global__ void nnSGDKernel(
             __syncthreads();
 
             // Forward L1
-            {
+            if (t < NN_HIDDEN_DIM) {
                 float sum = weights->b1[t];
                 for (int i = 0; i < NN_INPUT_DIM; i++)
                     sum += weights->w1[t * NN_INPUT_DIM + i] * s_x[i];
@@ -869,7 +993,7 @@ __global__ void nnSGDKernel(
             __syncthreads();
 
             // Forward L2
-            {
+            if (t < NN_HIDDEN_DIM) {
                 float sum = weights->b2[t];
                 for (int i = 0; i < NN_HIDDEN_DIM; i++)
                     sum += weights->w2[t * NN_HIDDEN_DIM + i] * s_h1[i];
@@ -878,21 +1002,41 @@ __global__ void nnSGDKernel(
             }
             __syncthreads();
 
+            // Forward L3
+            if (t < NN_HIDDEN_DIM) {
+                float sum = weights->b3[t];
+                for (int i = 0; i < NN_HIDDEN_DIM; i++)
+                    sum += weights->w3[t * NN_HIDDEN_DIM + i] * s_h2[i];
+                s_z3[t] = sum;
+                s_h3[t] = (sum > 0.0f) ? sum : 0.0f;
+            }
+            __syncthreads();
+
+            // Forward L4
+            if (t < NN_HIDDEN_DIM) {
+                float sum = weights->b4[t];
+                for (int i = 0; i < NN_HIDDEN_DIM; i++)
+                    sum += weights->w4[t * NN_HIDDEN_DIM + i] * s_h3[i];
+                s_z4[t] = sum;
+                s_h4[t] = (sum > 0.0f) ? sum : 0.0f;
+            }
+            __syncthreads();
+
             // ────────────────────────────────────────────────────────
-            // PCGrad-Lite: compute L3→L2 backward for ALL outputs,
+            // PCGrad-Lite: compute L5→L4 backward for ALL outputs,
             // project conflicting gradients, then continue backward.
             // ────────────────────────────────────────────────────────
 
-            // Step 1: Compute s_dz2 for ALL outputs and normalize.
+            // Step 1: Compute s_dz4 for ALL outputs and normalize.
             //
             // Normalization makes projection scale-invariant: a large-magnitude
             // output can't dominate the projection just because its gradient is
             // bigger.  After projection, we rescale back to the original magnitude.
-            {
+            if (t < NN_HIDDEN_DIM) {
                 for (int o = 0; o < NN_OUTPUT_DIM; o++) {
-                    float es = s_d3_all[si][o];
-                    float dh2_t = weights->w3[o * NN_HIDDEN_DIM + t] * es;
-                    s_dz2_all[o][t] = (s_z2[t] > 0.0f) ? dh2_t : 0.0f;
+                    float es = s_d5_all[si][o];
+                    float dh4_t = weights->w5[o * NN_HIDDEN_DIM + t] * es;
+                    s_dz4_all[o][t] = (s_z4[t] > 0.0f) ? dh4_t : 0.0f;
                 }
             }
             __syncthreads();
@@ -900,9 +1044,9 @@ __global__ void nnSGDKernel(
             // Normalize per-output gradients to unit vectors for PCGrad.
             // After projection, rescale by |error| (not gradient norm) so the
             // update magnitude reflects how wrong each output is, not how
-            // large W3 happens to make the gradient.
+            // large W5 happens to make the gradient.
             for (int o = 0; o < NN_OUTPUT_DIM; o++) {
-                float local_nsq = s_dz2_all[o][t] * s_dz2_all[o][t];
+                float local_nsq = s_dz4_all[o][t] * s_dz4_all[o][t];
                 s_reduce[t] = local_nsq;
                 __syncthreads();
                 for (int s = NN_HIDDEN_DIM / 2; s > 0; s >>= 1) {
@@ -910,9 +1054,9 @@ __global__ void nnSGDKernel(
                     __syncthreads();
                 }
                 float norm_o = sqrtf(s_reduce[0]) + 1e-6f;
-                if (t < NN_OUTPUT_DIM && t == o)
-                    s_pcgrad_dot[o] = fabsf(s_d3_all[si][o]);  // error magnitude for rescaling
-                s_dz2_all[o][t] /= norm_o;    // normalize to unit vector
+                if (t == o)
+                    s_pcgrad_dot[o] = fabsf(s_d5_all[si][o]);  // error magnitude for rescaling
+                s_dz4_all[o][t] /= norm_o;    // normalize to unit vector
                 __syncthreads();
             }
 
@@ -924,13 +1068,13 @@ __global__ void nnSGDKernel(
             // reacting to noise in single-sample SGD.
             constexpr float PCGRAD_COS_THRESH = -0.1f;  // only project if cos < -0.1
             {
-                float my_dz2 = s_dz2_all[target_out][t];
+                float my_dz4 = s_dz4_all[target_out][t];
 
                 for (int j = 0; j < NN_OUTPUT_DIM; j++) {
                     if (j == target_out) continue;
 
                     // Cosine similarity (vectors are unit-normalized)
-                    float local_dot = my_dz2 * s_dz2_all[j][t];
+                    float local_dot = my_dz4 * s_dz4_all[j][t];
                     s_reduce[t] = local_dot;
                     __syncthreads();
                     for (int s = NN_HIDDEN_DIM / 2; s > 0; s >>= 1) {
@@ -943,46 +1087,86 @@ __global__ void nnSGDKernel(
                     if (cos_ij < PCGRAD_COS_THRESH) {
                         // Vectors are unit-normalized → ||g_j||² = 1.0
                         // So projection simplifies to: g_i -= dot * g_j
-                        my_dz2 -= cos_ij * s_dz2_all[j][t];
+                        my_dz4 -= cos_ij * s_dz4_all[j][t];
                     }
                     __syncthreads();
                 }
 
                 // Rescale projected gradient back to original magnitude
-                s_dz2[t] = my_dz2 * s_pcgrad_dot[target_out];
+                s_dz4[t] = my_dz4 * s_pcgrad_dot[target_out];
             }
             __syncthreads();
 
-            // Step 3: Accumulate W3 gradient (uses ORIGINAL error_signal, not projected)
-            {
-                float error_signal = s_d3_all[si][target_out];
-                d_grad_buffer[WS + SGD_OFF_DW3 + target_out * NN_HIDDEN_DIM + t] +=
-                    error_signal * s_h2[t];
-                if (t == 0) {
-                    d_grad_buffer[WS + SGD_OFF_DB3 + target_out] += error_signal;
-                }
+            // Step 3: Accumulate W5 gradient (uses ORIGINAL error_signal, not projected)
+            if (t < NN_HIDDEN_DIM) {
+                float error_signal = s_d5_all[si][target_out];
+                d_grad_buffer[WS + SGD_OFF_DW5 + target_out * NN_HIDDEN_DIM + t] +=
+                    error_signal * s_h4[t];
+            }
+            if (t == 0) {
+                float error_signal = s_d5_all[si][target_out];
+                d_grad_buffer[WS + SGD_OFF_DB5 + target_out] += error_signal;
             }
 
-            // Step 4: Accumulate L2 gradients using PROJECTED s_dz2
-            for (int i = 0; i < NN_HIDDEN_DIM; i++) {
-                d_grad_buffer[WS + SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i] += s_dz2[t] * s_h1[i];
+            // Step 4: Accumulate L4 gradients using PROJECTED s_dz4
+            if (t < NN_HIDDEN_DIM) {
+                for (int i = 0; i < NN_HIDDEN_DIM; i++)
+                    d_grad_buffer[WS + SGD_OFF_DW4 + t * NN_HIDDEN_DIM + i] += s_dz4[t] * s_h3[i];
+                d_grad_buffer[WS + SGD_OFF_DB4 + t] += s_dz4[t];
             }
-            d_grad_buffer[WS + SGD_OFF_DB2 + t] += s_dz2[t];
 
-            // Step 5: Backward L2→L1 using PROJECTED s_dz2
-            float dz1_t;
-            {
+            // Step 4b: Backward L4→L3 using PROJECTED s_dz4
+            float dz3_t = 0.0f;
+            if (t < NN_HIDDEN_DIM) {
+                float dh3_t = 0.0f;
+                for (int j = 0; j < NN_HIDDEN_DIM; j++)
+                    dh3_t += weights->w4[j * NN_HIDDEN_DIM + t] * s_dz4[j];
+                dz3_t = (s_z3[t] > 0.0f) ? dh3_t : 0.0f;
+            }
+            // Store dz3 in shared mem for subsequent backward steps
+            if (t < NN_HIDDEN_DIM) s_dz3[t] = dz3_t;
+            __syncthreads();
+
+            // Step 4c: Accumulate L3 gradients
+            if (t < NN_HIDDEN_DIM) {
+                for (int i = 0; i < NN_HIDDEN_DIM; i++)
+                    d_grad_buffer[WS + SGD_OFF_DW3 + t * NN_HIDDEN_DIM + i] += s_dz3[t] * s_h2[i];
+                d_grad_buffer[WS + SGD_OFF_DB3 + t] += s_dz3[t];
+            }
+
+            // Step 5: Backward L3→L2 using s_dz3
+            float dz2_t = 0.0f;
+            if (t < NN_HIDDEN_DIM) {
+                float dh2_t = 0.0f;
+                for (int j = 0; j < NN_HIDDEN_DIM; j++)
+                    dh2_t += weights->w3[j * NN_HIDDEN_DIM + t] * s_dz3[j];
+                dz2_t = (s_z2[t] > 0.0f) ? dh2_t : 0.0f;
+            }
+            if (t < NN_HIDDEN_DIM) s_dz2b[t] = dz2_t;
+            __syncthreads();
+
+            // Step 5b: Accumulate L2 gradients
+            if (t < NN_HIDDEN_DIM) {
+                for (int i = 0; i < NN_HIDDEN_DIM; i++)
+                    d_grad_buffer[WS + SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i] += s_dz2b[t] * s_h1[i];
+                d_grad_buffer[WS + SGD_OFF_DB2 + t] += s_dz2b[t];
+            }
+
+            // Step 6: Backward L2→L1
+            float dz1_t = 0.0f;
+            if (t < NN_HIDDEN_DIM) {
                 float dh1_t = 0.0f;
                 for (int j = 0; j < NN_HIDDEN_DIM; j++)
-                    dh1_t += weights->w2[j * NN_HIDDEN_DIM + t] * s_dz2[j];
+                    dh1_t += weights->w2[j * NN_HIDDEN_DIM + t] * s_dz2b[j];
                 dz1_t = (s_z1[t] > 0.0f) ? dh1_t : 0.0f;
             }
 
-            // Step 6: Accumulate L1 gradients
-            for (int i = 0; i < NN_INPUT_DIM; i++) {
-                d_grad_buffer[WS + SGD_OFF_DW1 + t * NN_INPUT_DIM + i] += dz1_t * s_x[i];
+            // Step 6b: Accumulate L1 gradients
+            if (t < NN_HIDDEN_DIM) {
+                for (int i = 0; i < NN_INPUT_DIM; i++)
+                    d_grad_buffer[WS + SGD_OFF_DW1 + t * NN_INPUT_DIM + i] += dz1_t * s_x[i];
+                d_grad_buffer[WS + SGD_OFF_DB1 + t] += dz1_t;
             }
-            d_grad_buffer[WS + SGD_OFF_DB1 + t] += dz1_t;
 
             __syncthreads();
         }
@@ -991,35 +1175,56 @@ __global__ void nnSGDKernel(
         float inv_n = 1.0f / static_cast<float>(num_samples);
         float local_norm_sq = 0.0f;
 
-        for (int i = 0; i < NN_INPUT_DIM; i++) {
-            int idx = WS + SGD_OFF_DW1 + t * NN_INPUT_DIM + i;
-            d_grad_buffer[idx] *= inv_n;
-            local_norm_sq += d_grad_buffer[idx] * d_grad_buffer[idx];
+        if (t < NN_HIDDEN_DIM) {
+            for (int i = 0; i < NN_INPUT_DIM; i++) {
+                int idx = WS + SGD_OFF_DW1 + t * NN_INPUT_DIM + i;
+                d_grad_buffer[idx] *= inv_n;
+                local_norm_sq += d_grad_buffer[idx] * d_grad_buffer[idx];
+            }
+            {
+                int idx = WS + SGD_OFF_DB1 + t;
+                d_grad_buffer[idx] *= inv_n;
+                local_norm_sq += d_grad_buffer[idx] * d_grad_buffer[idx];
+            }
+            for (int i = 0; i < NN_HIDDEN_DIM; i++) {
+                int idx = WS + SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i;
+                d_grad_buffer[idx] *= inv_n;
+                local_norm_sq += d_grad_buffer[idx] * d_grad_buffer[idx];
+            }
+            {
+                int idx = WS + SGD_OFF_DB2 + t;
+                d_grad_buffer[idx] *= inv_n;
+                local_norm_sq += d_grad_buffer[idx] * d_grad_buffer[idx];
+            }
+            for (int i = 0; i < NN_HIDDEN_DIM; i++) {
+                int idx = WS + SGD_OFF_DW3 + t * NN_HIDDEN_DIM + i;
+                d_grad_buffer[idx] *= inv_n;
+                local_norm_sq += d_grad_buffer[idx] * d_grad_buffer[idx];
+            }
+            {
+                int idx = WS + SGD_OFF_DB3 + t;
+                d_grad_buffer[idx] *= inv_n;
+                local_norm_sq += d_grad_buffer[idx] * d_grad_buffer[idx];
+            }
+            for (int i = 0; i < NN_HIDDEN_DIM; i++) {
+                int idx = WS + SGD_OFF_DW4 + t * NN_HIDDEN_DIM + i;
+                d_grad_buffer[idx] *= inv_n;
+                local_norm_sq += d_grad_buffer[idx] * d_grad_buffer[idx];
+            }
+            {
+                int idx = WS + SGD_OFF_DB4 + t;
+                d_grad_buffer[idx] *= inv_n;
+                local_norm_sq += d_grad_buffer[idx] * d_grad_buffer[idx];
+            }
+            // Include W5 gradient for this output (from workspace)
+            {
+                int idx = WS + SGD_OFF_DW5 + target_out * NN_HIDDEN_DIM + t;
+                d_grad_buffer[idx] *= inv_n;
+                local_norm_sq += d_grad_buffer[idx] * d_grad_buffer[idx];
+            }
         }
-        {
-            int idx = WS + SGD_OFF_DB1 + t;
-            d_grad_buffer[idx] *= inv_n;
-            local_norm_sq += d_grad_buffer[idx] * d_grad_buffer[idx];
-        }
-        for (int i = 0; i < NN_HIDDEN_DIM; i++) {
-            int idx = WS + SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i;
-            d_grad_buffer[idx] *= inv_n;
-            local_norm_sq += d_grad_buffer[idx] * d_grad_buffer[idx];
-        }
-        {
-            int idx = WS + SGD_OFF_DB2 + t;
-            d_grad_buffer[idx] *= inv_n;
-            local_norm_sq += d_grad_buffer[idx] * d_grad_buffer[idx];
-        }
-
-        // Include W3 gradient for this output (from workspace)
-        {
-            int idx = WS + SGD_OFF_DW3 + target_out * NN_HIDDEN_DIM + t;
-            d_grad_buffer[idx] *= inv_n;
-            local_norm_sq += d_grad_buffer[idx] * d_grad_buffer[idx];
-        }
-        if (t == target_out) {
-            int idx = WS + SGD_OFF_DB3 + target_out;
+        if (t == target_out && t < NN_OUTPUT_DIM) {
+            int idx = WS + SGD_OFF_DB5 + target_out;
             d_grad_buffer[idx] *= inv_n;
             local_norm_sq += d_grad_buffer[idx] * d_grad_buffer[idx];
         }
@@ -1038,25 +1243,38 @@ __global__ void nnSGDKernel(
         total_norm += out_norm;
 
         // Accumulate clipped weight deltas into region 0 (deferred update)
-        for (int i = 0; i < NN_INPUT_DIM; i++) {
-            d_grad_buffer[SGD_OFF_DW1 + t * NN_INPUT_DIM + i] +=
-                lr_out * d_grad_buffer[WS + SGD_OFF_DW1 + t * NN_INPUT_DIM + i];
+        if (t < NN_HIDDEN_DIM) {
+            for (int i = 0; i < NN_INPUT_DIM; i++) {
+                d_grad_buffer[SGD_OFF_DW1 + t * NN_INPUT_DIM + i] +=
+                    lr_out * d_grad_buffer[WS + SGD_OFF_DW1 + t * NN_INPUT_DIM + i];
+            }
+            d_grad_buffer[SGD_OFF_DB1 + t] +=
+                lr_out * d_grad_buffer[WS + SGD_OFF_DB1 + t];
+            for (int i = 0; i < NN_HIDDEN_DIM; i++) {
+                d_grad_buffer[SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i] +=
+                    lr_out * d_grad_buffer[WS + SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i];
+            }
+            d_grad_buffer[SGD_OFF_DB2 + t] +=
+                lr_out * d_grad_buffer[WS + SGD_OFF_DB2 + t];
+            for (int i = 0; i < NN_HIDDEN_DIM; i++) {
+                d_grad_buffer[SGD_OFF_DW3 + t * NN_HIDDEN_DIM + i] +=
+                    lr_out * d_grad_buffer[WS + SGD_OFF_DW3 + t * NN_HIDDEN_DIM + i];
+            }
+            d_grad_buffer[SGD_OFF_DB3 + t] +=
+                lr_out * d_grad_buffer[WS + SGD_OFF_DB3 + t];
+            for (int i = 0; i < NN_HIDDEN_DIM; i++) {
+                d_grad_buffer[SGD_OFF_DW4 + t * NN_HIDDEN_DIM + i] +=
+                    lr_out * d_grad_buffer[WS + SGD_OFF_DW4 + t * NN_HIDDEN_DIM + i];
+            }
+            d_grad_buffer[SGD_OFF_DB4 + t] +=
+                lr_out * d_grad_buffer[WS + SGD_OFF_DB4 + t];
+            // W5/b5 for this output
+            d_grad_buffer[SGD_OFF_DW5 + target_out * NN_HIDDEN_DIM + t] +=
+                lr_out * d_grad_buffer[WS + SGD_OFF_DW5 + target_out * NN_HIDDEN_DIM + t];
         }
-        d_grad_buffer[SGD_OFF_DB1 + t] +=
-            lr_out * d_grad_buffer[WS + SGD_OFF_DB1 + t];
-        for (int i = 0; i < NN_HIDDEN_DIM; i++) {
-            d_grad_buffer[SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i] +=
-                lr_out * d_grad_buffer[WS + SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i];
-        }
-        d_grad_buffer[SGD_OFF_DB2 + t] +=
-            lr_out * d_grad_buffer[WS + SGD_OFF_DB2 + t];
-
-        // W3/b3 for this output
-        d_grad_buffer[SGD_OFF_DW3 + target_out * NN_HIDDEN_DIM + t] +=
-            lr_out * d_grad_buffer[WS + SGD_OFF_DW3 + target_out * NN_HIDDEN_DIM + t];
-        if (t == target_out) {
-            d_grad_buffer[SGD_OFF_DB3 + target_out] +=
-                lr_out * d_grad_buffer[WS + SGD_OFF_DB3 + target_out];
+        if (t == target_out && t < NN_OUTPUT_DIM) {
+            d_grad_buffer[SGD_OFF_DB5 + target_out] +=
+                lr_out * d_grad_buffer[WS + SGD_OFF_DB5 + target_out];
         }
 
         __syncthreads();
@@ -1077,22 +1295,34 @@ __global__ void nnSGDKernel(
     {
         // Step 5: Compute gradient norm for trust-region scaling
         float local_norm_sq = 0.0f;
-        for (int i = 0; i < NN_INPUT_DIM; i++) {
-            float v = d_grad_buffer[SGD_OFF_DW1 + t * NN_INPUT_DIM + i];
-            local_norm_sq += v * v;
-        }
-        local_norm_sq += d_grad_buffer[SGD_OFF_DB1 + t] * d_grad_buffer[SGD_OFF_DB1 + t];
-        for (int i = 0; i < NN_HIDDEN_DIM; i++) {
-            float v = d_grad_buffer[SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i];
-            local_norm_sq += v * v;
-        }
-        local_norm_sq += d_grad_buffer[SGD_OFF_DB2 + t] * d_grad_buffer[SGD_OFF_DB2 + t];
-        for (int out = 0; out < NN_OUTPUT_DIM; out++) {
-            float v = d_grad_buffer[SGD_OFF_DW3 + out * NN_HIDDEN_DIM + t];
-            local_norm_sq += v * v;
+        if (t < NN_HIDDEN_DIM) {
+            for (int i = 0; i < NN_INPUT_DIM; i++) {
+                float v = d_grad_buffer[SGD_OFF_DW1 + t * NN_INPUT_DIM + i];
+                local_norm_sq += v * v;
+            }
+            local_norm_sq += d_grad_buffer[SGD_OFF_DB1 + t] * d_grad_buffer[SGD_OFF_DB1 + t];
+            for (int i = 0; i < NN_HIDDEN_DIM; i++) {
+                float v = d_grad_buffer[SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i];
+                local_norm_sq += v * v;
+            }
+            local_norm_sq += d_grad_buffer[SGD_OFF_DB2 + t] * d_grad_buffer[SGD_OFF_DB2 + t];
+            for (int i = 0; i < NN_HIDDEN_DIM; i++) {
+                float v = d_grad_buffer[SGD_OFF_DW3 + t * NN_HIDDEN_DIM + i];
+                local_norm_sq += v * v;
+            }
+            local_norm_sq += d_grad_buffer[SGD_OFF_DB3 + t] * d_grad_buffer[SGD_OFF_DB3 + t];
+            for (int i = 0; i < NN_HIDDEN_DIM; i++) {
+                float v = d_grad_buffer[SGD_OFF_DW4 + t * NN_HIDDEN_DIM + i];
+                local_norm_sq += v * v;
+            }
+            local_norm_sq += d_grad_buffer[SGD_OFF_DB4 + t] * d_grad_buffer[SGD_OFF_DB4 + t];
+            for (int out = 0; out < NN_OUTPUT_DIM; out++) {
+                float v = d_grad_buffer[SGD_OFF_DW5 + out * NN_HIDDEN_DIM + t];
+                local_norm_sq += v * v;
+            }
         }
         if (t < NN_OUTPUT_DIM) {
-            local_norm_sq += d_grad_buffer[SGD_OFF_DB3 + t] * d_grad_buffer[SGD_OFF_DB3 + t];
+            local_norm_sq += d_grad_buffer[SGD_OFF_DB5 + t] * d_grad_buffer[SGD_OFF_DB5 + t];
         }
 
         s_reduce[t] = local_norm_sq;
@@ -1105,16 +1335,24 @@ __global__ void nnSGDKernel(
 
         // Normalize gradient to unit vector (trust-region: decouple direction from magnitude)
         float inv_norm = 1.0f / g_norm;
-        for (int i = 0; i < NN_INPUT_DIM; i++)
-            d_grad_buffer[SGD_OFF_DW1 + t * NN_INPUT_DIM + i] *= inv_norm;
-        d_grad_buffer[SGD_OFF_DB1 + t] *= inv_norm;
-        for (int i = 0; i < NN_HIDDEN_DIM; i++)
-            d_grad_buffer[SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i] *= inv_norm;
-        d_grad_buffer[SGD_OFF_DB2 + t] *= inv_norm;
-        for (int out = 0; out < NN_OUTPUT_DIM; out++)
-            d_grad_buffer[SGD_OFF_DW3 + out * NN_HIDDEN_DIM + t] *= inv_norm;
-        if (t < NN_OUTPUT_DIM)
+        if (t < NN_HIDDEN_DIM) {
+            for (int i = 0; i < NN_INPUT_DIM; i++)
+                d_grad_buffer[SGD_OFF_DW1 + t * NN_INPUT_DIM + i] *= inv_norm;
+            d_grad_buffer[SGD_OFF_DB1 + t] *= inv_norm;
+            for (int i = 0; i < NN_HIDDEN_DIM; i++)
+                d_grad_buffer[SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i] *= inv_norm;
+            d_grad_buffer[SGD_OFF_DB2 + t] *= inv_norm;
+            for (int i = 0; i < NN_HIDDEN_DIM; i++)
+                d_grad_buffer[SGD_OFF_DW3 + t * NN_HIDDEN_DIM + i] *= inv_norm;
             d_grad_buffer[SGD_OFF_DB3 + t] *= inv_norm;
+            for (int i = 0; i < NN_HIDDEN_DIM; i++)
+                d_grad_buffer[SGD_OFF_DW4 + t * NN_HIDDEN_DIM + i] *= inv_norm;
+            d_grad_buffer[SGD_OFF_DB4 + t] *= inv_norm;
+            for (int out = 0; out < NN_OUTPUT_DIM; out++)
+                d_grad_buffer[SGD_OFF_DW5 + out * NN_HIDDEN_DIM + t] *= inv_norm;
+        }
+        if (t < NN_OUTPUT_DIM)
+            d_grad_buffer[SGD_OFF_DB5 + t] *= inv_norm;
         __syncthreads();
 
         // Step 5 continued: Trust-region step size = k * avg_error, clamped
@@ -1125,7 +1363,7 @@ __global__ void nnSGDKernel(
             int count = 0;
             for (int si = 0; si < num_samples; si++) {
                 for (int o = 0; o < NN_OUTPUT_DIM; o++) {
-                    float e = fabsf(s_d3_raw[si][o]);
+                    float e = fabsf(s_d5_raw[si][o]);
                     if (e > 0.0f) { sum_err += e; count++; }
                 }
             }
@@ -1140,16 +1378,28 @@ __global__ void nnSGDKernel(
         // If they point in opposite directions, damp the step.
         // Use region 2 (EMA) as the "previous direction" reference.
         float local_dot_ema = 0.0f;
-        for (int i = 0; i < NN_INPUT_DIM; i++)
-            local_dot_ema += d_grad_buffer[SGD_OFF_DW1 + t * NN_INPUT_DIM + i]
-                           * d_grad_buffer[EMA_REGION + SGD_OFF_DW1 + t * NN_INPUT_DIM + i];
-        local_dot_ema += d_grad_buffer[SGD_OFF_DB1 + t]
-                       * d_grad_buffer[EMA_REGION + SGD_OFF_DB1 + t];
-        for (int i = 0; i < NN_HIDDEN_DIM; i++)
-            local_dot_ema += d_grad_buffer[SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i]
-                           * d_grad_buffer[EMA_REGION + SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i];
-        local_dot_ema += d_grad_buffer[SGD_OFF_DB2 + t]
-                       * d_grad_buffer[EMA_REGION + SGD_OFF_DB2 + t];
+        if (t < NN_HIDDEN_DIM) {
+            for (int i = 0; i < NN_INPUT_DIM; i++)
+                local_dot_ema += d_grad_buffer[SGD_OFF_DW1 + t * NN_INPUT_DIM + i]
+                               * d_grad_buffer[EMA_REGION + SGD_OFF_DW1 + t * NN_INPUT_DIM + i];
+            local_dot_ema += d_grad_buffer[SGD_OFF_DB1 + t]
+                           * d_grad_buffer[EMA_REGION + SGD_OFF_DB1 + t];
+            for (int i = 0; i < NN_HIDDEN_DIM; i++)
+                local_dot_ema += d_grad_buffer[SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i]
+                               * d_grad_buffer[EMA_REGION + SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i];
+            local_dot_ema += d_grad_buffer[SGD_OFF_DB2 + t]
+                           * d_grad_buffer[EMA_REGION + SGD_OFF_DB2 + t];
+            for (int i = 0; i < NN_HIDDEN_DIM; i++)
+                local_dot_ema += d_grad_buffer[SGD_OFF_DW3 + t * NN_HIDDEN_DIM + i]
+                               * d_grad_buffer[EMA_REGION + SGD_OFF_DW3 + t * NN_HIDDEN_DIM + i];
+            local_dot_ema += d_grad_buffer[SGD_OFF_DB3 + t]
+                           * d_grad_buffer[EMA_REGION + SGD_OFF_DB3 + t];
+            for (int i = 0; i < NN_HIDDEN_DIM; i++)
+                local_dot_ema += d_grad_buffer[SGD_OFF_DW4 + t * NN_HIDDEN_DIM + i]
+                               * d_grad_buffer[EMA_REGION + SGD_OFF_DW4 + t * NN_HIDDEN_DIM + i];
+            local_dot_ema += d_grad_buffer[SGD_OFF_DB4 + t]
+                           * d_grad_buffer[EMA_REGION + SGD_OFF_DB4 + t];
+        }
 
         s_reduce[t] = local_dot_ema;
         __syncthreads();
@@ -1172,52 +1422,88 @@ __global__ void nnSGDKernel(
         float ema_new = 1.0f - EMA_DECAY;
         {
             // Sanitize region 0 (current gradient) — zero any NaN/Inf entries
+            if (t < NN_HIDDEN_DIM) {
+                for (int i = 0; i < NN_INPUT_DIM; i++) {
+                    int idx = SGD_OFF_DW1 + t * NN_INPUT_DIM + i;
+                    if (!isfinite(d_grad_buffer[idx])) d_grad_buffer[idx] = 0.0f;
+                }
+                if (!isfinite(d_grad_buffer[SGD_OFF_DB1 + t]))
+                    d_grad_buffer[SGD_OFF_DB1 + t] = 0.0f;
+                for (int i = 0; i < NN_HIDDEN_DIM; i++) {
+                    int idx = SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i;
+                    if (!isfinite(d_grad_buffer[idx])) d_grad_buffer[idx] = 0.0f;
+                }
+                if (!isfinite(d_grad_buffer[SGD_OFF_DB2 + t]))
+                    d_grad_buffer[SGD_OFF_DB2 + t] = 0.0f;
+                for (int i = 0; i < NN_HIDDEN_DIM; i++) {
+                    int idx = SGD_OFF_DW3 + t * NN_HIDDEN_DIM + i;
+                    if (!isfinite(d_grad_buffer[idx])) d_grad_buffer[idx] = 0.0f;
+                }
+                if (!isfinite(d_grad_buffer[SGD_OFF_DB3 + t]))
+                    d_grad_buffer[SGD_OFF_DB3 + t] = 0.0f;
+                for (int i = 0; i < NN_HIDDEN_DIM; i++) {
+                    int idx = SGD_OFF_DW4 + t * NN_HIDDEN_DIM + i;
+                    if (!isfinite(d_grad_buffer[idx])) d_grad_buffer[idx] = 0.0f;
+                }
+                if (!isfinite(d_grad_buffer[SGD_OFF_DB4 + t]))
+                    d_grad_buffer[SGD_OFF_DB4 + t] = 0.0f;
+                for (int out = 0; out < NN_OUTPUT_DIM; out++) {
+                    int idx = SGD_OFF_DW5 + out * NN_HIDDEN_DIM + t;
+                    if (!isfinite(d_grad_buffer[idx])) d_grad_buffer[idx] = 0.0f;
+                }
+            }
+            if (t < NN_OUTPUT_DIM && !isfinite(d_grad_buffer[SGD_OFF_DB5 + t]))
+                d_grad_buffer[SGD_OFF_DB5 + t] = 0.0f;
+        }
+        if (t < NN_HIDDEN_DIM) {
             for (int i = 0; i < NN_INPUT_DIM; i++) {
                 int idx = SGD_OFF_DW1 + t * NN_INPUT_DIM + i;
-                if (!isfinite(d_grad_buffer[idx])) d_grad_buffer[idx] = 0.0f;
+                d_grad_buffer[EMA_REGION + idx] = EMA_DECAY * d_grad_buffer[EMA_REGION + idx]
+                                                + ema_new * d_grad_buffer[idx];
             }
-            if (!isfinite(d_grad_buffer[SGD_OFF_DB1 + t]))
-                d_grad_buffer[SGD_OFF_DB1 + t] = 0.0f;
+            {
+                int idx = SGD_OFF_DB1 + t;
+                d_grad_buffer[EMA_REGION + idx] = EMA_DECAY * d_grad_buffer[EMA_REGION + idx]
+                                                + ema_new * d_grad_buffer[idx];
+            }
             for (int i = 0; i < NN_HIDDEN_DIM; i++) {
                 int idx = SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i;
-                if (!isfinite(d_grad_buffer[idx])) d_grad_buffer[idx] = 0.0f;
+                d_grad_buffer[EMA_REGION + idx] = EMA_DECAY * d_grad_buffer[EMA_REGION + idx]
+                                                + ema_new * d_grad_buffer[idx];
             }
-            if (!isfinite(d_grad_buffer[SGD_OFF_DB2 + t]))
-                d_grad_buffer[SGD_OFF_DB2 + t] = 0.0f;
+            {
+                int idx = SGD_OFF_DB2 + t;
+                d_grad_buffer[EMA_REGION + idx] = EMA_DECAY * d_grad_buffer[EMA_REGION + idx]
+                                                + ema_new * d_grad_buffer[idx];
+            }
+            for (int i = 0; i < NN_HIDDEN_DIM; i++) {
+                int idx = SGD_OFF_DW3 + t * NN_HIDDEN_DIM + i;
+                d_grad_buffer[EMA_REGION + idx] = EMA_DECAY * d_grad_buffer[EMA_REGION + idx]
+                                                + ema_new * d_grad_buffer[idx];
+            }
+            {
+                int idx = SGD_OFF_DB3 + t;
+                d_grad_buffer[EMA_REGION + idx] = EMA_DECAY * d_grad_buffer[EMA_REGION + idx]
+                                                + ema_new * d_grad_buffer[idx];
+            }
+            for (int i = 0; i < NN_HIDDEN_DIM; i++) {
+                int idx = SGD_OFF_DW4 + t * NN_HIDDEN_DIM + i;
+                d_grad_buffer[EMA_REGION + idx] = EMA_DECAY * d_grad_buffer[EMA_REGION + idx]
+                                                + ema_new * d_grad_buffer[idx];
+            }
+            {
+                int idx = SGD_OFF_DB4 + t;
+                d_grad_buffer[EMA_REGION + idx] = EMA_DECAY * d_grad_buffer[EMA_REGION + idx]
+                                                + ema_new * d_grad_buffer[idx];
+            }
             for (int out = 0; out < NN_OUTPUT_DIM; out++) {
-                int idx = SGD_OFF_DW3 + out * NN_HIDDEN_DIM + t;
-                if (!isfinite(d_grad_buffer[idx])) d_grad_buffer[idx] = 0.0f;
+                int idx = SGD_OFF_DW5 + out * NN_HIDDEN_DIM + t;
+                d_grad_buffer[EMA_REGION + idx] = EMA_DECAY * d_grad_buffer[EMA_REGION + idx]
+                                                + ema_new * d_grad_buffer[idx];
             }
-            if (t < NN_OUTPUT_DIM && !isfinite(d_grad_buffer[SGD_OFF_DB3 + t]))
-                d_grad_buffer[SGD_OFF_DB3 + t] = 0.0f;
-        }
-        for (int i = 0; i < NN_INPUT_DIM; i++) {
-            int idx = SGD_OFF_DW1 + t * NN_INPUT_DIM + i;
-            d_grad_buffer[EMA_REGION + idx] = EMA_DECAY * d_grad_buffer[EMA_REGION + idx]
-                                            + ema_new * d_grad_buffer[idx];
-        }
-        {
-            int idx = SGD_OFF_DB1 + t;
-            d_grad_buffer[EMA_REGION + idx] = EMA_DECAY * d_grad_buffer[EMA_REGION + idx]
-                                            + ema_new * d_grad_buffer[idx];
-        }
-        for (int i = 0; i < NN_HIDDEN_DIM; i++) {
-            int idx = SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i;
-            d_grad_buffer[EMA_REGION + idx] = EMA_DECAY * d_grad_buffer[EMA_REGION + idx]
-                                            + ema_new * d_grad_buffer[idx];
-        }
-        {
-            int idx = SGD_OFF_DB2 + t;
-            d_grad_buffer[EMA_REGION + idx] = EMA_DECAY * d_grad_buffer[EMA_REGION + idx]
-                                            + ema_new * d_grad_buffer[idx];
-        }
-        for (int out = 0; out < NN_OUTPUT_DIM; out++) {
-            int idx = SGD_OFF_DW3 + out * NN_HIDDEN_DIM + t;
-            d_grad_buffer[EMA_REGION + idx] = EMA_DECAY * d_grad_buffer[EMA_REGION + idx]
-                                            + ema_new * d_grad_buffer[idx];
         }
         if (t < NN_OUTPUT_DIM) {
-            int idx = SGD_OFF_DB3 + t;
+            int idx = SGD_OFF_DB5 + t;
             d_grad_buffer[EMA_REGION + idx] = EMA_DECAY * d_grad_buffer[EMA_REGION + idx]
                                             + ema_new * d_grad_buffer[idx];
         }
@@ -1232,34 +1518,54 @@ __global__ void nnSGDKernel(
         } else {
             // Apply EMA-smoothed gradient with trust-region step size
             constexpr float W_CLAMP = 10.0f;  // prevent weight explosion
-            for (int i = 0; i < NN_INPUT_DIM; i++) {
-                float w = weights->w1[t * NN_INPUT_DIM + i] -
-                    step * d_grad_buffer[EMA_REGION + SGD_OFF_DW1 + t * NN_INPUT_DIM + i];
-                weights->w1[t * NN_INPUT_DIM + i] = fmaxf(-W_CLAMP, fminf(W_CLAMP, w));
-            }
-            {
-                float b = weights->b1[t] - step * d_grad_buffer[EMA_REGION + SGD_OFF_DB1 + t];
-                weights->b1[t] = fmaxf(-W_CLAMP, fminf(W_CLAMP, b));
-            }
-            for (int i = 0; i < NN_HIDDEN_DIM; i++) {
-                float w = weights->w2[t * NN_HIDDEN_DIM + i] -
-                    step * d_grad_buffer[EMA_REGION + SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i];
-                weights->w2[t * NN_HIDDEN_DIM + i] = fmaxf(-W_CLAMP, fminf(W_CLAMP, w));
-            }
-            {
-                float b = weights->b2[t] - step * d_grad_buffer[EMA_REGION + SGD_OFF_DB2 + t];
-                weights->b2[t] = fmaxf(-W_CLAMP, fminf(W_CLAMP, b));
-            }
-            for (int out = 0; out < NN_OUTPUT_DIM; out++) {
-                // Skip decomp_time head (output 1) — owned by batched deferred SGD
-                if (out == 1) continue;
-                float w = weights->w3[out * NN_HIDDEN_DIM + t] -
-                    step * d_grad_buffer[EMA_REGION + SGD_OFF_DW3 + out * NN_HIDDEN_DIM + t];
-                weights->w3[out * NN_HIDDEN_DIM + t] = fmaxf(-W_CLAMP, fminf(W_CLAMP, w));
+            if (t < NN_HIDDEN_DIM) {
+                for (int i = 0; i < NN_INPUT_DIM; i++) {
+                    float w = weights->w1[t * NN_INPUT_DIM + i] -
+                        step * d_grad_buffer[EMA_REGION + SGD_OFF_DW1 + t * NN_INPUT_DIM + i];
+                    weights->w1[t * NN_INPUT_DIM + i] = fmaxf(-W_CLAMP, fminf(W_CLAMP, w));
+                }
+                {
+                    float b = weights->b1[t] - step * d_grad_buffer[EMA_REGION + SGD_OFF_DB1 + t];
+                    weights->b1[t] = fmaxf(-W_CLAMP, fminf(W_CLAMP, b));
+                }
+                for (int i = 0; i < NN_HIDDEN_DIM; i++) {
+                    float w = weights->w2[t * NN_HIDDEN_DIM + i] -
+                        step * d_grad_buffer[EMA_REGION + SGD_OFF_DW2 + t * NN_HIDDEN_DIM + i];
+                    weights->w2[t * NN_HIDDEN_DIM + i] = fmaxf(-W_CLAMP, fminf(W_CLAMP, w));
+                }
+                {
+                    float b = weights->b2[t] - step * d_grad_buffer[EMA_REGION + SGD_OFF_DB2 + t];
+                    weights->b2[t] = fmaxf(-W_CLAMP, fminf(W_CLAMP, b));
+                }
+                for (int i = 0; i < NN_HIDDEN_DIM; i++) {
+                    float w = weights->w3[t * NN_HIDDEN_DIM + i] -
+                        step * d_grad_buffer[EMA_REGION + SGD_OFF_DW3 + t * NN_HIDDEN_DIM + i];
+                    weights->w3[t * NN_HIDDEN_DIM + i] = fmaxf(-W_CLAMP, fminf(W_CLAMP, w));
+                }
+                {
+                    float b = weights->b3[t] - step * d_grad_buffer[EMA_REGION + SGD_OFF_DB3 + t];
+                    weights->b3[t] = fmaxf(-W_CLAMP, fminf(W_CLAMP, b));
+                }
+                for (int i = 0; i < NN_HIDDEN_DIM; i++) {
+                    float w = weights->w4[t * NN_HIDDEN_DIM + i] -
+                        step * d_grad_buffer[EMA_REGION + SGD_OFF_DW4 + t * NN_HIDDEN_DIM + i];
+                    weights->w4[t * NN_HIDDEN_DIM + i] = fmaxf(-W_CLAMP, fminf(W_CLAMP, w));
+                }
+                {
+                    float b = weights->b4[t] - step * d_grad_buffer[EMA_REGION + SGD_OFF_DB4 + t];
+                    weights->b4[t] = fmaxf(-W_CLAMP, fminf(W_CLAMP, b));
+                }
+                for (int out = 0; out < NN_OUTPUT_DIM; out++) {
+                    // Skip decomp_time head (output 1) — owned by batched deferred SGD
+                    if (out == 1) continue;
+                    float w = weights->w5[out * NN_HIDDEN_DIM + t] -
+                        step * d_grad_buffer[EMA_REGION + SGD_OFF_DW5 + out * NN_HIDDEN_DIM + t];
+                    weights->w5[out * NN_HIDDEN_DIM + t] = fmaxf(-W_CLAMP, fminf(W_CLAMP, w));
+                }
             }
             if (t < NN_OUTPUT_DIM && t != 1) {
-                float b = weights->b3[t] - step * d_grad_buffer[EMA_REGION + SGD_OFF_DB3 + t];
-                weights->b3[t] = fmaxf(-W_CLAMP, fminf(W_CLAMP, b));
+                float b = weights->b5[t] - step * d_grad_buffer[EMA_REGION + SGD_OFF_DB5 + t];
+                weights->b5[t] = fmaxf(-W_CLAMP, fminf(W_CLAMP, b));
             }
 
             // Update call counter for warmup
@@ -1370,11 +1676,11 @@ bool loadNNFromBinary(const char* filepath) {
         return false;
     }
 
-    if (n_layers != 3 || input_dim != NN_INPUT_DIM ||
+    if (n_layers != NN_NUM_LAYERS || input_dim != NN_INPUT_DIM ||
         hidden_dim != NN_HIDDEN_DIM || output_dim != NN_OUTPUT_DIM) {
-        fprintf(stderr, "NN: Architecture mismatch: %u layers, %u→%u→%u (expected 3, %d→%d→%d)\n",
+        fprintf(stderr, "NN: Architecture mismatch: %u layers, %u→%u→%u (expected %d, %d→%d→%d)\n",
                 n_layers, input_dim, hidden_dim, output_dim,
-                NN_INPUT_DIM, NN_HIDDEN_DIM, NN_OUTPUT_DIM);
+                NN_NUM_LAYERS, NN_INPUT_DIM, NN_HIDDEN_DIM, NN_OUTPUT_DIM);
         return false;
     }
 
@@ -1399,17 +1705,25 @@ bool loadNNFromBinary(const char* filepath) {
     NN_READ(h_weights.y_means, NN_OUTPUT_DIM * sizeof(float), "y_means");
     NN_READ(h_weights.y_stds,  NN_OUTPUT_DIM * sizeof(float), "y_stds");
 
-    // Layer 1
+    // Layer 1: 8 -> 64
     NN_READ(h_weights.w1, NN_HIDDEN_DIM * NN_INPUT_DIM  * sizeof(float), "w1");
     NN_READ(h_weights.b1, NN_HIDDEN_DIM                 * sizeof(float), "b1");
 
-    // Layer 2
+    // Layer 2: 64 -> 64
     NN_READ(h_weights.w2, NN_HIDDEN_DIM * NN_HIDDEN_DIM * sizeof(float), "w2");
     NN_READ(h_weights.b2, NN_HIDDEN_DIM                 * sizeof(float), "b2");
 
-    // Layer 3
-    NN_READ(h_weights.w3, NN_OUTPUT_DIM * NN_HIDDEN_DIM * sizeof(float), "w3");
-    NN_READ(h_weights.b3, NN_OUTPUT_DIM                 * sizeof(float), "b3");
+    // Layer 3: 64 -> 64
+    NN_READ(h_weights.w3, NN_HIDDEN_DIM * NN_HIDDEN_DIM * sizeof(float), "w3");
+    NN_READ(h_weights.b3, NN_HIDDEN_DIM                 * sizeof(float), "b3");
+
+    // Layer 4: 64 -> 64
+    NN_READ(h_weights.w4, NN_HIDDEN_DIM * NN_HIDDEN_DIM * sizeof(float), "w4");
+    NN_READ(h_weights.b4, NN_HIDDEN_DIM                 * sizeof(float), "b4");
+
+    // Layer 5 (output): 64 -> 8
+    NN_READ(h_weights.w5, NN_OUTPUT_DIM * NN_HIDDEN_DIM * sizeof(float), "w5");
+    NN_READ(h_weights.b5, NN_OUTPUT_DIM                 * sizeof(float), "b5");
 
 #undef NN_READ
 
@@ -1496,7 +1810,9 @@ bool loadNNFromBinary(const char* filepath) {
         cudaMemset(d_sgd_grad_buffer + 2 * SGD_REGION, 0,
                    SGD_REGION * sizeof(float));
 
-    size_t total_params = NN_HIDDEN_DIM * NN_INPUT_DIM + NN_HIDDEN_DIM +
+    size_t total_params = NN_HIDDEN_DIM * NN_INPUT_DIM  + NN_HIDDEN_DIM +
+                          NN_HIDDEN_DIM * NN_HIDDEN_DIM + NN_HIDDEN_DIM +
+                          NN_HIDDEN_DIM * NN_HIDDEN_DIM + NN_HIDDEN_DIM +
                           NN_HIDDEN_DIM * NN_HIDDEN_DIM + NN_HIDDEN_DIM +
                           NN_OUTPUT_DIM * NN_HIDDEN_DIM + NN_OUTPUT_DIM;
     printf("NN: Loaded %zu parameters from %s (%.1f KB on GPU)\n",
@@ -1844,14 +2160,20 @@ int runNNFusedInferenceCtx(
     float* out_psnr,
     int* out_top_actions,
     float* out_predicted_costs,
-    cudaEvent_t nn_stop_event
+    cudaEvent_t nn_stop_event,
+    float* out_rmse,
+    float* out_max_error,
+    float* out_mae,
+    float* out_ssim,
+    NNDebugPerConfig* out_per_config
 ) {
     if (d_stats == nullptr || ctx == nullptr) return -1;
 
-    /* Debug: allocate per-config output buffer on first use */
+    /* Allocate per-config debug buffer when needed (debug print or caller wants it) */
     NNDebugPerConfig* d_debug = nullptr;
     static NNDebugPerConfig* s_d_debug = nullptr;
-    if (g_debug_nn) {
+    bool need_debug = g_debug_nn || (out_per_config != nullptr);
+    if (need_debug) {
         if (!s_d_debug) cudaMalloc(&s_d_debug, NN_NUM_CONFIGS * sizeof(NNDebugPerConfig));
         d_debug = s_d_debug;
     }
@@ -1900,11 +2222,12 @@ int runNNFusedInferenceCtx(
         if (err != cudaSuccess) return -1;
     }
 
-    /* Debug: copy back and print per-config costs */
+    /* Copy per-config debug output (for trace mode or GPUCOMPRESS_DEBUG_NN) */
     NNDebugPerConfig h_debug[NN_NUM_CONFIGS];
     if (d_debug) {
-        cudaMemcpyAsync(h_debug, d_debug, NN_NUM_CONFIGS * sizeof(NNDebugPerConfig),
-                         cudaMemcpyDeviceToHost, stream);
+        err = cudaMemcpyAsync(h_debug, d_debug, NN_NUM_CONFIGS * sizeof(NNDebugPerConfig),
+                              cudaMemcpyDeviceToHost, stream);
+        if (err != cudaSuccess) return -1;
     }
 
     if (nn_stop_event) cudaEventRecord(nn_stop_event, stream);
@@ -1912,7 +2235,7 @@ int runNNFusedInferenceCtx(
     err = cudaStreamSynchronize(stream);
     if (err != cudaSuccess) return -1;
 
-    if (d_debug) {
+    if (d_debug && g_debug_nn) {
         float dbg_entropy = -1.0f, dbg_mad = -1.0f, dbg_deriv = -1.0f;
         if (d_stats) {
             AutoStatsGPU h_stats;
@@ -1925,11 +2248,19 @@ int runNNFusedInferenceCtx(
                                           dbg_entropy, dbg_mad, dbg_deriv);
     }
 
+    /* Return per-config predictions to caller (e.g. trace mode) */
+    if (out_per_config)
+        memcpy(out_per_config, h_debug, NN_NUM_CONFIGS * sizeof(NNDebugPerConfig));
+
     if (out_action)      *out_action      = h_result.action;
     if (out_ratio)       *out_ratio       = h_result.predicted_ratio;
     if (out_comp_time)   *out_comp_time   = h_result.predicted_comp_time;
     if (out_decomp_time) *out_decomp_time = h_result.predicted_decomp_time;
     if (out_psnr)        *out_psnr        = h_result.predicted_psnr;
+    if (out_rmse)        *out_rmse        = h_result.predicted_rmse;
+    if (out_max_error)   *out_max_error   = h_result.predicted_max_error;
+    if (out_mae)         *out_mae         = h_result.predicted_mae;
+    if (out_ssim)        *out_ssim        = h_result.predicted_ssim;
 
     return h_result.action;
 }
@@ -2009,7 +2340,7 @@ int runNNSGDCtx(
  * Called ONCE per timestep after all chunks are read.
  * Receives N samples with actual decomp times, computes mean
  * gradient across all samples, applies ONE bounded update to
- * W3[1] + b3[1].  No shared-layer changes.
+ * W5[1] + b5[1].  No shared-layer changes.
  * ============================================================ */
 
 static DeferredDecompSample* d_decomp_samples = nullptr;
@@ -2043,10 +2374,10 @@ static void freeDecompSGDBuffers() {
 
 /**
  * Batched decomp head-only SGD kernel.
- * Processes N samples: for each, recomputes forward pass through frozen W1/W2,
- * accumulates mean gradient for W3[1]+b3[1], applies ONE update.
+ * Processes N samples: for each, recomputes forward pass through frozen W1..W4,
+ * accumulates mean gradient for W5[1]+b5[1], applies ONE update.
  *
- * Launch: <<<1, 128>>>
+ * Launch: <<<1, NN_HIDDEN_DIM>>> = <<<1, 64>>>
  */
 __global__ void nnBatchedDecompSGDKernel(
     NNWeightsGPU* __restrict__ weights,
@@ -2060,6 +2391,8 @@ __global__ void nnBatchedDecompSGDKernel(
     __shared__ float s_x[NN_INPUT_DIM];
     __shared__ float s_h1[NN_HIDDEN_DIM];
     __shared__ float s_h2[NN_HIDDEN_DIM];
+    __shared__ float s_h3[NN_HIDDEN_DIM];
+    __shared__ float s_h4[NN_HIDDEN_DIM];
     __shared__ float s_reduce[NN_HIDDEN_DIM];
     __shared__ float s_err;
 
@@ -2072,21 +2405,21 @@ __global__ void nnBatchedDecompSGDKernel(
     for (int si = 0; si < num_samples; si++) {
         const DeferredDecompSample& samp = samples[si];
 
-        // Thread 0 builds standardized input
+        // Thread 0 builds standardized input (integer encoding, 8 inputs)
         if (t == 0) {
             int algo_idx = samp.action % 8;
             int quant    = (samp.action / 8) % 2;
             int shuffle  = (samp.action / 16) % 2;
 
             float raw[NN_INPUT_DIM];
-            for (int i = 0; i < 8; i++) raw[i] = (i == algo_idx) ? 1.0f : 0.0f;
-            raw[8]  = static_cast<float>(quant);
-            raw[9]  = static_cast<float>(shuffle);
-            raw[10] = samp.error_bound_enc;
-            raw[11] = samp.data_size_enc;
-            raw[12] = samp.entropy;
-            raw[13] = samp.mad_normalized;
-            raw[14] = samp.deriv_normalized;
+            raw[0] = static_cast<float>(algo_idx);
+            raw[1] = static_cast<float>(quant);
+            raw[2] = static_cast<float>(shuffle);
+            raw[3] = samp.error_bound_enc;   // raw error_bound
+            raw[4] = samp.data_size_enc;     // raw data_size in bytes
+            raw[5] = samp.entropy;
+            raw[6] = samp.mad_normalized;
+            raw[7] = samp.deriv_normalized;
 
             for (int i = 0; i < NN_INPUT_DIM; i++) {
                 float std_val = weights->x_stds[i];
@@ -2096,8 +2429,8 @@ __global__ void nnBatchedDecompSGDKernel(
         }
         __syncthreads();
 
-        // Forward L1 (read-only)
-        {
+        // Forward L1 (read-only, frozen)
+        if (t < NN_HIDDEN_DIM) {
             float sum = weights->b1[t];
             for (int i = 0; i < NN_INPUT_DIM; i++)
                 sum += weights->w1[t * NN_INPUT_DIM + i] * s_x[i];
@@ -2105,8 +2438,8 @@ __global__ void nnBatchedDecompSGDKernel(
         }
         __syncthreads();
 
-        // Forward L2 (read-only)
-        {
+        // Forward L2 (read-only, frozen)
+        if (t < NN_HIDDEN_DIM) {
             float sum = weights->b2[t];
             for (int i = 0; i < NN_HIDDEN_DIM; i++)
                 sum += weights->w2[t * NN_HIDDEN_DIM + i] * s_h1[i];
@@ -2114,11 +2447,29 @@ __global__ void nnBatchedDecompSGDKernel(
         }
         __syncthreads();
 
-        // Forward L3 output 1 only, compute error in log-space
-        if (t == 0) {
-            float y_norm = weights->b3[1];
+        // Forward L3 (read-only, frozen)
+        if (t < NN_HIDDEN_DIM) {
+            float sum = weights->b3[t];
             for (int i = 0; i < NN_HIDDEN_DIM; i++)
-                y_norm += weights->w3[1 * NN_HIDDEN_DIM + i] * s_h2[i];
+                sum += weights->w3[t * NN_HIDDEN_DIM + i] * s_h2[i];
+            s_h3[t] = (sum > 0.0f) ? sum : 0.0f;
+        }
+        __syncthreads();
+
+        // Forward L4 (read-only, frozen)
+        if (t < NN_HIDDEN_DIM) {
+            float sum = weights->b4[t];
+            for (int i = 0; i < NN_HIDDEN_DIM; i++)
+                sum += weights->w4[t * NN_HIDDEN_DIM + i] * s_h3[i];
+            s_h4[t] = (sum > 0.0f) ? sum : 0.0f;
+        }
+        __syncthreads();
+
+        // Forward L5 output 1 only (decomp_time head), compute error in log-space
+        if (t == 0) {
+            float y_norm = weights->b5[1];
+            for (int i = 0; i < NN_HIDDEN_DIM; i++)
+                y_norm += weights->w5[1 * NN_HIDDEN_DIM + i] * s_h4[i];
 
             float y_std1 = weights->y_stds[1];
             if (y_std1 < 1e-8f) y_std1 = 1e-8f;
@@ -2140,8 +2491,8 @@ __global__ void nnBatchedDecompSGDKernel(
         // Skip if error is tiny (noise gate)
         if (fabsf(s_err) < 0.05f) { __syncthreads(); continue; }
 
-        // Accumulate gradient: dw3[t] += err * h2[t], db3 += err
-        acc_gw += s_err * s_h2[t];
+        // Accumulate gradient: dw5[t] += err * h4[t], db5 += err
+        if (t < NN_HIDDEN_DIM) acc_gw += s_err * s_h4[t];
         if (t == 0) {
             acc_gb += s_err;
             acc_abs_err += fabsf(s_err);
@@ -2192,16 +2543,18 @@ __global__ void nnBatchedDecompSGDKernel(
                         DECOMP_TRUST_K * s_mean_abs_err));
 
     // Normalize gradient, apply bounded step
-    float gw_normed = acc_gw / g_norm;
+    float gw_normed = (t < NN_HIDDEN_DIM) ? (acc_gw / g_norm) : 0.0f;
     float gb_normed = (t == 0) ? acc_gb / g_norm : 0.0f;
 
-    // Apply with weight clamp
+    // Apply with weight clamp (w5/b5 decomp time head — output 1)
     constexpr float W_CLAMP = 5.0f;
-    float new_w = weights->w3[1 * NN_HIDDEN_DIM + t] - step * gw_normed;
-    weights->w3[1 * NN_HIDDEN_DIM + t] = fmaxf(-W_CLAMP, fminf(W_CLAMP, new_w));
+    if (t < NN_HIDDEN_DIM) {
+        float new_w = weights->w5[1 * NN_HIDDEN_DIM + t] - step * gw_normed;
+        weights->w5[1 * NN_HIDDEN_DIM + t] = fmaxf(-W_CLAMP, fminf(W_CLAMP, new_w));
+    }
     if (t == 0) {
-        float new_b = weights->b3[1] - step * gb_normed;
-        weights->b3[1] = fmaxf(-W_CLAMP, fminf(W_CLAMP, new_b));
+        float new_b = weights->b5[1] - step * gb_normed;
+        weights->b5[1] = fmaxf(-W_CLAMP, fminf(W_CLAMP, new_b));
     }
 
     if (t == 0) {

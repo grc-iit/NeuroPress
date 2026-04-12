@@ -962,17 +962,24 @@ except: sys.exit(1)
                 fi
                 _FILE_BYTES=$(( _N_FLOATS * 4 ))
             else
-                _FILE_BYTES=$(stat --printf="%s" "$_FIRST_FILE")
+                _FILE_BYTES=$(stat -c%s "$_FIRST_FILE")
                 _N_FLOATS=$(( _FILE_BYTES / 4 ))
             fi
+            if [ -z "$_N_FLOATS" ] || [ "$_N_FLOATS" -le 0 ] 2>/dev/null; then
+                echo "ERROR: Cannot determine element count for $_FIRST_FILE"
+                continue
+            fi
             _N_FILES=$(ls "$AI_DATA_DIR"/*${_AI_EXT} | wc -l)
-            # Use 2D dims: find factor
+            # Use 2D dims: find largest factor <= sqrt(n)
             _DIM0=$(python3 -c "
 import math
 n=$_N_FLOATS; s=int(math.isqrt(n))
 while s>1 and n%s!=0: s-=1
 print(s)
 ")
+            if [ -z "$_DIM0" ] || [ "$_DIM0" -le 0 ] 2>/dev/null; then
+                _DIM0=1
+            fi
             _DIM1=$(( _N_FLOATS / _DIM0 ))
             AI_DIMS="${_DIM0},${_DIM1}"
 
