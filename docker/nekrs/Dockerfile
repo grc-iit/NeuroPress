@@ -1,5 +1,7 @@
 FROM gpucompress-base
 
+ARG CUDA_ARCH=80
+
 # Install nekRS build dependency (gfortran needed by Nek5000 backend)
 RUN apt-get update && apt-get install -y --no-install-recommends gfortran \
     && rm -rf /var/lib/apt/lists/*
@@ -28,6 +30,7 @@ RUN cd /opt/sims/nekRS \
     && CC=mpicc CXX=mpic++ FC=mpif77 cmake -S .. -B . \
         -DCMAKE_INSTALL_PREFIX=/opt/nekrs \
         -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+        "-DCMAKE_EXE_LINKER_FLAGS=-lcuda" \
     && cmake --build . --target install -j$(nproc)
 
 # Set up TGV benchmark case directory

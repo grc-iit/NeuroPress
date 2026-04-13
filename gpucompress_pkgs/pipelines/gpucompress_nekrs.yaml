@@ -1,0 +1,19 @@
+name: gpucompress_nekrs
+env: gpucompress
+
+pkgs:
+  - pkg_type: gpucompress_pkgs.gpucompress_nekrs
+    pkg_name: nekrs_benchmark
+    nprocs: 2
+    ppn: 2
+    nekrs_home: /opt/nekrs
+    case_dir: /opt/nekrs/cases/tgv
+    gpucompress_dir: /opt/GPUCompress
+    nvcomp_lib: /tmp/lib
+    hdf5_lib: /tmp/hdf5-install/lib
+    weights: /opt/GPUCompress/neural_net/weights/model.nnwt
+    num_steps: 20
+    checkpoint_int: 10
+    use_fp32: 1
+    policies: "balanced,ratio,speed"
+    results_dir: /tmp/gpucompress_nekrs_results

@@ -135,7 +135,11 @@ class GpucompressWarpx(Application):
         cmd = (f'{self.config["warpx_bin"]} {self.config["inputs"]}'
                f' amr.n_cell="{self.config["ncell"]}"'
                f' max_step={self.config["max_step"]}'
-               f' diagnostics.diag1.intervals={self.config["diag_int"]}')
+               f' diag1.intervals={self.config["diag_int"]}'
+               f' diag1.format=gpucompress'
+               f' gpucompress.weights_path={self.config["weights"]}'
+               f' gpucompress.algorithm=auto'
+               f' gpucompress.error_bound={self.config["error_bound"]}')
 
         if self.config['nprocs'] > 1:
             Exec(cmd,

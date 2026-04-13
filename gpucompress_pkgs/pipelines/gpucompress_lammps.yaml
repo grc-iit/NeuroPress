@@ -1,0 +1,21 @@
+name: gpucompress_lammps
+env: gpucompress
+
+pkgs:
+  - pkg_type: gpucompress_pkgs.gpucompress_lammps
+    pkg_name: lammps_benchmark
+    nprocs: 1
+    ppn: 1
+    lmp_bin: /opt/sims/lammps/build/lmp
+    gpucompress_dir: /opt/GPUCompress
+    nvcomp_lib: /tmp/lib
+    hdf5_lib: /tmp/hdf5-install/lib
+    weights: /opt/GPUCompress/neural_net/weights/model.nnwt
+    atoms: 80
+    chunk_mb: 4
+    timesteps: 10
+    sim_interval: 50
+    warmup_steps: 100
+    policies: "balanced,ratio,speed"
+    error_bound: 0.0
+    results_dir: /tmp/gpucompress_lammps_results

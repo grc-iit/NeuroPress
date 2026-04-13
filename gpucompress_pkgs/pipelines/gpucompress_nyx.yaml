@@ -1,0 +1,21 @@
+name: gpucompress_nyx
+env: gpucompress
+
+pkgs:
+  - pkg_type: gpucompress_pkgs.gpucompress_nyx
+    pkg_name: nyx_benchmark
+    nprocs: 1
+    ppn: 1
+    nyx_bin: /opt/sims/Nyx/build-gpucompress/Exec/HydroTests/nyx_HydroTests
+    inputs: /opt/sims/Nyx/Exec/HydroTests/inputs.3d.sph.sedov
+    gpucompress_dir: /opt/GPUCompress
+    nvcomp_lib: /tmp/lib
+    hdf5_lib: /tmp/hdf5-install/lib
+    weights: /opt/GPUCompress/neural_net/weights/model.nnwt
+    ncell: 128
+    max_step: 200
+    plot_int: 10
+    chunk_mb: 4
+    policies: "balanced,ratio,speed"
+    error_bound: 0.0
+    results_dir: /tmp/gpucompress_nyx_results

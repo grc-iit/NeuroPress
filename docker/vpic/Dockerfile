@@ -1,5 +1,7 @@
 FROM gpucompress-base
 
+ARG CUDA_ARCH=80
+
 # Clone VPIC-Kokkos with Kokkos submodule
 RUN git clone --recursive https://github.com/lanl/vpic-kokkos.git /opt/sims/vpic-kokkos
 
@@ -9,7 +11,7 @@ RUN cd /opt/sims/vpic-kokkos \
         -DCMAKE_BUILD_TYPE=Release \
         -DENABLE_KOKKOS_CUDA=ON \
         -DBUILD_INTERNAL_KOKKOS=ON \
-        -DKokkos_ARCH_AMPERE80=ON \
+        -DKokkos_ARCH_AMPERE${CUDA_ARCH}=ON \
         -DCMAKE_CXX_COMPILER="$(pwd)/kokkos/bin/nvcc_wrapper" \
     && cmake --build build-compress -j$(nproc)
 
@@ -21,7 +23,7 @@ RUN /opt/sims/vpic-kokkos/kokkos/bin/nvcc_wrapper \
     -std=c++17 \
     -c /opt/GPUCompress/benchmarks/vpic-kokkos/vpic_ranking_profiler.cu \
     -o /opt/GPUCompress/benchmarks/vpic-kokkos/vpic_ranking_profiler.o \
-    -x cu -expt-extended-lambda -arch=sm_80
+    -x cu -expt-extended-lambda -arch=sm_${CUDA_ARCH}
 
 # Compile PSNR kernel (CUDA object)
 RUN /opt/sims/vpic-kokkos/kokkos/bin/nvcc_wrapper \
@@ -29,7 +31,7 @@ RUN /opt/sims/vpic-kokkos/kokkos/bin/nvcc_wrapper \
     -std=c++17 \
     -c /opt/GPUCompress/benchmarks/vpic-kokkos/vpic_psnr.cu \
     -o /opt/GPUCompress/benchmarks/vpic-kokkos/vpic_psnr.o \
-    -x cu -expt-extended-lambda -arch=sm_80
+    -x cu -expt-extended-lambda -arch=sm_${CUDA_ARCH}
 
 # Compile and link the benchmark deck binary
 RUN /opt/sims/vpic-kokkos/kokkos/bin/nvcc_wrapper \
@@ -44,7 +46,10 @@ RUN /opt/sims/vpic-kokkos/kokkos/bin/nvcc_wrapper \
     -I/opt/sims/vpic-kokkos/kokkos/tpls/desul/include \
     -I/opt/sims/vpic-kokkos/build-compress/kokkos/containers/src \
     -I/opt/sims/vpic-kokkos/kokkos/containers/src \
-    -std=c++17 \
+    -I/opt/sims/vpic-kokkos/kokkos/tpls/mdspan/include \
+    -I/opt/sims/vpic-kokkos/kokkos/algorithms/src \
+    -I/opt/sims/vpic-kokkos/build-compress/kokkos/algorithms/src \
+    -std=c++20 \
     -DINPUT_DECK=\"/opt/GPUCompress/benchmarks/vpic-kokkos/vpic_benchmark_deck.cxx\" \
     -DGPU_DIR=\"/opt/GPUCompress\" \
     -DUSE_KOKKOS -DENABLE_KOKKOS_CUDA \
@@ -67,5 +72,5 @@ RUN /opt/sims/vpic-kokkos/kokkos/bin/nvcc_wrapper \
     -L/tmp/hdf5-install/lib -lhdf5 \
     -Wl,-rpath,/tmp/lib \
     -L/tmp/lib -lnvcomp \
-    $(mpicc --showme:link 2>/dev/null || echo '-lmpi') -lgomp \
-    -x cu -expt-extended-lambda -Wext-lambda-captures-this -arch=sm_80 -Xcompiler -fopenmp
+    $(mpicc --showme:link 2>/dev/null || echo '-lmpi') -lgomp -lcuda \
+    -x cu -expt-extended-lambda -Wext-lambda-captures-this -arch=sm_${CUDA_ARCH} -Xcompiler -fopenmp

@@ -1,19 +1,18 @@
 # Base image
-FROM nvidia/cuda:12.6.0-devel-ubuntu24.04                                             
+FROM nvidia/cuda:12.6.0-devel-ubuntu24.04
+
+# GPU architecture: override with --build-arg CUDA_ARCH=90 (H100), 80 (A100), 70 (V100)
+ARG CUDA_ARCH=80
 
 # System packages
 RUN apt-get update && apt-get install -y --no-install-recommends \                  
     build-essential cmake curl wget git python3 python3-pip \                         
     openmpi-bin libopenmpi-dev \                                                      
-    && rm -rf /var/lib/apt/lists/* 
-
-                                                                                       
-RUN mkdir -p /tmp/include /tmp/lib \
-    && curl -L -o /tmp/nvcomp.tar.xz \                                               
-    ...      
+    && rm -rf /var/lib/apt/lists/*
 
 # nvCOMP
-RUN curl -L -o /tmp/nvcomp.tar.xz \
+RUN mkdir -p /tmp/include /tmp/lib \
+    && curl -L -o /tmp/nvcomp.tar.xz \
     "https://developer.download.nvidia.com/compute/nvcomp/redist/nvcomp/linux-x86_64/nvcomp-linux-x86_64-5.1.0.21_cuda12-archive.tar.xz" \
     && cd /tmp && tar -xf nvcomp.tar.xz \
     && cp -r nvcomp-linux-x86_64-*/include/* /tmp/include/ \
@@ -28,6 +27,7 @@ RUN curl -L -o /tmp/hdf5.tar.gz \
     && cmake /tmp/hdf5-2.0.0 \
         -DCMAKE_INSTALL_PREFIX=/tmp/hdf5-install \
         -DCMAKE_BUILD_TYPE=Release \
+        -DHDF5_ENABLE_PARALLEL=ON \
         -DHDF5_BUILD_TOOLS=OFF \
         -DHDF5_BUILD_EXAMPLES=OFF \
         -DBUILD_TESTING=OFF \
@@ -51,11 +51,22 @@ COPY . /opt/GPUCompress
 WORKDIR /opt/GPUCompress
 
 RUN mkdir -p build && cd build \
-    && cmake .. -DCMAKE_CUDA_ARCHITECTURES=80 \
-    && make  -j$(nproc)
+    && cmake .. -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH} \
+       -DHDF5_ROOT=/tmp/hdf5-install \
+       -DHDF5_VOL_PREFIX=/tmp/hdf5-install \
+       -DCMAKE_CUDA_FLAGS="-I/usr/lib/x86_64-linux-gnu/openmpi/include" \
+    && make -j$(nproc)
 
 ENV LD_LIBRARY_PATH=/opt/GPUCompress/build:${LD_LIBRARY_PATH}
 ENV HDF5_PLUGIN_PATH=/opt/GPUCompress/build
 ENV GPUCOMPRESS_WEIGHTS=/opt/GPUCompress/neural_net/weights/model.nnwt
+
+# Install Jarvis-CD and GPUCompress packages
+RUN pip3 install --break-system-packages -q \
+        pyyaml pandas podman-compose \
+    && pip3 install --break-system-packages -q -e /opt/GPUCompress/jarvis-cd \
+    && pip3 install --break-system-packages -q -e /opt/GPUCompress/gpucompress_pkgs \
+    && jarvis init /root/.jarvis /root/.jarvis /root/.jarvis \
+    && jarvis repo add /opt/GPUCompress/gpucompress_pkgs
 
 CMD ["/bin/bash"]

@@ -1,5 +1,7 @@
 FROM gpucompress-base
 
+ARG CUDA_ARCH=80
+
 # Clone WarpX
 RUN git clone https://github.com/BLAST-WarpX/warpx.git /opt/sims/warpx
 
@@ -31,7 +33,8 @@ RUN cd /opt/sims/warpx \
         -DWarpX_GPUCOMPRESS=ON \
         -DGPUCOMPRESS_PREFIX="/opt/GPUCompress/build" \
         "-DCMAKE_PREFIX_PATH=/tmp/hdf5-install" \
-        "-DCMAKE_CXX_FLAGS=-mcmodel=large -I/tmp/hdf5-install/include" \
-        "-DCMAKE_CUDA_FLAGS=-Xcompiler -mcmodel=large -I/tmp/hdf5-install/include" \
+        -DAMReX_CUDA_ARCH=${CUDA_ARCH} \
+        "-DCMAKE_CXX_FLAGS=-mcmodel=large -I/opt/GPUCompress/include -I/opt/GPUCompress/examples -I/opt/GPUCompress/benchmarks -I/tmp/hdf5-install/include" \
+        "-DCMAKE_CUDA_FLAGS=-Xcompiler -mcmodel=large -I/opt/GPUCompress/include -I/opt/GPUCompress/examples -I/opt/GPUCompress/benchmarks -I/tmp/hdf5-install/include --diag-suppress=222 --diag-suppress=221" \
         "-DCMAKE_EXE_LINKER_FLAGS=-Wl,--no-relax -L/opt/GPUCompress/build -lgpucompress -lH5VLgpucompress -lH5Zgpucompress -L/tmp/hdf5-install/lib -lhdf5 -L/usr/local/cuda/lib64 -lcudart" \
     && cmake --build . -j$(nproc)

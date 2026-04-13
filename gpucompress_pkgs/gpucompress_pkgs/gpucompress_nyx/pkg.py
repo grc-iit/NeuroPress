@@ -38,6 +38,12 @@ class GpucompressNyx(Application):
                 'default': '/opt/sims/Nyx/build-gpucompress/Exec/HydroTests/nyx_HydroTests',
             },
             {
+                'name': 'inputs',
+                'msg': 'Path to Nyx inputs file',
+                'type': str,
+                'default': '/opt/sims/Nyx/Exec/HydroTests/inputs.3d.sph.sedov',
+            },
+            {
                 'name': 'gpucompress_dir',
                 'msg': 'Path to GPUCompress installation',
                 'type': str,
@@ -127,12 +133,13 @@ class GpucompressNyx(Application):
         env['GPUCOMPRESS_WEIGHTS'] = self.config['weights']
         env['HDF5_PLUGIN_PATH'] = f'{gpuc}/build'
 
-        cmd = (f'{self.config["nyx_bin"]}'
+        cmd = (f'{self.config["nyx_bin"]} {self.config["inputs"]}'
                f' amr.n_cell={ncell} {ncell} {ncell}'
                f' max_step={self.config["max_step"]}'
                f' amr.plot_int={self.config["plot_int"]}'
                f' nyx.write_hdf5=1'
-               f' nyx.use_gpucompress=1')
+               f' nyx.use_gpucompress=1'
+               f' nyx.gpucompress_weights={self.config["weights"]}')
 
         if self.config['nprocs'] > 1:
             Exec(cmd,
