@@ -6,8 +6,15 @@ set -e
 export DEBIAN_FRONTEND=noninteractive
 
 # ── System dependencies ─────────────────────────────────────────────────
+# NOTE: install gcc-12 / g++-12 alongside the default gcc-13 from Ubuntu 24.04.
+# CUDA 12.8's NVCC has documented ICE issues (find_allocated_name_reference,
+# lexical.c:22310) when parsing gcc-13's C++23-extended STL headers in
+# template-heavy TUs like AMReX's Nyx_output.cpp. NVIDIA officially supports
+# gcc 11-12 for CUDA 12.8; downstream build.sh scripts pin CMAKE_CUDA_HOST_COMPILER
+# to g++-12 to avoid these crashes.
 apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl wget git cmake build-essential gfortran \
+    gcc-12 g++-12 \
     python3 python3-pip \
     openmpi-bin libopenmpi-dev \
     openssh-server openssh-client \
