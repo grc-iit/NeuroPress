@@ -1,0 +1,61 @@
+# Pipeline: GPUCompress Nyx single-node on Delta via Apptainer.
+#
+# Mirrors the reference at:
+#   ~/jarvis-cd/builtin/pipelines/portability/delta/nyx_single_node.yaml
+# but chains our custom gpucompress_base + gpucompress_nyx packages so the
+# Nyx binary is built against HDF5 + nvcomp + GPUCompress.
+#
+# Usage:
+#   # One-time, on the login node (has network + no GPU needed for build):
+#   jarvis repo add /u/imuradli/GPUCompress/gpucompress_pkgs
+#   jarvis ppl load yaml /u/imuradli/GPUCompress/gpucompress_pkgs/pipelines/gpucompress_nyx_single_node.yaml
+#   jarvis ppl build            # produces ~/.ppi-jarvis/pipelines/<name>/shared/<name>.sif
+#
+#   # Per-run, on a GPU compute node:
+#   salloc --account=bekn-delta-gpu --partition=gpuA100x4 \
+#          --nodes=1 --ntasks=4 --gpus=1 --time=02:00:00 --mem=64g
+#   scontrol show hostnames $SLURM_JOB_NODELIST > ~/hostfile_single.txt
+#   jarvis hostfile set ~/hostfile_single.txt
+#   jarvis ppl run
+
+name: gpucompress_nyx_delta_single_node
+install_manager: container
+
+container_engine: apptainer
+container_base: nvidia/cuda:12.8.0-devel-ubuntu24.04
+container_ssh_port: 2233
+container_gpu: true
+
+hostfile: $HOME/hostfile_single.txt
+
+pkgs:
+  # 1. Install HDF5 + nvcomp + GPUCompress into the build image.
+  - pkg_type: gpucompress_pkgs.gpucompress_base
+    pkg_name: gpuc_base
+    cuda_arch: 80
+    hdf5_version: 2.0.0
+    nvcomp_version: 5.1.0.21_cuda12
+    gpucompress_repo: https://github.com/grc-iit/GPUCompress.git
+    gpucompress_ref: main
+    deploy_base: nvidia/cuda:12.8.0-runtime-ubuntu24.04
+
+  # 2. Build Nyx with the GPUCompress patches applied; this is the workload.
+  - pkg_type: gpucompress_pkgs.gpucompress_nyx_delta
+    pkg_name: gpuc_nyx
+    cuda_arch: 80
+    use_gpu: true
+    deploy_base: nvidia/cuda:12.8.0-runtime-ubuntu24.04
+
+    # Physics — smoke-test defaults (64^3 grid, 30 steps, 3 plots).
+    # Scale up for real runs (e.g. ncell=192, max_step=200, plot_int=50).
+    ncell: 64
+    max_step: 30
+    plot_int: 10
+
+    # Benchmark configuration — 'default' exercises no-comp baseline.
+    # Switch to hdf5_mode=vol + phase=nn-rl+exp50 for adaptive selection.
+    hdf5_mode: default
+    chunk_mb: 4
+    verify: 1
+    policy: balanced
+    error_bound: 0.0
