@@ -34,7 +34,7 @@ class GpucompressBase(Library):
             {'name': 'deploy_base',
              'msg': 'Base image for the deploy stage',
              'type': str,
-             'default': 'nvidia/cuda:12.8.0-runtime-ubuntu24.04'},
+             'default': 'nvidia/cuda:12.6.0-runtime-ubuntu24.04'},
         ]
 
     def _build_phase(self):

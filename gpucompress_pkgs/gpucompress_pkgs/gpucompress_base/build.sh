@@ -6,15 +6,13 @@ set -e
 export DEBIAN_FRONTEND=noninteractive
 
 # ── System dependencies ─────────────────────────────────────────────────
-# NOTE: install gcc-12 / g++-12 alongside the default gcc-13 from Ubuntu 24.04.
-# CUDA 12.8's NVCC has documented ICE issues (find_allocated_name_reference,
-# lexical.c:22310) when parsing gcc-13's C++23-extended STL headers in
-# template-heavy TUs like AMReX's Nyx_output.cpp. NVIDIA officially supports
-# gcc 11-12 for CUDA 12.8; downstream build.sh scripts pin CMAKE_CUDA_HOST_COMPILER
-# to g++-12 to avoid these crashes.
+# Use the Ubuntu 24.04 default GCC (13), which matches the Delta system
+# (gcc-native/13.2 module). The NVCC 12.8 ICE (find_allocated_name_reference,
+# lexical.c:22310) is a NVCC 12.8 parser bug — not a GCC 13 issue. The
+# reference docker/Dockerfile uses GCC 13 + CUDA 12.6 without problems.
+# Workaround for NVCC 12.8: --expt-relaxed-constexpr in CMAKE_CUDA_FLAGS.
 apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl wget git cmake build-essential gfortran \
-    gcc-12 g++-12 \
     python3 python3-pip \
     openmpi-bin libopenmpi-dev \
     openssh-server openssh-client \
@@ -55,6 +53,7 @@ cmake /tmp/hdf5-##HDF5_VERSION## \
     -DCMAKE_INSTALL_PREFIX=/opt/hdf5-install \
     -DCMAKE_BUILD_TYPE=Release \
     -DBUILD_SHARED_LIBS=ON \
+    -DHDF5_ENABLE_PARALLEL=ON \
     -DHDF5_BUILD_TOOLS=OFF \
     -DHDF5_BUILD_EXAMPLES=OFF \
     -DBUILD_TESTING=OFF \
@@ -62,7 +61,7 @@ cmake /tmp/hdf5-##HDF5_VERSION## \
     -DHDF5_BUILD_FORTRAN=OFF \
     -DHDF5_BUILD_JAVA=OFF \
     -DHDF5_BUILD_HL_LIB=ON
-make -j"${BUILD_JOBS:-4}"
+make -j"${BUILD_JOBS:-8}"
 make install
 echo '/opt/hdf5-install/lib' > /etc/ld.so.conf.d/hdf5.conf
 ldconfig
@@ -78,8 +77,9 @@ cmake .. \
     -DCMAKE_CUDA_ARCHITECTURES=##CUDA_ARCH## \
     -DCMAKE_PREFIX_PATH="/opt/hdf5-install;/opt/nvcomp" \
     -DHDF5_VOL_PREFIX=/opt/hdf5-install \
-    -DNVCOMP_PREFIX=/opt/nvcomp
-make -j"${BUILD_JOBS:-4}"
+    -DNVCOMP_PREFIX=/opt/nvcomp \
+    -DCMAKE_CUDA_FLAGS="-I/usr/lib/x86_64-linux-gnu/openmpi/include"
+make -j"${BUILD_JOBS:-8}"
 
 # ── Runtime linker hints ────────────────────────────────────────────────
 cat > /etc/ld.so.conf.d/gpucompress.conf <<'EOF'

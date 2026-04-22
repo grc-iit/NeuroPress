@@ -1,0 +1,79 @@
+# Pipeline: GPUCompress LAMMPS single-node on Delta via Apptainer.
+#
+# Mirrors the reference at:
+#   ~/jarvis-cd/builtin/pipelines/portability/delta/nyx_single_node.yaml
+# but chains our custom gpucompress_base + gpucompress_lammps_delta packages
+# so the LAMMPS `lmp` binary is built against HDF5 + nvcomp + GPUCompress with
+# the Kokkos-CUDA `fix gpucompress` compiled into src/KOKKOS/.
+#
+# Unlike Nyx/VPIC/WarpX this is a single-phase workflow: the LAMMPS fix writes
+# compressed HDF5 in-situ during the MD run (producing gpuc_step_* output
+# directories) and the package parses those host-side into a CSV — no separate
+# generic_benchmark invocation.
+#
+# Usage:
+#   # One-time, on the login node (has network + no GPU needed for build):
+#   jarvis repo add /u/imuradli/GPUCompress/gpucompress_pkgs
+#   jarvis ppl load yaml /u/imuradli/GPUCompress/gpucompress_pkgs/pipelines/gpucompress_lammps_single_node.yaml
+#   jarvis ppl build            # produces ~/.ppi-jarvis/pipelines/<name>/shared/<name>.sif
+#
+#   # Per-run, on a GPU compute node:
+#   salloc --account=bekn-delta-gpu --partition=gpuA100x4 \
+#          --nodes=1 --ntasks=1 --gpus=1 --time=02:00:00 --mem=64g
+#   scontrol show hostnames $SLURM_JOB_NODELIST > ~/hostfile_single.txt
+#   jarvis hostfile set ~/hostfile_single.txt
+#   jarvis ppl run
+
+name: gpucompress_lammps_delta_single_node
+install_manager: container
+
+container_engine: apptainer
+container_base: nvidia/cuda:12.6.0-devel-ubuntu24.04
+container_ssh_port: 2236
+container_gpu: true
+
+hostfile: $HOME/hostfile_single.txt
+
+pkgs:
+  # 1. Install HDF5 + nvcomp + GPUCompress into the build image.
+  - pkg_type: gpucompress_pkgs.gpucompress_base
+    pkg_name: gpuc_base
+    cuda_arch: 80
+    hdf5_version: 2.0.0
+    nvcomp_version: 5.1.0.21_cuda12
+    gpucompress_repo: https://github.com/grc-iit/GPUCompress.git
+    gpucompress_ref: main
+    deploy_base: nvidia/cuda:12.6.0-runtime-ubuntu24.04
+
+  # 2. Clone + patch + build LAMMPS with the GPUCompress Kokkos fix.
+  - pkg_type: gpucompress_pkgs.gpucompress_lammps_delta
+    pkg_name: gpuc_lammps
+    cuda_arch: 80
+    kokkos_arch: AMPERE80      # A100; change to HOPPER90 for H100
+    use_gpu: true
+    deploy_base: nvidia/cuda:12.6.0-runtime-ubuntu24.04
+
+    # I/O volume — smoke-test defaults (ATOMS=40 → ~27 MB/dump, 3 dumps).
+    # Scale up for real runs (e.g. atoms=120, timesteps=20).
+    atoms: 40
+    timesteps: 3
+    sim_interval: 50
+    warmup_steps: 20
+    chunk_mb: 4
+    verify: 1
+
+    # Physics (mirrors bench_tests/lammps.sh defaults: shock-expansion LJ)
+    t_hot: 10.0
+    t_cold: 0.01
+    hot_radius_frac: 0.25
+
+    # Benchmark configuration — VOL mode with adaptive NN + RL selection.
+    hdf5_mode: vol
+    phase: nn-rl
+    policy: balanced
+    error_bound: 0.0
+
+    # MPI / GPU launch (single A100).
+    nprocs: 1
+    ppn: 1
+    num_gpus: 1
