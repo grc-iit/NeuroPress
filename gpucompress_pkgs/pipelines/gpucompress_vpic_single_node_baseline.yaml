@@ -1,0 +1,90 @@
+# Pipeline: GPUCompress VPIC single-node on Delta — NO-COMP BASELINE variant.
+#
+# Identical to gpucompress_vpic_single_node.yaml except hdf5_mode=default
+# (no compression). Use this to measure raw HDF5 I/O bandwidth alongside
+# the adaptive run. Switch between the two by re-running `jarvis ppl load
+# yaml <path>` before `jarvis ppl run`.
+#
+# Chains gpucompress_base + gpucompress_vpic_delta so the VPIC benchmark
+# deck is built against HDF5 + nvcomp + GPUCompress.
+#
+# Usage:
+#   # One-time, on the login node:
+#   jarvis repo add /u/$USER/GPUCompress/gpucompress_pkgs
+#   jarvis ppl load yaml /u/$USER/GPUCompress/gpucompress_pkgs/pipelines/gpucompress_vpic_single_node_baseline.yaml
+#   jarvis ppl build
+#
+#   # Per-run, on a GPU compute node:
+#   salloc --account="$SLURM_ACCOUNT" --partition=gpuA100x4 \
+#          --nodes=1 --ntasks=1 --gpus=1 --time=01:00:00 --mem=64g
+#   hostname > ~/hostfile_single.txt
+#   jarvis hostfile set ~/hostfile_single.txt
+#   jarvis ppl run
+
+name: gpucompress_vpic_delta_single_node
+install_manager: container
+
+container_engine: apptainer
+container_base: nvidia/cuda:12.6.0-devel-ubuntu24.04
+# Distinct from gpucompress_nyx_delta (2233) so both pipelines can be loaded
+# simultaneously without port conflicts inside the apptainer instance.
+container_ssh_port: 2234
+container_gpu: true
+
+hostfile: $HOME/hostfile_single.txt
+
+pkgs:
+  # 1. Install HDF5 + nvcomp + GPUCompress into the build image.
+  - pkg_type: gpucompress_pkgs.gpucompress_base
+    pkg_name: gpuc_base
+    cuda_arch: 80
+    hdf5_version: 2.0.0
+    nvcomp_version: 5.1.0.21_cuda12
+    gpucompress_repo: https://github.com/grc-iit/GPUCompress.git
+    gpucompress_ref: main
+    deploy_base: nvidia/cuda:12.6.0-runtime-ubuntu24.04
+
+  # 2. Build VPIC-Kokkos with the GPUCompress benchmark deck linked in;
+  #    this is the workload. Must follow gpucompress_base so that the
+  #    GPUCompress headers / libs / deck sources are available at
+  #    /opt/GPUCompress/ before build.sh's cmake + nvcc_wrapper steps.
+  - pkg_type: gpucompress_pkgs.gpucompress_vpic_delta
+    pkg_name: gpuc_vpic
+    cuda_arch: 80
+    use_gpu: true
+    deploy_base: nvidia/cuda:12.6.0-runtime-ubuntu24.04
+
+    # MPI sizing — VPIC requires VPIC_NX to be divisible by nprocs.
+    # Smoke test: 1 rank, NX=64. Scale up together (e.g. nprocs=4, nx=128).
+    nprocs: 1
+    ppn: 1
+
+    # I/O volume — smoke-test defaults (NX=64, TIMESTEPS=3, SIM_INT=190,
+    # WARMUP=100, CHUNK=4 MB). Scale up for paper runs.
+    nx: 64
+    timesteps: 3
+    sim_interval: 190
+    warmup: 100
+    chunk_mb: 4
+    verify: 1
+
+    # Physics — default Harris-sheet parameters.
+    mi_me: 25
+    wpe_wce: 3.0
+    ti_te: 1.0
+    perturbation: 0.1
+    guide_field: 0.0
+    nppc: 2
+
+    # Benchmark configuration — NO-COMP baseline. Phase is ignored when
+    # mode=default (pkg.py maps to the internal no-comp pseudo-phase).
+    hdf5_mode: default
+    phase: nn-rl      # ignored in default mode, kept valid for _validate()
+    policy: balanced
+    error_bound: 0.0
+
+    # NN online-learning knobs
+    sgd_lr: 0.2
+    sgd_mape: 0.10
+    explore_k: 4
+    explore_thresh: 0.20

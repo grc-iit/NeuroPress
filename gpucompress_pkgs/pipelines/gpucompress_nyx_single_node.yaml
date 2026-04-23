@@ -1,20 +1,18 @@
 # Pipeline: GPUCompress Nyx single-node on Delta via Apptainer.
 #
-# Mirrors the reference at:
-#   ~/jarvis-cd/builtin/pipelines/portability/delta/nyx_single_node.yaml
-# but chains our custom gpucompress_base + gpucompress_nyx packages so the
-# Nyx binary is built against HDF5 + nvcomp + GPUCompress.
+# Chains gpucompress_base + gpucompress_nyx_delta so the Nyx binary is built
+# against HDF5 + nvcomp + GPUCompress.
 #
 # Usage:
-#   # One-time, on the login node (has network + no GPU needed for build):
-#   jarvis repo add /u/imuradli/GPUCompress/gpucompress_pkgs
-#   jarvis ppl load yaml /u/imuradli/GPUCompress/gpucompress_pkgs/pipelines/gpucompress_nyx_single_node.yaml
-#   jarvis ppl build            # produces ~/.ppi-jarvis/pipelines/<name>/shared/<name>.sif
+#   # One-time, on the login node:
+#   jarvis repo add /u/$USER/GPUCompress/gpucompress_pkgs
+#   jarvis ppl load yaml /u/$USER/GPUCompress/gpucompress_pkgs/pipelines/gpucompress_nyx_single_node.yaml
+#   jarvis ppl build
 #
 #   # Per-run, on a GPU compute node:
-#   salloc --account=bekn-delta-gpu --partition=gpuA100x4 \
-#          --nodes=1 --ntasks=4 --gpus=1 --time=02:00:00 --mem=64g
-#   scontrol show hostnames $SLURM_JOB_NODELIST > ~/hostfile_single.txt
+#   salloc --account="$SLURM_ACCOUNT" --partition=gpuA100x4 \
+#          --nodes=1 --ntasks=1 --gpus=1 --time=02:00:00 --mem=64g
+#   hostname > ~/hostfile_single.txt
 #   jarvis hostfile set ~/hostfile_single.txt
 #   jarvis ppl run
 
@@ -46,11 +44,12 @@ pkgs:
     use_gpu: true
     deploy_base: nvidia/cuda:12.6.0-runtime-ubuntu24.04
 
-    # Physics — smoke-test defaults sized to stay under ~2 min wall on A100.
-    # Scale up for real runs (e.g. ncell=192, max_step=200, plot_int=50).
-    ncell: 48
-    max_step: 20
-    plot_int: 5
+    # Physics — small-grid Sedov-blast defaults.
+    # For longer paper-scale runs override on the command line or edit here
+    # (e.g. ncell=192, max_step=200, plot_int=50).
+    ncell: 64
+    max_step: 30
+    plot_int: 10
 
     # Benchmark configuration — VOL mode with NN + RL + 50% exploration.
     hdf5_mode: vol
@@ -58,4 +57,4 @@ pkgs:
     chunk_mb: 4
     verify: 1
     policy: ratio
-    error_bound: 0.001
+    error_bound: 0.0
