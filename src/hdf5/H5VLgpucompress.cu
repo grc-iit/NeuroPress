@@ -1320,10 +1320,7 @@ gpu_trace_chunked_write(H5VL_gpucompress_t *o,
         get_args.op_type                 = H5VL_DATASET_GET_SPACE;
         get_args.args.get_space.space_id = H5I_INVALID_HID;
         if (H5VLdataset_get(o->under_object, o->under_vol_id,
-                            &get_args, dxpl_id, NULL) < 0) {
-            fprintf(stderr, "gpu_trace_chunked_write: H5VLdataset_get(GET_SPACE) failed\n");
-            goto done_trace;
-        }
+                            &get_args, dxpl_id, NULL) < 0) goto done_trace;
         actual_space_id  = get_args.args.get_space.space_id;
         need_close_space = 1;
     } else {
@@ -1332,34 +1329,19 @@ gpu_trace_chunked_write(H5VL_gpucompress_t *o,
 
     {
         int ndims = H5Sget_simple_extent_ndims(actual_space_id);
-        if (ndims <= 0 || ndims > 32) {
-            fprintf(stderr, "gpu_trace_chunked_write: invalid ndims=%d\n", ndims);
-            goto done_trace;
-        }
+        if (ndims <= 0 || ndims > 32) goto done_trace;
 
         hsize_t dset_dims[32];
         H5Sget_simple_extent_dims(actual_space_id, dset_dims, NULL);
 
         hsize_t chunk_dims[32] = {0};
-        if (H5Pget_chunk(o->dcpl_id, ndims, chunk_dims) < 0) {
-            fprintf(stderr,
-                    "gpu_trace_chunked_write: H5Pget_chunk failed "
-                    "(dcpl layout not H5D_CHUNKED or dcpl invalid) ndims=%d\n",
-                    ndims);
-            goto done_trace;
-        }
+        if (H5Pget_chunk(o->dcpl_id, ndims, chunk_dims) < 0) goto done_trace;
 
         size_t elem_size = H5Tget_size(mem_type_id);
-        if (elem_size == 0) {
-            fprintf(stderr, "gpu_trace_chunked_write: H5Tget_size returned 0\n");
-            goto done_trace;
-        }
+        if (elem_size == 0) goto done_trace;
 
         gpucompress_config_t cfg;
-        if (get_gpucompress_config_from_dcpl(o->dcpl_id, &cfg) != 0) {
-            fprintf(stderr, "gpu_trace_chunked_write: get_gpucompress_config_from_dcpl failed\n");
-            goto done_trace;
-        }
+        if (get_gpucompress_config_from_dcpl(o->dcpl_id, &cfg) != 0) goto done_trace;
 
         size_t chunk_elems = 1;
         for (int d = 0; d < ndims; d++) chunk_elems *= (size_t)chunk_dims[d];
@@ -1368,29 +1350,12 @@ gpu_trace_chunked_write(H5VL_gpucompress_t *o,
 
         /* Single device compression buffer */
         void* d_comp = nullptr;
-        {
-            cudaError_t ce = cudaMalloc(&d_comp, max_comp);
-            if (ce != cudaSuccess) {
-                fprintf(stderr,
-                        "gpu_trace_chunked_write: cudaMalloc(d_comp, %zu bytes) "
-                        "failed: %s (chunk_bytes=%zu)\n",
-                        max_comp, cudaGetErrorString(ce), chunk_bytes);
-                goto done_trace;
-            }
-        }
+        if (cudaMalloc(&d_comp, max_comp) != cudaSuccess) goto done_trace;
 
         /* Single pinned host buffer for D→H */
         void* h_comp = nullptr;
-        {
-            cudaError_t ce = cudaMallocHost(&h_comp, max_comp);
-            if (ce != cudaSuccess) {
-                fprintf(stderr,
-                        "gpu_trace_chunked_write: cudaMallocHost(h_comp, %zu bytes) "
-                        "failed: %s\n",
-                        max_comp, cudaGetErrorString(ce));
-                cudaFree(d_comp);
-                goto done_trace;
-            }
+        if (cudaMallocHost(&h_comp, max_comp) != cudaSuccess) {
+            cudaFree(d_comp); goto done_trace;
         }
 
         /* CompContext for NN inference */
@@ -1459,34 +1424,18 @@ gpu_trace_chunked_write(H5VL_gpucompress_t *o,
                     src     = raw;
                     d_owned = NULL;
                 } else {
-                    cudaError_t ce = cudaMalloc(&d_owned, actual_bytes);
-                    if (ce != cudaSuccess) {
-                        fprintf(stderr,
-                                "gpu_trace_chunked_write: chunk %zu cudaMalloc(d_owned, "
-                                "%zu bytes) contiguous-partial failed: %s\n",
-                                ci, actual_bytes, cudaGetErrorString(ce));
-                        ret = -1; break;
-                    }
+                    if (cudaMalloc(&d_owned, actual_bytes) != cudaSuccess)
+                        { ret = -1; break; }
                     vol_memcpy(d_owned, raw, actual_bytes, cudaMemcpyDeviceToDevice);
                     src     = d_owned;
                 }
             } else {
-                cudaError_t ce = cudaMalloc(&d_owned, chunk_bytes);
-                if (ce != cudaSuccess) {
-                    fprintf(stderr,
-                            "gpu_trace_chunked_write: chunk %zu cudaMalloc(d_owned, "
-                            "%zu bytes) non-contiguous failed: %s\n",
-                            ci, chunk_bytes, cudaGetErrorString(ce));
-                    ret = -1; break;
-                }
+                if (cudaMalloc(&d_owned, chunk_bytes) != cudaSuccess)
+                    { ret = -1; break; }
                 if (!d_dset_dims) {
                     if (alloc_dim_arrays(ndims, dset_dims, actual_chunk, chunk_start,
-                                        &d_dset_dims, &d_chunk_dims_d, &d_chunk_start_d) < 0) {
-                        fprintf(stderr,
-                                "gpu_trace_chunked_write: chunk %zu alloc_dim_arrays failed\n",
-                                ci);
-                        cudaFree(d_owned); ret = -1; break;
-                    }
+                                        &d_dset_dims, &d_chunk_dims_d, &d_chunk_start_d) < 0)
+                        { cudaFree(d_owned); ret = -1; break; }
                 } else {
                     vol_memcpy(d_chunk_dims_d,  actual_chunk, (size_t)ndims * sizeof(hsize_t),
                                cudaMemcpyHostToDevice);
@@ -1499,24 +1448,13 @@ gpu_trace_chunked_write(H5VL_gpucompress_t *o,
                     static_cast<const uint8_t*>(d_buf), d_owned,
                     ndims, elem_size, actual_elems,
                     d_dset_dims, d_chunk_dims_d, d_chunk_start_d);
-                cudaError_t k_ce   = cudaGetLastError();
-                cudaError_t syn_ce = cudaStreamSynchronize(gather_stream);
-                if (k_ce != cudaSuccess || syn_ce != cudaSuccess) {
-                    fprintf(stderr,
-                            "gpu_trace_chunked_write: chunk %zu gather_chunk_kernel "
-                            "failed: launch=%s sync=%s\n",
-                            ci, cudaGetErrorString(k_ce), cudaGetErrorString(syn_ce));
-                    cudaFree(d_owned); ret = -1; break;
-                }
+                if (cudaGetLastError() != cudaSuccess ||
+                    cudaStreamSynchronize(gather_stream) != cudaSuccess)
+                    { cudaFree(d_owned); ret = -1; break; }
                 src = d_owned;
             }
 
-            if (!src) {
-                fprintf(stderr,
-                        "gpu_trace_chunked_write: chunk %zu src==nullptr after gather\n",
-                        ci);
-                ret = -1; break;
-            }
+            if (!src) { ret = -1; break; }
 
             /* ---- NN inference: get action + per_config[32] ---- */
             int chosen_nn_action = 0;
