@@ -1,7 +1,12 @@
-# Pipeline: GPUCompress WarpX LWFA single-node on Delta via Apptainer.
+# Pipeline: GPUCompress WarpX single-node on Delta — NO-COMP BASELINE variant.
 #
-# Mirrors gpucompress_nyx_single_node.yaml but chains our WarpX package so
-# the WarpX binary is built against HDF5 + nvcomp + GPUCompress.
+# Identical to gpucompress_warpx_single_node.yaml except hdf5_mode=default
+# (no compression). Use this to measure raw HDF5 I/O bandwidth alongside
+# the adaptive run. Switch between the two by re-running `jarvis ppl load
+# yaml <path>` before `jarvis ppl run`.
+#
+# Chains gpucompress_base + gpucompress_warpx_delta so the WarpX binary is
+# built against HDF5 + nvcomp + GPUCompress.
 #
 # Usage:
 #   # One-time, on the login node — ppl load yaml builds the SIF when
@@ -53,9 +58,10 @@ pkgs:
     max_grid_size: ""
     blocking_factor: ""
 
-    # Benchmark configuration — VOL mode, fixed zstd (no NN/RL).
-    hdf5_mode: vol
-    phase: zstd
+    # Benchmark configuration — NO-COMP baseline. Phase is ignored when
+    # mode=default (pkg.py maps to the internal no-comp pseudo-phase).
+    hdf5_mode: default
+    phase: nn-rl+exp50    # ignored in default mode, kept valid for _validate()
     chunk_mb: 4
     verify: 1
     policy: ratio
