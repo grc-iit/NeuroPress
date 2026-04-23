@@ -1,15 +1,19 @@
-# Pipeline: GPUCompress LAMMPS single-node on Delta via Apptainer.
+# Pipeline: GPUCompress LAMMPS single-node on Delta — NO-COMP BASELINE variant.
 #
-# Mirrors the reference at:
-#   ~/jarvis-cd/builtin/pipelines/portability/delta/nyx_single_node.yaml
-# but chains our custom gpucompress_base + gpucompress_lammps_delta packages
-# so the LAMMPS `lmp` binary is built against HDF5 + nvcomp + GPUCompress with
-# the Kokkos-CUDA `fix gpucompress` compiled into src/KOKKOS/.
+# Identical to gpucompress_lammps_single_node.yaml except hdf5_mode=default
+# (algo=lz4 is still in the code path but ratio is reported as 1.00).
+# Use this to measure raw HDF5 I/O bandwidth alongside the adaptive run.
+# Switch between the two by re-running `jarvis ppl load yaml <path>`
+# before `jarvis ppl run`.
 #
-# Unlike Nyx/VPIC/WarpX this is a single-phase workflow: the LAMMPS fix writes
-# compressed HDF5 in-situ during the MD run (producing gpuc_step_* output
-# directories) and the package parses those host-side into a CSV — no separate
-# generic_benchmark invocation.
+# Chains gpucompress_base + gpucompress_lammps_delta so the LAMMPS `lmp`
+# binary is built against HDF5 + nvcomp + GPUCompress with the
+# Kokkos-CUDA `fix gpucompress` compiled into src/KOKKOS/.
+#
+# Single-phase workflow: the LAMMPS fix writes compressed HDF5 in-situ
+# during the MD run (producing gpuc_step_* output directories) and the
+# package parses those host-side into a CSV — no separate generic_benchmark
+# invocation.
 #
 # Usage:
 #   # One-time, on the login node — ppl load yaml builds the SIF when
@@ -67,9 +71,10 @@ pkgs:
     t_cold: 0.01
     hot_radius_frac: 0.25
 
-    # Benchmark configuration — VOL mode with adaptive NN + RL selection.
-    hdf5_mode: vol
-    phase: nn-rl
+    # Benchmark configuration — NO-COMP baseline. Phase is ignored when
+    # mode=default (pkg.py maps to the internal no-comp pseudo-phase).
+    hdf5_mode: default
+    phase: nn-rl     # ignored in default mode, kept valid for _validate()
     policy: balanced
     error_bound: 0.0
 
