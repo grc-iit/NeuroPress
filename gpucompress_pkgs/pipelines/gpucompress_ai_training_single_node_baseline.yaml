@@ -1,5 +1,10 @@
-# Pipeline: GPUCompress AI-training checkpoint benchmark, single-node on
-# Delta via Apptainer.
+# Pipeline: GPUCompress AI-training single-node on Delta — NO-COMP BASELINE.
+#
+# Identical to gpucompress_ai_training_single_node.yaml except
+# hdf5_mode=default (no compression). Use this to measure raw HDF5 I/O
+# bandwidth on the ResNet-18 checkpoint workload alongside the adaptive
+# run. Switch between the two by re-running `jarvis ppl load yaml <path>`
+# before `jarvis ppl run`.
 #
 # Phase 1 trains ResNet-18 on CIFAR-10 with short-horizon batched training
 # and per-epoch checkpoint export (via scripts/train_and_export_checkpoints.py).
@@ -64,8 +69,10 @@ pkgs:
     skip_validate: 1
     skip_training: 0
 
-    # ── Benchmark configuration (Phase 2) — VOL mode with NN+RL+exp50 ─
-    hdf5_mode: vol
+    # ── Benchmark configuration (Phase 2) — NO-COMP BASELINE ──────────
+    # Phase is ignored when mode=default (pkg.py maps to the internal
+    # no-comp pseudo-phase). Kept at a valid value for _validate().
+    hdf5_mode: default
     phase: nn-rl+exp50
     policy: balanced
     error_bound: 0.0
