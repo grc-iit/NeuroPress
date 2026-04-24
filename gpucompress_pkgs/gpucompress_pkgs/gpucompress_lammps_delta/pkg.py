@@ -258,6 +258,12 @@ class GpucompressLammpsDelta(Application):
         lmp_env['GPUCOMPRESS_ERROR_BOUND']     = str(error_bound)
         lmp_env['GPUCOMPRESS_CHUNK_MB']        = str(chunk_mb)
         lmp_env['GPUCOMPRESS_DETAILED_TIMING'] = '1'
+        # LAMMPS_LOG_CHUNKS=1 triggers fix_gpucompress_kokkos to emit the
+        # 52-column benchmark_<dataset>_positions_timesteps.csv with
+        # per-H5Dwrite stage timings (stats_ms, nn_ms, comp_ms, read_ms,
+        # decomp_ms, ...). Required by evaluations/figure_5/plot_anatomy.py
+        # — without it Fig.~5's pie charts render as empty wedges.
+        lmp_env['LAMMPS_LOG_CHUNKS']           = '1'
         lmp_env['HDF5_PLUGIN_PATH']            = '/opt/GPUCompress/build'
         # VOL-level contract (docs/reproducability.md):
         lmp_env['GPUCOMPRESS_VOL_MODE']      = cfg.get('vol_mode', 'release')

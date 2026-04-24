@@ -22,14 +22,32 @@ set(CMAKE_CUDA_FLAGS_DEBUG "-g -G -O0")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3")
 set(CMAKE_CUDA_FLAGS_RELEASE "-O3")
 
-# Target the actual GPU architecture (sm_80 = Ampere A100).
-# Override at configure time: cmake -B build -DCMAKE_CUDA_ARCHITECTURES=90
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES 80 CACHE STRING "CUDA architectures to target")
+# Target the actual GPU architecture (sm_80 = Ampere A100). A100 is the
+# reference platform for this artifact; override at configure time for
+# H100 or Hopper via -DCMAKE_CUDA_ARCHITECTURES=90. sm_70+ is required
+# because we use atomicAdd(double*, double) which is a sm_60+ intrinsic
+# (we use sm_80 default; CMake's "native" or lower defaults won't work).
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "" OR CMAKE_CUDA_ARCHITECTURES LESS 60)
+    set(CMAKE_CUDA_ARCHITECTURES 80 CACHE STRING "CUDA architectures to target" FORCE)
+    message(STATUS "CMAKE_CUDA_ARCHITECTURES unset or too low; forcing 80 (A100)")
 endif()
 
 # Find CUDA
 find_package(CUDAToolkit REQUIRED)
+
+# Dependency auto-detection. Try two conventions in order:
+#   1. ${CMAKE_SOURCE_DIR}/.deps/   (bare-metal: scripts/install_deps.sh)
+#   2. /tmp/ and /tmp/hdf5-install  (Docker/Apptainer: docker/Dockerfile)
+# Explicit -DHDF5_ROOT / -DNVCOMP_PREFIX still override both.
+if(NOT DEFINED HDF5_ROOT)
+    if(EXISTS "${CMAKE_SOURCE_DIR}/.deps/hdf5/lib/libhdf5.so")
+        set(HDF5_ROOT "${CMAKE_SOURCE_DIR}/.deps/hdf5" CACHE PATH "HDF5 install prefix (auto from .deps/)")
+        message(STATUS "Auto-detected HDF5_ROOT=${HDF5_ROOT} from .deps/")
+    elseif(EXISTS "/tmp/hdf5-install/lib/libhdf5.so")
+        set(HDF5_ROOT "/tmp/hdf5-install" CACHE PATH "HDF5 install prefix (auto from /tmp/hdf5-install)")
+        message(STATUS "Auto-detected HDF5_ROOT=${HDF5_ROOT} from /tmp/ (Docker convention)")
+    endif()
+endif()
 
 # Optional: Find HDF5 for filter plugin
 find_package(HDF5 COMPONENTS C)
@@ -37,8 +55,28 @@ find_package(HDF5 COMPONENTS C)
 # Optional: Find MPI for multi-GPU benchmark support
 find_package(MPI)
 
-# External dependency prefix (nvcomp, etc.)
-set(NVCOMP_PREFIX "/tmp" CACHE PATH "nvcomp install prefix (include/ and lib/)")
+# If HDF5 was built with parallel (MPI) support, every header that
+# includes H5public.h transitively #includes <mpi.h>. CMake's
+# find_package(HDF5) does NOT automatically propagate MPI include dirs
+# to consumers, so nvcc fails with "mpi.h: No such file or directory"
+# on any test/benchmark that pulls in hdf5.h. Add them globally.
+if(HDF5_IS_PARALLEL AND MPI_C_FOUND)
+    include_directories(${MPI_C_INCLUDE_DIRS})
+    message(STATUS "HDF5 is parallel; propagating MPI include dirs: ${MPI_C_INCLUDE_DIRS}")
+endif()
+
+# External dependency prefix (nvcomp, etc.). Mirror the HDF5 auto-detect:
+# try .deps/ first, then /tmp/ (Docker convention); default is /tmp so the
+# existing container build keeps working even if neither header is found.
+if(EXISTS "${CMAKE_SOURCE_DIR}/.deps/include/nvcomp.hpp")
+    set(NVCOMP_PREFIX "${CMAKE_SOURCE_DIR}/.deps" CACHE PATH "nvcomp install prefix (include/ and lib/)")
+    message(STATUS "Auto-detected NVCOMP_PREFIX=${NVCOMP_PREFIX} from .deps/")
+elseif(EXISTS "/tmp/include/nvcomp.hpp")
+    set(NVCOMP_PREFIX "/tmp" CACHE PATH "nvcomp install prefix (include/ and lib/)")
+    message(STATUS "Auto-detected NVCOMP_PREFIX=${NVCOMP_PREFIX} from /tmp/ (Docker convention)")
+else()
+    set(NVCOMP_PREFIX "/tmp" CACHE PATH "nvcomp install prefix (include/ and lib/)")
+endif()
 
 # Include directories
 include_directories(

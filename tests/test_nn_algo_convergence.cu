@@ -22,6 +22,7 @@
 #include <string.h>
 #include <math.h>
 #include <stdint.h>
+#include <vector>
 
 #include <hdf5.h>
 #include <cuda_runtime.h>
@@ -297,19 +298,60 @@ static int run_nn_rl(float* d_data, float* d_readback)
     H5Dread(dset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL, H5P_DEFAULT, d_readback);
     H5Dclose(dset); H5Fclose(fid);
 
-    unsigned long long* d_mm;
-    CUDA_CHECK(cudaMalloc(&d_mm, sizeof(unsigned long long)));
-    CUDA_CHECK(cudaMemset(d_mm, 0, sizeof(unsigned long long)));
+    /* Per-chunk mismatch counts — critical for diagnosing which actions/
+     * preproc combos violate the lossless contract. One kernel launch per
+     * chunk into a per-chunk counter; total is the sum. */
+    unsigned long long* d_mm_chunks;
+    CUDA_CHECK(cudaMalloc(&d_mm_chunks, (size_t)NUM_CHUNKS * sizeof(unsigned long long)));
+    CUDA_CHECK(cudaMemset(d_mm_chunks, 0, (size_t)NUM_CHUNKS * sizeof(unsigned long long)));
     int threads = 256;
-    int blocks  = ((int)TOTAL_FLOATS + threads - 1) / threads;
-    compare_kernel<<<blocks, threads>>>(d_data, d_readback, TOTAL_FLOATS, d_mm);
+    int blocks_per_chunk = ((int)CHUNK_FLOATS + threads - 1) / threads;
+    for (int c = 0; c < NUM_CHUNKS; c++) {
+        const float* d_chunk_orig = d_data     + (size_t)c * CHUNK_FLOATS;
+        const float* d_chunk_read = d_readback + (size_t)c * CHUNK_FLOATS;
+        compare_kernel<<<blocks_per_chunk, threads>>>(
+            d_chunk_orig, d_chunk_read, CHUNK_FLOATS, &d_mm_chunks[c]);
+    }
     CUDA_CHECK(cudaDeviceSynchronize());
-    unsigned long long mm = 0;
-    cudaMemcpy(&mm, d_mm, sizeof(unsigned long long), cudaMemcpyDeviceToHost);
-    cudaFree(d_mm);
 
-    printf("\n  Lossless verification: %llu mismatches → %s\n",
-           mm, mm == 0 ? "PASS" : "FAIL");
+    std::vector<unsigned long long> mm_chunks(NUM_CHUNKS, 0);
+    cudaMemcpy(mm_chunks.data(), d_mm_chunks,
+               (size_t)NUM_CHUNKS * sizeof(unsigned long long),
+               cudaMemcpyDeviceToHost);
+    cudaFree(d_mm_chunks);
+
+    unsigned long long mm = 0;
+    int n_bad_chunks = 0;
+    for (int c = 0; c < NUM_CHUNKS; c++) {
+        mm += mm_chunks[c];
+        if (mm_chunks[c] > 0) n_bad_chunks++;
+    }
+
+    printf("\n  Lossless verification: %llu mismatches across %d/%zu chunks → %s\n",
+           mm, n_bad_chunks, (size_t)NUM_CHUNKS, mm == 0 ? "PASS" : "FAIL");
+
+    /* For every failing chunk, print its NN action + decoded algo/quant/shuf.
+     * This lets us tell apart: (a) specific algo broken on this data,
+     * (b) specific preproc broken, (c) scatter across many actions (race). */
+    if (mm > 0) {
+        static const char* kAlgoNames[] = {
+            "LZ4","Snappy","Deflate","GDeflate","Zstd","ANS","Cascaded","Bitcomp"
+        };
+        int n_hist = gpucompress_get_chunk_history_count();
+        printf("  Failing chunks (chunk_id  action  algo  quant  shuf  mismatches):\n");
+        for (int c = 0; c < NUM_CHUNKS && c < n_hist; c++) {
+            if (mm_chunks[c] == 0) continue;
+            gpucompress_chunk_diag_t d;
+            if (gpucompress_get_chunk_diag(c, &d) != 0) continue;
+            int a     = d.nn_action;
+            int algo  = a % 8;
+            int quant = (a / 8) % 2;
+            int shuf  = (a / 16) % 2;
+            const char* aname = (algo >= 0 && algo < 8) ? kAlgoNames[algo] : "???";
+            printf("    %6d  %4d  %-8s  %d      %d     %llu\n",
+                   c, a, aname, quant, shuf, mm_chunks[c]);
+        }
+    }
 
     gpucompress_disable_online_learning();
     return (mm > 0) ? 1 : 0;

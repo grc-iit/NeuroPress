@@ -1,0 +1,658 @@
+% SC26 reproducibility appendix — template from
+% https://github.com/jennfshr/sc26-repro/tree/main/for-paper-authors
+\documentclass[conference]{IEEEtran}
+
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{tagging}
+
+\usepackage{sc26repro}
+\usepackage{url}
+\emergencystretch=3em  % forgive long \texttt tokens in 2-column
+\sloppy
+
+% Uncomment/comment the following usetag lines
+% if you would like to get an explanation or an example.
+% Don't forget to comment them for the final submission.
+%\usetag{explanation}
+%\usetag{example}
+
+\begin{document}
+
+\twocolumn[%
+{\begin{center}
+\Huge
+Appendix: Artifact Description/Artifact Evaluation
+\end{center}}
+]
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%  AD Appendix
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\appendixAD
+
+\section{Overview of Contributions and Artifacts}
+
+\subsection{Paper's Main Contributions}
+
+\begin{description}
+\item[$C_1$] \textbf{GPU-accelerated I/O library interposition.} A VOL
+  connector and filter for HDF5 (and an ADIOS2 operator) that
+  transparently redirect scientific I/O calls onto a GPU-resident
+  pipeline, keeping simulation data on the device from production
+  through compression and storage without source-code changes to the
+  application.
+\item[$C_2$] \textbf{GPU-aware compression pipeline synthesis.} A
+  lightweight neural-network selector driven by a Compression
+  Characteristic Model that extracts eight per-chunk statistical
+  descriptors and jointly picks the codec (among eight nvCOMP
+  backends), byte-shuffle mode, quantization level, and error bound.
+  Multi-level online refinement (cost-model scoring, SGD correction,
+  top-$K$ exploration) adapts the selector to unseen workloads at
+  runtime.
+\item[$C_3$] \textbf{Resource-aware dynamic data organization.} A
+  placement engine that routes compressed chunks across the HBM /
+  DRAM / NVMe / HDD hierarchy using current tier capacity and
+  bandwidth, asynchronously flushing to slower tiers during compute
+  phases so data movement overlaps with productive work.
+\end{description}
+
+
+\subsection{Computational Artifacts}
+
+\begin{description}
+\item[$A_1$] NeuroPress core library + HDF5 VOL connector.
+  Public source repository:
+  \url{https://github.com/grc-iit/NeuroPress}.
+\item[$A_2$] Neural-network training pipeline and synthetic
+  benchmark. Same repository as $A_1$, under
+  \texttt{neural\_net/} and \texttt{synthetic/}.
+\item[$A_3$] Jarvis-CD pipelines for five scientific workloads
+  (VPIC, Nyx, LAMMPS, WarpX, ResNet/ViT AI checkpoints),
+  under \texttt{gpucompress\_pkgs/} in the $A_1$ repository.
+  Built on the Jarvis-CD orchestration framework:
+  \url{https://github.com/grc-iit/jarvis-cd}.
+\item[$A_4$] Paper-evaluation harness and plot-generation scripts,
+  under \texttt{evaluations/} and \texttt{analysis/} in the $A_1$
+  repository.
+\end{description}
+
+\begin{center}
+\begin{tabular}{rll}
+\toprule
+Artifact ID  &  Contributions &  Related \\
+             &  Supported     &  Paper Elements \\
+\midrule
+$A_1$   &  $C_1, C_2, C_3$ & Fig.~3; Tab.~I \\
+\midrule
+$A_2$   &  $C_2$           & Fig.~4; \S IV.A \\
+\midrule
+$A_3$   &  $C_1, C_2, C_3$ & Fig.~5; Fig.~6; Fig.~8; Fig.~9;
+                             Tab.~III \\
+\midrule
+$A_4$   &  $C_1, C_2, C_3$ & Figs.~4, 5, 6, 8, 9 (plotting) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+
+\subsection{Scope of Reproducibility}
+
+One experiment in the paper --- the GPUDirect Storage (GDS)
+bandwidth study in Fig.~7 --- was collected on an
+NVIDIA-internal H100 + enterprise-NVMe testbed during an
+author's internship and cannot be re-executed by external
+reviewers. GDS requires a narrow stack alignment (GPU
+firmware, NVMe firmware, kernel GDS module, file-system
+driver, and matched CUDA/driver versions) that very few sites
+have available; the hardware and platform access, not the
+source code, are the limiting factor. Because the underlying
+measurements are NVIDIA-internal, neither the raw CSVs nor a
+dedicated plotter for Fig.~7 ship with this artifact; the
+bars in the published Fig.~7 are a one-time archival result
+and are out of scope for external reproduction.
+
+All other results are fully reproducible on commodity A100
+nodes (the NCSA Delta \texttt{gpuA100x4} partition was used
+for the paper) through artifacts $A_1$--$A_4$ without any
+NVIDIA-internal infrastructure:
+Fig.~4 (NN selector accuracy and SHAP feature importance,
+$C_2$) from $A_2$;
+Fig.~5 (per-chunk cost breakdown pie charts, $C_2$) from
+$A_3$'s figure\_5 pipelines (release-mode runs with
+stage-timing instrumentation);
+Fig.~6 (VPIC threshold-sensitivity sweep, $C_2$) from $A_3$;
+Fig.~8 (cross-workload regret and MAPE convergence over five
+workloads, $C_2$) from $A_3$; and
+Fig.~9 (end-to-end wall-clock reduction of Baseline vs.
+nvCOMP vs. NeuroPress configurations, $C_1$ and $C_3$) from
+$A_3$. Tables~II and~III (cost-model weights and loss
+configurations) are author-specified configuration tables,
+not generated outputs.
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Artifact Identification}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+\newartifact
+
+\artrel
+$A_1$ is the NeuroPress core library and substantiates all
+three contributions; it is the implementation of the system.
+For $C_1$ (transparent GPU-resident I/O path) it provides
+\texttt{libgpucompress.so} (core runtime) and
+\texttt{libH5VLgpucompress.so} (HDF5 VOL connector), which
+together intercept standard HDF5 calls and route buffers
+through a GPU-resident compression pipeline. For $C_2$
+(GPU-aware compression pipeline synthesis), the library
+implements the four blocks of the selector shown in Fig.~3:
+the Compression Characteristic Model (per-chunk
+statistical-descriptor extraction), Compression Selection (NN
+forward pass over eight candidate pipelines, cost-model
+re-ranking, online SGD correction, and top-$K$ exploration),
+the Preprocess Factory (BitShuffle, Quantize), and the
+Compressor Factory (ZLIB, LZMA, SZ3, and the eight nvCOMP
+backends). The offline training that produces the weights
+consumed by Compression Selection lives in $A_2$. For $C_3$
+(resource-aware dynamic data organization), the library
+contains the tier-aware placement engine --- the Operator
+Offloader and Data Transfer Engine in Fig.~3 --- that routes
+compressed chunks across the HBM/DRAM/NVMe/HDD hierarchy and
+overlaps flushes with compute.
+
+\artexp
+Running the VOL-enabled unit tests (\texttt{ctest --test-dir
+build}) should complete with all targets passing, with every
+lossless round-trip returning bit-identical data and every
+device-pointer write path bypassing the host bounce buffer
+(verified via the xfer-audit counters in
+\texttt{test\_vol\_xfer\_audit}). This substantiates $C_1$
+(transparent GPU-resident I/O path) and confirms that the $C_3$
+placement engine routes data through the full tiered-storage
+path without corruption.
+
+\arttime
+The full \emph{build + test} cycle for $A_1$ completes in
+under \textbf{10 minutes} end-to-end on an A100 node. Measured
+breakdown (verified on Delta's \texttt{dt-login02}, 128 cores;
+compute-node variance bounded by core count):
+\texttt{./scripts/install\_deps.sh} (fetch pre-built nvcomp
+5.1 archive from NVIDIA, then download, configure, build, and
+install HDF5 2.0.0 with
+\texttt{-DHDF5\_ENABLE\_PARALLEL=ON}) --- \textbf{1 min 36 s};
+configure and build NeuroPress via
+\texttt{cmake -B build \&\& cmake --build build -j\$(nproc)}
+(library, 90 test binaries, MPI benchmarks)
+--- \textbf{41 s};
+\texttt{ctest --test-dir build --output-on-failure} (71 unit
+/ VOL / regression / perf / nn tests) --- \textbf{$\le$ 2
+minutes} on A100. Total: approximately \textbf{4 minutes on a
+well-provisioned login node, $\le$ 10 minutes on a compute
+node with fewer cores or slower links}. Analysis (inspect the
+\texttt{ctest} summary and the per-test log under
+\texttt{build/Testing/}) 2 minutes. No workload execution at
+this stage --- workload runs are covered by $A_3$.
+
+\artin
+
+\artinpart{Hardware}
+x86\_64 host with an NVIDIA GPU of compute capability $\geq$
+7.0. Tested configurations: A100-40GB on NCSA Delta, RTX 4070 on
+local development, H100 for the GDS evaluation. At least 32~GB
+host RAM and 20~GB of free disk for the build tree.
+
+\artinpart{Software}
+Ubuntu 22.04 or RHEL 9 equivalent; CUDA 12.x; nvCOMP 5.x;
+HDF5 1.14+ built with parallel support
+(\texttt{-DHDF5\_ENABLE\_PARALLEL=ON}); OpenMPI 4.x or MPICH
+4.x; GCC 12 (NVCC 12.8 has an ICE with libstdc++ 13); CMake
+3.24+. The full dependency manifest is given in
+\texttt{docker/Dockerfile} and
+\texttt{cmake/CoreLibrary.cmake}.
+
+\artinpart{Datasets / Inputs}
+No external dataset is required for $A_1$. The synthetic
+benchmark (\texttt{build/synthetic\_generator})
+generates float32 chunks with controlled statistical properties
+for unit validation.
+
+\artinpart{Installation and Deployment}
+\begin{verbatim}
+git clone https://github.com/grc-iit/NeuroPress
+cd NeuroPress
+./scripts/install_deps.sh
+cmake -B build
+cmake --build build -j$(nproc)
+ctest --test-dir build --output-on-failure
+\end{verbatim}
+\texttt{scripts/install\_deps.sh} stages HDF5-parallel 2.0.0
+and nvcomp 5.1 under \texttt{.deps/} following the exact
+recipe used by \texttt{docker/Dockerfile}; the Apptainer path
+(used by $A_3$'s Jarvis pipelines) stages the same pair under
+\texttt{/opt/deps/} inside the container. Bare-metal and
+containerised builds therefore consume an identical dependency
+tree. After the script runs, \texttt{cmake -B build}
+auto-detects \texttt{HDF5\_ROOT} and \texttt{NVCOMP\_PREFIX}
+from \texttt{.deps/}; no \texttt{-D} flags are required for
+the default build. On non-Delta systems,
+\texttt{CMAKE\_CUDA\_ARCHITECTURES} may need
+\texttt{-DCMAKE\_CUDA\_ARCHITECTURES=<cc>} for a specific GPU
+(default is \texttt{80} for A100).
+
+\artcomp
+Unit-level workflow: $T_1$ generates synthetic chunks, $T_2$
+compresses and decompresses each chunk under every codec, and
+$T_3$ verifies bitwise equality and records timing. Parameters:
+4000 chunks, 32 (algorithm, shuffle, quant) configurations, seed
+42.
+
+\artout
+\texttt{results/synthetic\_results.csv} (128k rows). A successful
+build produces all three shared objects under \texttt{build/} and
+all ctest targets pass.
+
+
+\newartifact
+
+\artrel
+$A_2$ substantiates $C_2$: the neural compression selector. It
+produces the packed-weight file
+(\texttt{neural\_net/weights/model.nnwt}) consumed at runtime by
+the VOL connector shipped in $A_1$.
+
+Training the 8-input / 5-layer / 8-output fully-connected
+network (13{,}312 parameters) on 128{,}000 synthetic rows
+(2{,}000 chunks $\times$ 64 configurations, 80/20 by-chunk
+split, 5-fold CV, Adam lr=$3\times10^{-4}$, weight
+decay=$10^{-5}$, batch 512, up to 150 epochs with early
+stopping) should converge to MAPE in the 10--23\% range
+across all eight predicted statistics, reproducing Fig.~4(b)
+of the paper; the SHAP feature-importance heatmap over the
+eight inputs should reproduce Fig.~4(a), with compression
+library, first derivative, and quantization level dominating
+the predictions. Together these substantiate $C_2$ (GPU-aware
+compression pipeline synthesis). The trained weights
+(\texttt{neural\_net/weights/model.nnwt}) are consumed at
+runtime by $A_3$'s figure\_5 pipelines to produce the
+per-chunk stage-timing pie charts of Fig.~5, and by the
+figure\_6/figure\_8 pipelines for online refinement (SGD +
+top-$K$ exploration).
+
+\arttime
+Setup (Python environment and PyTorch) 10 minutes. Execution:
+synthetic benchmark to generate the 128k-row training CSV
+(\texttt{build/synthetic\_generator}) 15--20
+minutes; training with five-fold cross-validation
+(\texttt{neural\_net/training/train.py}) 25--35 minutes on one A100;
+weight export (\texttt{neural\_net/export/export\_weights.py}) under 1 minute.
+Analysis (regenerate the Fig.~4 accuracy and SHAP panels from
+\texttt{results/}) 5 minutes. Total wall time: approximately
+one hour on a single GPU.
+
+\artin
+
+\artinpart{Hardware}
+Any CUDA-capable GPU with $\geq$ 8~GB VRAM. Training is not
+latency-sensitive; a consumer GPU is sufficient.
+
+\artinpart{Software}
+Python 3.10+, PyTorch 2.2, torchvision, pyyaml, xgboost, shap,
+matplotlib, seaborn, scikit-learn, pandas, numpy. The full
+installation command is listed in
+\texttt{docs/reproducability.md} under ``Prerequisites''.
+
+\artinpart{Datasets / Inputs}
+Generated in-tree. The synthetic benchmark produces the 128k-row
+training CSV; no external download is required.
+
+\artinpart{Installation and Deployment}
+\begin{verbatim}
+pip install torch torchvision pyyaml xgboost shap \
+    matplotlib seaborn scikit-learn pandas numpy
+build/synthetic_generator \
+    --num-chunks 4000 \
+    --output results/synthetic_results.csv \
+    --seed 42
+python neural_net/training/train.py \
+    --csv results/synthetic_results.csv
+# train.py writes neural_net/weights/model.pt
+# The separate export step produces the .nnwt binary
+# format that libgpucompress.so loads at runtime:
+python neural_net/export/export_weights.py \
+    --input  neural_net/weights/model.pt \
+    --output neural_net/weights/model.nnwt
+\end{verbatim}
+
+Workflow:
+$T_1$ synthetic data generation (2{,}000 float32 chunks at
+four sizes: 64~KB, 256~KB, 1~MB, 4~MB, each tested under 64
+configurations = 8 algorithms $\times$ 2 shuffle modes
+$\times$ 4 quantization levels);
+$T_2$ five-fold cross-validation
+(\texttt{neural\_net/training/cross\_validate.py}) producing
+the per-output MAPE bars of Fig.~4(b);
+$T_3$ SHAP analysis on held-out chunks producing Fig.~4(a)'s
+feature-importance heatmap;
+$T_4$ weight export
+(\texttt{neural\_net/export/export\_weights.py}) to the packed
+\texttt{.nnwt} format consumed by $A_1$. Seeds are fixed to
+42 throughout. Fig.~5 (per-chunk cost breakdown) is produced
+by $A_3$'s figure\_5 pipelines at workload scale, not by a
+microbenchmark here.
+
+\artout
+\texttt{neural\_net/weights/model.nnwt} (13\,312 parameters);
+\texttt{results/training\_metrics.csv} (per-epoch loss and MAPE);
+SHAP figures under \texttt{results/shap/}. The full procedure is
+documented in \texttt{docs/reproducability.md}.
+
+
+\newartifact
+
+\artrel
+$A_3$ substantiates $C_1$, $C_2$, and $C_3$ jointly by driving
+the full stack on realistic simulations. Each Jarvis package
+builds an Apptainer image containing the application linked
+against GPUCompress and runs it with both a \emph{baseline}
+(unmodified I/O) and an \emph{adaptive} (VOL + NN selector)
+configuration.
+
+\artexp
+The adaptive configuration (\texttt{NeuroPress + Tier +
+Async}) should reproduce four falsifiable predictions:
+(i) \textbf{stage-timing anatomy (Fig.~5, per workload)}: the
+figure\_5 pipelines emit six-wedge write-path and three-wedge
+read-path pie charts over one H5Dwrite/H5Dread. The Stats
+Kernel, NN Inference, and Compress Choice wedges should each
+take $<15\%$ of the total write time, with Compress Time and
+I/O Time dominating the remainder; the read path should show
+Decompress Time and I/O Time accounting for $>90\%$ of total
+read time;
+(ii) \textbf{threshold sweep (Fig.~6, VPIC)}: cost MAPE and
+regret rise monotonically with both online-learning thresholds
+$X_1$ (proportional correction) and $X_2 - X_1$ (exploration);
+write and read bandwidth peak near $X_1 = 30$, $X_2 - X_1 =
+20$, giving the accuracy--throughput sweet spot adopted for
+the remaining experiments;
+(iii) \textbf{online convergence (Fig.~8, all five workloads)}:
+LAMMPS and the AI checkpoint workload start near 15$\times$
+and 8$\times$ regret respectively and decay to near-zero
+within 200--500 chunks; VPIC, Nyx, and WarpX stabilise near
+zero regret from the first chunk;
+(iv) \textbf{end-to-end wall-clock (Fig.~9)}: NeuroPress +
+Tier + Async reduces wall-clock time by approximately 53\%
+versus the uncompressed baseline and 24\% versus
+\texttt{nvCOMP + tiering} on I/O-heavy workloads (VPIC,
+LAMMPS), 7--12\% on compute-heavy workloads (Nyx, WarpX, AI),
+with an additional 10--15\% reduction when relaxing the
+quality constraint from $\epsilon_L$ to $\epsilon_H$.
+
+\arttime
+Per workload on a single A100, broken out by phase:
+(i) one-time image build and dependency resolution
+(\texttt{jarvis ppl load yaml}) 15--20 minutes cold, cached
+thereafter; (ii) SLURM allocation 1--5 minutes depending on
+queue; (iii) actual benchmark execution (\texttt{jarvis ppl
+run}, which drives both the baseline and adaptive variants
+end-to-end and writes the CSVs listed under \artout):
+approximately 15 seconds for the smoke configuration, 3
+minutes for the small configuration, and 1.5 hours at paper
+scale (the grid sizes and timestep counts reported in \S V);
+(iv) archiving the outputs from the compute-node scratch into
+\texttt{\$HOME} approximately 1 minute. All five workloads at
+paper scale fit in the 8-hour AE budget on a single A100
+allocation.
+
+\artin
+
+\artinpart{Hardware}
+One NVIDIA A100-40GB (the NCSA Delta \texttt{gpuA100x4}
+partition was used for the paper). Multi-GPU runs require the
+grid dimension to divide the rank count cleanly; per-workload
+READMEs list the valid combinations.
+
+\artinpart{Software}
+Apptainer 1.2+; Jarvis-CD (\texttt{pip install jarvis-cd}); CUDA
+12.x host driver; SLURM for scheduling. All other dependencies
+are baked into the Apptainer image produced by
+\texttt{gpucompress\_base} and the per-workload
+\texttt{gpucompress\_*\_delta} packages.
+
+\artinpart{Datasets / Inputs}
+All inputs are deterministically regenerated from shipped decks
+and patches; no external dataset download (beyond CIFAR-10 for
+the AI workload) is required. The on-disk output volume
+produced during a run, however, scales with the simulation and
+is tens of gigabytes at paper scale. Per-workload inputs:
+VPIC --- Harris-sheet magnetic-reconnection deck, generated
+in-tree at \texttt{benchmarks/vpic-kokkos/}; Nyx --- Sedov
+blast wave ($256^3$) and Santa Barbara cosmology ($32^3$)
+input decks, shipped in \texttt{benchmarks/nyx/patches/};
+LAMMPS --- Lennard-Jones melt, generated in-tree; WarpX ---
+laser--plasma acceleration input file, shipped in
+\texttt{benchmarks/warpx/}; AI checkpointing --- CIFAR-10,
+downloaded by \texttt{torchvision} on first run
+(\textasciitilde 170~MB).
+
+\artinpart{Installation and Deployment}
+The Jarvis Path-B workflow replaces the earlier hand-written
+shell scripts. Pipeline YAMLs live in two places: the
+baseline pair (\texttt{<wl>\_baseline.yaml},
+\texttt{<wl>\_single\_node.yaml}) under
+\texttt{gpucompress\_pkgs/pipelines/} for $A_2/A_3$, and the
+figure-specific YAMLs (trace-mode for Fig.~6,
+release-mode-per-policy for Fig.~8) under
+\texttt{evaluations/figure\_6/} and
+\texttt{evaluations/figure\_8/}. Register the repo once, then
+load whichever YAML matches the target figure:
+\begin{verbatim}
+# After the A_1 clone, export the repo root so every
+# subsequent command is path-independent:
+cd NeuroPress && export NEUROPRESS=$PWD
+cd $NEUROPRESS
+jarvis repo add gpucompress_pkgs
+
+# Fig. 5 -- per-chunk cost breakdown (pie anatomy)
+# Supported workloads for Fig. 5: VPIC, Nyx, WarpX
+# (all three route through generic_benchmark which emits
+#  stats_ms / nn_ms / comp_ms / read_ms / decomp_ms).
+# LAMMPS's in-situ fix_gpucompress_kokkos does NOT currently
+# emit those columns, so LAMMPS is not included in Fig. 5.
+jarvis ppl load yaml \
+  evaluations/figure_5/pipeline_<workload>.yaml
+
+# Fig. 6 -- trace-mode threshold sweep (all four workloads)
+jarvis ppl load yaml \
+  evaluations/figure_6/pipeline_<workload>.yaml
+
+# Fig. 8 -- release-mode per-policy (balanced/ratio)
+jarvis ppl load yaml \
+  evaluations/figure_8/pipeline_<workload>.yaml
+\end{verbatim}
+The first \texttt{jarvis ppl load yaml} invocation builds the
+Apptainer image (15--20 minutes cold, cached thereafter). On
+Delta's \texttt{pam\_slurm\_adopt}-gated nodes, the
+per-pipeline hostfile under
+\texttt{\$HOME/.ppi-jarvis/shared/} must reference the
+currently-allocated compute node, otherwise \texttt{jarvis
+ppl run} fails with \emph{no active jobs on this node}.
+Refresh it immediately after \texttt{salloc}:
+\begin{verbatim}
+# On the GPU compute node, before each jarvis ppl run.
+# <pipeline-dir> is the value of the YAML's "name:" field, e.g.
+#   Fig. 5 : gpucompress_figure_5_<workload>
+#   Fig. 6 : gpucompress_<workload>_delta_single_node
+#   Fig. 8 : gpucompress_<workload>_delta_single_node
+hostname > $HOME/hostfile_single.txt
+cp $HOME/hostfile_single.txt \
+   $HOME/.ppi-jarvis/shared/<pipeline-dir>/hostfile
+jarvis ppl run
+\end{verbatim}
+Each subsequent \texttt{jarvis ppl run} executes the baseline
+and adaptive runs back-to-back inside the container. Each
+\texttt{gpucompress\_<workload>\_delta/README.md} gives the
+full four-phase (clean, build, allocate, run-and-archive)
+recipe; the figure-specific READMEs under
+\texttt{evaluations/figure\_6/} and
+\texttt{evaluations/figure\_8/} cover the trace-mode and
+per-policy flows respectively.
+
+\artcomp
+For each workload $W$ (VPIC, Nyx, LAMMPS, WarpX, AI-ckpt):
+$T_1(W)$ build the image; $T_2(W)$ run the baseline
+(\texttt{\_baseline.yaml}); $T_3(W)$ run the adaptive variant
+with \texttt{phase=nn-rl} and \texttt{policy=balanced};
+$T_4(W)$ outputs land under the YAML-configurable
+\texttt{results\_dir}. The figure-specific pipelines use
+dedicated subdirectories:
+\texttt{\$HOME/GPUCompress/tmp/figure\_6\_<wl>\_trace/} for
+Fig.~6 trace-mode runs and
+\texttt{\$HOME/GPUCompress/tmp/figure\_8\_<wl>\_<policy>/}
+(with \texttt{<policy>} $\in$ \{\texttt{balanced},
+\texttt{ratio}\}) for Fig.~8 per-policy runs. Baseline
+\texttt{gpucompress\_pkgs/pipelines/} runs default to
+\texttt{\$HOME/GPUCompress/tmp/<workload>/}. No post-run
+archiving step is required. Key sweep parameters: three
+policies (\texttt{speed}, \texttt{balanced}, \texttt{ratio});
+error bounds $\in \{0.0, 10^{-3}, 10^{-2}\}$ for lossy runs;
+grid sizes as documented per README.
+
+\artout
+Per run, under the relevant
+\path{$HOME/GPUCompress/tmp/<outdir>/} (see \artcomp{} for
+the three \texttt{<outdir>} conventions), the following files
+are produced:
+\path{benchmark_*_timesteps.csv} (per-snapshot write/read time
+and ratio);
+\path{benchmark_*_timestep_chunks.csv} (per-chunk features and
+decisions);
+\path{benchmark_*_ranking.csv} (Kendall $\tau$ and regret);
+\path{gpucompress_trace.csv} (per-chunk $\times$ per-config
+trace, 24-column CSV, produced only by the Fig.~6 trace-mode
+pipelines);
+and
+\path{gpucompress_vol_summary.txt} (lifetime I/O totals).
+These CSVs are the direct inputs to $A_4$.
+
+
+\newartifact
+
+$A_4$ substantiates the published evidence for $C_1$, $C_2$,
+and $C_3$ by turning the raw CSVs produced by $A_2$ and $A_3$
+into the headline figures that back each claim:
+Fig.~4 (NN selector MAPE across outputs and SHAP feature
+importance --- $C_2$) from $A_2$'s training metrics;
+Fig.~5 (per-chunk cost breakdown pie charts on the write
+and read paths --- $C_2$) from $A_3$'s figure\_5 pipelines'
+\texttt{benchmark\_<dataset>\_timesteps.csv} (release mode
+with stage-timing instrumentation);
+Fig.~6 (VPIC threshold-sensitivity heatmaps for regret, MAPE,
+write bandwidth, and read bandwidth --- $C_2$) from $A_3$;
+Fig.~8 (cross-workload regret and cost MAPE convergence over
+the five unseen workloads --- $C_2$) from $A_3$;
+Fig.~9 (total wall-clock time across six configurations ---
+Baseline, nvCOMP, nvCOMP+tiering, NeuroPress+tiering,
+NeuroPress+tiering+async, and loss-config sweep --- on all
+five workloads, $C_1$ and $C_3$) from $A_3$. Without $A_4$ the
+reviewer would have per-run CSVs but no mechanical path from
+those CSVs back to the figures in the paper.
+
+Running the plotters over a directory of archived run outputs
+reproduces:
+Fig.~4 (NN accuracy + SHAP, from $A_2$'s training metrics);
+Fig.~5 (per-chunk cost breakdown pie charts, from $A_3$'s
+figure\_5 stage-timing CSVs);
+Fig.~6 (four $7 \times 7$ VPIC threshold-sweep heatmaps);
+and Fig.~8 and Fig.~9 from the per-workload CSVs. Each plot
+regenerated from the shipped archive should be
+pixel-comparable to the corresponding plot in the submitted
+PDF. Fig.~7 (GPUDirect Storage bandwidth) is NVIDIA-internal
+and out of scope for $A_4$ (see \S1.3).
+
+Plot regeneration from pre-collected CSVs: approximately 10
+minutes end-to-end on a laptop (Fig.~4 under 1 minute, Fig.~5
+under 1 minute, Fig.~6 $\sim$3 minutes for the four heatmap
+panels, Fig.~8 $\sim$2 minutes, Fig.~9 $\sim$2 minutes for the
+stacked-bar panel across five workloads). No GPU is required
+at this stage.
+
+\artin
+
+\artinpart{Hardware}
+Any x86\_64 workstation with $\geq$ 8~GB RAM.
+
+\artinpart{Software}
+Python 3.10+; matplotlib, seaborn, pandas, numpy. No CUDA
+required.
+
+\artinpart{Datasets / Inputs}
+The per-figure result directories produced by $A_3$ under
+\texttt{\$HOME/GPUCompress/tmp/}:
+\texttt{figure\_5\_<wl>/} (stage-timing CSVs for Fig.~5),
+\texttt{figure\_6\_<wl>\_trace/} (per-chunk $\times$
+per-config trace for Fig.~6 and Fig.~9), and
+\texttt{figure\_8\_<wl>\_<policy>/} (release-mode per-policy
+CSVs for Fig.~8). WarpX's Fig.~6 trace nests one level deeper
+under \texttt{vol\_nn-rl+exp50/}; \texttt{plot\_trace.py} and
+\texttt{throughput.py} both auto-detect this case.
+
+\artinpart{Installation and Deployment}
+Each figure has a dedicated plotter committed under
+\texttt{evaluations/}, \texttt{analysis/}, or
+\texttt{neural\_net/}:
+\begin{verbatim}
+# Fig. 4 (NN MAPE + SHAP panels)
+neural_net/training/cross_validate.py
+# Fig. 5 (pie anatomy of write/read path timing)
+evaluations/figure_5/plot_anatomy.py
+# Fig. 6 (threshold sweep + MAPE/regret plots)
+analysis/plot_trace.py
+# Fig. 7 is NVIDIA-internal (see Section 1.3) and not included.
+# Fig. 8
+evaluations/figure_8/plot.py
+# Fig. 9
+evaluations/figure_8/throughput.py
+\end{verbatim}
+All plotters take a directory of archived run outputs and
+write PNG/PDF plus a numerical summary CSV alongside.
+
+Each plotter is driven independently:
+$T_1$ \texttt{python neural\_net/training/cross\_validate.py
+--csv results/synthetic\_results.csv}
+$\rightarrow$ Fig.~4 (MAPE bars; SHAP heatmap is emitted by
+\texttt{neural\_net/training/hyperparam\_study.py});
+$T_2$ \texttt{python evaluations/figure\_5/plot\_anatomy.py
+<figure\_5\_<workload>/>} $\rightarrow$ Fig.~5 (write- and
+read-path pie anatomy, reads
+\texttt{benchmark\_<dataset>\_timesteps.csv} emitted by the
+figure\_5 pipeline);
+$T_3$ \texttt{python analysis/plot\_trace.py
+<figure\_6\_<workload>\_trace/gpucompress\_trace.csv>}
+$\rightarrow$ Fig.~6 (MAPE / regret line plots plus four
+$40\times 40$ threshold heatmaps, all produced by a single
+invocation);
+$T_4$ \texttt{python evaluations/figure\_8/plot.py
+--sc26-dir <tmp> --policies balanced ratio}
+$\rightarrow$ Fig.~8 (regret + cost-MAPE convergence + per-metric
+MAPE bar);
+$T_5$ \texttt{python evaluations/figure\_8/throughput.py}
+$\rightarrow$ Fig.~9 (wall-clock across eight configurations,
+five workloads) via
+\texttt{analysis/plot\_e2e.py:plot\_fig8}.
+
+PNG and PDF figures under \texttt{evaluations/*/figures/} and
+\texttt{analysis/figures/}, matching Figs.~4, 5, 6, 8, 9 in
+the paper. A numerical summary CSV is written alongside each
+figure to enable spot-checking against the values reported in
+the text (e.g., 53\%, 24\%, 12\% reductions for Fig.~9;
+$X_1=30$, $X_2-X_1=20$ sweet spot for Fig.~6).
+
+\end{document}

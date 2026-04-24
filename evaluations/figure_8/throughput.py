@@ -78,12 +78,23 @@ def main() -> int:
         if override:
             defaults[name] = _expand(override)
 
-    # Keep paper's left-to-right workload order.
+    # Keep paper's left-to-right workload order. The WarpX pipeline writes
+    # its trace.csv one level deeper under vol_nn-rl+exp50/ (the other
+    # workloads write flat). Auto-fall-back to that nested path so
+    # reviewers don't need --warpx-trace unless they archived somewhere
+    # custom.
+    nested_fallbacks = {
+        "WarpX": base / "figure_6_warpx_trace" / "vol_nn-rl+exp50" / "gpucompress_trace.csv",
+    }
     trace_paths = {}
     for name in PAPER_ORDER:
         p = defaults[name]
         if _has_rows(p):
             trace_paths[name] = p
+        elif name in nested_fallbacks and _has_rows(nested_fallbacks[name]):
+            trace_paths[name] = nested_fallbacks[name]
+            print(f"[auto] {name}: using nested path {nested_fallbacks[name]}",
+                  file=sys.stderr)
         else:
             print(f"[skip] {name}: {p} missing or header-only", file=sys.stderr)
 

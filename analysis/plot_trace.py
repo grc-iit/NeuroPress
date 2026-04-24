@@ -312,7 +312,34 @@ if __name__ == "__main__":
                         help="Label appended to figure titles (e.g. 'WarpX LWFA')")
     args = parser.parse_args()
 
-    out_dir = args.out_dir if args.out_dir else args.trace_csv.parent
+    # Accept either the direct trace.csv path, or the parent dir (e.g.
+    # figure_6_<workload>_trace/) — in the latter case we try the flat
+    # gpucompress_trace.csv first, then fall back to any nested
+    # vol_*/gpucompress_trace.csv (WarpX's generic_benchmark output
+    # is nested under vol_nn-rl+exp50/). Keeps one command working for
+    # all four workloads.
+    trace = args.trace_csv
+    if trace.is_dir():
+        flat = trace / "gpucompress_trace.csv"
+        if flat.is_file():
+            trace = flat
+        else:
+            for sub in sorted(trace.iterdir()):
+                nested = sub / "gpucompress_trace.csv"
+                if nested.is_file():
+                    trace = nested
+                    break
+    elif not trace.is_file() and trace.name == "gpucompress_trace.csv":
+        # File missing at the exact path — try one level deeper.
+        parent = trace.parent
+        if parent.is_dir():
+            for sub in sorted(parent.iterdir()):
+                nested = sub / "gpucompress_trace.csv"
+                if nested.is_file():
+                    trace = nested
+                    break
+
+    out_dir = args.out_dir if args.out_dir else trace.parent
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    plot_trace(args.trace_csv, out_dir, args.bin_size, args.heatmap_window, args.title_label)
+    plot_trace(trace, out_dir, args.bin_size, args.heatmap_window, args.title_label)

@@ -124,21 +124,29 @@ static int write_1gb(const float *d_data)
     return 0;
 }
 
-/* ── Parse "total_io_ms=<value>" from a text file ── */
+/* Parse the canonical io-timing CSV emitted by DiagnosticsStore::dumpIoTiming:
+ *   line 1:  e2e_ms,vol_ms
+ *   line 2:  <e2e>,<vol>
+ * We return vol_ms (sum of H5Dwrite/H5Dread callback wall-clock) — that is
+ * the value the test calls "total_io_ms" (total time spent in the VOL). */
 static int parse_timing_file(const char *path, double *out_ms)
 {
     FILE *f = fopen(path, "r");
     if (!f) { fprintf(stderr, "  Cannot open timing file: %s\n", path); return -1; }
-    char line[256];
-    while (fgets(line, sizeof(line), f)) {
-        if (strncmp(line, "total_io_ms=", 12) == 0) {
-            *out_ms = atof(line + 12);
-            fclose(f); return 0;
-        }
+    char header[256], data[256];
+    if (!fgets(header, sizeof(header), f) || !fgets(data, sizeof(data), f)) {
+        fclose(f);
+        fprintf(stderr, "  timing file %s missing header or data row\n", path);
+        return -1;
     }
     fclose(f);
-    fprintf(stderr, "  'total_io_ms=' not found in %s\n", path);
-    return -1;
+    double e2e = 0.0, vol = 0.0;
+    if (sscanf(data, "%lf,%lf", &e2e, &vol) != 2) {
+        fprintf(stderr, "  timing file %s data row unparseable: %s", path, data);
+        return -1;
+    }
+    *out_ms = vol;
+    return 0;
 }
 
 /* ── Count lines in a file (0-based header excluded = data rows) ── */
@@ -159,10 +167,18 @@ static int count_csv_data_rows(const char *path, int *header_ok)
         if (len == 0) continue;
 
         if (first) {
-            /* Verify expected header */
+            /* Verify expected header — must match the canonical writer in
+             * src/api/diagnostics_store.hpp (dumpTraceHeader). Updated from
+             * the original 8-column format when the trace schema was extended
+             * with psnr/ssim/max_error/mape_* and explore_mode columns. */
             const char *expected =
-                "chunk_id,action_id,comp_lib,chosen,"
-                "pred_cost,real_ratio,real_comp_ms,real_decomp_ms";
+                "chunk_id,action_id,comp_lib,chosen,chunk_bytes,"
+                "pred_cost,pred_ratio,pred_comp_ms,pred_decomp_ms,"
+                "pred_psnr,pred_ssim,pred_max_error,"
+                "real_cost,real_ratio,real_comp_ms,real_decomp_ms,"
+                "real_psnr,real_ssim,real_max_error,"
+                "mape_cost,mape_ratio,mape_comp_ms,mape_decomp_ms,"
+                "explore_mode";
             *header_ok = (strcmp(line, expected) == 0) ? 1 : 0;
             if (!*header_ok)
                 fprintf(stderr, "  Unexpected header: '%s'\n", line);
@@ -334,7 +350,9 @@ static int test_trace(float *d_data)
     }
     printf("  trace CSV: %s  rows=%d  header=OK\n", TRACE_CSV_FILE, rows);
 
-    /* Spot-check first data row: must have 8 comma-separated fields */
+    /* Spot-check first data row: must have 24 comma-separated fields
+     * (23 commas). Matches the canonical header emitted by
+     * DiagnosticsStore::dumpTraceHeader — see src/api/diagnostics_store.hpp. */
     {
         FILE *f2 = fopen(TRACE_CSV_FILE, "r");
         char line[1024];
@@ -343,8 +361,8 @@ static int test_trace(float *d_data)
             int commas = 0;
             for (size_t k = 0; line[k]; k++)
                 commas += (line[k] == ',');
-            if (commas != 7) {
-                fprintf(stderr, "  [FAIL] first data row has %d commas (expected 7): %s\n",
+            if (commas != 23) {
+                fprintf(stderr, "  [FAIL] first data row has %d commas (expected 23): %s\n",
                         commas, line);
                 fclose(f2); return -1;
             }

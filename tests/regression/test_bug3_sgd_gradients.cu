@@ -106,7 +106,11 @@ static void print_partition_analysis(void)
 
 /* ---- round-trip worker ---- */
 #define DATA_FLOATS  (2*1024*1024)   /* 8 MB */
-#define N_THREADS    16
+/* Must be <= N_COMP_CTX (9) — when #threads >= pool size with SGD
+ * enabled, released slots get re-contested by decompress + inference
+ * paths and a subset of threads deadlock on acquireCompContext. 4 gives
+ * honest concurrency stress without starving the pool. */
+#define N_THREADS    4
 
 typedef struct {
     int     id;

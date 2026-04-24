@@ -38,7 +38,13 @@ static double cpu_entropy_bits(const float *data, int n)
     return H;
 }
 
-/* Matches finalizeStatsOnlyKernel: (mad_sum/n) / range */
+/* Matches finalizeStatsOnlyKernel in src/stats/stats_kernel.cu:
+ *   mad_normalized = mad_sum / n
+ * Despite the field name, there is NO /range divisor — the NN features
+ * are raw mean-absolute-deviation, not range-normalized. An earlier
+ * version of this test applied /range, which caused apparent 2×
+ * failures on zero-mean inputs like sine and {-1,+1} alternating.
+ * Sentinel returns 0 for constant data (MAD is identically zero). */
 static double cpu_mad_normalized(const float *data, int n)
 {
     if (n == 0) return 0.0;
@@ -49,15 +55,14 @@ static double cpu_mad_normalized(const float *data, int n)
         sum += data[i];
     }
     double mean = sum / n;
-    double range = vmax - vmin;
-    if (range < 1e-12) return 0.0;
+    if ((vmax - vmin) < 1e-12) return 0.0;  /* constant → MAD=0 (kernel also skips) */
     double mad = 0.0;
     for (int i = 0; i < n; i++) mad += fabs((double)data[i] - mean);
-    return (mad / n) / range;
+    return mad / n;
 }
 
-/* Matches statsPass1Kernel + finalizeStatsOnlyKernel:
- * sum |x[i+1] - 2x[i] + x[i-1]| for i=1..n-2, then divide by (n-2)*range */
+/* Matches statsPass1Kernel + finalizeStatsOnlyKernel: raw second-difference
+ * sum divided by (n-2); no /range — see note on cpu_mad_normalized. */
 static double cpu_deriv_normalized(const float *data, int n)
 {
     if (n < 3) return 0.0;
@@ -66,12 +71,11 @@ static double cpu_deriv_normalized(const float *data, int n)
         if (data[i] < vmin) vmin = data[i];
         if (data[i] > vmax) vmax = data[i];
     }
-    double range = vmax - vmin;
-    if (range < 1e-12) return 0.0;
+    if ((vmax - vmin) < 1e-12) return 0.0;
     double sum = 0.0;
     for (int i = 1; i < n - 1; i++)
         sum += fabs((double)data[i+1] - 2.0*(double)data[i] + (double)data[i-1]);
-    return (sum / (n - 2)) / range;
+    return sum / (n - 2);
 }
 
 /* ── Test patterns ───────────────────────────────────────────────────── */

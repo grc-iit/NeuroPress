@@ -141,6 +141,13 @@ static double unpack_double(unsigned int lo, unsigned int hi) {
 static pthread_once_t g_init_once = PTHREAD_ONCE_INIT;
 static int g_init_result = -1;
 static void do_initialize(void) {
+    /* Deliberately no atexit or __attribute__((destructor)) cleanup:
+     * gpucompress_cleanup -> destroyCompContextPool -> nvcomp LZ4Manager
+     * destructor segfaulted at both exit points (see commit history +
+     * gdb backtrace in SC26 test triage). The process is exiting;
+     * CUDA context teardown + OS reclaim handle GPU and host memory.
+     * Tests that want a clean cleanup (test_vol_8mb et al.) still call
+     * gpucompress_cleanup() explicitly before returning from main. */
     const char* weights = getenv("GPUCOMPRESS_WEIGHTS");
     if (gpucompress_init(weights) == GPUCOMPRESS_SUCCESS) {
         g_gpucompress_initialized = 1;
@@ -599,15 +606,14 @@ herr_t H5Z_gpucompress_write_chunk_attr(hid_t dset_id) {
  * ============================================================ */
 
 /**
- * Called automatically when the shared library is unloaded.
- * Ensures gpucompress_cleanup() is called to free CUDA resources.
+ * Library-unload finalizer. Only frees CPU-side state; GPU teardown
+ * (gpucompress_cleanup) happens earlier via atexit — see
+ * h5z_gpucompress_atexit_cleanup above. Doing GPU teardown here
+ * runs during _dl_fini, after CUDA has started shutting down, and
+ * crashed in nvcomp destructors (LZ4Manager::~LZ4Manager).
  */
 __attribute__((destructor))
 static void H5Z_gpucompress_fini(void) {
-    if (g_gpucompress_initialized) {
-        gpucompress_cleanup();
-        g_gpucompress_initialized = 0;
-    }
     pthread_mutex_lock(&g_chunk_mutex);
     if (g_chunk_algorithms) {
         free(g_chunk_algorithms);

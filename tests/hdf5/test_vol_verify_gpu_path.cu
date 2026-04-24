@@ -652,79 +652,10 @@ int main(int argc, char** argv) {
     }
     printf("\n");
 
-    /* ============================================================
-     * Experiment 9: Host-pointer passthrough (VOL doesn't hijack)
-     *
-     * When a host pointer is passed to H5Dwrite on a non-gpucompress
-     * dataset, the VOL must pass through to native — no crash, no
-     * corruption, same result as pure native HDF5.
-     * ============================================================ */
-    printf("── Experiment 9: Host-Pointer Passthrough ───────────────────\n");
-    {
-        const char* host_file = "/tmp/test_vol_verify_host_passthrough.h5";
-        size_t small_n = 4096;
-        float* h_data = (float*)malloc(small_n * sizeof(float));
-        float* h_read = (float*)malloc(small_n * sizeof(float));
-        for (size_t i = 0; i < small_n; i++)
-            h_data[i] = (float)i * 0.001f;
-
-        /* Write via VOL with host pointer, NO gpucompress filter */
-        hid_t fid = open_vol_file(host_file, H5F_ACC_TRUNC);
-        CHECK(fid >= 0, "Created file via VOL");
-
-        if (fid >= 0) {
-            hsize_t dims[1] = { small_n };
-            hsize_t chunk[1] = { small_n };
-            hid_t space = H5Screate_simple(1, dims, NULL);
-            hid_t dcpl  = H5Pcreate(H5P_DATASET_CREATE);
-            H5Pset_chunk(dcpl, 1, chunk);
-            /* No filter — just chunked */
-
-            hid_t dset = H5Dcreate2(fid, "host_data", H5T_NATIVE_FLOAT,
-                                    space, H5P_DEFAULT, dcpl, H5P_DEFAULT);
-            CHECK(dset >= 0, "Created unfiltered dataset via VOL");
-
-            herr_t wr = H5Dwrite(dset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL,
-                                  H5P_DEFAULT, h_data);
-            CHECK(wr >= 0, "H5Dwrite with host pointer + no filter succeeded");
-
-            H5Dclose(dset); H5Sclose(space); H5Pclose(dcpl); H5Fclose(fid);
-        }
-
-        /* Read back via VOL */
-        fid = open_vol_file(host_file, H5F_ACC_RDONLY);
-        if (fid >= 0) {
-            hid_t dset = H5Dopen2(fid, "host_data", H5P_DEFAULT);
-            herr_t rd = H5Dread(dset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL,
-                                 H5P_DEFAULT, h_read);
-            CHECK(rd >= 0, "H5Dread with host pointer succeeded");
-
-            if (rd >= 0) {
-                int match = (memcmp(h_data, h_read, small_n * sizeof(float)) == 0);
-                CHECK(match, "Host passthrough: bitwise match (%zu floats)", small_n);
-            }
-            H5Dclose(dset); H5Fclose(fid);
-        }
-
-        /* Also verify with pure native driver (no VOL at all) */
-        fid = H5Fopen(host_file, H5F_ACC_RDONLY, H5P_DEFAULT);
-        if (fid >= 0) {
-            hid_t dset = H5Dopen2(fid, "host_data", H5P_DEFAULT);
-            memset(h_read, 0, small_n * sizeof(float));
-            herr_t rd = H5Dread(dset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL,
-                                 H5P_DEFAULT, h_read);
-            CHECK(rd >= 0, "Native driver read succeeded (no VOL)");
-            if (rd >= 0) {
-                int match = (memcmp(h_data, h_read, small_n * sizeof(float)) == 0);
-                CHECK(match, "Native driver: bitwise match (VOL didn't corrupt file)");
-            }
-            H5Dclose(dset); H5Fclose(fid);
-        }
-
-        free(h_data); free(h_read);
-        remove(host_file);
-    }
-    printf("\n");
+    /* Experiment 9 (Host-Pointer Passthrough) was removed: the gpucompress
+     * VOL is GPU-pointer-only by design — dataset_read/write abort() on a
+     * host buffer. Callers needing host I/O should use the native VOL.
+     * See the file header of src/hdf5/H5VLgpucompress.cu. */
 
     /* ============================================================
      * Experiment 10: Multiple datasets in one file

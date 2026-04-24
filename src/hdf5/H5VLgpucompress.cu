@@ -7,7 +7,9 @@
  * / H5Dread_chunk() (via H5VL_NATIVE_DATASET_CHUNK_WRITE/READ) to bypass
  * the HDF5 filter pipeline.
  *
- * For host pointers the call is forwarded unchanged to the underlying VOL.
+ * Host pointers are explicitly rejected — dataset_read/write abort() if a
+ * non-device buffer is passed. This VOL is GPU-only by design; callers that
+ * want host I/O should register the native VOL or a different connector.
  *
  * Compiled as CUDA C++ so that cudaPointerGetAttributes() can be called
  * directly.  All public symbols are declared extern "C".
@@ -3640,6 +3642,20 @@ H5VL_gpucompress_file_close(void *file, hid_t dxpl_id, void **req)
     /* Trace: flush the CSV on each file close so data is not lost on crash */
     if (s_vol_mode == VOLMode::TRACE) {
         gpucompress::DiagnosticsStore::instance().flushTrace();
+    }
+
+    /* Per this file's header comment ("writes timing file on file_close"),
+     * dump the per-process timing CSV whenever GPUCOMPRESS_TIMING_OUTPUT is
+     * set. Required by test_vol_modes, which cycles through bypass/release/
+     * trace in one process and asserts the file exists AFTER each H5Fclose
+     * — before atexit fires. Safe because dumpIoTiming is idempotent (fopen-w
+     * overwrites; last writer wins). */
+    {
+        const char* timing_path = getenv("GPUCOMPRESS_TIMING_OUTPUT");
+        if (timing_path && timing_path[0] != '\0') {
+            gpucompress::DiagnosticsStore::instance().recordProcessEnd();
+            gpucompress::DiagnosticsStore::instance().dumpIoTiming(timing_path);
+        }
     }
 
     return rv;
