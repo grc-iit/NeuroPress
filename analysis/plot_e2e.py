@@ -35,6 +35,20 @@ LOSSY_SPEEDUPS = [("ε_L", 1.05), ("ε_M", 1.01), ("ε_H", 1.08)]
 
 WL_COLORS = {"LAMMPS": "#4878d0", "VPIC": "#ee854a", "NYX": "#6acc65"}
 
+# Paper Fig 9 per-configuration hues. Compute rendered opaque, I/O
+# rendered on top at alpha=0.55 so it reads as a lighter tint of the
+# same color. Order mirrors _configs() output.
+CFG_COLORS = [
+    "#606060",  # Baseline — gray
+    "#1f77b4",  # nvCOMP — blue
+    "#2ca02c",  # nvCOMP+Tier — green
+    "#ff7f0e",  # NeuroPr+Tier — orange
+    "#9467bd",  # NeuroPr+Tier+Async — purple
+    "#d62728",  # +Lossy ε_L — red
+    "#e377c2",  # +Lossy ε_M — pink
+    "#17becf",  # +Lossy ε_H — teal
+]
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def block_mean(chunk_idx, values, bin_size):
@@ -198,51 +212,77 @@ def _configs(df, ch):
     return configs
 
 
-COMP_COLOR = "#5B8DB8"
-IO_COLOR   = "#E07B54"
-
-
 def plot_throughput(workload_data, out_dir: Path):
+    """Paper Fig 9 exact style.
+    Layout: one subplot per workload, 8 side-by-side bars per subplot
+    (Baseline, NVComp, NVComp+Tier, NP+Tier, NP+Tier+Async, +Lossy L/M/H).
+    Each bar = compute opaque + I/O at alpha=0.55 stacked on top (lighter
+    tint of the same hue). No per-bar x-tick labels; the workload name
+    sits under each subplot as the single x label. No top title. Legend
+    is below the chart in a 5-col × 2-row block — paper ordering."""
     workloads = list(workload_data.keys())
     n_wl = len(workloads)
 
-    # Gather config timings
     wl_cfgs = {wl: _configs(df, ch) for wl, (df, ch) in workload_data.items()}
     cfg_names = list(next(iter(wl_cfgs.values())).keys())
     n_cfg = len(cfg_names)
 
-    fig, axes = plt.subplots(1, n_wl, figsize=(5 * n_wl, 5), sharey=False)
+    # Paper legend labels (short, single-line) in paper order.
+    legend_labels = [
+        "Baseline", "NVComp", "NVComp+Tier", "NP+Tier", "NP+Tier+Async",
+        "+Lossy (low)", "+Lossy (med)", "+Lossy (high)",
+    ]
+
+    # Adaptive width: paper Fig 9 is ~2.6 in per workload subplot. Scale
+    # linearly with a floor of 6.5 in so the 1-workload case stays wide
+    # enough for the 10-entry bottom legend.
+    fig_w = max(6.5, 2.6 * n_wl + 2.0)
+    fig, axes = plt.subplots(1, n_wl, figsize=(fig_w, 4.2),
+                             sharey=False, constrained_layout=False)
+    if n_wl == 1:
+        axes = [axes]
 
     for ax, wl in zip(axes, workloads):
         cfgs = wl_cfgs[wl]
         comp_vals = [cfgs[c][0] for c in cfg_names]
         io_vals   = [cfgs[c][1] for c in cfg_names]
         x = np.arange(n_cfg)
+        colors = [CFG_COLORS[i % len(CFG_COLORS)] for i in range(n_cfg)]
 
-        ax.bar(x, comp_vals, color=COMP_COLOR, label="Compression compute")
-        ax.bar(x, io_vals,   bottom=comp_vals, color=IO_COLOR,
-               hatch="//", label="Disk I/O")
+        ax.bar(x, comp_vals, color=colors, alpha=1.0,
+               edgecolor="black", linewidth=0.4)
+        ax.bar(x, io_vals, bottom=comp_vals, color=colors,
+               alpha=0.55, edgecolor="black", linewidth=0.4)
 
-        ax.set_xticks(x)
-        ax.set_xticklabels(cfg_names, fontsize=6.5, ha="center")
-        ax.set_title(wl, fontsize=11, fontweight="bold")
-        ax.set_ylabel("Time per chunk  (ms)", fontsize=9)
+        # Paper: no per-bar x-tick labels. Workload name goes on x axis.
+        ax.set_xticks([])
+        ax.set_xlabel(wl, fontsize=11, fontweight="bold", labelpad=6)
+        ax.tick_params(axis="y", labelsize=8)
+        ax.spines[["top", "right"]].set_visible(False)
         ax.set_ylim(bottom=0)
 
-        # Annotate total time at top of each bar
+        # Total-on-top annotation, lightweight and within plot area.
         for i, (c, io) in enumerate(zip(comp_vals, io_vals)):
-            ax.text(i, c + io + 0.2, f"{c + io:.1f}",
-                    ha="center", va="bottom", fontsize=6, rotation=90)
+            ax.text(i, c + io, f"{c + io:.1f}",
+                    ha="center", va="bottom", fontsize=6)
 
-    # Shared legend
-    handles = [
-        Patch(facecolor=COMP_COLOR, label="Compression compute"),
-        Patch(facecolor=IO_COLOR, hatch="//", label="Disk I/O"),
+    # Y-axis label: only leftmost subplot (paper convention).
+    axes[0].set_ylabel("Total wall-clock time (min)", fontsize=9)
+
+    # Legend: 8 config hues + Compute/I/O shade swatches, in 5-col × 2-row
+    # paper ordering: row 1 = Baseline/NVComp/+Tier/NP/NP+Async;
+    # row 2 = +Lossy(low/med/high)/Compute/I/O.
+    handles = [Patch(facecolor=CFG_COLORS[i], edgecolor="black",
+                     linewidth=0.4, label=legend_labels[i])
+               for i in range(n_cfg)]
+    handles += [
+        Patch(facecolor="black", alpha=1.0,  label="Compute"),
+        Patch(facecolor="black", alpha=0.55, label="I/O"),
     ]
-    fig.legend(handles=handles, loc="upper center", ncol=2,
-               fontsize=9, bbox_to_anchor=(0.5, 1.02))
-    fig.suptitle("Write Throughput Breakdown per Configuration", fontsize=11, y=1.06)
-    fig.tight_layout()
+    fig.legend(handles=handles, loc="lower center", ncol=5,
+               fontsize=8, frameon=False, bbox_to_anchor=(0.5, -0.02))
+    # Reserve bottom for the 2-row legend (~12%); no top title per paper.
+    fig.tight_layout(rect=(0, 0.14, 1, 0.98))
     _save(fig, out_dir / "fig8_throughput")
 
 

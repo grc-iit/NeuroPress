@@ -1,0 +1,66 @@
+# Pipeline: GPUCompress LAMMPS single-cell run in VOL trace mode.
+#
+# LAMMPS's fix_gpucompress_kokkos goes through the VOL in-situ, so
+# gpucompress_trace.csv lands directly under results_dir (no Phase 2
+# replay needed).
+#
+# Trace mode is ~32x slower than release; atoms and timesteps are small.
+
+# Name matches the cached single-cell LAMMPS SIF so Jarvis reuses it
+# (skips the ~20-30 min LAMMPS + Kokkos build).
+name: gpucompress_lammps_delta_single_node
+install_manager: container
+
+container_engine: apptainer
+container_base: nvidia/cuda:12.6.0-devel-ubuntu24.04
+container_ssh_port: 2252
+container_gpu: true
+
+hostfile: $HOME/hostfile_single.txt
+
+pkgs:
+  - pkg_type: gpucompress_pkgs.gpucompress_base
+    pkg_name: gpuc_base
+    cuda_arch: 80
+    hdf5_version: 2.0.0
+    nvcomp_version: 5.1.0.21_cuda12
+    gpucompress_repo: https://github.com/grc-iit/GPUCompress.git
+    gpucompress_ref: main
+    deploy_base: nvidia/cuda:12.6.0-runtime-ubuntu24.04
+
+  - pkg_type: gpucompress_pkgs.gpucompress_lammps_delta
+    pkg_name: gpuc_lammps
+    cuda_arch: 80
+    use_gpu: true
+    deploy_base: nvidia/cuda:12.6.0-runtime-ubuntu24.04
+
+    hdf5_mode: vol
+    phase: nn-rl+exp50
+    policy: balanced
+    error_bound: 0.01
+
+    atoms: 40
+    timesteps: 3
+    sim_interval: 50
+    warmup_steps: 50
+    chunk_mb: 4
+    verify: 0
+
+    t_hot: 10.0
+    t_cold: 0.01
+    hot_radius_frac: 0.25
+
+    nprocs: 1
+    ppn: 1
+    num_gpus: 1
+
+    sgd_lr: 0.2
+    sgd_mape: 0.10
+    explore_k: 4
+    explore_thresh: 0.20
+
+    # Shared FS so plot_trace.py can read trace.csv from the login node.
+    results_dir: $HOME/GPUCompress/tmp/figure_6_lammps_trace
+    vol_mode: trace
+    timing_csv_name: gpucompress_io_timing.csv
+    trace_csv_name: gpucompress_trace.csv

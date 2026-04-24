@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-evaluations/figure8_cross_workload_regret/plot.py
+evaluations/figure_8/plot.py
 
 Reads each workload's per-chunk + ranking CSVs from an SC26 sweep directory
 and produces THREE combined figures per policy, with all workloads on the
@@ -59,27 +59,81 @@ METRIC_DEFS = [
 
 def chunks_csv(rdir, key):
     if key == "ai":
-        p = os.path.join(rdir, "ai", "inline_benchmark_chunks.csv")
+        p = os.path.join(rdir, "inline_benchmark_chunks.csv")
         return p if os.path.isfile(p) else None
-    p = os.path.join(rdir, key, f"benchmark_{key}_timestep_chunks.csv")
-    if os.path.isfile(p):
-        return p
-    if key == "vpic":
-        p = os.path.join(rdir, "vpic", "benchmark_vpic_deck_timestep_chunks.csv")
-        if os.path.isfile(p):
-            return p
-    return None
+    # VPIC's benchmark deck names CSVs benchmark_vpic_deck_*.csv;
+    # every other workload uses benchmark_<key>_*.csv.
+    candidate = "benchmark_vpic_deck_timestep_chunks.csv" if key == "vpic" \
+        else f"benchmark_{key}_timestep_chunks.csv"
+    p = os.path.join(rdir, candidate)
+    return p if os.path.isfile(p) else None
 
 
 def ranking_csv(rdir, key):
-    p = os.path.join(rdir, key, f"benchmark_{key}_ranking.csv")
-    if os.path.isfile(p):
-        return p
-    if key == "vpic":
-        p = os.path.join(rdir, "vpic", "benchmark_vpic_deck_ranking.csv")
-        if os.path.isfile(p):
-            return p
+    candidate = "benchmark_vpic_deck_ranking.csv" if key == "vpic" \
+        else f"benchmark_{key}_ranking.csv"
+    p = os.path.join(rdir, candidate)
+    return p if os.path.isfile(p) else None
+
+
+def trace_csv(sc26_dir, key):
+    """Locate gpucompress_trace.csv from a figure_6 trace-mode run.
+    WarpX nests the file one level deeper under vol_<phase>/; other
+    workloads keep it flat under figure_6_<wl>_trace/."""
+    base = os.path.join(sc26_dir, f"figure_6_{key}_trace")
+    flat = os.path.join(base, "gpucompress_trace.csv")
+    if os.path.isfile(flat):
+        return flat
+    # Fall back to any vol_*/gpucompress_trace.csv inside the base dir.
+    if os.path.isdir(base):
+        for sub in sorted(os.listdir(base)):
+            nested = os.path.join(base, sub, "gpucompress_trace.csv")
+            if os.path.isfile(nested):
+                return nested
     return None
+
+
+def load_trace_regret(path):
+    """Per-chunk regret computed from a figure_6 trace.csv, matching the
+    primary author's analysis/plot_e2e.py:load_workload() derivation:
+
+        oracle_cost   = min(real_cost) across all 32 configs per chunk_id
+        chosen_cost   = real_cost where chosen == 1
+        regret (%)    = (chosen_cost / oracle_cost - 1) * 100
+
+    Returns a list of per-chunk regret percentages, sorted by chunk_id.
+    Uses the same granularity the paper's Fig 7a regret line plot shows —
+    one data point per chunk, yielding a smooth convergence curve instead
+    of the six-point step function that ranking.csv:top1_regret produces."""
+    if not path or not os.path.isfile(path):
+        return []
+    import pandas as pd  # keep the heavy import local
+    df = pd.read_csv(path)
+    if "chosen" not in df.columns or "real_cost" not in df.columns:
+        return []
+    chosen = df[df["chosen"] == 1].copy().sort_values("chunk_id")
+    oracle = df.groupby("chunk_id")["real_cost"].min()
+    chosen = chosen.join(oracle.rename("min_real_cost"), on="chunk_id")
+    regret = ((chosen["real_cost"] / chosen["min_real_cost"].clip(lower=1e-9))
+              - 1.0) * 100.0
+    return regret.dropna().tolist()
+
+
+def load_trace_cost_mape(path):
+    """Per-chunk cost-MAPE read directly from trace.csv's mape_cost column,
+    matching the primary author's analysis/plot_e2e.py:plot_mape_convergence
+    logic (chosen==1 rows, clamp to 0–100 %). The VOL emits mape_cost as an
+    already-percent value."""
+    if not path or not os.path.isfile(path):
+        return []
+    import pandas as pd
+    import numpy as np
+    df = pd.read_csv(path)
+    if "chosen" not in df.columns or "mape_cost" not in df.columns:
+        return []
+    chosen = df[df["chosen"] == 1].copy().sort_values("chunk_id")
+    mape = np.clip(chosen["mape_cost"].values, 0, 100)
+    return mape.tolist()
 
 
 def load_column(path, col, scale=1.0, drop_nan=True):
@@ -288,7 +342,7 @@ def plot_line(series, title, ylabel, png_path, csv_path, cap=None):
             ax.plot(xs, ys_capped, color=color, linewidth=2.0, label=label)
         for i, y in enumerate(ys):
             rows.append((label, i, y))
-    ax.set_xlabel("Chunk Index (sequential across profiled fields)")
+    ax.set_xlabel("Chunk index")
     ax.set_ylabel(ylabel)
     ax.set_title(title)
     ax.grid(True, alpha=0.25)
@@ -379,47 +433,66 @@ def build_for_policy(sc26_dir, policy):
     chunk_mb = int(os.environ.get("CHUNK_MB", "32"))
 
     for key, label, color in WORKLOADS:
-        rdir = os.path.join(sc26_dir, f"{key}_{policy}")
-        if not os.path.isdir(rdir):
+        # Two independent data sources per workload:
+        #  - figure_8_{key}_{policy}/ — release-mode benchmark CSVs used by
+        #    cost_mape + metric_breakdown panels
+        #  - figure_6_{key}_trace/ — trace-mode trace.csv used by the
+        #    per-chunk regret panel (primary author's method)
+        # A workload is included if EITHER source exists, so running only
+        # figure_6 trace mode is enough to populate the regret curve.
+        rdir   = os.path.join(sc26_dir, f"figure_8_{key}_{policy}")
+        has_f8 = os.path.isdir(rdir)
+        tc     = trace_csv(sc26_dir, key)
+        if not has_f8 and not tc:
             continue
         any_workload = True
 
         if key == "ai":
-            # AI uses inline_benchmark_chunks.csv with a different schema
-            # — compute everything on the fly via load_ai_inline_chunks.
-            ai_path = chunks_csv(rdir, "ai")
-            ai = load_ai_inline_chunks(ai_path, policy, chunk_mb)
-            if ai["cost_mape"]:
-                cost_series.append((label, color, ai["cost_mape"]))
-            if ai["regret"]:
-                regret_series.append((label, color, ai["regret"]))
-            metrics = {
-                "comp":   final_mean(ai["mape_comp"]),
-                "decomp": final_mean(ai["mape_decomp"]),
-                "ratio":  final_mean(ai["mape_ratio"]),
-                "psnr":   final_mean(ai["mape_psnr"]),
-            }
-            bar_data.append((label, color, metrics))
+            # AI workload schema is different (inline_benchmark_chunks.csv);
+            # everything computed via load_ai_inline_chunks as before.
+            if has_f8:
+                ai_path = chunks_csv(rdir, "ai")
+                ai = load_ai_inline_chunks(ai_path, policy, chunk_mb)
+                if ai["cost_mape"]:
+                    cost_series.append((label, color, ai["cost_mape"]))
+                if ai["regret"]:
+                    regret_series.append((label, color, ai["regret"]))
+                metrics = {
+                    "comp":   final_mean(ai["mape_comp"]),
+                    "decomp": final_mean(ai["mape_decomp"]),
+                    "ratio":  final_mean(ai["mape_ratio"]),
+                    "psnr":   final_mean(ai["mape_psnr"]),
+                }
+                bar_data.append((label, color, metrics))
             continue
 
-        cc = chunks_csv(rdir, key)
-        rc = ranking_csv(rdir, key)
-
-        cost_vals = load_column(cc, "cost_model_error_pct", scale=100.0)
-        if cost_vals:
-            cost_series.append((label, color, cost_vals))
-
-        # top1_regret is a RATIO; convert to percent overhead vs oracle.
-        reg_ratios = load_column(rc, "top1_regret")
-        reg_vals = [(r - 1.0) * 100.0 for r in reg_ratios]
+        # Regret (per-chunk, trace-derived — matches primary author's
+        # plot_e2e.py exactly, modulo ×100 for percent Y-axis).
+        reg_vals = load_trace_regret(tc)
         if reg_vals:
             regret_series.append((label, color, reg_vals))
 
-        metrics = {}
-        for mkey, src, _l, _c in METRIC_DEFS:
-            vals = load_column(cc, src)
-            metrics[mkey] = final_mean(vals)
-        bar_data.append((label, color, metrics))
+        # Cost MAPE: prefer trace.csv's mape_cost (per-chunk, same source
+        # the primary author's plot_mape_convergence uses). Fall back to
+        # figure_8 chunks CSV's cost_model_error_pct only if no trace is
+        # available.
+        cost_vals = load_trace_cost_mape(tc)
+        if not cost_vals and has_f8:
+            cc_fallback = chunks_csv(rdir, key)
+            cost_vals = load_column(cc_fallback, "cost_model_error_pct",
+                                    scale=100.0)
+        if cost_vals:
+            cost_series.append((label, color, cost_vals))
+
+        # Per-metric MAPE bar still reads figure_8 release-mode chunks CSV
+        # (mape_comp/decomp/ratio/psnr columns live there, not in trace.csv).
+        if has_f8:
+            cc = chunks_csv(rdir, key)
+            metrics = {}
+            for mkey, src, _l, _c in METRIC_DEFS:
+                vals = load_column(cc, src)
+                metrics[mkey] = final_mean(vals)
+            bar_data.append((label, color, metrics))
 
     if not any_workload:
         print(f"=== Policy {policy}: no workload subdirs found, skipping")
@@ -436,8 +509,8 @@ def build_for_policy(sc26_dir, policy):
     )
     plot_line(
         regret_series,
-        f"Figure 2 — Top-1 Regret Convergence ({policy})",
-        "Top-1 Regret (%)",
+        f"Figure 2 — Regret Convergence ({policy})",
+        "Regret (%)",
         os.path.join(fig_dir, f"sc26_{policy}_regret.png"),
         os.path.join(csv_dir, f"sc26_{policy}_regret.csv"),
         cap=100.0,

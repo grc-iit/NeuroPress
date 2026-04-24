@@ -1,0 +1,98 @@
+# Pipeline: GPUCompress VPIC single-cell run in VOL trace mode for Figure 6.
+#
+# Matches the LAMMPS / WarpX / Nyx figure_6 flow exactly:
+#   - Single-cell package (gpucompress_vpic_delta, NOT the sweep subclass).
+#   - vol_mode=trace tells the HDF5 VOL to profile every chunk against all
+#     32 algorithm configs and emit gpucompress_trace.csv.
+#   - analysis/plot_trace.py (primary author's plotter) consumes trace.csv
+#     and renders the 40×40 log-spaced threshold-sensitivity heatmap with
+#     the ★ at (30%, 20%).
+#
+# Prerequisite: the VPIC benchmark deck must honor GPUCOMPRESS_VOL_MODE=trace.
+# We patched benchmarks/vpic-kokkos/vpic_benchmark_deck.cxx line ~748 to do
+# so (previously it forcibly disabled trace). **Pre-existing SIFs built
+# before that patch need a one-time rebuild**:
+#   rm $HOME/.ppi-jarvis/shared/gpucompress_vpic_delta_single_node/*.sif
+#   jarvis ppl load yaml <this file>
+#   # (~20-30 min rebuild; subsequent loads skip build.)
+#
+# Usage:
+#   export PATH="$HOME/jarvis-cd/bin:$PATH"
+#   jarvis ppl load yaml $HOME/GPUCompress/evaluations/figure_6/pipeline_vpic.yaml
+#   # on GPU node:
+#   hostname > $HOME/.ppi-jarvis/shared/gpucompress_vpic_delta_single_node/hostfile
+#   jarvis ppl run
+#   # then plot:
+#   python3 $HOME/GPUCompress/analysis/plot_trace.py \
+#           $HOME/GPUCompress/tmp/figure_6_vpic_trace/gpucompress_trace.csv \
+#           --out-dir $HOME/GPUCompress/tmp/figure_6_vpic_trace --title VPIC
+
+name: gpucompress_vpic_delta_single_node
+install_manager: container
+
+container_engine: apptainer
+container_base: nvidia/cuda:12.6.0-devel-ubuntu24.04
+container_ssh_port: 2234
+container_gpu: true
+
+hostfile: $HOME/hostfile_single.txt
+
+pkgs:
+  - pkg_type: gpucompress_pkgs.gpucompress_base
+    pkg_name: gpuc_base
+    cuda_arch: 80
+    hdf5_version: 2.0.0
+    nvcomp_version: 5.1.0.21_cuda12
+    gpucompress_repo: https://github.com/grc-iit/GPUCompress.git
+    gpucompress_ref: main
+    deploy_base: nvidia/cuda:12.6.0-runtime-ubuntu24.04
+
+  - pkg_type: gpucompress_pkgs.gpucompress_vpic_delta
+    pkg_name: gpuc_vpic
+    cuda_arch: 80
+    use_gpu: true
+    deploy_base: nvidia/cuda:12.6.0-runtime-ubuntu24.04
+
+    nprocs: 1
+    ppn: 1
+
+    # Small grid — trace mode is ~32x slower than release (profiles every
+    # chunk against all 32 algorithm configs). NX=32 keeps a single run
+    # under a few minutes. Bump for denser heatmaps.
+    nx: 32
+    timesteps: 3
+    sim_interval: 190
+    warmup: 100
+    # VPIC field dataset = 16 * nx^3 * 4 B = 2 MiB at nx=32.
+    # chunk_mb=1 → 2 full 1-MiB chunks (no partial-chunk branch in
+    # gpu_trace_chunked_write, matches LAMMPS multi-chunk shape).
+    # Previously chunk_mb=4 made the dataset fit in 1 partial chunk,
+    # which triggered silent H5Dwrite failure on the trace code path.
+    chunk_mb: 1
+    verify: 0
+
+    mi_me: 25
+    wpe_wce: 3.0
+    ti_te: 1.0
+    perturbation: 0.1
+    guide_field: 0.0
+    nppc: 2
+
+    hdf5_mode: vol
+    phase: nn-rl+exp50
+    policy: balanced
+    error_bound: 0.01
+
+    sgd_lr: 0.2
+    sgd_mape: 0.10
+    explore_k: 4
+    explore_thresh: 0.20
+
+    # VOL trace mode — emits gpucompress_trace.csv (per-chunk-per-config
+    # rows) consumed by analysis/plot_trace.py. Same contract as LAMMPS.
+    vol_mode: trace
+    timing_csv_name: gpucompress_io_timing.csv
+    trace_csv_name: gpucompress_trace.csv
+
+    # Shared FS so plot_trace.py can read trace.csv from the login node.
+    results_dir: $HOME/GPUCompress/tmp/figure_6_vpic_trace

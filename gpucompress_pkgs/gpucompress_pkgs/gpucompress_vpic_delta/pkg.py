@@ -160,6 +160,27 @@ class GpucompressVpicDelta(Application):
             {'name': 'results_dir',
              'msg': 'Output root (empty = /tmp/gpucompress_vpic_<pkg_id>_…)',
              'type': str, 'default': ''},
+
+            # ── VOL-level contract (docs/reproducability.md §VOL Configuration) ──
+            {'name': 'vol_mode',
+             'msg': "GPUCOMPRESS_VOL_MODE: 'release' (default, NN + online SGD), "
+                    "'bypass' (GPU->CPU passthrough, baseline I/O), "
+                    "'trace' (per-chunk profiling of 32 configs, ~32x slower; "
+                    "output feeds analysis/plot_trace.py and plot_e2e.py)",
+             'type': str, 'default': 'release'},
+            {'name': 'timing_csv_name',
+             'msg': 'GPUCOMPRESS_TIMING_OUTPUT filename under results_dir '
+                    '(e2e_ms + vol_ms CSV from gpucompress_vol_atexit)',
+             'type': str, 'default': 'gpucompress_io_timing.csv'},
+            {'name': 'results_dir_policy_suffix',
+             'msg': 'Append "_<policy>" to results_dir at runtime so flipping '
+                    "the policy knob between runs writes to distinct dirs "
+                    "(used by figure_8 pipelines)",
+             'type': bool, 'default': False},
+            {'name': 'trace_csv_name',
+             'msg': 'GPUCOMPRESS_TRACE_OUTPUT filename under results_dir '
+                    '(only written when vol_mode=trace)',
+             'type': str, 'default': 'gpucompress_trace.csv'},
         ]
 
     def _configure(self, **kwargs):
@@ -210,6 +231,10 @@ class GpucompressVpicDelta(Application):
             f"_NX{cfg['nx']}_ts{cfg['timesteps']}_{cfg['hdf5_mode']}"
             f"{eb_tag}{verify_tag}"
         )
+        # Expand $HOME / ~ so YAMLs can use portable paths.
+        results_dir = os.path.expandvars(os.path.expanduser(results_dir))
+        if cfg.get('results_dir_policy_suffix', False):
+            results_dir = f"{results_dir}_{cfg['policy']}"
         Mkdir(results_dir).run()
 
         # Derive included / excluded phase list exactly as bench_tests/vpic.sh
@@ -260,7 +285,18 @@ class GpucompressVpicDelta(Application):
             'VPIC_MAPE_THRESHOLD':  str(cfg['sgd_mape']),
             'VPIC_EXPLORE_K':       str(cfg['explore_k']),
             'VPIC_EXPLORE_THRESH':  str(cfg['explore_thresh']),
+            # ── VOL-level contract ───────────────────────────────────────
+            'GPUCOMPRESS_VOL_MODE':      cfg.get('vol_mode', 'release'),
+            'GPUCOMPRESS_TIMING_OUTPUT': (
+                f'{results_dir}/'
+                f'{cfg.get("timing_csv_name", "gpucompress_io_timing.csv")}'
+            ),
         })
+        if cfg.get('vol_mode') == 'trace':
+            vpic_env['GPUCOMPRESS_TRACE_OUTPUT'] = (
+                f'{results_dir}/'
+                f'{cfg.get("trace_csv_name", "gpucompress_trace.csv")}'
+            )
 
         cmd = f'env LD_LIBRARY_PATH={LD_LIBRARY_PATH} {VPIC_BIN}'
         run = Exec(cmd, MpiExecInfo(

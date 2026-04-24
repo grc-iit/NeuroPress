@@ -1,0 +1,87 @@
+# Pipeline: GPUCompress VPIC single-cell run for Figure 5 (anatomy pies).
+#
+# Produces the per-chunk cost-breakdown figure — one PNG containing two
+# donut charts (write path + read path) that match the paper's Figure 5.
+#
+# Data path:
+#   VPIC binary -> benchmark_vpic_deck_timesteps.csv (per-timestep per-
+#                  stage timing columns, emitted under GPUCOMPRESS_DETAILED_TIMING=1)
+#   plot_anatomy.py -> anatomy.png (two donuts, averaged across timesteps)
+#
+# Default config uses the larger VPIC grid that gives a paper-like pie
+# shape (Compress Time dominating, NN overhead amortized). Bump chunk_mb
+# higher for a bigger "Compress Time" fraction; reduce nx/timesteps for
+# faster iteration.
+#
+# Usage:
+#   jarvis repo add /u/$USER/GPUCompress/gpucompress_pkgs
+#   jarvis ppl load yaml /u/$USER/GPUCompress/evaluations/figure_5/pipeline_vpic.yaml
+#   jarvis ppl run
+#   python3 /u/$USER/GPUCompress/evaluations/figure_5/plot_anatomy.py \
+#           $HOME/GPUCompress/tmp/figure_5_vpic
+
+name: gpucompress_figure_5_vpic
+install_manager: container
+
+container_engine: apptainer
+container_base: nvidia/cuda:12.6.0-devel-ubuntu24.04
+container_ssh_port: 2234
+container_gpu: true
+
+hostfile: $HOME/hostfile_single.txt
+
+pkgs:
+  - pkg_type: gpucompress_pkgs.gpucompress_base
+    pkg_name: gpuc_base
+    cuda_arch: 80
+    hdf5_version: 2.0.0
+    nvcomp_version: 5.1.0.21_cuda12
+    gpucompress_repo: https://github.com/grc-iit/GPUCompress.git
+    gpucompress_ref: main
+    deploy_base: nvidia/cuda:12.6.0-runtime-ubuntu24.04
+
+  - pkg_type: gpucompress_pkgs.gpucompress_vpic_delta
+    pkg_name: gpuc_vpic
+    cuda_arch: 80
+    use_gpu: true
+    deploy_base: nvidia/cuda:12.6.0-runtime-ubuntu24.04
+
+    # MPI sizing — VPIC_NX must be divisible by nprocs.
+    nprocs: 1
+    ppn: 1
+
+    # I/O volume — tuned for a paper-like anatomy pie shape.
+    # (152)^3 * 64 B ≈ 225 MiB/dump * 18 dumps = ~4 GB total.
+    # ~5-6 min wall on a single A100. With chunk_mb=8 the Compress Time
+    # wedge should dominate (~35-40%) with NN Inference ~25% and I/O
+    # ~25%. For a stronger paper match (Compress Time closer to 70%)
+    # bump chunk_mb to 16 or nx further.
+    nx: 150
+    timesteps: 18
+    sim_interval: 190
+    warmup: 500
+    chunk_mb: 8
+    verify: 1
+
+    # Slow-reconnection Harris-sheet physics (same combo that gave the
+    # cleanest ratio swing in the paper sweep).
+    mi_me: 25
+    wpe_wce: 3.0
+    ti_te: 1.0
+    perturbation: 0.1
+    guide_field: 0.0
+    nppc: 2
+
+    # Adaptive NN + RL selection (what the paper figure measures).
+    hdf5_mode: vol
+    phase: nn-rl
+    policy: balanced
+    error_bound: 0.0
+
+    sgd_lr: 0.2
+    sgd_mape: 0.10
+    explore_k: 4
+    explore_thresh: 0.20
+
+    # Output on shared FS so plot_anatomy.py can read it from login node.
+    results_dir: $HOME/GPUCompress/tmp/figure_5_vpic

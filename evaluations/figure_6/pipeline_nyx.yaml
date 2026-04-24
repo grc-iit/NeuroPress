@@ -1,0 +1,58 @@
+# Pipeline: GPUCompress Nyx single-cell run in VOL trace mode.
+#
+# Nyx's single-cell path is dump-then-replay. Phase 1 runs nyx_HydroTests
+# with NYX_DUMP_FIELDS=1 (raw .f32 dumps, bypasses the VOL). Phase 2 runs
+# generic_benchmark on the dumps — that's where the VOL runs, so
+# gpucompress_trace.csv lands under bench_dir:
+#   <results_dir>/<hdf5_mode>_<bench_phase>/gpucompress_trace.csv
+#
+# Trace mode is ~32x slower than release; ncell and max_step are kept tiny.
+
+# Name matches the cached Nyx SIF so Jarvis reuses it (skips rebuild).
+name: gpucompress_nyx_delta_single_node
+install_manager: container
+
+container_engine: apptainer
+container_base: nvidia/cuda:12.6.0-devel-ubuntu24.04
+container_ssh_port: 2253
+container_gpu: true
+
+hostfile: $HOME/hostfile_single.txt
+
+pkgs:
+  - pkg_type: gpucompress_pkgs.gpucompress_base
+    pkg_name: gpuc_base
+    cuda_arch: 80
+    hdf5_version: 2.0.0
+    nvcomp_version: 5.1.0.21_cuda12
+    gpucompress_repo: https://github.com/grc-iit/GPUCompress.git
+    gpucompress_ref: main
+    deploy_base: nvidia/cuda:12.6.0-runtime-ubuntu24.04
+
+  - pkg_type: gpucompress_pkgs.gpucompress_nyx_delta
+    pkg_name: gpuc_nyx
+    cuda_arch: 80
+    use_gpu: true
+    deploy_base: nvidia/cuda:12.6.0-runtime-ubuntu24.04
+
+    hdf5_mode: vol
+    phase: nn-rl+exp50
+    policy: balanced
+    error_bound: 0.01
+
+    ncell: 32
+    max_step: 30
+    plot_int: 10
+    chunk_mb: 4
+    verify: 0
+
+    sgd_lr: 0.2
+    sgd_mape: 0.10
+    explore_k: 4
+    explore_thresh: 0.20
+
+    # Shared FS so plot_trace.py can read trace.csv from the login node.
+    results_dir: $HOME/GPUCompress/tmp/figure_6_nyx_trace
+    vol_mode: trace
+    timing_csv_name: gpucompress_io_timing.csv
+    trace_csv_name: gpucompress_trace.csv

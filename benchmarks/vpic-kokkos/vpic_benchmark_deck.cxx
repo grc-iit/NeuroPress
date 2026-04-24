@@ -745,7 +745,13 @@ begin_initialization {
     H5VLclose(native_id);
 
     H5Eset_auto2(H5E_DEFAULT, NULL, NULL);
-    H5VL_gpucompress_set_trace(0);
+    // Honor GPUCOMPRESS_VOL_MODE=trace so the VOL's per-chunk-per-config
+    // emitter fires (input to analysis/plot_trace.py's Figure 6 heatmap).
+    // Matches how LAMMPS's fix_gpucompress_kokkos routes through the VOL.
+    {
+        const char* vm = getenv("GPUCOMPRESS_VOL_MODE");
+        H5VL_gpucompress_set_trace((vm && strcmp(vm, "trace") == 0) ? 1 : 0);
+    }
     gpucompress_set_ranking_weights(rank_w0, rank_w1, rank_w2);
     global->rank_w0 = rank_w0;
     global->rank_w1 = rank_w1;

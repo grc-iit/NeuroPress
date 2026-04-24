@@ -1,0 +1,73 @@
+# Pipeline: GPUCompress VPIC single-cell run for Figure 8, balanced policy.
+#
+# Uses the single-cell gpucompress_vpic_delta package with Figure 8's
+# equalized hyperparameters (LOSSY 0.1%, phase nn-rl+exp50, SGD LR=0.2,
+# MAPE=0.10, EXPLORE_K=4, EXPLORE_THRESH=0.20) and the slow-reconnection
+# Harris-sheet parameters commit 918fa14 found to give the cleanest MAPE
+# convergence and ratio swing.
+#
+# Load + run:
+#   jarvis ppl load yaml /u/$USER/GPUCompress/evaluations/figure_8/pipeline_vpic_balanced.yaml
+#   jarvis ppl run
+#
+# Output lands under /tmp/gpucompress_figure8_vpic_balanced/ in the layout
+# figure8/plot.py expects at <sc26_dir>/vpic_balanced/.
+
+name: gpucompress_vpic_delta_single_node
+install_manager: container
+
+container_engine: apptainer
+container_base: nvidia/cuda:12.6.0-devel-ubuntu24.04
+container_ssh_port: 2240
+container_gpu: true
+
+hostfile: $HOME/hostfile_single.txt
+
+pkgs:
+  - pkg_type: gpucompress_pkgs.gpucompress_base
+    pkg_name: gpuc_base
+    cuda_arch: 80
+    hdf5_version: 2.0.0
+    nvcomp_version: 5.1.0.21_cuda12
+    gpucompress_repo: https://github.com/grc-iit/GPUCompress.git
+    gpucompress_ref: main
+    deploy_base: nvidia/cuda:12.6.0-runtime-ubuntu24.04
+
+  - pkg_type: gpucompress_pkgs.gpucompress_vpic_delta
+    pkg_name: gpuc_vpic
+    cuda_arch: 80
+    use_gpu: true
+    deploy_base: nvidia/cuda:12.6.0-runtime-ubuntu24.04
+
+    nprocs: 1
+    ppn: 1
+
+    # Figure 8 paper-scale defaults: NX=147 -> ~200 MiB/dump, 8 dumps.
+    nx: 147
+    timesteps: 8
+    sim_interval: 190
+    warmup: 500
+    chunk_mb: 4
+    verify: 0
+
+    # Slow-reconnection Harris-sheet physics combo (mi_me=25, wpe_wce=1, Ti_Te=5).
+    mi_me: 25
+    wpe_wce: 1.0
+    ti_te: 5.0
+    perturbation: 0.1
+    guide_field: 0.0
+    nppc: 2
+
+    # Compression — LOSSY 0.1%, nn-rl+exp50, BALANCED policy.
+    hdf5_mode: vol
+    phase: nn-rl+exp50
+    policy: balanced
+    error_bound: 0.001
+
+    sgd_lr: 0.2
+    sgd_mape: 0.10
+    explore_k: 4
+    explore_thresh: 0.20
+
+    results_dir: $HOME/GPUCompress/tmp/figure_8_vpic
+    results_dir_policy_suffix: true  # auto-appends _<policy> so flipping policy writes to distinct dirs

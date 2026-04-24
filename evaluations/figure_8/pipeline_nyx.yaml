@@ -1,0 +1,53 @@
+# Pipeline: GPUCompress Nyx single-cell run for Figure 8, balanced policy.
+#
+# 88^3 Sedov blast, 500 steps, dumps every 10; LOSSY 0.1% with the
+# figure-8 equalized NN hyperparameters.
+#
+# Load + run:
+#   jarvis ppl load yaml /u/$USER/GPUCompress/evaluations/figure_8/pipeline_nyx_balanced.yaml
+#   jarvis ppl run
+
+name: gpucompress_nyx_delta_single_node
+install_manager: container
+
+container_engine: apptainer
+container_base: nvidia/cuda:12.6.0-devel-ubuntu24.04
+container_ssh_port: 2241
+container_gpu: true
+
+hostfile: $HOME/hostfile_single.txt
+
+pkgs:
+  - pkg_type: gpucompress_pkgs.gpucompress_base
+    pkg_name: gpuc_base
+    cuda_arch: 80
+    hdf5_version: 2.0.0
+    nvcomp_version: 5.1.0.21_cuda12
+    gpucompress_repo: https://github.com/grc-iit/GPUCompress.git
+    gpucompress_ref: main
+    deploy_base: nvidia/cuda:12.6.0-runtime-ubuntu24.04
+
+  - pkg_type: gpucompress_pkgs.gpucompress_nyx_delta
+    pkg_name: gpuc_nyx
+    cuda_arch: 80
+    use_gpu: true
+    deploy_base: nvidia/cuda:12.6.0-runtime-ubuntu24.04
+
+    ncell: 88
+    max_step: 500
+    plot_int: 10
+    chunk_mb: 4
+    verify: 0
+
+    hdf5_mode: vol
+    phase: nn-rl+exp50
+    policy: balanced
+    error_bound: 0.001
+
+    sgd_lr: 0.2
+    sgd_mape: 0.10
+    explore_k: 4
+    explore_thresh: 0.20
+
+    results_dir: $HOME/GPUCompress/tmp/figure_8_nyx
+    results_dir_policy_suffix: true  # auto-appends _<policy> so flipping policy writes to distinct dirs

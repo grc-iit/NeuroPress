@@ -52,16 +52,18 @@ pkgs:
     deploy_base: nvidia/cuda:12.6.0-runtime-ubuntu24.04
 
     # MPI sizing — VPIC requires VPIC_NX to be divisible by nprocs.
-    # Smoke test: 1 rank, NX=64. Scale up together (e.g. nprocs=4, nx=128).
     nprocs: 1
     ppn: 1
 
-    # I/O volume — smoke-test defaults (NX=64, TIMESTEPS=3, SIM_INT=190,
-    # WARMUP=100, CHUNK=4 MB). Scale up for paper runs.
-    nx: 64
-    timesteps: 3
+    # I/O volume — smaller run with chunk_mb=4 for anatomy comparison.
+    # (98)^3 * 64 B ≈ 60 MiB/dump; 10 dumps -> ~600 MiB total (~15% of the
+    # NX=150 run). Smaller chunks amortize fixed per-chunk overhead less,
+    # so the anatomy pie should show NN Inference + Stats Kernel + I/O
+    # Time growing as fractions and Compress Time shrinking.
+    nx: 96
+    timesteps: 10
     sim_interval: 190
-    warmup: 100
+    warmup: 300
     chunk_mb: 4
     verify: 1
 
@@ -84,3 +86,9 @@ pkgs:
     sgd_mape: 0.10
     explore_k: 4
     explore_thresh: 0.20
+
+    # Output on shared FS (/u/... is visible from login + compute nodes)
+    # instead of the package default /tmp which is node-local on Delta and
+    # disappears when the allocation ends. Distinct from the smoke-test
+    # output dir so both runs coexist for side-by-side anatomy comparison.
+    results_dir: $HOME/GPUCompress/tmp/vpic_4mb

@@ -143,6 +143,24 @@ class GpucompressLammpsDelta(Application):
             {'name': 'results_dir',
              'msg': 'Output root (empty = /tmp/gpucompress_lammps_<pkg_id>...)',
              'type': str, 'default': ''},
+
+            # ── VOL-level contract (docs/reproducability.md §VOL Configuration) ──
+            {'name': 'vol_mode',
+             'msg': "GPUCOMPRESS_VOL_MODE: release | bypass | trace "
+                    "(trace ~32x slower; feeds analysis/plot_trace.py)",
+             'type': str, 'default': 'release'},
+            {'name': 'timing_csv_name',
+             'msg': 'GPUCOMPRESS_TIMING_OUTPUT filename under results_dir',
+             'type': str, 'default': 'gpucompress_io_timing.csv'},
+            {'name': 'results_dir_policy_suffix',
+             'msg': 'Append "_<policy>" to results_dir at runtime so flipping '
+                    "the policy knob between runs writes to distinct dirs "
+                    "(used by figure_8 pipelines)",
+             'type': bool, 'default': False},
+            {'name': 'trace_csv_name',
+             'msg': 'GPUCOMPRESS_TRACE_OUTPUT filename under results_dir '
+                    '(only written when vol_mode=trace)',
+             'type': str, 'default': 'gpucompress_trace.csv'},
         ]
 
     def _configure(self, **kwargs):
@@ -215,6 +233,10 @@ class GpucompressLammpsDelta(Application):
             f"/tmp/gpucompress_lammps_{self.pkg_id}"
             f"_box{atoms}_ts{timesteps}_{cfg['hdf5_mode']}{verify_tag}"
         )
+        # Expand $HOME / ~ so YAMLs can use portable paths.
+        results_dir = os.path.expandvars(os.path.expanduser(results_dir))
+        if cfg.get('results_dir_policy_suffix', False):
+            results_dir = f"{results_dir}_{cfg['policy']}"
         workdir = f'{results_dir}/work_{phase_label}'
         for d in (results_dir, workdir):
             Mkdir(d).run()
@@ -237,6 +259,17 @@ class GpucompressLammpsDelta(Application):
         lmp_env['GPUCOMPRESS_CHUNK_MB']        = str(chunk_mb)
         lmp_env['GPUCOMPRESS_DETAILED_TIMING'] = '1'
         lmp_env['HDF5_PLUGIN_PATH']            = '/opt/GPUCompress/build'
+        # VOL-level contract (docs/reproducability.md):
+        lmp_env['GPUCOMPRESS_VOL_MODE']      = cfg.get('vol_mode', 'release')
+        lmp_env['GPUCOMPRESS_TIMING_OUTPUT'] = (
+            f'{results_dir}/'
+            f'{cfg.get("timing_csv_name", "gpucompress_io_timing.csv")}'
+        )
+        if cfg.get('vol_mode') == 'trace':
+            lmp_env['GPUCOMPRESS_TRACE_OUTPUT'] = (
+                f'{results_dir}/'
+                f'{cfg.get("trace_csv_name", "gpucompress_trace.csv")}'
+            )
 
         cmd = (
             f'env LD_LIBRARY_PATH={LD_LIBRARY_PATH} '
