@@ -13,8 +13,14 @@
 
 \usepackage{sc26repro}
 \usepackage{url}
+\usepackage[htt]{hyphenat}   % allow hyphenation inside \texttt
 \emergencystretch=3em  % forgive long \texttt tokens in 2-column
 \sloppy
+
+% Shrink verbatim so long shell commands fit the narrow IEEE column
+\makeatletter
+\renewcommand{\verbatim@font}{\ttfamily\footnotesize}
+\makeatother
 
 % Uncomment/comment the following usetag lines
 % if you would like to get an explanation or an example.
@@ -43,7 +49,7 @@ Appendix: Artifact Description/Artifact Evaluation
 
 \begin{description}
 \item[$C_1$] \textbf{GPU-accelerated I/O library interposition.} A VOL
-  connector and filter for HDF5 (and an ADIOS2 operator) that
+  connector and filter for HDF5 that
   transparently redirect scientific I/O calls onto a GPU-resident
   pipeline, keeping simulation data on the device from production
   through compression and storage without source-code changes to the
@@ -84,7 +90,9 @@ Appendix: Artifact Description/Artifact Evaluation
 \end{description}
 
 \begin{center}
-\begin{tabular}{rll}
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}rlp{0.42\columnwidth}@{}}
 \toprule
 Artifact ID  &  Contributions &  Related \\
              &  Supported     &  Paper Elements \\
@@ -93,8 +101,7 @@ $A_1$   &  $C_1, C_2, C_3$ & Fig.~3; Tab.~I \\
 \midrule
 $A_2$   &  $C_2$           & Fig.~4; \S IV.A \\
 \midrule
-$A_3$   &  $C_1, C_2, C_3$ & Fig.~5; Fig.~6; Fig.~8; Fig.~9;
-                             Tab.~III \\
+$A_3$   &  $C_1, C_2, C_3$ & Figs.~5, 6, 8, 9; Tab.~III \\
 \midrule
 $A_4$   &  $C_1, C_2, C_3$ & Figs.~4, 5, 6, 8, 9 (plotting) \\
 \bottomrule
@@ -127,7 +134,7 @@ $C_2$) from $A_2$;
 Fig.~5 (per-chunk cost breakdown pie charts, $C_2$) from
 $A_3$'s figure\_5 pipelines (release-mode runs with
 stage-timing instrumentation);
-Fig.~6 (VPIC threshold-sensitivity sweep, $C_2$) from $A_3$;
+Fig.~6 (LAMMPS threshold-sensitivity sweep, $C_2$) from $A_3$;
 Fig.~8 (cross-workload regret and MAPE convergence over five
 workloads, $C_2$) from $A_3$; and
 Fig.~9 (end-to-end wall-clock reduction of Baseline vs.
@@ -194,9 +201,7 @@ configure and build NeuroPress via
 --- \textbf{41 s};
 \texttt{ctest --test-dir build --output-on-failure} (71 unit
 / VOL / regression / perf / nn tests) --- \textbf{$\le$ 2
-minutes} on A100. Total: approximately \textbf{4 minutes on a
-well-provisioned login node, $\le$ 10 minutes on a compute
-node with fewer cores or slower links}. Analysis (inspect the
+minutes} on A100. Analysis (inspect the
 \texttt{ctest} summary and the per-test log under
 \texttt{build/Testing/}) 2 minutes. No workload execution at
 this stage --- workload runs are covered by $A_3$.
@@ -376,24 +381,28 @@ take $<15\%$ of the total write time, with Compress Time and
 I/O Time dominating the remainder; the read path should show
 Decompress Time and I/O Time accounting for $>90\%$ of total
 read time;
-(ii) \textbf{threshold sweep (Fig.~6, VPIC)}: cost MAPE and
+(ii) \textbf{threshold sweep (Fig.~6, LAMMPS)}: cost MAPE and
 regret rise monotonically with both online-learning thresholds
 $X_1$ (proportional correction) and $X_2 - X_1$ (exploration);
 write and read bandwidth peak near $X_1 = 30$, $X_2 - X_1 =
 20$, giving the accuracy--throughput sweet spot adopted for
 the remaining experiments;
 (iii) \textbf{online convergence (Fig.~8, all five workloads)}:
-LAMMPS and the AI checkpoint workload start near 15$\times$
-and 8$\times$ regret respectively and decay to near-zero
-within 200--500 chunks; VPIC, Nyx, and WarpX stabilise near
-zero regret from the first chunk;
-(iv) \textbf{end-to-end wall-clock (Fig.~9)}: NeuroPress +
-Tier + Async reduces wall-clock time by approximately 53\%
-versus the uncompressed baseline and 24\% versus
-\texttt{nvCOMP + tiering} on I/O-heavy workloads (VPIC,
-LAMMPS), 7--12\% on compute-heavy workloads (Nyx, WarpX, AI),
-with an additional 10--15\% reduction when relaxing the
-quality constraint from $\epsilon_L$ to $\epsilon_H$.
+in Fig.~8(a), LAMMPS and the AI checkpoint workload start
+near 15$\times$ and 8$\times$ regret respectively and decay
+to near-zero within 200--500 chunks; VPIC, Nyx, and WarpX
+stabilise near zero regret from the first chunk. In
+Fig.~8(b), cost MAPE converges toward a stable floor as the
+model accumulates corrective observations, with the AI
+workload showing the sharpest initial decay;
+(iv) \textbf{end-to-end wall-clock (Fig.~9)}: NeuroPress with
+tiering and async I/O reduces wall-clock time by
+approximately 53\% versus the uncompressed baseline and 24\%
+versus \texttt{nvCOMP + tiering} on I/O-heavy workloads
+(VPIC, LAMMPS), and by 7--12\% on compute-heavy workloads
+(Nyx, WarpX, AI); relaxing the quality constraint from
+$\epsilon_L$ to $\epsilon_H$ yields an additional 10--15\%
+reduction.
 
 \arttime
 Per workload on a single A100, broken out by phase:
@@ -402,7 +411,8 @@ Per workload on a single A100, broken out by phase:
 thereafter; (ii) SLURM allocation 1--5 minutes depending on
 queue; (iii) actual benchmark execution (\texttt{jarvis ppl
 run}, which drives both the baseline and adaptive variants
-end-to-end and writes the CSVs listed under \artout):
+end-to-end and writes the CSVs listed under the outputs
+section below):
 approximately 15 seconds for the smoke configuration, 3
 minutes for the small configuration, and 1.5 hours at paper
 scale (the grid sizes and timestep counts reported in \S V);
@@ -460,16 +470,16 @@ cd NeuroPress && export NEUROPRESS=$PWD
 cd $NEUROPRESS
 jarvis repo add gpucompress_pkgs
 
-# Fig. 5 -- per-chunk cost breakdown (pie anatomy)
-# Supported workloads for Fig. 5: VPIC, Nyx, WarpX
-# (all three route through generic_benchmark which emits
-#  stats_ms / nn_ms / comp_ms / read_ms / decomp_ms).
-# LAMMPS's in-situ fix_gpucompress_kokkos does NOT currently
-# emit those columns, so LAMMPS is not included in Fig. 5.
+# Fig. 5 -- per-chunk cost breakdown (pie anatomy).
+# Supported: VPIC, Nyx, WarpX (routed through
+# generic_benchmark, which emits stats_ms / nn_ms /
+# comp_ms / read_ms / decomp_ms). LAMMPS's in-situ
+# fix_gpucompress_kokkos does NOT emit those columns,
+# so LAMMPS is not included in Fig. 5.
 jarvis ppl load yaml \
   evaluations/figure_5/pipeline_<workload>.yaml
 
-# Fig. 6 -- trace-mode threshold sweep (all four workloads)
+# Fig. 6 -- trace-mode threshold sweep (four workloads)
 jarvis ppl load yaml \
   evaluations/figure_6/pipeline_<workload>.yaml
 
@@ -487,10 +497,10 @@ ppl run} fails with \emph{no active jobs on this node}.
 Refresh it immediately after \texttt{salloc}:
 \begin{verbatim}
 # On the GPU compute node, before each jarvis ppl run.
-# <pipeline-dir> is the value of the YAML's "name:" field, e.g.
-#   Fig. 5 : gpucompress_figure_5_<workload>
-#   Fig. 6 : gpucompress_<workload>_delta_single_node
-#   Fig. 8 : gpucompress_<workload>_delta_single_node
+# <pipeline-dir> is the YAML's "name:" field, e.g.
+#   Fig. 5: gpucompress_figure_5_<workload>
+#   Fig. 6: gpucompress_<workload>_delta_single_node
+#   Fig. 8: gpucompress_<workload>_delta_single_node
 hostname > $HOME/hostfile_single.txt
 cp $HOME/hostfile_single.txt \
    $HOME/.ppi-jarvis/shared/<pipeline-dir>/hostfile
@@ -554,7 +564,7 @@ Fig.~5 (per-chunk cost breakdown pie charts on the write
 and read paths --- $C_2$) from $A_3$'s figure\_5 pipelines'
 \texttt{benchmark\_<dataset>\_timesteps.csv} (release mode
 with stage-timing instrumentation);
-Fig.~6 (VPIC threshold-sensitivity heatmaps for regret, MAPE,
+Fig.~6 (LAMMPS threshold-sensitivity heatmaps for regret, MAPE,
 write bandwidth, and read bandwidth --- $C_2$) from $A_3$;
 Fig.~8 (cross-workload regret and cost MAPE convergence over
 the five unseen workloads --- $C_2$) from $A_3$;
@@ -570,7 +580,7 @@ reproduces:
 Fig.~4 (NN accuracy + SHAP, from $A_2$'s training metrics);
 Fig.~5 (per-chunk cost breakdown pie charts, from $A_3$'s
 figure\_5 stage-timing CSVs);
-Fig.~6 (four $7 \times 7$ VPIC threshold-sweep heatmaps);
+Fig.~6 (four $7 \times 7$ LAMMPS threshold-sweep heatmaps);
 and Fig.~8 and Fig.~9 from the per-workload CSVs. Each plot
 regenerated from the shipped archive should be
 pixel-comparable to the corresponding plot in the submitted
@@ -615,7 +625,7 @@ neural_net/training/cross_validate.py
 evaluations/figure_5/plot_anatomy.py
 # Fig. 6 (threshold sweep + MAPE/regret plots)
 analysis/plot_trace.py
-# Fig. 7 is NVIDIA-internal (see Section 1.3) and not included.
+# Fig. 7 is NVIDIA-internal (see Sec. 1.3); not included.
 # Fig. 8
 evaluations/figure_8/plot.py
 # Fig. 9
